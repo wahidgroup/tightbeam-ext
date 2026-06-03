@@ -1,0 +1,20 @@
+{
+	"compilerOptions": {
+		"target": "ES2022",
+		"module": "ESNext",
+		"moduleResolution": "bundler",
+		"strict": true,
+		"noEmit": true,
+		"skipLibCheck": true,
+		"esModuleInterop": true,
+		"types": ["@playwright/test", "node"],
+		"lib": ["ES2022", "DOM", "DOM.Iterable"]
+	},
+	"include": [
+		"app",
+		"specs",
+		"global.d.ts",
+		"vite.config.ts",
+		"playwright.config.ts"
+	]
+}

@@ -1,0 +1,44 @@
+[package]
+name = "tightbeam-ws"
+description = "WebSocket transport for the tightbeam messaging protocol"
+authors.workspace = true
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lib]
+name = "tightbeam_ws"
+
+[features]
+fixtures = []
+
+[[example]]
+name = "gen_certs"
+required-features = ["fixtures"]
+
+[[example]]
+name = "echo_server_secure"
+required-features = ["fixtures"]
+
+[dependencies]
+tightbeam-rs = { workspace = true }
+tokio = { workspace = true, features = ["net", "rt", "io-util", "macros"] }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
+
+[dev-dependencies]
+tightbeam-rs = { workspace = true, features = ["testing"] }
+tokio = { workspace = true, features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "sync",
+    "time",
+] }

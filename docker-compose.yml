@@ -1,0 +1,11 @@
+# Self-contained e2e stack: a single tightbeam-ws echo server container.
+#
+# The image is built by scripts/stack.sh.
+
+services:
+  echo-server:
+    image: ${ECHO_IMAGE:-tightbeam-ws-echo:dev}
+    environment:
+      ECHO_WS_PORT: "9100"
+    ports:
+      - "${ECHO_WS_HOST_PORT:-9100}:9100"

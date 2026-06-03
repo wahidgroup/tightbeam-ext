@@ -1,0 +1,33 @@
+version: "0.2"
+language: en
+words:
+  - chdir
+  - cyclonedx
+  - darraghor
+  - eslint
+  - hostnames
+  - nestjs
+  - npmrc
+  - nvmrc
+  - openapi
+  - openpgp
+  - pkill
+  - presign
+  - resumability
+  - sbom
+  - spellcheck
+  - supertest
+  - swagger
+  - swc
+  - tailwindcss
+  - tsconfig
+  - vitest
+  - yankable
+ignorePaths:
+  - node_modules
+  - target
+  - dist
+  - "*.lock"
+  - package-lock.json
+  - npm-shrinkwrap.json
+  - sbom.json

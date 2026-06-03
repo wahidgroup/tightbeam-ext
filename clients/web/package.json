@@ -1,0 +1,41 @@
+{
+	"name": "@wahidgroup/tightbeam-ws-client",
+	"version": "0.1.0",
+	"description": "Browser client for the tightbeam WebSocket transport: build tightbeam frames from a payload and ship them over a socket.",
+	"type": "module",
+	"main": "dist/index.js",
+	"module": "dist/index.js",
+	"types": "dist/index.d.ts",
+	"files": [
+		"dist",
+		"wasm"
+	],
+	"engines": {
+		"node": "24.14.0",
+		"npm": "11.9.0"
+	},
+	"scripts": {
+		"build:wasm": "wasm-pack build ../../tightbeam-ws-wasm --target web --out-dir ../clients/web/wasm --out-name tightbeam_ws_wasm",
+		"build": "npm run build:wasm && tsc",
+		"typecheck": "tsc --noEmit",
+		"lint": "eslint . && prettier --check .",
+		"lint:fix": "eslint . --fix && prettier --write .",
+		"clean": "rm -rf dist wasm"
+	},
+	"dependencies": {
+		"@wahidgroup/tightbeam-ts": "0.1.0",
+		"@wahidgroup/typing-ts": "0.1.0"
+	},
+	"devDependencies": {
+		"@wahidgroup/lint-rules": "0.1.0",
+		"typescript": "5.9.3"
+	},
+	"publishConfig": {
+		"registry": "https://npm.pkg.github.com"
+	},
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/wahidgroup/tightbeam-ws"
+	},
+	"license": "MIT OR Apache-2.0"
+}

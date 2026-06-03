@@ -1,0 +1,52 @@
+version: "0.2"
+language: en
+import:
+  - ./packages/lint-rules/cspell.base.yaml
+words:
+  - tightbeam
+  - Errorizable
+  - websocket
+  - websockets
+  - tungstenite
+  - tokio
+  - rustfmt
+  - clippy
+  - Cargo
+  - crates
+  - semver
+  - Swatinem
+  - dtolnay
+  - changelog
+  - backport
+  - Tanveer
+  - Wahid
+  - wahidgroup
+  - dockerized
+  - rustup
+  - tbws
+  - buildkit
+  - parameterised
+  - startswith
+  - secp
+  - beamable
+  - nonrepudiation
+  - gloo
+  - ecies
+  - encryptor
+  - decryptor
+  - ciphertext
+  - spki
+  - signingkey
+ignorePaths:
+  - node_modules/**
+  - "**/node_modules/**"
+  - target/**
+  - built/**
+  - dist/**
+  - "**/dist/**"
+  - "**/wasm/**"
+  - Cargo.lock
+  - package-lock.json
+  - .git/**
+  - .github/**
+  - "**/*.toml"
