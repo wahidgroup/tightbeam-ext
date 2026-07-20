@@ -4,7 +4,7 @@ Hybrid TypeScript/WebAssembly client for the [tightbeam](https://crates.io/crate
 
 The frame codec (ASN.1 DER structure engine) is the actual Rust implementation (`tightbeam-ws-wasm`) compiled with `wasm-pack`; the TypeScript layer adds the builder, validation, and connection ergonomics. Two wasm bundles ship in the package - a `web` build and a `nodejs` build - selected automatically via the package's `imports` map. Node ≥ 24 uses its global `WebSocket`; no shim required.
 
-Same builder methods as tightbeam-rs (`withSigner`, `withEncryptor`, `withMessageHasher`), the same `Frame` type with the same verification methods (`verify`, `frameIntegrityVerdict`, `messageCommitmentVerdict`, `decryptBytes`), the same enums with the same ordinals (`Version`, `MessagePriority`), and `emit` returning the response frame.
+Same builder methods as tightbeam-rs (`withSigner`, `withEncryptor`, `withMessageHasher`), the same `Frame` type with the same verification methods (`verify`, `frameIntegrityVerdict`, `messageCommitmentVerdict`, `decryptMessage`), the same enums with the same ordinals (`Version`, `MessagePriority`), and `emit` returning the response frame.
 
 Cryptography is bring-your-own: every security operation goes through a capability interface (`Hasher`, `BodyEncryptor`, `BodyDecryptor`, `Signatory`) identified by the dotted algorithm OID it writes into the frame. The tightbeam profile (SHA3-256 / secp256k1 ECDSA / AES-256-GCM / ECIES) ships as ready-made wasm-backed implementations; any hash, cipher, or signing library plugs in the same way.
 
@@ -23,7 +23,11 @@ The package is published to GitHub Packages; point the `@wahidgroup` scope there
 ## Cleartext round-trip
 
 ```ts
-import { TightbeamWsClient, frame } from "@wahidgroup/tightbeam-ws-client";
+import {
+	Opaque,
+	TightbeamWsClient,
+	frame,
+} from "@wahidgroup/tightbeam-ws-client";
 
 const client = await TightbeamWsClient.connect("ws://localhost:9100");
 
@@ -33,12 +37,12 @@ const built = await frame(new TextEncoder().encode("hello"))
 	.build();
 
 const response = await client.emit(built);
-console.log(response?.body, response?.order, response?.signed);
+console.log(response?.message(Opaque), response?.order, response?.signed);
 
 client.close();
 ```
 
-`emit` resolves with the response `Frame`, or `undefined` when the peer returns no response (`client.emit(frame) -> Option<Frame>`). A `Frame` exposes the decoded body, metadata (`version`, `id`, `order`, and the V2+/V3+ fields `priority`, `lifetime`, `previousFrame`, `matrix` when present), the security markers (`signed`, `messageIntegrity`, `frameIntegrity`, `confidential`) with their carried infos (`signatureInfo`, `messageIntegrityInfo`, `frameIntegrityInfo`, `confidentialityInfo`), the raw bytes via `toDer()`, and the verification methods below.
+`emit` resolves with the response `Frame`, or `undefined` when the peer returns no response (`client.emit(frame) -> Option<Frame>`). A `Frame` exposes the typed body via `message(codec)` (the raw DER via `bodyDer`), metadata (`version`, `id`, `order`, and the V2+/V3+ fields `priority`, `lifetime`, `previousFrame`, `matrix` when present), the security markers (`signed`, `messageIntegrity`, `frameIntegrity`, `confidential`) with their carried infos (`signatureInfo`, `messageIntegrityInfo`, `frameIntegrityInfo`, `confidentialityInfo`), the raw bytes via `toDer()`, and the verification methods below.
 
 ## Encrypted sessions (ECIES)
 
@@ -96,6 +100,46 @@ const built = await frame(body)
 - `withEncryptor` takes any `BodyEncryptor`: the profile symmetric cipher (`Aes256Gcm.fromKey(k)`, opened with the shared key), the profile asymmetric encryptor to a recipient (`EciesEncryptor.fromBytes(recipientPublicKey)`, opened with the recipient secret), or your own scheme. The frame has a single body-encryption slot.
 - Structurally invalid specs reject with a `ValidationError` carrying per-field issues.
 
+## Typed messages
+
+The protocol treats the frame body as opaque DER: what it encodes is your contract with the peer. A `MessageCodec<T>` pairs a TypeScript type with that contract - `encode` produces the body DER, `decode` parses and runtime-validates it - so payloads are typed at every call site while the wire stays schema-agnostic.
+
+For payloads without an ASN.1 schema, `wrapped(inner)` lifts any byte-level serialization (JSON, CBOR, protobuf) into a codec by wrapping it in the profile opaque body:
+
+```ts
+import type { MessageCodec } from "@wahidgroup/tightbeam-ws-client";
+import { frame, wrapped } from "@wahidgroup/tightbeam-ws-client";
+
+interface ChatMessage {
+	author: string;
+	text: string;
+}
+
+const Chat: MessageCodec<ChatMessage> = wrapped({
+	encode: (message) => new TextEncoder().encode(JSON.stringify(message)),
+	decode: (payload) => {
+		const parsed = JSON.parse(new TextDecoder().decode(payload));
+		// Runtime validation is the codec's responsibility.
+		if (
+			typeof parsed?.author !== "string" ||
+			typeof parsed?.text !== "string"
+		) {
+			throw new Error("not a ChatMessage");
+		}
+		return parsed;
+	},
+});
+
+const built = await frame()
+	.withMessage(Chat, { author: "ada", text: "hello" })
+	.build();
+
+const reply = await client.emit(built);
+const message = reply?.message(Chat); // ChatMessage
+```
+
+To interoperate with a peer expecting a specific ASN.1 `Message` schema (e.g. a Rust `der::Sequence`), implement `MessageCodec` directly with the ASN.1 library of your choice; the DER it emits is installed in the frame. `frame(bytes)` / `withMessage(bytes)` are sugar for the profile `Opaque` codec (raw bytes in the opaque wrapper), and a codec's optional `contentOid` is recorded in the confidentiality info when the body is sealed.
+
 ## Bring your own cryptography
 
 Each capability interface pairs the operation with the dotted OID recorded in the frame, so implementations are interchangeable across libraries and languages:
@@ -140,9 +184,13 @@ await response.frameIntegrityVerdict(); // "verified" | "absent" | ...
 await response.frameIntegrityVerdict(sha3_512Hasher); // under your own hasher
 await response.messageCommitmentVerdict(salt); // checks the body commitment
 
-// Open an encrypted body with the matching cipher or recipient secret:
-await response.decryptBytes(Aes256Gcm.fromKey(key));
-await response.decryptBytes(EciesDecryptor.fromBytes(recipientSecretKey));
+// Open an encrypted body with the matching cipher or recipient secret,
+// decoding the plaintext under any codec (Opaque for raw bytes):
+await response.decryptMessage(Aes256Gcm.fromKey(key), Opaque);
+await response.decryptMessage(
+	EciesDecryptor.fromBytes(recipientSecretKey),
+	Chat,
+);
 
 // Raw surfaces for external verification:
 response.tbs(); // to-be-signed bytes

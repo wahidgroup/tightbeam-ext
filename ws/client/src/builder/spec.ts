@@ -36,6 +36,24 @@ export interface MatrixSpec {
 }
 
 /**
+ * The frame body captured by `withMessage`: encoding is deferred to
+ * assembly, so builders stay usable before the wasm module initializes and
+ * the codec's type parameter never leaks into the spec.
+ */
+export interface MessageSlot {
+	/**
+	 * Content-type OID declared by the codec, recorded when the body is
+	 * sealed (an explicit `withContentOid` takes precedence).
+	 */
+	readonly contentOid?: string;
+
+	/**
+	 * Produce the body DER installed in the frame.
+	 */
+	encodeBody(): Uint8Array;
+}
+
+/**
  * Message-body integrity (V2+): commits to the body under the caller's
  * hasher.
  */
@@ -72,9 +90,9 @@ export interface FrameSpec {
 	 */
 	readonly order?: bigint;
 	/**
-	 * The opaque message body carried by the frame.
+	 * The frame body: a deferred encoding of the caller's message.
 	 */
-	readonly message?: Uint8Array;
+	readonly message?: MessageSlot;
 	/**
 	 * Dotted OID describing the body content type.
 	 */

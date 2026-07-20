@@ -10,9 +10,7 @@
 
 import type { FrameView } from "#wasm";
 import {
-	bodyPreimage,
 	commitmentPreimage,
-	decodeBody,
 	inspectFrame,
 	tbsBytes,
 	verifySignature as wasmVerifySignature,
@@ -22,6 +20,7 @@ import {
 import type { MessagePriority } from "./builder/priority.js";
 import type { Version } from "./builder/version.js";
 import type { BodyDecryptor, Hasher, Secp256k1VerifyingKey } from "./crypto.js";
+import type { MessageCodec } from "./message.js";
 import { ValidationError } from "./builder/errors.js";
 import { priorityFromOrdinal } from "./builder/priority.js";
 import { versionFromOrdinal } from "./builder/version.js";
@@ -121,7 +120,7 @@ interface FrameFields {
 	readonly version: Version;
 	readonly id: Uint8Array;
 	readonly order: bigint;
-	readonly body: Uint8Array;
+	readonly bodyDer: Uint8Array;
 	readonly priority: MessagePriority | undefined;
 	readonly lifetime: bigint | undefined;
 	readonly previousFrame: PreviousFrame | undefined;
@@ -224,7 +223,7 @@ function fieldsOf(view: FrameView): FrameFields {
 		version,
 		id: view.id,
 		order: view.order,
-		body: view.body,
+		bodyDer: view.bodyDer,
 		priority,
 		lifetime: view.lifetime,
 		previousFrame: digestInfoFrom(
@@ -364,12 +363,13 @@ export class Frame {
 	}
 
 	/**
-	 * Opaque message body. When {@link confidential} is true this is
-	 * ciphertext; open it with {@link decryptBytes}.
+	 * The raw frame body DER. When {@link confidential} is true this is
+	 * ciphertext; open it with {@link decryptMessage}. Decode a cleartext
+	 * body into a typed message with {@link message}.
 	 */
-	get body(): Uint8Array {
-		const body = this.decoded().body;
-		return body;
+	get bodyDer(): Uint8Array {
+		const bodyDer = this.decoded().bodyDer;
+		return bodyDer;
 	}
 
 	/**
@@ -488,11 +488,11 @@ export class Frame {
 
 	/**
 	 * The message-commitment preimage under `salt` (the salt passed to
-	 * `withMessageHasher`; may be empty), computed over the carried body.
+	 * `withMessageHasher`; may be empty), computed over the carried body
+	 * DER.
 	 */
 	commitmentInput(salt: Uint8Array): Uint8Array {
-		const body = bodyPreimage(this.body);
-		const commitmentInput = commitmentPreimage(salt, body);
+		const commitmentInput = commitmentPreimage(salt, this.bodyDer);
 		return commitmentInput;
 	}
 
@@ -539,15 +539,42 @@ export class Frame {
 	}
 
 	/**
-	 * Decrypt the encrypted body with any {@link BodyDecryptor} and resolve
-	 * with the plaintext payload. The profile decryptors are `Aes256Gcm` and
-	 * `EciesDecryptor`.
+	 * Decode the cleartext body into a typed message under `codec` - the
+	 * profile `Opaque` codec for raw bytes, or the implementor's schema.
+	 * The codec runtime-validates the bytes and throws on mismatch.
+	 *
+	 * @throws ValidationError when the frame is encrypted; use
+	 * {@link decryptMessage} instead.
+	 */
+	message<T>(codec: MessageCodec<T>): T {
+		if (this.confidential) {
+			throw new ValidationError("FRAME_CONFIDENTIAL", [
+				{
+					path: "frame",
+					message:
+						"The frame body is encrypted; decode it with decryptMessage",
+				},
+			]);
+		}
+
+		const message = codec.decode(this.bodyDer);
+		return message;
+	}
+
+	/**
+	 * Decrypt the encrypted body with any {@link BodyDecryptor} and decode
+	 * the plaintext into a typed message under `codec`. The profile
+	 * decryptors are `Aes256Gcm` and `EciesDecryptor`; the profile codec
+	 * for raw bytes is `Opaque`.
 	 *
 	 * @throws ValidationError when the frame is not encrypted.
 	 * @throws when the decryptor rejects the sealed body (wrong key or
-	 * algorithm).
+	 * algorithm), or the codec rejects the plaintext.
 	 */
-	async decryptBytes(decryptor: BodyDecryptor): Promise<Uint8Array> {
+	async decryptMessage<T>(
+		decryptor: BodyDecryptor,
+		codec: MessageCodec<T>,
+	): Promise<T> {
 		const confidentiality = this.decoded().confidentiality;
 		if (confidentiality === undefined) {
 			throw new ValidationError("FRAME_NOT_CONFIDENTIAL", [
@@ -561,10 +588,10 @@ export class Frame {
 		const plaintextDer = await decryptor.decrypt({
 			algorithmOid: confidentiality.algorithmOid,
 			parametersDer: confidentiality.parametersDer,
-			ciphertext: this.decoded().body,
+			ciphertext: this.decoded().bodyDer,
 		});
 
-		const plaintext = decodeBody(plaintextDer);
-		return plaintext;
+		const message = codec.decode(plaintextDer);
+		return message;
 	}
 }

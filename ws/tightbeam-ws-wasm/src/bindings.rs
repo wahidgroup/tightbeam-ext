@@ -90,10 +90,11 @@ impl FrameComposer {
 		self.config.order = order;
 	}
 
-	/// Set the opaque message body.
+	/// Set the frame body DER. Wrap raw payload bytes with `bodyPreimage` for
+	/// the profile opaque body.
 	#[wasm_bindgen(js_name = withMessage)]
-	pub fn with_message(&mut self, message: Vec<u8>) {
-		self.config.message = message;
+	pub fn with_message(&mut self, body_der: Vec<u8>) {
+		self.config.message = body_der;
 	}
 
 	/// Set the message priority by ordinal (`LowEffort` -> 0, ...).
@@ -261,11 +262,12 @@ impl FrameView {
 		self.summary.order
 	}
 
-	/// Opaque message body: the decoded payload when cleartext, the raw
-	/// ciphertext when confidential.
-	#[wasm_bindgen(getter)]
-	pub fn body(&self) -> Vec<u8> {
-		self.summary.body.clone()
+	/// The raw frame body: the sender's body DER when cleartext, the
+	/// ciphertext when confidential. Decode a profile opaque body with
+	/// `decodeBody`. Typed bodies decode under the caller's schema.
+	#[wasm_bindgen(getter, js_name = bodyDer)]
+	pub fn body_der(&self) -> Vec<u8> {
+		self.summary.body_der.clone()
 	}
 
 	/// Message priority ordinal (`LowEffort` -> 0, ...), when present (V2+).

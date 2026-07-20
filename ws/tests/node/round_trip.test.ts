@@ -1,16 +1,18 @@
 import { describe, expect, it } from "vitest";
 
-import type { Frame } from "@wahidgroup/tightbeam-ws-client";
+import type { Frame, MessageCodec } from "@wahidgroup/tightbeam-ws-client";
 import {
 	Aes256Gcm,
 	EciesDecryptor,
 	EciesEncryptor,
+	Opaque,
 	PROFILE_OIDS,
 	Secp256k1SigningKey,
 	Sha3_256,
 	TightbeamWsClient,
 	TightbeamWsSecureClient,
 	frame,
+	wrapped,
 } from "@wahidgroup/tightbeam-ws-client";
 
 import { certBytes, secureEndpoint, sinkEndpoint, wsEndpoint } from "../env.js";
@@ -74,7 +76,7 @@ describe("Node round-trips against the dockerized echo server", () => {
 				.build();
 
 			const response = await emitOrFail(client, built);
-			expect(response.body).toEqual(BODY);
+			expect(response.message(Opaque)).toEqual(BODY);
 			expect(TEXT.decode(response.id)).toBe("node-e2e");
 			expect(response.order).toBe(3n);
 		});
@@ -119,8 +121,10 @@ describe("Node round-trips against the dockerized echo server", () => {
 			expect(response.confidentialityInfo?.algorithmOid).toBe(
 				PROFILE_OIDS.aes256Gcm,
 			);
-			expect(response.body).not.toEqual(BODY);
-			await expect(response.decryptBytes(cipher)).resolves.toEqual(BODY);
+			expect(response.bodyDer).not.toEqual(BODY);
+			await expect(
+				response.decryptMessage(cipher, Opaque),
+			).resolves.toEqual(BODY);
 		});
 	});
 
@@ -137,12 +141,52 @@ describe("Node round-trips against the dockerized echo server", () => {
 
 			const response = await emitOrFail(client, built);
 			expect(response.confidential).toBe(true);
-			expect(response.body).not.toEqual(BODY);
+			expect(response.bodyDer).not.toEqual(BODY);
 
 			const decryptor = EciesDecryptor.fromBytes(recipientSecret);
-			await expect(response.decryptBytes(decryptor)).resolves.toEqual(
-				BODY,
-			);
+			await expect(
+				response.decryptMessage(decryptor, Opaque),
+			).resolves.toEqual(BODY);
+		});
+	});
+
+	it("round-trips a typed message under a wrapped payload codec", async () => {
+		interface Ping {
+			seq: number;
+		}
+
+		const PingCodec: MessageCodec<Ping> = wrapped({
+			encode(message: Ping): Uint8Array {
+				const payload = new TextEncoder().encode(
+					JSON.stringify(message),
+				);
+				return payload;
+			},
+			decode(payload: Uint8Array): Ping {
+				const parsed: unknown = JSON.parse(TEXT.decode(payload));
+				if (
+					typeof parsed !== "object" ||
+					parsed === null ||
+					!("seq" in parsed) ||
+					typeof parsed.seq !== "number"
+				) {
+					throw new Error("not a Ping payload");
+				}
+
+				const ping = { seq: parsed.seq };
+				return ping;
+			},
+		});
+
+		await withEchoClient(async (client) => {
+			const built = await frame()
+				.withId("node-typed")
+				.withOrder(5)
+				.withMessage(PingCodec, { seq: 42 })
+				.build();
+
+			const response = await emitOrFail(client, built);
+			expect(response.message(PingCodec)).toEqual({ seq: 42 });
 		});
 	});
 
@@ -173,7 +217,7 @@ describe("Node round-trips against the dockerized echo server", () => {
 					.build();
 
 				const response = await emitOrFail(client, built);
-				expect(response.body).toEqual(BODY);
+				expect(response.message(Opaque)).toEqual(BODY);
 				expect(TEXT.decode(response.id)).toBe("node-secure");
 			},
 		);

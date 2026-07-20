@@ -1,6 +1,8 @@
-import type { FrameBuilder } from "./builder.js";
 import { describe, expect, it } from "vitest";
 
+import { decodeBody } from "#wasm";
+
+import type { FrameBuilder } from "./builder.js";
 import { Aes256Gcm, EciesEncryptor, Sha3_256 } from "../crypto.js";
 import { Frame } from "../frame.js";
 import { frame, initClient } from "../index.js";
@@ -99,9 +101,12 @@ describe("FrameBuilder accumulation", () => {
 		expect(spec.encryptor).toBe(encryptor);
 	});
 
-	it("frame() seeds the message body", () => {
+	it("frame() seeds the message body as a deferred opaque encoding", () => {
 		const spec = frame(BODY).toSpec();
-		expect(spec.message).toEqual(BODY);
+
+		const bodyDer = spec.message?.encodeBody() ?? new Uint8Array();
+		const payload = decodeBody(bodyDer);
+		expect(payload).toEqual(BODY);
 	});
 });
 

@@ -9,6 +9,7 @@
 import type { Frame } from "@wahidgroup/tightbeam-ws-client";
 import {
 	Aes256Gcm,
+	Opaque,
 	Secp256k1SigningKey,
 	Sha3_256,
 	TightbeamWsClient,
@@ -82,7 +83,7 @@ async function emitFrame(client: EmitClient, built: Frame): Promise<Frame> {
 
 function toResult(response: Frame): RoundTripResult {
 	return {
-		bodyHex: bytesToHex(response.body),
+		bodyHex: bytesToHex(response.message(Opaque)),
 		version: response.version,
 		idText: TEXT.decode(response.id),
 		order: response.order.toString(),
@@ -251,8 +252,8 @@ async function sealedRoundTrip(
 	return {
 		confidential: response.confidential,
 		confidentialityOid: response.confidentialityInfo?.algorithmOid ?? "",
-		ciphertextDiffers: bytesToHex(response.body) !== payloadHex,
-		decryptedHex: bytesToHex(await response.decryptBytes(cipher)),
+		ciphertextDiffers: bytesToHex(response.bodyDer) !== payloadHex,
+		decryptedHex: bytesToHex(await response.decryptMessage(cipher, Opaque)),
 	};
 }
 

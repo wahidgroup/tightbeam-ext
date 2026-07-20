@@ -36,6 +36,8 @@ export type {
 	Hasher,
 	Signatory,
 } from "./crypto.js";
+export { Opaque, wrapped } from "./message.js";
+export type { MessageCodec, PayloadCodec } from "./message.js";
 export {
 	FrameBuilder,
 	MessagePriority,
@@ -49,6 +51,7 @@ export type {
 	FrameSpec,
 	MatrixSpec,
 	MessageIntegritySpec,
+	MessageSlot,
 	PreviousHashSpec,
 	ValidationIssue,
 } from "./builder/index.js";

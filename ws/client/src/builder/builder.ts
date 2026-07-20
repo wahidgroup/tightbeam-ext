@@ -3,11 +3,19 @@
  */
 
 import type { BodyEncryptor, Hasher, Signatory } from "../crypto.js";
+import type { MessageCodec } from "../message.js";
 import type { FrameCodec } from "./codec.js";
 import type { ValidationIssue } from "./errors.js";
 import type { MessagePriority } from "./priority.js";
-import type { FrameSpec, MatrixSpec, PreviousHashSpec } from "./spec.js";
+import type {
+	FrameSpec,
+	MatrixSpec,
+	MessageSlot,
+	PreviousHashSpec,
+} from "./spec.js";
 import { Frame } from "../frame.js";
+import { InternalError } from "../errors.js";
+import { Opaque } from "../message.js";
 import { ValidationError } from "./errors.js";
 import { Version } from "./version.js";
 
@@ -212,6 +220,19 @@ function validateVersionAssertion(
 }
 
 /**
+ * Capture a codec/message pair as a deferred body encoding, erasing the
+ * codec's type parameter from the spec.
+ */
+function slotOf<T>(codec: MessageCodec<T>, message: T): MessageSlot {
+	return {
+		contentOid: codec.contentOid,
+		encodeBody(): Uint8Array {
+			return codec.encode(message);
+		},
+	};
+}
+
+/**
  * A fluent builder over an injected {@link FrameCodec}.
  */
 export class FrameBuilder {
@@ -263,11 +284,34 @@ export class FrameBuilder {
 	}
 
 	/**
-	 * Set the opaque message body.
+	 * Set the frame body: raw bytes ride the profile opaque wrapper, while
+	 * a `MessageCodec<T>` carries a typed message under the implementor's
+	 * schema. Encoding is deferred to `build()`.
 	 */
-	withMessage(message: Uint8Array): FrameBuilder {
-		const next = this.with({ message });
-		return next;
+	withMessage(message: Uint8Array): FrameBuilder;
+	withMessage<T>(codec: MessageCodec<T>, message: T): FrameBuilder;
+	withMessage<T>(
+		messageOrCodec: Uint8Array | MessageCodec<T>,
+		...rest: [T] | []
+	): FrameBuilder {
+		if (messageOrCodec instanceof Uint8Array) {
+			const next = this.with({ message: slotOf(Opaque, messageOrCodec) });
+			return next;
+		}
+
+		if (rest.length === 1) {
+			const [message] = rest;
+			const next = this.with({
+				message: slotOf(messageOrCodec, message),
+			});
+
+			return next;
+		}
+
+		throw new InternalError(
+			"MESSAGE_ARITY",
+			"withMessage(codec, message) requires the message argument",
+		);
 	}
 
 	/**
@@ -336,7 +380,7 @@ export class FrameBuilder {
 	 * Encrypt the message body with any `BodyEncryptor` (V1+). The profile
 	 * encryptors are `Aes256Gcm` (shared key) and `EciesEncryptor` (to a
 	 * recipient public key); bring your own for other schemes. Open the
-	 * received body with `Frame.decryptBytes(decryptor)`.
+	 * received body with `Frame.decryptMessage(decryptor, codec)`.
 	 */
 	withEncryptor(encryptor: BodyEncryptor): FrameBuilder {
 		const next = this.with({ encryptor });

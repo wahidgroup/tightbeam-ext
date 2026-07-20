@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Echoes a usable TCP port. If a preferred port is given and free, it is
-# returned verbatim; otherwise an OS-assigned ephemeral port is emitted.
+# returned; otherwise an OS-assigned ephemeral port is emitted.
 #
 # Usage: ./scripts/get-port.sh [preferred-port]
 

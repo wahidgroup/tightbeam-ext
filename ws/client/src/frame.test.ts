@@ -2,7 +2,7 @@ import { secp256k1 } from "@noble/curves/secp256k1.js";
 import { sha3_256, sha3_512 } from "@noble/hashes/sha3.js";
 import { describe, expect, it } from "vitest";
 
-import { profileSignerId } from "#wasm";
+import { bodyPreimage, profileSignerId } from "#wasm";
 
 import type {
 	BodyDecryptor,
@@ -11,7 +11,7 @@ import type {
 	Hasher,
 	Signatory,
 } from "./crypto.js";
-import type { FrameBuilder } from "./index.js";
+import type { FrameBuilder, MessageCodec } from "./index.js";
 import { MessagePriority } from "./builder/priority.js";
 import { Version } from "./builder/version.js";
 import {
@@ -23,7 +23,13 @@ import {
 	Secp256k1VerifyingKey,
 	Sha3_256,
 } from "./crypto.js";
-import { ValidationError, frame, initClient } from "./index.js";
+import {
+	Opaque,
+	ValidationError,
+	frame,
+	initClient,
+	wrapped,
+} from "./index.js";
 
 /**
  * Wasm-backed round-trips through the real codec: what the builder writes,
@@ -66,7 +72,7 @@ describe("Frame metadata round-trip", () => {
 		expect(built.version).toBe(Version.V0);
 		expect(built.id).toEqual(new TextEncoder().encode("clear-1"));
 		expect(built.order).toBe(7n);
-		expect(built.body).toEqual(BODY);
+		expect(built.message(Opaque)).toEqual(BODY);
 		expect(built.signed).toBe(false);
 		expect(built.messageIntegrity).toBe(false);
 		expect(built.frameIntegrity).toBe(false);
@@ -381,7 +387,7 @@ describe("external Signatory across the wasm boundary", () => {
 	});
 });
 
-describe("Frame.decryptBytes", () => {
+describe("Frame.decryptMessage", () => {
 	it("round-trips an AES-256-GCM sealed body", async () => {
 		const cipher = Aes256Gcm.fromKey(new Uint8Array(32).fill(7));
 
@@ -390,8 +396,10 @@ describe("Frame.decryptBytes", () => {
 		expect(built.confidentialityInfo?.algorithmOid).toBe(
 			PROFILE_OIDS.aes256Gcm,
 		);
-		expect(built.body).not.toEqual(BODY);
-		await expect(built.decryptBytes(cipher)).resolves.toEqual(BODY);
+		expect(built.bodyDer).not.toEqual(bodyPreimage(BODY));
+		await expect(built.decryptMessage(cipher, Opaque)).resolves.toEqual(
+			BODY,
+		);
 	});
 
 	it("rejects the wrong AEAD key", async () => {
@@ -399,7 +407,7 @@ describe("Frame.decryptBytes", () => {
 		const wrong = Aes256Gcm.fromKey(new Uint8Array(32).fill(9));
 
 		const built = await frame(BODY).withEncryptor(cipher).build();
-		await expect(built.decryptBytes(wrong)).rejects.toThrow();
+		await expect(built.decryptMessage(wrong, Opaque)).rejects.toThrow();
 	});
 
 	it("round-trips an ECIES body sealed to a recipient", async () => {
@@ -413,10 +421,12 @@ describe("Frame.decryptBytes", () => {
 		expect(built.confidentialityInfo?.algorithmOid).toBe(
 			PROFILE_OIDS.eciesSecp256k1,
 		);
-		expect(built.body).not.toEqual(BODY);
+		expect(built.bodyDer).not.toEqual(bodyPreimage(BODY));
 
 		const decryptor = EciesDecryptor.fromBytes(recipientSecret);
-		await expect(built.decryptBytes(decryptor)).resolves.toEqual(BODY);
+		await expect(built.decryptMessage(decryptor, Opaque)).resolves.toEqual(
+			BODY,
+		);
 	});
 
 	it("rejects the wrong ECIES secret", async () => {
@@ -426,14 +436,14 @@ describe("Frame.decryptBytes", () => {
 			.build();
 
 		const wrong = EciesDecryptor.fromBytes(new Uint8Array(32).fill(2));
-		await expect(built.decryptBytes(wrong)).rejects.toThrow();
+		await expect(built.decryptMessage(wrong, Opaque)).rejects.toThrow();
 	});
 
 	it("rejects decryption of a cleartext frame", async () => {
 		const cipher = Aes256Gcm.fromKey(new Uint8Array(32).fill(7));
 		const cleartext = await frame(BODY).build();
 
-		await expect(cleartext.decryptBytes(cipher)).rejects.toThrow(
+		await expect(cleartext.decryptMessage(cipher, Opaque)).rejects.toThrow(
 			ValidationError,
 		);
 	});
@@ -516,7 +526,9 @@ describe("bring-your-own encryption across the wasm boundary", () => {
 		);
 
 		const decryptor = Aes256Gcm.fromKey(KEY);
-		await expect(built.decryptBytes(decryptor)).resolves.toEqual(BODY);
+		await expect(built.decryptMessage(decryptor, Opaque)).resolves.toEqual(
+			BODY,
+		);
 	});
 
 	it("opens a profile-sealed body with the WebCrypto decryptor", async () => {
@@ -524,6 +536,140 @@ describe("bring-your-own encryption across the wasm boundary", () => {
 		const built = await frame(BODY).withEncryptor(encryptor).build();
 
 		const decryptor = new WebCryptoAes256Gcm(KEY);
-		await expect(built.decryptBytes(decryptor)).resolves.toEqual(BODY);
+		await expect(built.decryptMessage(decryptor, Opaque)).resolves.toEqual(
+			BODY,
+		);
+	});
+});
+
+describe("typed message codecs", () => {
+	interface ChatMessage {
+		author: string;
+		text: string;
+	}
+
+	/**
+	 * A wrapped payload codec: JSON inside the profile opaque body, with
+	 * caller-side runtime validation on decode.
+	 */
+	const Chat: MessageCodec<ChatMessage> = wrapped({
+		encode(message: ChatMessage): Uint8Array {
+			const payload = new TextEncoder().encode(JSON.stringify(message));
+			return payload;
+		},
+		decode(payload: Uint8Array): ChatMessage {
+			const parsed: unknown = JSON.parse(
+				new TextDecoder().decode(payload),
+			);
+			if (
+				typeof parsed !== "object" ||
+				parsed === null ||
+				!("author" in parsed) ||
+				!("text" in parsed) ||
+				typeof parsed.author !== "string" ||
+				typeof parsed.text !== "string"
+			) {
+				throw new ValidationError("CHAT_MESSAGE", [
+					{ path: "body", message: "Not a chat message" },
+				]);
+			}
+
+			const message = { author: parsed.author, text: parsed.text };
+			return message;
+		},
+	});
+
+	/**
+	 * A full-DER codec for `SEQUENCE { title UTF8String }`, the schema of
+	 * the Rust `Doc` interop test: no opaque wrapper, so a typed Rust peer
+	 * decodes the body directly.
+	 */
+	const Doc: MessageCodec<{ title: string }> = {
+		encode(message: { title: string }): Uint8Array {
+			const title = new TextEncoder().encode(message.title);
+			const bodyDer = new Uint8Array([
+				0x30,
+				title.length + 2,
+				0x0c,
+				title.length,
+				...title,
+			]);
+			return bodyDer;
+		},
+		decode(bodyDer: Uint8Array): { title: string } {
+			const length = bodyDer[3] ?? 0;
+			if (
+				bodyDer[0] !== 0x30 ||
+				bodyDer[2] !== 0x0c ||
+				bodyDer.length !== length + 4
+			) {
+				throw new ValidationError("DOC", [
+					{ path: "body", message: "Not a Doc body" },
+				]);
+			}
+
+			const title = new TextDecoder().decode(bodyDer.slice(4));
+			return { title };
+		},
+	};
+
+	const CHAT: ChatMessage = { author: "ada", text: "hello" };
+
+	it("round-trips a wrapped typed message", async () => {
+		const built = await frame().withMessage(Chat, CHAT).build();
+		expect(built.message(Chat)).toEqual(CHAT);
+	});
+
+	it("round-trips a wrapped typed message through encryption", async () => {
+		const cipher = Aes256Gcm.fromKey(new Uint8Array(32).fill(7));
+		const built = await frame()
+			.withMessage(Chat, CHAT)
+			.withEncryptor(cipher)
+			.build();
+
+		await expect(built.decryptMessage(cipher, Chat)).resolves.toEqual(CHAT);
+	});
+
+	it("rejects decoding under a codec the body does not satisfy", async () => {
+		const built = await frame(BODY).build();
+		expect(() => built.message(Chat)).toThrow();
+	});
+
+	it("rejects typed decode of an encrypted frame", async () => {
+		const cipher = Aes256Gcm.fromKey(new Uint8Array(32).fill(7));
+		const built = await frame()
+			.withMessage(Chat, CHAT)
+			.withEncryptor(cipher)
+			.build();
+
+		expect(() => built.message(Chat)).toThrow(ValidationError);
+	});
+
+	it("installs a full-DER body, matching the Rust Doc schema", async () => {
+		const built = await frame()
+			.withMessage(Doc, { title: "typed-body" })
+			.build();
+
+		// The exact DER the Rust interop test produces for the same Doc.
+		const expected = new Uint8Array([
+			0x30,
+			0x0c,
+			0x0c,
+			0x0a,
+			...new TextEncoder().encode("typed-body"),
+		]);
+		expect(built.bodyDer).toEqual(expected);
+		expect(built.message(Doc)).toEqual({ title: "typed-body" });
+	});
+
+	it("commits to the typed body DER, not the payload", async () => {
+		const built = await frame()
+			.withMessage(Doc, { title: "committed" })
+			.withMessageHasher(new Sha3_256())
+			.build();
+
+		await expect(
+			built.messageCommitmentVerdict(new Uint8Array()),
+		).resolves.toBe("verified");
 	});
 });

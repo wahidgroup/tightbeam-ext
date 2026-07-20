@@ -43,7 +43,9 @@ pub struct FrameConfig {
 	pub id: Vec<u8>,
 	/// Monotonic order (Unix seconds).
 	pub order: u64,
-	/// Opaque message body.
+	/// The frame body as DER: any `Message` encoding the peer expects.
+	/// Callers without an ASN.1 schema wrap raw payload bytes with
+	/// [`body_preimage`] (the opaque profile body).
 	pub message: Vec<u8>,
 	/// Message priority (V2+).
 	pub priority: Option<MessagePriority>,
@@ -76,13 +78,18 @@ impl FrameConfig {
 	}
 
 	/// Assemble the structural frame and return its DER.
+	///
+	/// `message` is installed as the frame body. The builder never
+	/// re-encodes it, so any `Message` schema round-trips bit-exactly.
 	pub fn build(self) -> Result<Vec<u8>, TightBeamError> {
-		let body = OpaqueBody { body: OctetString::new(self.message.as_slice())? };
+		// The upstream builder requires a typed message; build with an
+		// empty placeholder body, then install the caller's body DER.
+		let placeholder = OpaqueBody { body: OctetString::new([])? };
 
 		let mut builder = FrameBuilder::<OpaqueBody>::from(self.effective_version())
 			.with_id(self.id)
 			.with_order(self.order)
-			.with_message(body);
+			.with_message(placeholder);
 
 		if let Some(priority) = self.priority {
 			builder = builder.with_priority(priority);
@@ -97,7 +104,8 @@ impl FrameConfig {
 			builder = builder.with_matrix_dyn(matrix);
 		}
 
-		let frame = builder.build()?;
+		let mut frame = builder.build()?;
+		frame.message = self.message;
 		Ok(frame.to_der()?)
 	}
 }
@@ -283,9 +291,10 @@ pub struct FrameSummary {
 	pub id: Vec<u8>,
 	/// Monotonic order (Unix seconds).
 	pub order: u64,
-	/// Opaque message body: the decoded payload when cleartext, the raw
-	/// ciphertext when confidential.
-	pub body: Vec<u8>,
+	/// The raw frame body: the caller's body DER when cleartext, the
+	/// ciphertext when confidential. Decode a profile opaque body with
+	/// [`decode_body`]; typed bodies decode under the caller's schema.
+	pub body_der: Vec<u8>,
 	/// Message priority ordinal (`LowEffort` -> 0, ...), when present (V2+).
 	pub priority: Option<u8>,
 	/// Time-to-live in seconds, when present (V2+).
@@ -320,22 +329,10 @@ pub struct FrameSummary {
 }
 
 /// Decode a frame DER into a [`FrameSummary`].
-///
-/// No cryptography runs; a cleartext body is the decoded payload, an
-/// encrypted body is surfaced as ciphertext alongside its confidentiality
-/// info.
 pub fn inspect_frame(frame_der: impl AsRef<[u8]>) -> Result<FrameSummary, TightBeamError> {
 	let frame = Frame::from_der(frame_der.as_ref())?;
 	let metadata = &frame.metadata;
-
-	// An encrypted body is ciphertext, not an OpaqueBody encoding; surface
-	// it as-is for the caller's decryptor.
 	let confidentiality = metadata.confidentiality.as_ref();
-	let body = if confidentiality.is_some() {
-		frame.message.clone()
-	} else {
-		OpaqueBody::from_der(&frame.message)?.body.into_bytes()
-	};
 
 	let confidentiality_parameters_der = confidentiality
 		.and_then(|info| info.content_enc_alg.parameters.as_ref())
@@ -346,7 +343,7 @@ pub fn inspect_frame(frame_der: impl AsRef<[u8]>) -> Result<FrameSummary, TightB
 		version: frame.version as u8,
 		id: metadata.id.clone(),
 		order: metadata.order,
-		body,
+		body_der: frame.message.clone(),
 		priority: metadata.priority.map(|priority| priority as u8),
 		lifetime: metadata.lifetime,
 		previous_hash_algorithm_oid: metadata.previous_frame.as_ref().map(|digest| digest.algorithm.oid.to_string()),
@@ -519,11 +516,12 @@ mod tests {
 	use tightbeam::crypto::secret::ToInsecure;
 	use tightbeam::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey};
 	use tightbeam::der::oid::AssociatedOid;
-	use tightbeam::der::Decode;
+	use tightbeam::der::{Decode, Encode, Sequence};
 	use tightbeam::matrix::MatrixDyn;
 	use tightbeam::oids::{AES_256_GCM, HASH_SHA3_256, SIGNER_ECDSA_WITH_SHA3_256};
 	use tightbeam::{
-		AlgorithmIdentifierOwned, DigestInfo, Frame, IntegrityVerdict, MessagePriority, ObjectIdentifier, Version,
+		AlgorithmIdentifierOwned, Beamable, DigestInfo, Frame, IntegrityVerdict, MessagePriority, ObjectIdentifier,
+		Version,
 	};
 
 	use super::{
@@ -540,16 +538,21 @@ mod tests {
 		b"opaque-message-body".to_vec()
 	}
 
+	/// The profile body DER wrapping [`sample_message`].
+	fn sample_body() -> AnyResult<Vec<u8>> {
+		Ok(body_preimage(sample_message())?)
+	}
+
 	fn signing_key() -> AnyResult<Secp256k1SigningKey> {
 		Ok(Secp256k1SigningKey::from_bytes(&[1u8; 32].into())?)
 	}
 
-	fn base_config(id: &[u8], order: u64) -> FrameConfig {
-		FrameConfig { id: id.to_vec(), order, message: sample_message(), ..Default::default() }
+	fn base_config(id: &[u8], order: u64) -> AnyResult<FrameConfig> {
+		Ok(FrameConfig { id: id.to_vec(), order, message: sample_body()?, ..Default::default() })
 	}
 
 	fn seal_frame(id: &[u8], order: u64) -> AnyResult<Vec<u8>> {
-		Ok(base_config(id, order).build()?)
+		Ok(base_config(id, order)?.build()?)
 	}
 
 	fn open_frame(frame_der: impl AsRef<[u8]>) -> AnyResult<Vec<u8>> {
@@ -564,10 +567,10 @@ mod tests {
 	/// Drive the full caller-side pipeline with the profile primitives, the
 	/// way the TS builder does: commit, witness, then sign detached.
 	fn signed_frame(id: &[u8], order: u64, key_bytes: [u8; 32]) -> AnyResult<Vec<u8>> {
-		let config = FrameConfig { version: Some(Version::V2), ..base_config(id, order) };
+		let config = FrameConfig { version: Some(Version::V2), ..base_config(id, order)? };
 		let der = config.build()?;
 
-		let commitment = sha3_256_digest(commitment_preimage([], body_preimage(sample_message())?));
+		let commitment = sha3_256_digest(commitment_preimage([], sample_body()?));
 		let der = set_message_integrity(&der, HASH_SHA3_256, commitment)?;
 
 		let witness = sha3_256_digest(witness_input(&der)?);
@@ -607,7 +610,7 @@ mod tests {
 
 	#[test]
 	fn config_defaults_to_v0_cleartext() -> TestResult {
-		let frame = frame_from(base_config(b"plain", 1))?;
+		let frame = frame_from(base_config(b"plain", 1)?)?;
 		assert_eq!(frame.version, Version::V0);
 		assert!(frame.nonrepudiation.is_none());
 		Ok(())
@@ -618,7 +621,7 @@ mod tests {
 		let config = FrameConfig {
 			priority: Some(MessagePriority::LowLatency),
 			lifetime: Some(60),
-			..base_config(b"meta", 9)
+			..base_config(b"meta", 9)?
 		};
 
 		let frame = frame_from(config)?;
@@ -631,7 +634,7 @@ mod tests {
 	#[test]
 	fn config_matrix_requires_v3() -> TestResult {
 		let matrix = MatrixDyn::from_row_major(2, vec![0, 1, 1, 0]).ok_or("matrix dims")?;
-		let config = FrameConfig { matrix: Some(matrix), ..base_config(b"matrix", 1) };
+		let config = FrameConfig { matrix: Some(matrix), ..base_config(b"matrix", 1)? };
 
 		let frame = frame_from(config)?;
 		assert_eq!(frame.version, Version::V3);
@@ -643,7 +646,7 @@ mod tests {
 
 	#[test]
 	fn config_pins_explicit_version() -> TestResult {
-		let config = FrameConfig { version: Some(Version::V2), ..base_config(b"pinned", 3) };
+		let config = FrameConfig { version: Some(Version::V2), ..base_config(b"pinned", 3)? };
 		let frame = frame_from(config)?;
 		assert_eq!(frame.version, Version::V2);
 		Ok(())
@@ -656,7 +659,8 @@ mod tests {
 		assert_eq!(summary.version, 0);
 		assert_eq!(summary.id, b"view-1");
 		assert_eq!(summary.order, 11);
-		assert_eq!(summary.body, sample_message());
+		assert_eq!(summary.body_der, sample_body()?);
+		assert_eq!(decode_body(&summary.body_der)?, sample_message());
 		assert_eq!(summary.signature_algorithm_oid, None);
 		assert_eq!(summary.message_integrity_algorithm_oid, None);
 		assert_eq!(summary.frame_integrity_algorithm_oid, None);
@@ -676,7 +680,7 @@ mod tests {
 			lifetime: Some(300),
 			previous_hash: Some(previous),
 			matrix: Some(matrix),
-			..base_config(b"rich", 21)
+			..base_config(b"rich", 21)?
 		};
 
 		let summary = inspect_frame(config.build()?)?;
@@ -790,7 +794,7 @@ mod tests {
 	#[test]
 	fn caller_side_commitment_verifies_with_tightbeam() -> TestResult {
 		let salt = b"pepper";
-		let der = FrameConfig { version: Some(Version::V2), ..base_config(b"mi", 1) }.build()?;
+		let der = FrameConfig { version: Some(Version::V2), ..base_config(b"mi", 1)? }.build()?;
 
 		let commitment = sha3_256_digest(commitment_preimage(salt, body_preimage(sample_message())?));
 		let der = set_message_integrity(&der, HASH_SHA3_256, commitment)?;
@@ -809,7 +813,7 @@ mod tests {
 	/// tightbeam's own frame-integrity verdict: pins the scaffold encoding.
 	#[test]
 	fn caller_side_witness_verifies_with_tightbeam() -> TestResult {
-		let der = FrameConfig { version: Some(Version::V2), ..base_config(b"fi", 1) }.build()?;
+		let der = FrameConfig { version: Some(Version::V2), ..base_config(b"fi", 1)? }.build()?;
 
 		let witness = sha3_256_digest(witness_input(&der)?);
 		let der = attach_witness(&der, HASH_SHA3_256, witness)?;
@@ -824,7 +828,7 @@ mod tests {
 
 	#[test]
 	fn tampered_witness_reports_mismatch() -> TestResult {
-		let der = FrameConfig { version: Some(Version::V2), ..base_config(b"fi-bad", 1) }.build()?;
+		let der = FrameConfig { version: Some(Version::V2), ..base_config(b"fi-bad", 1)? }.build()?;
 		let der = attach_witness(&der, HASH_SHA3_256, [0u8; 32])?;
 
 		let frame = Frame::from_der(&der)?;
@@ -840,7 +844,7 @@ mod tests {
 	#[test]
 	fn caller_side_aead_seal_opens_with_tightbeam() -> TestResult {
 		let key = [0x42u8; 32];
-		let der = FrameConfig { version: Some(Version::V1), ..base_config(b"sealed", 8) }.build()?;
+		let der = FrameConfig { version: Some(Version::V1), ..base_config(b"sealed", 8)? }.build()?;
 
 		let sealed = seal_aes_256_gcm(key, body_preimage(sample_message())?)?;
 		assert_eq!(sealed.algorithm_oid, AES_256_GCM.to_string());
@@ -855,7 +859,7 @@ mod tests {
 
 		let summary = inspect_frame(&der)?;
 		assert_eq!(summary.confidentiality_algorithm_oid, Some(AES_256_GCM.to_string()));
-		assert_ne!(summary.body, sample_message());
+		assert_ne!(summary.body_der, sample_body()?);
 
 		let cipher = Aes256Gcm::new_from_slice(&key)?;
 		let frame = Frame::from_der(&der)?;
@@ -926,6 +930,55 @@ mod tests {
 	fn body_preimage_round_trips_through_decode() -> TestResult {
 		let preimage = body_preimage(sample_message())?;
 		assert_eq!(decode_body(preimage)?, sample_message());
+		Ok(())
+	}
+
+	/// A typed message schema, standing in for any peer-defined `Message`
+	/// body that is not the profile opaque wrapper.
+	#[derive(Beamable, Clone, Debug, PartialEq, Eq, Sequence)]
+	#[beam(min_version = "V0")]
+	struct Doc {
+		title: String,
+	}
+
+	/// A caller-supplied typed body DER must land in the frame and
+	/// decode under the peer's schema: pins the raw body path.
+	#[test]
+	fn typed_body_round_trips_through_raw_path() -> TestResult {
+		let doc = Doc { title: "typed-body".into() };
+		let body_der = doc.to_der()?;
+
+		let config = FrameConfig { message: body_der.clone(), ..base_config(b"typed", 1)? };
+		let frame = Frame::from_der(&config.build()?)?;
+		assert_eq!(frame.message, body_der);
+		assert_eq!(Doc::from_der(&frame.message)?, doc);
+		Ok(())
+	}
+
+	/// A caller-side commitment over a typed body must satisfy tightbeam's
+	/// verdict computed from the typed message itself.
+	#[test]
+	fn typed_body_commitment_verifies_with_tightbeam() -> TestResult {
+		let salt = b"pepper";
+		let doc = Doc { title: "committed".into() };
+		let body_der = doc.to_der()?;
+
+		let config = FrameConfig {
+			version: Some(Version::V2),
+			message: body_der.clone(),
+			..base_config(b"typed-mi", 1)?
+		};
+
+		let der = config.build()?;
+		let commitment = sha3_256_digest(commitment_preimage(salt, &body_der));
+		let der = set_message_integrity(&der, HASH_SHA3_256, commitment)?;
+
+		let frame = Frame::from_der(&der)?;
+		let (_, opening) = Opening::prove::<Sha3_256, _>(&doc, salt)?;
+		assert!(matches!(
+			frame.message_commitment_verdict::<Sha3_256>(&opening)?,
+			IntegrityVerdict::Verified
+		));
 		Ok(())
 	}
 }

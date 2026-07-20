@@ -3,6 +3,7 @@ export type {
 	FrameSpec,
 	MatrixSpec,
 	MessageIntegritySpec,
+	MessageSlot,
 	PreviousHashSpec,
 } from "./spec.js";
 export type { ValidationIssue } from "./errors.js";

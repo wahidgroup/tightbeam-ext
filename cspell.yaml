@@ -52,6 +52,7 @@ words:
   - submod
   - bindgen
   - oids
+  - CBOR
 ignorePaths:
   - node_modules/**
   - "**/node_modules/**"
