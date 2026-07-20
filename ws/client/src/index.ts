@@ -143,7 +143,7 @@ export class TightbeamWsClient {
 	static async connect(url: string): Promise<TightbeamWsClient> {
 		await initClient();
 
-		let client = new TightbeamWsClient(WsClient.connect(url));
+		const client = new TightbeamWsClient(WsClient.connect(url));
 		return client;
 	}
 
@@ -191,7 +191,7 @@ export class TightbeamWsSecureClient {
 	): Promise<TightbeamWsSecureClient> {
 		await initClient();
 
-		let client = new TightbeamWsSecureClient(
+		const client = new TightbeamWsSecureClient(
 			SecureWsClient.connect(url, serverCertDer),
 		);
 		return client;
@@ -214,7 +214,7 @@ export class TightbeamWsSecureClient {
 	): Promise<TightbeamWsSecureClient> {
 		await initClient();
 
-		let client = new TightbeamWsSecureClient(
+		const client = new TightbeamWsSecureClient(
 			SecureWsClient.connectMutual(
 				url,
 				serverCertDer,

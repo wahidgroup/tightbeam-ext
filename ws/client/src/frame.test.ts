@@ -460,9 +460,13 @@ describe("bring-your-own encryption across the wasm boundary", () => {
 		constructor(private readonly key: Uint8Array<ArrayBuffer>) {}
 
 		private cryptoKey(usage: KeyUsage): Promise<CryptoKey> {
-			const key = crypto.subtle.importKey("raw", this.key, "AES-GCM", false, [
-				usage,
-			]);
+			const key = crypto.subtle.importKey(
+				"raw",
+				this.key,
+				"AES-GCM",
+				false,
+				[usage],
+			);
 			return key;
 		}
 
