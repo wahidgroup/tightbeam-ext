@@ -1,6 +1,5 @@
 /**
- * Frame protocol versions, mirroring tightbeam's `Version` enum. The value of
- * each member is its wire ordinal.
+ * Frame protocol versions. The value of each member is its wire ordinal.
  */
 
 /**

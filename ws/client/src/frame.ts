@@ -1,6 +1,6 @@
 /**
- * The TypeScript mirror of Rust's `Frame`: a decoded tightbeam frame with
- * its metadata, carried security infos, and verification methods.
+ * A decoded tightbeam frame with its metadata, carried security infos, and
+ * verification methods.
  *
  * Verification is algorithm-agile: the verdict methods recompute digests
  * with any {@link Hasher}, and the preimage accessors ({@link Frame.tbs},
@@ -29,7 +29,7 @@ import { Sha3_256 } from "./crypto.js";
 import { InternalError } from "./errors.js";
 
 /**
- * The integrity-check outcomes, mirroring Rust's `IntegrityVerdict`.
+ * The integrity-check outcomes.
  */
 export const INTEGRITY_VERDICTS = [
 	"verified",
@@ -46,7 +46,7 @@ export type IntegrityVerdict = (typeof INTEGRITY_VERDICTS)[number];
 
 /**
  * A digest carried by a frame: the algorithm that produced it and the raw
- * octets, mirroring the ASN.1 `DigestInfo`.
+ * octets of an ASN.1 `DigestInfo`.
  */
 export interface DigestInfo {
 	/**
@@ -60,8 +60,7 @@ export interface DigestInfo {
 }
 
 /**
- * A link to a parent frame by the digest of its content (V2+), mirroring
- * the `previousFrame` metadata field.
+ * A link to a parent frame by the digest of its content (V2+).
  */
 export type PreviousFrame = DigestInfo;
 
@@ -144,7 +143,8 @@ function digestInfoFrom(
 		return undefined;
 	}
 
-	return { algorithmOid, digest };
+	const digestInfo = { algorithmOid, digest };
+	return digestInfo;
 }
 
 /**
@@ -157,7 +157,8 @@ function matrixOf(view: FrameView): FrameMatrix | undefined {
 		return undefined;
 	}
 
-	return { n, data };
+	const matrix = { n, data };
+	return matrix;
 }
 
 /**
@@ -169,7 +170,11 @@ function confidentialityOf(view: FrameView): ConfidentialityInfo | undefined {
 		return undefined;
 	}
 
-	return { algorithmOid, parametersDer: view.confidentialityParametersDer };
+	const confidentiality = {
+		algorithmOid,
+		parametersDer: view.confidentialityParametersDer,
+	};
+	return confidentiality;
 }
 
 /**
@@ -187,7 +192,8 @@ function signatureOf(view: FrameView): SignatureInfo | undefined {
 		return undefined;
 	}
 
-	return { algorithmOid, digestAlgorithmOid, signature };
+	const signatureInfo = { algorithmOid, digestAlgorithmOid, signature };
+	return signatureInfo;
 }
 
 /**
@@ -214,7 +220,7 @@ function fieldsOf(view: FrameView): FrameFields {
 		}
 	}
 
-	return {
+	const fields = {
 		version,
 		id: view.id,
 		order: view.order,
@@ -237,6 +243,7 @@ function fieldsOf(view: FrameView): FrameFields {
 		confidentiality: confidentialityOf(view),
 		signature: signatureOf(view),
 	};
+	return fields;
 }
 
 /**
@@ -252,12 +259,12 @@ function digestsEqual(left: Uint8Array, right: Uint8Array): boolean {
 		difference |= (left[index] ?? 0) ^ (right[index] ?? 0);
 	}
 
-	return difference === 0;
+	const equal = difference === 0;
+	return equal;
 }
 
 /**
- * Check a recomputable digest against a carried one, mirroring Rust's
- * `IntegrityVerdict` semantics.
+ * Check a recomputable digest against a carried one.
  */
 async function verdictOf(
 	carried: DigestInfo | undefined,
@@ -273,7 +280,8 @@ async function verdictOf(
 	}
 
 	const recomputed = await hasher.digest(preimage());
-	if (digestsEqual(recomputed, carried.digest)) {
+	const verified = digestsEqual(recomputed, carried.digest);
+	if (verified) {
 		return "verified";
 	}
 
@@ -281,7 +289,7 @@ async function verdictOf(
 }
 
 /**
- * A tightbeam frame, mirroring Rust's `Frame`.
+ * A tightbeam frame.
  *
  * Construct one from received bytes with {@link Frame.fromDer} or from the
  * fluent builder's `build()`. Metadata getters decode the frame lazily on
@@ -296,15 +304,16 @@ export class Frame {
 	private constructor(private readonly der: Uint8Array) {}
 
 	/**
-	 * Wrap a frame DER, mirroring Rust `Frame::from_der`. Decoding is lazy:
-	 * structurally invalid bytes throw on first metadata access, not here.
+	 * Wrap a frame DER. Decoding is lazy: structurally invalid bytes throw on
+	 * first metadata access, not here.
 	 */
 	static fromDer(der: Uint8Array): Frame {
-		return new Frame(der);
+		const frame = new Frame(der);
+		return frame;
 	}
 
 	/**
-	 * The frame DER, mirroring Rust `Frame::to_der`.
+	 * The frame DER.
 	 */
 	toDer(): Uint8Array {
 		return this.der;
@@ -334,21 +343,24 @@ export class Frame {
 	 * Protocol version.
 	 */
 	get version(): Version {
-		return this.decoded().version;
+		const version = this.decoded().version;
+		return version;
 	}
 
 	/**
 	 * Opaque message identifier.
 	 */
 	get id(): Uint8Array {
-		return this.decoded().id;
+		const id = this.decoded().id;
+		return id;
 	}
 
 	/**
 	 * Monotonic order (Unix seconds).
 	 */
 	get order(): bigint {
-		return this.decoded().order;
+		const order = this.decoded().order;
+		return order;
 	}
 
 	/**
@@ -356,100 +368,113 @@ export class Frame {
 	 * ciphertext; open it with {@link decryptBytes}.
 	 */
 	get body(): Uint8Array {
-		return this.decoded().body;
+		const body = this.decoded().body;
+		return body;
 	}
 
 	/**
 	 * The frame carries a non-repudiation signature.
 	 */
 	get signed(): boolean {
-		return this.decoded().signature !== undefined;
+		const signed = this.decoded().signature !== undefined;
+		return signed;
 	}
 
 	/**
 	 * The metadata commits to the body (message integrity).
 	 */
 	get messageIntegrity(): boolean {
-		return this.decoded().messageIntegrity !== undefined;
+		const messageIntegrity = this.decoded().messageIntegrity !== undefined;
+		return messageIntegrity;
 	}
 
 	/**
 	 * The envelope is witnessed (frame integrity).
 	 */
 	get frameIntegrity(): boolean {
-		return this.decoded().frameIntegrity !== undefined;
+		const frameIntegrity = this.decoded().frameIntegrity !== undefined;
+		return frameIntegrity;
 	}
 
 	/**
 	 * The body is encrypted.
 	 */
 	get confidential(): boolean {
-		return this.decoded().confidentiality !== undefined;
+		const confidential = this.decoded().confidentiality !== undefined;
+		return confidential;
 	}
 
 	/**
 	 * The carried message-commitment digest, when committed.
 	 */
 	get messageIntegrityInfo(): DigestInfo | undefined {
-		return this.decoded().messageIntegrity;
+		const messageIntegrityInfo = this.decoded().messageIntegrity;
+		return messageIntegrityInfo;
 	}
 
 	/**
 	 * The carried witness digest, when witnessed.
 	 */
 	get frameIntegrityInfo(): DigestInfo | undefined {
-		return this.decoded().frameIntegrity;
+		const frameIntegrityInfo = this.decoded().frameIntegrity;
+		return frameIntegrityInfo;
 	}
 
 	/**
 	 * The carried confidentiality info, when encrypted.
 	 */
 	get confidentialityInfo(): ConfidentialityInfo | undefined {
-		return this.decoded().confidentiality;
+		const confidentialityInfo = this.decoded().confidentiality;
+		return confidentialityInfo;
 	}
 
 	/**
 	 * The carried signature info, when signed.
 	 */
 	get signatureInfo(): SignatureInfo | undefined {
-		return this.decoded().signature;
+		const signatureInfo = this.decoded().signature;
+		return signatureInfo;
 	}
 
 	/**
 	 * Message priority, when present (V2+).
 	 */
 	get priority(): MessagePriority | undefined {
-		return this.decoded().priority;
+		const priority = this.decoded().priority;
+		return priority;
 	}
 
 	/**
 	 * Time-to-live in seconds, when present (V2+).
 	 */
 	get lifetime(): bigint | undefined {
-		return this.decoded().lifetime;
+		const lifetime = this.decoded().lifetime;
+		return lifetime;
 	}
 
 	/**
 	 * Parent-frame link by content digest, when present (V2+).
 	 */
 	get previousFrame(): PreviousFrame | undefined {
-		return this.decoded().previousFrame;
+		const previousFrame = this.decoded().previousFrame;
+		return previousFrame;
 	}
 
 	/**
 	 * N×N control matrix, when present (V3+).
 	 */
 	get matrix(): FrameMatrix | undefined {
-		return this.decoded().matrix;
+		const matrix = this.decoded().matrix;
+		return matrix;
 	}
 
 	/**
-	 * The to-be-signed bytes (everything but the signature field),
-	 * mirroring Rust `Frame::to_tbs`. Verify {@link signatureInfo} over
-	 * these bytes with any signature library.
+	 * The to-be-signed bytes (everything but the signature field). Verify
+	 * {@link signatureInfo} over these bytes with any signature library.
 	 */
 	tbs(): Uint8Array {
-		return tbsBytes(this.der);
+		const tbs = tbsBytes(this.der);
+		return tbs;
 	}
 
 	/**
@@ -457,7 +482,8 @@ export class Frame {
 	 * carried witness digest is computed over.
 	 */
 	witnessInput(): Uint8Array {
-		return wasmWitnessInput(this.der);
+		const witnessInput = wasmWitnessInput(this.der);
+		return witnessInput;
 	}
 
 	/**
@@ -465,14 +491,16 @@ export class Frame {
 	 * `withMessageHasher`; may be empty), computed over the carried body.
 	 */
 	commitmentInput(salt: Uint8Array): Uint8Array {
-		return commitmentPreimage(salt, bodyPreimage(this.body));
+		const body = bodyPreimage(this.body);
+		const commitmentInput = commitmentPreimage(salt, body);
+		return commitmentInput;
 	}
 
 	/**
 	 * Verify the frame's non-repudiation signature under the tightbeam
-	 * profile scheme (secp256k1 ECDSA over SHA3-256), mirroring Rust
-	 * `Frame::verify`. Frames signed under other schemes verify from
-	 * {@link tbs} and {@link signatureInfo} with your own library.
+	 * profile scheme (secp256k1 ECDSA over SHA3-256). Frames signed under
+	 * other schemes verify from {@link tbs} and {@link signatureInfo} with
+	 * your own library.
 	 *
 	 * @throws when the frame is unsigned, the algorithm differs, or the
 	 * signature does not verify.
@@ -483,37 +511,37 @@ export class Frame {
 
 	/**
 	 * Check the carried witness digest by recomputing it with `hasher`
-	 * (profile SHA3-256 by default), mirroring Rust
-	 * `Frame::frame_integrity_verdict::<D>`.
+	 * (profile SHA3-256 by default).
 	 */
 	frameIntegrityVerdict(
 		hasher: Hasher = new Sha3_256(),
 	): Promise<IntegrityVerdict> {
-		return verdictOf(this.decoded().frameIntegrity, hasher, () =>
+		const verdict = verdictOf(this.decoded().frameIntegrity, hasher, () =>
 			this.witnessInput(),
 		);
+		return verdict;
 	}
 
 	/**
 	 * Check the carried message commitment against the disclosed `salt` by
-	 * recomputing it with `hasher` (profile SHA3-256 by default), mirroring
-	 * Rust `Frame::message_commitment_verdict::<D>`. The commitment is over
-	 * the plaintext body, so decrypt a confidential frame first and check
-	 * the commitment on the plaintext side.
+	 * recomputing it with `hasher` (profile SHA3-256 by default). The
+	 * commitment is over the plaintext body, so decrypt a confidential frame
+	 * first and check the commitment on the plaintext side.
 	 */
 	messageCommitmentVerdict(
 		salt: Uint8Array,
 		hasher: Hasher = new Sha3_256(),
 	): Promise<IntegrityVerdict> {
-		return verdictOf(this.decoded().messageIntegrity, hasher, () =>
+		const verdict = verdictOf(this.decoded().messageIntegrity, hasher, () =>
 			this.commitmentInput(salt),
 		);
+		return verdict;
 	}
 
 	/**
 	 * Decrypt the encrypted body with any {@link BodyDecryptor} and resolve
-	 * with the plaintext payload, mirroring Rust `Frame::decrypt_bytes`.
-	 * The profile decryptors are `Aes256Gcm` and `EciesDecryptor`.
+	 * with the plaintext payload. The profile decryptors are `Aes256Gcm` and
+	 * `EciesDecryptor`.
 	 *
 	 * @throws ValidationError when the frame is not encrypted.
 	 * @throws when the decryptor rejects the sealed body (wrong key or
@@ -536,6 +564,7 @@ export class Frame {
 			ciphertext: this.decoded().body,
 		});
 
-		return decodeBody(plaintextDer);
+		const plaintext = decodeBody(plaintextDer);
+		return plaintext;
 	}
 }

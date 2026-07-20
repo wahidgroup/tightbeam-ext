@@ -68,7 +68,9 @@ export class WasmFrameCodec implements FrameCodec {
  * The body DER the hashers commit to and the encryptor seals.
  */
 function bodyDerOf(spec: FrameSpec): Uint8Array {
-	return bodyPreimage(spec.message ?? EMPTY_MESSAGE);
+	const message = spec.message ?? EMPTY_MESSAGE;
+	const bodyDer = bodyPreimage(message);
+	return bodyDer;
 }
 
 /**
@@ -105,5 +107,6 @@ function composeStructural(spec: FrameSpec): Uint8Array {
 		composer.withMatrix(spec.matrix.n, spec.matrix.data);
 	}
 
-	return composer.build();
+	const der = composer.build();
+	return der;
 }

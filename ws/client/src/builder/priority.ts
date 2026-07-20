@@ -1,6 +1,6 @@
 /**
- * Message priority levels (V2+), mirroring tightbeam's `MessagePriority`
- * enum. The value of each member is its wire ordinal.
+ * Message priority levels (V2+). The value of each member is its wire
+ * ordinal.
  */
 
 /**
@@ -39,5 +39,6 @@ const PRIORITIES_BY_ORDINAL: readonly MessagePriority[] = [
 export function priorityFromOrdinal(
 	ordinal: number,
 ): MessagePriority | undefined {
-	return PRIORITIES_BY_ORDINAL[ordinal];
+	const priority = PRIORITIES_BY_ORDINAL[ordinal];
+	return priority;
 }

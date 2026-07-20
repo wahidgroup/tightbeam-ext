@@ -4,9 +4,9 @@ Hybrid TypeScript/WebAssembly client for the [tightbeam](https://crates.io/crate
 
 The frame codec (ASN.1 DER structure engine) is the actual Rust implementation (`tightbeam-ws-wasm`) compiled with `wasm-pack`; the TypeScript layer adds the builder, validation, and connection ergonomics. Two wasm bundles ship in the package - a `web` build and a `nodejs` build - selected automatically via the package's `imports` map. Node ≥ 24 uses its global `WebSocket`; no shim required.
 
-The API mirrors tightbeam-rs: the same builder methods (`withSigner`, `withEncryptor`, `withMessageHasher`), the same `Frame` type with the same verification methods (`verify`, `frameIntegrityVerdict`, `messageCommitmentVerdict`, `decryptBytes`), the same enums with the same ordinals (`Version`, `MessagePriority`), and `emit` returning the response frame.
+Same builder methods as tightbeam-rs (`withSigner`, `withEncryptor`, `withMessageHasher`), the same `Frame` type with the same verification methods (`verify`, `frameIntegrityVerdict`, `messageCommitmentVerdict`, `decryptBytes`), the same enums with the same ordinals (`Version`, `MessagePriority`), and `emit` returning the response frame.
 
-Cryptography is bring-your-own, mirroring the Rust generics: every security operation goes through a capability interface (`Hasher`, `BodyEncryptor`, `BodyDecryptor`, `Signatory`) identified by the dotted algorithm OID it writes into the frame. The tightbeam profile (SHA3-256 / secp256k1 ECDSA / AES-256-GCM / ECIES) ships as ready-made wasm-backed implementations; any hash, cipher, or signing library plugs in the same way.
+Cryptography is bring-your-own: every security operation goes through a capability interface (`Hasher`, `BodyEncryptor`, `BodyDecryptor`, `Signatory`) identified by the dotted algorithm OID it writes into the frame. The tightbeam profile (SHA3-256 / secp256k1 ECDSA / AES-256-GCM / ECIES) ships as ready-made wasm-backed implementations; any hash, cipher, or signing library plugs in the same way.
 
 ## Install
 
@@ -38,7 +38,7 @@ console.log(response?.body, response?.order, response?.signed);
 client.close();
 ```
 
-`emit` mirrors Rust `client.emit(frame) -> Option<Frame>`: it resolves with the response `Frame`, or `undefined` when the peer returns no response. A `Frame` exposes the decoded body, metadata (`version`, `id`, `order`, and the V2+/V3+ fields `priority`, `lifetime`, `previousFrame`, `matrix` when present), the security markers (`signed`, `messageIntegrity`, `frameIntegrity`, `confidential`) with their carried infos (`signatureInfo`, `messageIntegrityInfo`, `frameIntegrityInfo`, `confidentialityInfo`), the raw bytes via `toDer()`, and the verification methods below.
+`emit` resolves with the response `Frame`, or `undefined` when the peer returns no response (`client.emit(frame) -> Option<Frame>`). A `Frame` exposes the decoded body, metadata (`version`, `id`, `order`, and the V2+/V3+ fields `priority`, `lifetime`, `previousFrame`, `matrix` when present), the security markers (`signed`, `messageIntegrity`, `frameIntegrity`, `confidential`) with their carried infos (`signatureInfo`, `messageIntegrityInfo`, `frameIntegrityInfo`, `confidentialityInfo`), the raw bytes via `toDer()`, and the verification methods below.
 
 ## Encrypted sessions (ECIES)
 
@@ -61,7 +61,7 @@ const mutual = await TightbeamWsSecureClient.connectMutual(
 
 ## Frame builder
 
-Every `with*` returns a new immutable builder; `build()` validates the spec and resolves with the assembled `Frame`. Algorithms are selected with capability objects, mirroring the Rust generics:
+Every `with*` returns a new immutable builder; `build()` validates the spec and resolves with the assembled `Frame`. Algorithms are selected with capability objects:
 
 ```ts
 import {
@@ -130,7 +130,7 @@ const built = await frame(body)
 
 ## Verification and decryption
 
-Verification is on the `Frame` itself, mirroring the Rust methods. Verdicts mirror Rust's `IntegrityVerdict`: `"verified" | "absent" | "algorithm-mismatch" | "mismatch"`. The verdict methods recompute under any `Hasher` (profile SHA3-256 by default); for frames signed under non-profile schemes, verify `signatureInfo.signature` over `tbs()` with your own library.
+Verification is on the `Frame` itself. Verdicts are `"verified" | "absent" | "algorithm-mismatch" | "mismatch"`. The verdict methods recompute under any `Hasher` (profile SHA3-256 by default); for frames signed under non-profile schemes, verify `signatureInfo.signature` over `tbs()` with your own library.
 
 ```ts
 import { Aes256Gcm, EciesDecryptor } from "@wahidgroup/tightbeam-ws-client";

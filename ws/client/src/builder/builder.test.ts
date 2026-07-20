@@ -30,7 +30,8 @@ async function validationIssuePathsOf(
 		await attempt.build();
 	} catch (error) {
 		if (ValidationError.isInstance(error)) {
-			return error.issues.map((issue) => issue.path);
+			const paths = error.issues.map((issue) => issue.path);
+			return paths;
 		}
 
 		throw error;

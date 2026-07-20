@@ -19,11 +19,13 @@ function validationMessage(issueCount: number): string {
 		label = "issue";
 	}
 
-	return `Validation failed (${issueCount} ${label})`;
+	const message = `Validation failed (${issueCount} ${label})`;
+	return message;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null;
+	const record = typeof value === "object" && value !== null;
+	return record;
 }
 
 function isValidationIssue(value: unknown): value is ValidationIssue {
@@ -31,7 +33,9 @@ function isValidationIssue(value: unknown): value is ValidationIssue {
 		return false;
 	}
 
-	return typeof value.path === "string" && typeof value.message === "string";
+	const valid =
+		typeof value.path === "string" && typeof value.message === "string";
+	return valid;
 }
 
 /**
@@ -70,6 +74,8 @@ export class ValidationError extends Error {
 			return false;
 		}
 
-		return Array.isArray(err.issues) && err.issues.every(isValidationIssue);
+		const valid =
+			Array.isArray(err.issues) && err.issues.every(isValidationIssue);
+		return valid;
 	}
 }

@@ -16,8 +16,7 @@ import {
 import { ValidationError } from "./builder/errors.js";
 
 /**
- * The dotted algorithm OIDs of the tightbeam profile, mirroring
- * `tightbeam::oids`.
+ * The dotted algorithm OIDs of the tightbeam profile (`tightbeam::oids`).
  */
 export const PROFILE_OIDS = {
 	/** SHA3-256, the profile digest. */
@@ -139,7 +138,7 @@ function requireLength(
 
 /**
  * Reject a sealed body whose algorithm differs from what the decryptor
- * implements, mirroring tightbeam's OID binding on decryption.
+ * implements.
  */
 function requireAlgorithm(sealed: EncryptedBody, expectedOid: string): void {
 	if (sealed.algorithmOid !== expectedOid) {
@@ -162,7 +161,9 @@ export class Sha3_256 implements Hasher {
 	 * Digest `data` with SHA3-256.
 	 */
 	digest(data: Uint8Array): Promise<Uint8Array> {
-		return Promise.resolve(wasmSha3_256(data));
+		const digest = wasmSha3_256(data);
+		const result = Promise.resolve(digest);
+		return result;
 	}
 }
 
@@ -180,7 +181,8 @@ export class Secp256k1VerifyingKey {
 	static fromSec1Bytes(sec1: Uint8Array): Secp256k1VerifyingKey {
 		requireLength(sec1, [33, 65], "sec1");
 
-		return new Secp256k1VerifyingKey(sec1);
+		const key = new Secp256k1VerifyingKey(sec1);
+		return key;
 	}
 
 	/**
@@ -214,8 +216,8 @@ export class Secp256k1SigningKey implements Signatory {
 	}
 
 	/**
-	 * Derive the verifying key, mirroring Rust `SigningKey::verifying_key`.
-	 * The wasm module MUST be initialized (`initClient`).
+	 * Derive the verifying key. The wasm module MUST be initialized
+	 * (`initClient`).
 	 */
 	verifyingKey(): Secp256k1VerifyingKey {
 		const key = Secp256k1VerifyingKey.fromSec1Bytes(
@@ -239,14 +241,15 @@ export class Secp256k1SigningKey implements Signatory {
 	 */
 	sign(tbs: Uint8Array): Promise<Uint8Array> {
 		const signature = signTbs(this.scalar, tbs);
-		return Promise.resolve(signature);
+		const result = Promise.resolve(signature);
+		return result;
 	}
 }
 
 /**
  * The profile symmetric {@link BodyEncryptor} and {@link BodyDecryptor}:
- * AES-256-GCM under a 32-byte shared key, mirroring tightbeam's
- * `Aes256Gcm`. The shared key both seals and opens.
+ * AES-256-GCM under a 32-byte shared key. The shared key both seals and
+ * opens.
  */
 export class Aes256Gcm implements BodyEncryptor, BodyDecryptor {
 	private constructor(private readonly keyBytes: Uint8Array) {}
@@ -274,7 +277,9 @@ export class Aes256Gcm implements BodyEncryptor, BodyDecryptor {
 				parametersDer: sealed.parametersDer,
 				ciphertext: sealed.ciphertext,
 			};
-			return Promise.resolve(encryptedBody);
+
+			const result = Promise.resolve(encryptedBody);
+			return result;
 		} finally {
 			sealed.free();
 		}
@@ -299,16 +304,15 @@ export class Aes256Gcm implements BodyEncryptor, BodyDecryptor {
 
 /**
  * The profile asymmetric {@link BodyEncryptor}: ECIES to a recipient
- * public key (secp256k1 + HKDF-SHA3-256 + AES-256-GCM), mirroring
- * tightbeam's `EciesEncryptor`. Only the holder of the matching secret key
- * can open the body.
+ * public key (secp256k1 + HKDF-SHA3-256 + AES-256-GCM). Only the holder of
+ * the matching secret key can open the body.
  */
 export class EciesEncryptor implements BodyEncryptor {
 	private constructor(private readonly recipient: Uint8Array) {}
 
 	/**
 	 * Wrap the recipient's SEC1-encoded public key (33-byte compressed or
-	 * 65-byte uncompressed), mirroring Rust `EciesEncryptor::from_bytes`.
+	 * 65-byte uncompressed).
 	 *
 	 * @throws ValidationError when the encoding length is wrong.
 	 */
@@ -330,7 +334,9 @@ export class EciesEncryptor implements BodyEncryptor {
 				parametersDer: sealed.parametersDer,
 				ciphertext: sealed.ciphertext,
 			};
-			return Promise.resolve(encryptedBody);
+
+			const result = Promise.resolve(encryptedBody);
+			return result;
 		} finally {
 			sealed.free();
 		}
@@ -338,9 +344,8 @@ export class EciesEncryptor implements BodyEncryptor {
 }
 
 /**
- * The matching profile {@link BodyDecryptor} for ECIES-sealed bodies,
- * mirroring tightbeam's `EciesDecryptor`: holds the raw 32-byte recipient
- * secret key.
+ * The matching profile {@link BodyDecryptor} for ECIES-sealed bodies:
+ * holds the raw 32-byte recipient secret key.
  */
 export class EciesDecryptor implements BodyDecryptor {
 	private constructor(private readonly secret: Uint8Array) {}

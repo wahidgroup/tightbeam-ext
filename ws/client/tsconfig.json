@@ -9,7 +9,10 @@
 		"strict": true,
 		"noUncheckedIndexedAccess": true,
 		"skipLibCheck": true,
-		"forceConsistentCasingInFileNames": true
+		"forceConsistentCasingInFileNames": true,
+		"paths": {
+			"#wasm": ["./wasm/tightbeam_ws_wasm.d.ts"]
+		}
 	},
 	"include": ["src"]
 }

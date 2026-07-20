@@ -47,6 +47,7 @@ fn digest_info(algorithm_oid: &str, digest: &[u8]) -> Result<DigestInfo, JsError
 	let oid = oid_from(algorithm_oid, "previousHash.algorithmOid")?;
 	let algorithm = AlgorithmIdentifierOwned { oid, parameters: None };
 	let digest = OctetString::new(digest).map_err(|error| JsError::new(&error.to_string()))?;
+
 	Ok(DigestInfo { algorithm, digest })
 }
 
@@ -408,7 +409,7 @@ pub fn profile_signer_id(public_key_sec1: Vec<u8>) -> Result<Vec<u8>, JsError> {
 
 /// Verify a frame's non-repudiation signature against a SEC1-encoded
 /// secp256k1 public key (33-byte compressed or 65-byte uncompressed) under
-/// the profile scheme (ECDSA over SHA3-256), mirroring Rust `Frame::verify`.
+/// the profile scheme (ECDSA over SHA3-256).
 ///
 /// Resolves on a valid signature; a missing signature, an algorithm
 /// mismatch, or a bad signature all throw. Frames signed under other schemes

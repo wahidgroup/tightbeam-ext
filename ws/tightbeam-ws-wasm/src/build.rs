@@ -115,8 +115,8 @@ pub fn decode_body(body_der: impl AsRef<[u8]>) -> Result<Vec<u8>, TightBeamError
 	Ok(OpaqueBody::from_der(body_der.as_ref())?.body.into_bytes())
 }
 
-/// The message-commitment preimage over `body_der` under `salt`, mirroring
-/// tightbeam's `commit_digest`: the bare body DER for an empty salt, or
+/// The message-commitment preimage over `body_der` under `salt`
+/// (`commit_digest`): the bare body DER for an empty salt, or
 /// `len(salt) as u64 BE || salt || body DER` otherwise (length framing keeps
 /// distinct `(salt, body)` pairs from colliding).
 ///
@@ -240,9 +240,8 @@ pub fn attach_witness(
 	})
 }
 
-/// The to-be-signed bytes of a frame (everything but the signature field),
-/// mirroring `Frame::to_tbs`. Sign them with any scheme and install the
-/// result via [`attach_signature`].
+/// The to-be-signed bytes of a frame (everything but the signature field).
+/// Sign them with any scheme and install the result via [`attach_signature`].
 ///
 /// Call after [`attach_witness`]: the signature covers the witness.
 pub fn tbs_bytes(frame_der: impl AsRef<[u8]>) -> Result<Vec<u8>, TightBeamError> {
@@ -396,8 +395,7 @@ pub fn sign_tbs(key_bytes: [u8; 32], tbs: impl AsRef<[u8]>) -> Result<Vec<u8>, T
 }
 
 /// The subject-key-identifier octets naming a secp256k1 signer (the SHA3-256
-/// digest of its SPKI encoding, truncated to 20 octets), mirroring
-/// tightbeam's `secp256k1_signer_identifier`.
+/// digest of its SPKI encoding, truncated to 20 octets).
 pub fn profile_signer_id(public_key_sec1: impl AsRef<[u8]>) -> Result<Vec<u8>, TightBeamError> {
 	let key = Secp256k1VerifyingKey::from_sec1_bytes(public_key_sec1.as_ref())?;
 	match secp256k1_signer_identifier(&key)? {
@@ -407,8 +405,7 @@ pub fn profile_signer_id(public_key_sec1: impl AsRef<[u8]>) -> Result<Vec<u8>, T
 }
 
 /// Verify a frame's non-repudiation signature against a SEC1-encoded
-/// secp256k1 public key under the profile scheme (ECDSA over SHA3-256),
-/// mirroring `Frame::verify`.
+/// secp256k1 public key under the profile scheme (ECDSA over SHA3-256).
 ///
 /// `Ok(())` means the signature is valid; a missing signature, an algorithm
 /// mismatch, or a bad signature are all errors. Frames signed under other
@@ -907,7 +904,7 @@ mod tests {
 	}
 
 	#[test]
-	fn profile_oids_mirror_tightbeam() {
+	fn profile_oids() {
 		assert_eq!(HASH_SHA3_256.to_string(), "2.16.840.1.101.3.4.2.8");
 		assert_eq!(SIGNER_ECDSA_WITH_SHA3_256.to_string(), "2.16.840.1.101.3.4.3.10");
 		assert_eq!(AES_256_GCM.to_string(), "2.16.840.1.101.3.4.1.46");

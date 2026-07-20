@@ -16,7 +16,19 @@ import {
 
 await initClient();
 
-describe("enum ordinals mirror tightbeam-rs", () => {
+/**
+ * Lowercase hex encoding of `bytes` (no Node `Buffer`).
+ */
+function bytesToHex(bytes: Uint8Array): string {
+	let hex = "";
+	for (const byte of bytes) {
+		hex += byte.toString(16).padStart(2, "0");
+	}
+
+	return hex;
+}
+
+describe("enum ordinals", () => {
 	it.each([
 		{ name: "V0", value: Version.V0, ordinal: 0 },
 		{ name: "V1", value: Version.V1, ordinal: 1 },
@@ -114,7 +126,8 @@ describe("profile Hasher", () => {
 			new TextEncoder().encode("abc"),
 		);
 
-		expect(Buffer.from(digest).toString("hex")).toBe(
+		const digestHex = bytesToHex(digest);
+		expect(digestHex).toBe(
 			"3a985da74fe225b2045c172d6bd390bd855f086e3e9d525b46bfe24511431532",
 		);
 	});

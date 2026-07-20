@@ -46,8 +46,9 @@ impl<P: CryptoProvider> WsListener<P> {
 impl<P: CryptoProvider + Send + Sync> WsListener<P> {
 	/// Accept the next connection, applying server encryption when configured.
 	///
-	/// Inherent accept used by the `server!` macro loop; mirrors
-	/// [`AsyncListenerTrait::accept`] but yields the raw [`std::net::SocketAddr`].
+	/// Inherent accept used by the `server!` macro loop.
+	/// Yields the raw [`std::net::SocketAddr`] (see also
+	/// [`AsyncListenerTrait::accept`]).
 	pub async fn accept(&self) -> Result<(WsTransport<WsInner, P>, std::net::SocketAddr), TransportError> {
 		let (tcp, addr) = self.listener.accept().await.map_err(io_error)?;
 		let websocket = accept_async(MaybeTlsStream::Plain(tcp)).await.map_err(map_ws_error)?;

@@ -12,7 +12,7 @@ Each extension lives in its own directory carrying everything it needs: crates, 
 
 - **[ws/tightbeam-ws](ws/tightbeam-ws)** - the host transport. Carries DER-encoded tightbeam envelopes as WebSocket binary frames ([RFC 6455](https://www.rfc-editor.org/rfc/rfc6455)), one envelope per message, with cleartext and ECIES-encrypted round-trips. Published to crates.io.
 - **[ws/tightbeam-ws-wasm](ws/tightbeam-ws-wasm)** - the browser counterpart, compiled to WebAssembly via `wasm-pack`. Not published to crates.io; consumed by the web client package below.
-- **[ws/client](ws/client)** - `@wahidgroup/tightbeam-ws-client`, the published hybrid TS/wasm package for browsers and Node. Mirrors the tightbeam-rs API: fluent frame builder with algorithm selection, `Frame` with Rust-parity verification methods, `Signatory` external signers, and ECIES sessions.
+- **[ws/client](ws/client)** - `@wahidgroup/tightbeam-ws-client`, the published hybrid TS/wasm package for browsers and Node. Fluent frame builder with algorithm selection, `Frame` with Rust-parity verification methods, `Signatory` external signers, and ECIES sessions.
 - **[ws/tests](ws/tests)** - end-to-end suites exercising the compiled client against dockerized echo servers: Playwright (Chromium) plus a vitest lane on Node's global WebSocket.
 
 ## Development

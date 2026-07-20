@@ -1,6 +1,5 @@
 /**
  * A fluent, immutable builder for tightbeam frames.
- * The method surface mirrors the Rust `FrameBuilder` API.
  */
 
 import type { BodyEncryptor, Hasher, Signatory } from "../crypto.js";
@@ -32,7 +31,8 @@ const UTF8 = new TextEncoder();
  */
 function toBytes(value: Uint8Array | string): Uint8Array {
 	if (typeof value === "string") {
-		return UTF8.encode(value);
+		const bytes = UTF8.encode(value);
+		return bytes;
 	}
 
 	return value;
@@ -43,7 +43,8 @@ function toBytes(value: Uint8Array | string): Uint8Array {
  */
 function toBigInt(value: bigint | number): bigint {
 	if (typeof value === "number") {
-		return BigInt(value);
+		const bigint = BigInt(value);
+		return bigint;
 	}
 
 	return value;
@@ -54,7 +55,8 @@ function toBigInt(value: bigint | number): bigint {
  */
 function requiredVersion(spec: FrameSpec): Version {
 	if (spec.matrix !== undefined) {
-		return Version.V3;
+		const version = Version.V3;
+		return version;
 	}
 
 	if (
@@ -64,14 +66,17 @@ function requiredVersion(spec: FrameSpec): Version {
 		spec.lifetime !== undefined ||
 		spec.previousHash !== undefined
 	) {
-		return Version.V2;
+		const version = Version.V2;
+		return version;
 	}
 
 	if (spec.signer !== undefined || spec.encryptor !== undefined) {
-		return Version.V1;
+		const version = Version.V1;
+		return version;
 	}
 
-	return Version.V0;
+	const version = Version.V0;
+	return version;
 }
 
 /**
@@ -84,7 +89,8 @@ export function effectiveVersion(spec: FrameSpec): Version {
 		return spec.version;
 	}
 
-	return requiredVersion(spec);
+	const version = requiredVersion(spec);
+	return version;
 }
 
 /**
@@ -218,7 +224,8 @@ export class FrameBuilder {
 	}
 
 	private with(patch: Partial<FrameSpec>): FrameBuilder {
-		return new FrameBuilder(this.codec, { ...this.spec, ...patch });
+		const next = new FrameBuilder(this.codec, { ...this.spec, ...patch });
+		return next;
 	}
 
 	/**
@@ -226,7 +233,8 @@ export class FrameBuilder {
 	 * that admits the requested fields is used.
 	 */
 	withVersion(version: Version): FrameBuilder {
-		return this.with({ version });
+		const next = this.with({ version });
+		return next;
 	}
 
 	/**
@@ -234,63 +242,72 @@ export class FrameBuilder {
 	 * the effective version (pinned or derived) differs from `version`.
 	 */
 	assertVersion(version: Version): FrameBuilder {
-		return this.with({ assertedVersion: version });
+		const next = this.with({ assertedVersion: version });
+		return next;
 	}
 
 	/**
 	 * Set the opaque message identifier.
 	 */
 	withId(id: Uint8Array | string): FrameBuilder {
-		return this.with({ id: toBytes(id) });
+		const next = this.with({ id: toBytes(id) });
+		return next;
 	}
 
 	/**
 	 * Set the monotonic order (Unix seconds).
 	 */
 	withOrder(order: bigint | number): FrameBuilder {
-		return this.with({ order: toBigInt(order) });
+		const next = this.with({ order: toBigInt(order) });
+		return next;
 	}
 
 	/**
 	 * Set the opaque message body.
 	 */
 	withMessage(message: Uint8Array): FrameBuilder {
-		return this.with({ message });
+		const next = this.with({ message });
+		return next;
 	}
 
 	/**
 	 * Set the body content-type OID.
 	 */
 	withContentOid(oid: string): FrameBuilder {
-		return this.with({ contentOid: oid });
+		const next = this.with({ contentOid: oid });
+		return next;
 	}
 
 	/**
 	 * Set the message priority (V2+).
 	 */
 	withPriority(priority: MessagePriority): FrameBuilder {
-		return this.with({ priority });
+		const next = this.with({ priority });
+		return next;
 	}
 
 	/**
 	 * Set the time-to-live in seconds (V2+).
 	 */
 	withLifetime(seconds: bigint | number): FrameBuilder {
-		return this.with({ lifetime: toBigInt(seconds) });
+		const next = this.with({ lifetime: toBigInt(seconds) });
+		return next;
 	}
 
 	/**
 	 * Link this frame to a parent by its content digest (V2+).
 	 */
 	withPreviousHash(parent: PreviousHashSpec): FrameBuilder {
-		return this.with({ previousHash: parent });
+		const next = this.with({ previousHash: parent });
+		return next;
 	}
 
 	/**
 	 * Set an N×N control matrix from row-major bytes (V3+).
 	 */
 	withMatrix(n: number, data: Uint8Array): FrameBuilder {
-		return this.with({ matrix: { n, data } });
+		const next = this.with({ matrix: { n, data } });
+		return next;
 	}
 
 	/**
@@ -299,17 +316,20 @@ export class FrameBuilder {
 	 */
 	withMessageHasher(hasher: Hasher, salt?: Uint8Array): FrameBuilder {
 		if (salt === undefined) {
-			return this.with({ messageIntegrity: { hasher } });
+			const next = this.with({ messageIntegrity: { hasher } });
+			return next;
 		}
 
-		return this.with({ messageIntegrity: { hasher, salt } });
+		const next = this.with({ messageIntegrity: { hasher, salt } });
+		return next;
 	}
 
 	/**
 	 * Witness the envelope with frame integrity under any `Hasher` (V2+).
 	 */
 	withWitnessHasher(hasher: Hasher): FrameBuilder {
-		return this.with({ frameIntegrity: hasher });
+		const next = this.with({ frameIntegrity: hasher });
+		return next;
 	}
 
 	/**
@@ -319,7 +339,8 @@ export class FrameBuilder {
 	 * received body with `Frame.decryptBytes(decryptor)`.
 	 */
 	withEncryptor(encryptor: BodyEncryptor): FrameBuilder {
-		return this.with({ encryptor });
+		const next = this.with({ encryptor });
+		return next;
 	}
 
 	/**
@@ -328,7 +349,8 @@ export class FrameBuilder {
 	 * HSM) whose private key never enters wasm memory.
 	 */
 	withSigner(signatory: Signatory): FrameBuilder {
-		return this.with({ signer: signatory });
+		const next = this.with({ signer: signatory });
+		return next;
 	}
 
 	/**
@@ -336,7 +358,8 @@ export class FrameBuilder {
 	 * assembling a frame.
 	 */
 	toSpec(): Readonly<FrameSpec> {
-		return Object.freeze({ ...this.spec });
+		const spec = Object.freeze({ ...this.spec });
+		return spec;
 	}
 
 	/**
@@ -353,9 +376,10 @@ export class FrameBuilder {
 			throw new ValidationError("FRAME_SPEC", issues);
 		}
 
-		return this.assertBuilt(
-			Frame.fromDer(await this.codec.compose(this.spec)),
-		);
+		const der = await this.codec.compose(this.spec);
+		const frame = Frame.fromDer(der);
+		const built = this.assertBuilt(frame);
+		return built;
 	}
 
 	/**
@@ -387,5 +411,6 @@ export function frame(codec: FrameCodec, message?: Uint8Array): FrameBuilder {
 		return builder;
 	}
 
-	return builder.withMessage(message);
+	const builderWithMessage = builder.withMessage(message);
+	return builderWithMessage;
 }

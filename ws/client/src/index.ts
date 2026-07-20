@@ -71,7 +71,8 @@ export function frame(message?: Uint8Array): FrameBuilder {
 		return builder;
 	}
 
-	return builder.withMessage(message);
+	const builderWithMessage = builder.withMessage(message);
+	return builderWithMessage;
 }
 
 /**

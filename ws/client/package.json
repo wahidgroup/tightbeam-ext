@@ -14,6 +14,7 @@
 	},
 	"imports": {
 		"#wasm": {
+			"types": "./wasm/tightbeam_ws_wasm.d.ts",
 			"node": "./wasm-node/tightbeam_ws_wasm.js",
 			"default": "./wasm/tightbeam_ws_wasm.js"
 		}

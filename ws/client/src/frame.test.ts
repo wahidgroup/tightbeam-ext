@@ -52,7 +52,9 @@ class NobleHasher implements Hasher {
 	) {}
 
 	digest(data: Uint8Array): Promise<Uint8Array> {
-		return Promise.resolve(this.hash(data));
+		const digest = this.hash(data);
+		const result = Promise.resolve(digest);
+		return result;
 	}
 }
 
@@ -328,11 +330,13 @@ describe("external Signatory across the wasm boundary", () => {
 		constructor(private readonly secret: Uint8Array) {}
 
 		publicKey(): Uint8Array {
-			return secp256k1.getPublicKey(this.secret, true);
+			const publicKey = secp256k1.getPublicKey(this.secret, true);
+			return publicKey;
 		}
 
 		signerId(): Uint8Array {
-			return profileSignerId(this.publicKey());
+			const id = profileSignerId(this.publicKey());
+			return id;
 		}
 
 		sign(tbs: Uint8Array): Promise<Uint8Array> {
@@ -341,7 +345,8 @@ describe("external Signatory across the wasm boundary", () => {
 				prehash: false,
 			});
 
-			return Promise.resolve(signature);
+			const result = Promise.resolve(signature);
+			return result;
 		}
 	}
 
@@ -442,7 +447,8 @@ describe("bring-your-own encryption across the wasm boundary", () => {
 	 * profile uses to carry the GCM nonce.
 	 */
 	function derOctetString(bytes: Uint8Array): Uint8Array {
-		return new Uint8Array([0x04, bytes.length, ...bytes]);
+		const der = new Uint8Array([0x04, bytes.length, ...bytes]);
+		return der;
 	}
 
 	/**
@@ -454,14 +460,15 @@ describe("bring-your-own encryption across the wasm boundary", () => {
 		constructor(private readonly key: Uint8Array<ArrayBuffer>) {}
 
 		private cryptoKey(usage: KeyUsage): Promise<CryptoKey> {
-			return crypto.subtle.importKey("raw", this.key, "AES-GCM", false, [
+			const key = crypto.subtle.importKey("raw", this.key, "AES-GCM", false, [
 				usage,
 			]);
+			return key;
 		}
 
 		async encrypt(bodyDer: Uint8Array): Promise<EncryptedBody> {
-			const algorithm = { name: "AES-GCM", length: 256 };
 			const nonce = crypto.getRandomValues(new Uint8Array(12));
+			const algorithm = { name: "AES-GCM", iv: nonce };
 			const cryptoKey = await this.cryptoKey("encrypt");
 			const bodyDerView = new Uint8Array(bodyDer);
 			const sealed = await crypto.subtle.encrypt(
@@ -470,11 +477,12 @@ describe("bring-your-own encryption across the wasm boundary", () => {
 				bodyDerView,
 			);
 
-			return {
+			const encryptedBody = {
 				algorithmOid: PROFILE_OIDS.aes256Gcm,
 				parametersDer: derOctetString(nonce),
 				ciphertext: new Uint8Array(sealed),
 			};
+			return encryptedBody;
 		}
 
 		async decrypt(sealed: EncryptedBody): Promise<Uint8Array> {
