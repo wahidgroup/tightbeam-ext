@@ -1,7 +1,7 @@
 version: "0.2"
 language: en
 import:
-  - ./packages/lint-rules/cspell.base.yaml
+  - ./ws/node_modules/@wahidgroup/lint-rules/cspell.base.json
 words:
   - tightbeam
   - Errorizable
@@ -33,10 +33,25 @@ words:
   - gloo
   - ecies
   - encryptor
+  - encryptors
   - decryptor
+  - decryptors
+  - hasher
+  - hashers
+  - preimage
+  - preimages
+  - recomputable
+  - parameterless
+  - hkdf
+  - chacha
+  - prehash
   - ciphertext
   - spki
   - signingkey
+  - passthroughs
+  - submod
+  - bindgen
+  - oids
 ignorePaths:
   - node_modules/**
   - "**/node_modules/**"
@@ -45,6 +60,7 @@ ignorePaths:
   - dist/**
   - "**/dist/**"
   - "**/wasm/**"
+  - "**/wasm-node/**"
   - Cargo.lock
   - package-lock.json
   - .git/**

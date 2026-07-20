@@ -4,13 +4,16 @@ set -euo pipefail
 # Run the self-contained e2e example against a dockerized echo server, then tear
 # it down. Hard-fails when e2e deps are missing or docker is unavailable.
 #
-# Flags: --ui (interactive), --trace (force traces), --verbose (list reporter).
+# Options (environment, set by the Makefile):
+#   E2E_UI=1     interactive Playwright UI mode
+#   E2E_TRACE=1  force Playwright traces
+#   E2E_DEBUG=1  verbose list reporter
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-# The e2e package is an npm workspace member, so its dependencies are hoisted
-# to the workspace root rather than living under e2e/node_modules.
-if [ ! -d "$ROOT/node_modules/@playwright/test" ]; then
+# The e2e package (ws/tests) is an npm workspace member, so its dependencies
+# are hoisted to the npm root (ws/) rather than living under tests/node_modules.
+if [ ! -d "$ROOT/ws/node_modules/@playwright/test" ]; then
 	echo "ERROR: workspace dependencies not installed; run 'make setup'" >&2
 	exit 1
 fi
@@ -34,16 +37,25 @@ set -a
 set +a
 
 export E2E_ECHO_WS_ENDPOINT="$ECHO_WS_ENDPOINT"
+export E2E_ECHO_WS_SECURE_ENDPOINT="$ECHO_WS_SECURE_ENDPOINT"
+export E2E_ECHO_WS_MUTUAL_ENDPOINT="$ECHO_WS_MUTUAL_ENDPOINT"
+export E2E_ECHO_WS_SINK_ENDPOINT="$ECHO_WS_SINK_ENDPOINT"
+export E2E_CERT_DIR="$CERT_DIR"
 
-cd "$ROOT/e2e"
+cd "$ROOT/ws/tests"
 
 ARGS=()
-for arg in "$@"; do
-	case "$arg" in
-		--ui)      ARGS+=(--ui) ;;
-		--trace)   ARGS+=(--trace on) ;;
-		--verbose) ARGS+=(--reporter=list) ;;
-	esac
-done
+if [ -n "${E2E_UI:-}" ]; then
+	ARGS+=(--ui)
+fi
+if [ -n "${E2E_TRACE:-}" ]; then
+	ARGS+=(--trace on)
+fi
+if [ -n "${E2E_DEBUG:-}" ]; then
+	ARGS+=(--reporter=list)
+fi
 
 npx playwright test ${ARGS[@]+"${ARGS[@]}"}
+
+echo "==> Node lane (vitest against the same echo servers)"
+npm run test:node

@@ -4,61 +4,55 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - main
+      - master
     tags:
       - "releases/v*"
   pull_request:
     branches:
-      - main
+      - master
 
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+  packages: read
+
 env:
   CARGO_TERM_COLOR: always
+  NO_HUSKY_HOOKS: "1"
 
 jobs:
-  lint:
-    name: Lint
+  ci:
+    name: CI
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
-      - name: Run linters
-        run: make lint
-      - name: Lint and build browser client (wasm32)
-        run: make wasm
 
-  test:
-    name: Test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Test default features
-        run: make test
-      - name: Test all features
-        run: cargo test --all-features
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
-  client:
-    name: Web client
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
-      - name: Install wasm-pack
-        run: cargo install wasm-pack
-      - name: Build hybrid TS/wasm client
-        run: make client
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: ws/package-lock.json
+          registry-url: https://npm.pkg.github.com
+          scope: "@wahidgroup"
+
+      - name: Setup
+        run: make setup
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: CI
+        run: make ci

@@ -1,0 +1,268 @@
+/**
+ * Minimal, headless example app for the generic tightbeam-ws client.
+ *
+ * Builds frames with the fluent {@link frame} builder, ships them over the
+ * socket, and surfaces the decoded response so the Playwright spec can assert
+ * the body and metadata survived the round-trip.
+ */
+
+import type { Frame } from "@wahidgroup/tightbeam-ws-client";
+import {
+	Aes256Gcm,
+	Secp256k1SigningKey,
+	Sha3_256,
+	TightbeamWsClient,
+	TightbeamWsSecureClient,
+	frame,
+} from "@wahidgroup/tightbeam-ws-client";
+
+const TEXT = new TextDecoder();
+
+/**
+ * The decoded outcome of a single round-trip, in a structured-clone-safe shape
+ * (no `bigint`) so it crosses the Playwright `page.evaluate` boundary.
+ */
+export interface RoundTripResult {
+	readonly bodyHex: string;
+	readonly version: number;
+	readonly idText: string;
+	readonly order: string;
+	readonly signed: boolean;
+	readonly messageIntegrity: boolean;
+	readonly frameIntegrity: boolean;
+}
+
+function hexToBytes(hex: string): Uint8Array {
+	const bytes = new Uint8Array(hex.length / 2);
+	for (let i = 0; i < bytes.length; i += 1) {
+		bytes[i] = Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+	}
+
+	return bytes;
+}
+
+function bytesToHex(bytes: Uint8Array): string {
+	let hex = "";
+	for (const byte of bytes) {
+		hex += byte.toString(16).padStart(2, "0");
+	}
+
+	return hex;
+}
+
+function base64ToBytes(base64: string): Uint8Array {
+	const binary = atob(base64);
+	const bytes = new Uint8Array(binary.length);
+	for (let i = 0; i < binary.length; i += 1) {
+		bytes[i] = binary.charCodeAt(i);
+	}
+
+	return bytes;
+}
+
+/**
+ * The emit surface shared by the cleartext and encrypted clients.
+ */
+interface EmitClient {
+	emit(frame: Frame): Promise<Frame | undefined>;
+	close(): void;
+}
+
+/**
+ * Emit `frame` and return the response frame.
+ */
+async function emitFrame(client: EmitClient, built: Frame): Promise<Frame> {
+	const response = await client.emit(built);
+	if (response === undefined) {
+		throw new Error("the peer returned no response frame");
+	}
+
+	return response;
+}
+
+function toResult(response: Frame): RoundTripResult {
+	return {
+		bodyHex: bytesToHex(response.body),
+		version: response.version,
+		idText: TEXT.decode(response.id),
+		order: response.order.toString(),
+		signed: response.signed,
+		messageIntegrity: response.messageIntegrity,
+		frameIntegrity: response.frameIntegrity,
+	};
+}
+
+async function emitAndDecode(
+	client: EmitClient,
+	payloadHex: string,
+	idText: string,
+	order: number,
+): Promise<RoundTripResult> {
+	try {
+		const built = await frame(hexToBytes(payloadHex))
+			.withId(idText)
+			.withOrder(order)
+			.build();
+
+		return toResult(await emitFrame(client, built));
+	} finally {
+		client.close();
+	}
+}
+
+async function roundTrip(
+	url: string,
+	payloadHex: string,
+	idText: string,
+	order: number,
+): Promise<RoundTripResult> {
+	const client = await TightbeamWsClient.connect(url);
+	const result = await emitAndDecode(client, payloadHex, idText, order);
+	return result;
+}
+
+async function secureRoundTrip(
+	url: string,
+	serverCertB64: string,
+	payloadHex: string,
+	idText: string,
+	order: number,
+): Promise<RoundTripResult> {
+	const client = await TightbeamWsSecureClient.connect(
+		url,
+		base64ToBytes(serverCertB64),
+	);
+
+	const result = await emitAndDecode(client, payloadHex, idText, order);
+	return result;
+}
+
+async function mutualRoundTrip(
+	url: string,
+	serverCertB64: string,
+	clientCertB64: string,
+	clientKeyB64: string,
+	payloadHex: string,
+	idText: string,
+	order: number,
+): Promise<RoundTripResult> {
+	const client = await TightbeamWsSecureClient.connectMutual(
+		url,
+		base64ToBytes(serverCertB64),
+		base64ToBytes(clientCertB64),
+		base64ToBytes(clientKeyB64),
+	);
+
+	const result = await emitAndDecode(client, payloadHex, idText, order);
+	return result;
+}
+
+/**
+ * The outcome of a signed round-trip: what the frame reported plus the
+ * verification verdicts recomputed on the echoed bytes.
+ */
+export interface SignedRoundTripResult extends RoundTripResult {
+	readonly signatureValid: boolean;
+	readonly frameVerdict: string;
+	readonly messageVerdict: string;
+	readonly wrongSaltVerdict: string;
+}
+
+async function signedRoundTrip(
+	url: string,
+	payloadHex: string,
+	idText: string,
+	order: number,
+	signingKeyHex: string,
+	saltHex: string,
+): Promise<SignedRoundTripResult> {
+	const signingKey = Secp256k1SigningKey.fromBytes(hexToBytes(signingKeyHex));
+	const salt = hexToBytes(saltHex);
+
+	const client = await TightbeamWsClient.connect(url);
+	let response: Frame;
+	try {
+		const built = await frame(hexToBytes(payloadHex))
+			.withId(idText)
+			.withOrder(order)
+			.withMessageHasher(new Sha3_256(), salt)
+			.withWitnessHasher(new Sha3_256())
+			.withSigner(signingKey)
+			.build();
+		response = await emitFrame(client, built);
+	} finally {
+		client.close();
+	}
+
+	let signatureValid = false;
+	try {
+		response.verify(signingKey.verifyingKey());
+		signatureValid = true;
+	} catch {
+		signatureValid = false;
+	}
+
+	return {
+		...toResult(response),
+		signatureValid,
+		frameVerdict: await response.frameIntegrityVerdict(),
+		messageVerdict: await response.messageCommitmentVerdict(salt),
+		wrongSaltVerdict: await response.messageCommitmentVerdict(
+			hexToBytes("deadbeef"),
+		),
+	};
+}
+
+/**
+ * The outcome of an AEAD-sealed round-trip: the ciphertext markers plus the
+ * plaintext recovered with the key.
+ */
+export interface SealedRoundTripResult {
+	readonly confidential: boolean;
+	readonly confidentialityOid: string;
+	readonly ciphertextDiffers: boolean;
+	readonly decryptedHex: string;
+}
+
+async function sealedRoundTrip(
+	url: string,
+	payloadHex: string,
+	idText: string,
+	order: number,
+	keyHex: string,
+): Promise<SealedRoundTripResult> {
+	const payload = hexToBytes(payloadHex);
+	const cipher = Aes256Gcm.fromKey(hexToBytes(keyHex));
+
+	const client = await TightbeamWsClient.connect(url);
+	let response: Frame;
+	try {
+		const built = await frame(payload)
+			.withId(idText)
+			.withOrder(order)
+			.withEncryptor(cipher)
+			.build();
+
+		response = await emitFrame(client, built);
+	} finally {
+		client.close();
+	}
+
+	return {
+		confidential: response.confidential,
+		confidentialityOid: response.confidentialityInfo?.algorithmOid ?? "",
+		ciphertextDiffers: bytesToHex(response.body) !== payloadHex,
+		decryptedHex: bytesToHex(await response.decryptBytes(cipher)),
+	};
+}
+
+window.tbRoundTrip = roundTrip;
+window.tbSecureRoundTrip = secureRoundTrip;
+window.tbMutualRoundTrip = mutualRoundTrip;
+window.tbSignedRoundTrip = signedRoundTrip;
+window.tbSealedRoundTrip = sealedRoundTrip;
+
+const status = document.querySelector("#status");
+if (status) {
+	status.textContent = "client ready";
+}

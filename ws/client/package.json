@@ -1,0 +1,55 @@
+{
+	"name": "@wahidgroup/tightbeam-ws-client",
+	"version": "0.1.0",
+	"description": "Browser client for the tightbeam WebSocket transport: build tightbeam frames from a payload and ship them over a socket.",
+	"type": "module",
+	"main": "dist/index.js",
+	"module": "dist/index.js",
+	"types": "dist/index.d.ts",
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"default": "./dist/index.js"
+		}
+	},
+	"imports": {
+		"#wasm": {
+			"node": "./wasm-node/tightbeam_ws_wasm.js",
+			"default": "./wasm/tightbeam_ws_wasm.js"
+		}
+	},
+	"files": [
+		"dist",
+		"wasm",
+		"wasm-node"
+	],
+	"engines": {
+		"node": ">=24"
+	},
+	"scripts": {
+		"build:wasm": "wasm-pack build ../tightbeam-ws-wasm --target web --out-dir ../client/wasm --out-name tightbeam_ws_wasm",
+		"build:wasm:node": "wasm-pack build ../tightbeam-ws-wasm --target nodejs --out-dir ../client/wasm-node --out-name tightbeam_ws_wasm",
+		"build": "npm run build:wasm && npm run build:wasm:node && tsc -p tsconfig.build.json",
+		"typecheck": "tsc --noEmit",
+		"test": "vitest run",
+		"test:watch": "vitest",
+		"lint": "eslint . && prettier --check .",
+		"lint:fix": "eslint . --fix && prettier --write .",
+		"clean": "rm -rf dist wasm wasm-node"
+	},
+	"devDependencies": {
+		"@noble/curves": "2.2.0",
+		"@noble/hashes": "2.2.0",
+		"@wahidgroup/lint-rules": "0.1.2",
+		"typescript": "5.9.3",
+		"vitest": "4.1.1"
+	},
+	"publishConfig": {
+		"registry": "https://npm.pkg.github.com"
+	},
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/wahidgroup/tightbeam-ext"
+	},
+	"license": "MIT OR Apache-2.0"
+}

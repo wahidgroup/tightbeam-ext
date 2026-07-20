@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["tightbeam-ws", "tightbeam-ws-wasm"]
+members = ["ws/tightbeam-ws", "ws/tightbeam-ws-wasm"]
 
 [workspace.package]
 authors = ["Tanveer Wahid <tan@wahid.email>"]
@@ -8,41 +8,29 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.85.1"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/wahidgroup/tightbeam-ws"
-homepage = "https://github.com/wahidgroup/tightbeam-ws"
+repository = "https://github.com/wahidgroup/tightbeam-ext"
+homepage = "https://github.com/wahidgroup/tightbeam-ext"
 documentation = "https://docs.rs/tightbeam-ws"
-readme = "README.md"
 keywords = ["websocket", "transport", "messaging", "protocol", "tightbeam"]
 categories = ["network-programming", "asynchronous"]
 
 [workspace.dependencies]
-tightbeam-rs = { version = "0.8.0", default-features = false, features = [
-	"tcp",
-	"tokio",
-	"transport-ecies",
-] }
-tokio = { version = "1.50.0", default-features = false }
-tokio-tungstenite = { version = "0.24", default-features = false, features = [
-	"connect",
-	"handshake",
-] }
-futures-util = { version = "0.3.32", default-features = false, features = [
-	"std",
-	"sink",
-] }
+tightbeam-rs = { version = "0.9.0", default-features = false }
+tokio = { version = "1.53.0", default-features = false }
+tokio-tungstenite = { version = "0.30.0", default-features = false }
+futures-util = { version = "0.3.33", default-features = false }
 
 # Browser (wasm32) client dependencies.
-wasm-bindgen = "0.2"
-wasm-bindgen-futures = "0.4"
-gloo-net = { version = "0.6", default-features = false, features = [
-	"websocket",
-] }
+wasm-bindgen = "0.2.126"
+wasm-bindgen-futures = "0.4.76"
+gloo-net = { version = "0.7.0", default-features = false }
 
-der = { version = "0.7", default-features = false, features = [
-	"alloc",
-	"derive",
-	"oid",
-] }
+# Pinned to 0.7 to match the der version the RustCrypto stack (and therefore
+# tightbeam-rs) is built against.
+der = { version = "0.7", default-features = false }
+
+# Git hooks manager
+husky-rs = "0.3"
 
 [profile.release]
 lto = true

@@ -16,12 +16,15 @@ temp
 **/mutants.out*/
 
 # Node / e2e harness
-node_modules
-e2e/test-results
-e2e/playwright-report
+node_modules/
+**/tests/test-results
+**/tests/playwright-report
 
 # Per-instance e2e stack state + assembled docker build context
 .dev
+
+# Setup stamp + lock (scripts/setup.sh)
+.make
 
 # Build resources
 dist/

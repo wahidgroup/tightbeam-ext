@@ -33,12 +33,14 @@ fi
 INSTANCE_DIR="$ROOT/.dev/$INSTANCE"
 CONTEXT_DIR="$INSTANCE_DIR/context"
 ENV_FILE="$INSTANCE_DIR/.env"
+CERT_DIR="$INSTANCE_DIR/certs"
 PROJECT="${STACK_PROJECT_PREFIX}-$INSTANCE"
 ECHO_IMAGE="${STACK_PROJECT_PREFIX}-echo:$INSTANCE"
 
 compose() {
 	DOCKER_BUILDKIT=1 COMPOSE_DOCKER_CLI_BUILD=1 \
-		docker compose --project-name "$PROJECT" --env-file "$ENV_FILE" "$@"
+		docker compose -f "$ROOT/ws/docker-compose.yml" \
+		--project-name "$PROJECT" --env-file "$ENV_FILE" "$@"
 }
 
 alloc_port() {
@@ -58,18 +60,10 @@ read_prior() {
 }
 
 assemble_context() {
-	# Stage both repos under one context so the Dockerfile can honour the
-	# workspace patch (tightbeam-rs -> ../tightbeam/tightbeam) inside the build.
-	local tb_src
-	tb_src="$(cd "$ROOT/$TIGHTBEAM_SRC" 2>/dev/null && pwd || true)"
-	if [ -z "$tb_src" ] || [ ! -f "$tb_src/Cargo.toml" ]; then
-		echo "ERROR: local tightbeam not found at '$ROOT/$TIGHTBEAM_SRC'" >&2
-		echo "       set TIGHTBEAM_SRC to the local tightbeam checkout" >&2
-		exit 1
-	fi
-
+	# Stage the repo under the context so the image build is self-contained;
+	# tightbeam-rs resolves from crates.io inside the build.
 	rm -rf "$CONTEXT_DIR"
-	mkdir -p "$CONTEXT_DIR/tightbeam-ws" "$CONTEXT_DIR/tightbeam"
+	mkdir -p "$CONTEXT_DIR/tightbeam-ext"
 
 	local excludes=(
 		--exclude '.git'
@@ -80,8 +74,19 @@ assemble_context() {
 		--exclude 'wasm'
 		--exclude 'pkg'
 	)
-	rsync -a "${excludes[@]}" "$ROOT/" "$CONTEXT_DIR/tightbeam-ws/"
-	rsync -a "${excludes[@]}" "$tb_src/" "$CONTEXT_DIR/tightbeam/"
+	rsync -a "${excludes[@]}" "$ROOT/" "$CONTEXT_DIR/tightbeam-ext/"
+}
+
+generate_certs() {
+	# Mint the X.509 identity fixtures the encrypted echo servers present and
+	# the browser suite pins. Idempotent per instance: reuse existing certs so
+	# restarts keep the same trust anchors.
+	if [ -f "$CERT_DIR/server.cert.der" ] && [ -f "$CERT_DIR/client.cert.der" ]; then
+		return
+	fi
+
+	echo "==> Generating identity fixtures under '$CERT_DIR'"
+	CERT_DIR="$CERT_DIR" cargo run -p tightbeam-ws --features testing --example gen_certs
 }
 
 case "$ACTION" in
@@ -103,7 +108,8 @@ case "$ACTION" in
 				"$(alloc_port "${!pref_var}" "$(read_prior "$key")")"
 		done
 
-		export ECHO_IMAGE
+		export ECHO_IMAGE CERT_DIR
+		generate_certs
 		render_env_file > "$ENV_FILE"
 
 		echo "==> Assembling build context for '$PROJECT'"
@@ -111,7 +117,7 @@ case "$ACTION" in
 
 		echo "==> Building image '$ECHO_IMAGE'"
 		DOCKER_BUILDKIT=1 docker build \
-			-f "$ROOT/docker/echo-server/Dockerfile" \
+			-f "$ROOT/ws/docker/echo-server/Dockerfile" \
 			-t "$ECHO_IMAGE" \
 			"$CONTEXT_DIR"
 
@@ -130,8 +136,8 @@ case "$ACTION" in
 		if [ -f "$ENV_FILE" ]; then
 			compose down --volumes --remove-orphans || true
 		else
-			DOCKER_BUILDKIT=1 docker compose --project-name "$PROJECT" \
-				down --volumes --remove-orphans || true
+			DOCKER_BUILDKIT=1 docker compose -f "$ROOT/ws/docker-compose.yml" \
+				--project-name "$PROJECT" down --volumes --remove-orphans || true
 		fi
 		rm -rf "$INSTANCE_DIR"
 		echo "==> Stack '$PROJECT' stopped"

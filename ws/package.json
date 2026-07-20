@@ -1,0 +1,28 @@
+{
+	"name": "@wahidgroup/tightbeam-ws-workspace",
+	"version": "0.0.0",
+	"private": true,
+	"description": "npm workspace for the tightbeam-ws browser stack: hybrid TS/wasm client (with fluent frame builder) and Playwright e2e harness.",
+	"type": "module",
+	"engines": {
+		"node": ">=24"
+	},
+	"workspaces": [
+		"client",
+		"tests"
+	],
+	"scripts": {
+		"build": "npm run build --workspace @wahidgroup/tightbeam-ws-client",
+		"test": "npm run test --workspace @wahidgroup/tightbeam-ws-client",
+		"typecheck": "npm run typecheck --workspaces --if-present",
+		"lint": "npm run lint --workspaces --if-present",
+		"lint:fix": "npm run lint:fix --workspaces --if-present",
+		"clean": "npm run clean --workspaces --if-present"
+	},
+	"devDependencies": {
+		"cspell": "10.0.1",
+		"eslint": "9.39.5",
+		"prettier": "3.9.5"
+	},
+	"license": "MIT OR Apache-2.0"
+}
