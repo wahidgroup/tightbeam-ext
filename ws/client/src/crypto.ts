@@ -27,6 +27,10 @@ export const PROFILE_OIDS = {
 	aes256Gcm: "2.16.840.1.101.3.4.1.46",
 	/** ECIES over secp256k1 (HKDF-SHA3-256 + AES-256-GCM). */
 	eciesSecp256k1: "1.3.132.1.12.0",
+	/** Zstandard (RFC 8878), the profile compression. */
+	zstd: "1.3.6.1.4.1.55555.2.1",
+	/** zlib (RFC 3274), interoperable with `CompressionStream("deflate")`. */
+	zlib: "1.2.840.113549.1.9.16.3.8",
 } as const;
 
 /**

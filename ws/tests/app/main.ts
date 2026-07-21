@@ -6,7 +6,7 @@
  * the body and metadata survived the round-trip.
  */
 
-import type { Frame } from "@wahidgroup/tightbeam-ws-client";
+import type { Frame, MessageCodec } from "@wahidgroup/tightbeam-ws-client";
 import {
 	Aes256Gcm,
 	Opaque,
@@ -14,7 +14,9 @@ import {
 	Sha3_256,
 	TightbeamWsClient,
 	TightbeamWsSecureClient,
+	ZstdCompression,
 	frame,
+	wrapped,
 } from "@wahidgroup/tightbeam-ws-client";
 
 const TEXT = new TextDecoder();
@@ -111,6 +113,22 @@ async function emitAndDecode(
 	}
 }
 
+/**
+ * Open a cleartext client to `url`, run the round-trip body, and always
+ * release the socket.
+ */
+async function withEchoClient<T>(
+	url: string,
+	run: (client: EmitClient) => Promise<T>,
+): Promise<T> {
+	const client = await TightbeamWsClient.connect(url);
+	try {
+		return await run(client);
+	} finally {
+		client.close();
+	}
+}
+
 async function roundTrip(
 	url: string,
 	payloadHex: string,
@@ -180,9 +198,7 @@ async function signedRoundTrip(
 	const signingKey = Secp256k1SigningKey.fromBytes(hexToBytes(signingKeyHex));
 	const salt = hexToBytes(saltHex);
 
-	const client = await TightbeamWsClient.connect(url);
-	let response: Frame;
-	try {
+	const response = await withEchoClient(url, async (client) => {
 		const built = await frame(hexToBytes(payloadHex))
 			.withId(idText)
 			.withOrder(order)
@@ -190,10 +206,8 @@ async function signedRoundTrip(
 			.withWitnessHasher(new Sha3_256())
 			.withSigner(signingKey)
 			.build();
-		response = await emitFrame(client, built);
-	} finally {
-		client.close();
-	}
+		return emitFrame(client, built);
+	});
 
 	let signatureValid = false;
 	try {
@@ -235,19 +249,15 @@ async function sealedRoundTrip(
 	const payload = hexToBytes(payloadHex);
 	const cipher = Aes256Gcm.fromKey(hexToBytes(keyHex));
 
-	const client = await TightbeamWsClient.connect(url);
-	let response: Frame;
-	try {
+	const response = await withEchoClient(url, async (client) => {
 		const built = await frame(payload)
 			.withId(idText)
 			.withOrder(order)
 			.withEncryptor(cipher)
 			.build();
 
-		response = await emitFrame(client, built);
-	} finally {
-		client.close();
-	}
+		return emitFrame(client, built);
+	});
 
 	return {
 		confidential: response.confidential,
@@ -257,11 +267,135 @@ async function sealedRoundTrip(
 	};
 }
 
+/**
+ * The outcome of a compressed round-trip: the compactness markers plus the
+ * body recovered with the profile zstd inflator.
+ */
+export interface CompressedRoundTripResult {
+	readonly compressed: boolean;
+	readonly compactnessOid: string;
+	readonly inflatedHex: string;
+}
+
+async function compressedRoundTrip(
+	url: string,
+	payloadHex: string,
+	idText: string,
+	order: number,
+): Promise<CompressedRoundTripResult> {
+	const zstd = new ZstdCompression();
+
+	const response = await withEchoClient(url, async (client) => {
+		const built = await frame(hexToBytes(payloadHex))
+			.withId(idText)
+			.withOrder(order)
+			.withCompressor(zstd)
+			.build();
+
+		return emitFrame(client, built);
+	});
+
+	const inflated = await response.inflateMessage(zstd, Opaque);
+	return {
+		compressed: response.compressed,
+		compactnessOid: response.compactnessInfo?.algorithmOid ?? "",
+		inflatedHex: bytesToHex(inflated),
+	};
+}
+
+async function compressedSealedRoundTrip(
+	url: string,
+	payloadHex: string,
+	idText: string,
+	order: number,
+	keyHex: string,
+): Promise<CompressedRoundTripResult> {
+	const zstd = new ZstdCompression();
+	const cipher = Aes256Gcm.fromKey(hexToBytes(keyHex));
+
+	const response = await withEchoClient(url, async (client) => {
+		const built = await frame(hexToBytes(payloadHex))
+			.withId(idText)
+			.withOrder(order)
+			.withCompressor(zstd)
+			.withEncryptor(cipher)
+			.build();
+
+		return emitFrame(client, built);
+	});
+
+	const inflated = await response.decryptMessage(cipher, Opaque, zstd);
+	return {
+		compressed: response.compressed,
+		compactnessOid: response.compactnessInfo?.algorithmOid ?? "",
+		inflatedHex: bytesToHex(inflated),
+	};
+}
+
+/**
+ * A chat message round-tripped as a typed body: JSON under a wrapped
+ * payload codec, decoded and runtime-validated in the browser.
+ */
+export interface TypedRoundTripResult {
+	readonly author: string;
+	readonly text: string;
+}
+
+const Chat: MessageCodec<TypedRoundTripResult> = wrapped({
+	encode(message: TypedRoundTripResult): Uint8Array {
+		const payload = new TextEncoder().encode(JSON.stringify(message));
+		return payload;
+	},
+	decode(payload: Uint8Array): TypedRoundTripResult {
+		const parsed: unknown = JSON.parse(TEXT.decode(payload));
+		if (
+			typeof parsed !== "object" ||
+			parsed === null ||
+			!("author" in parsed) ||
+			!("text" in parsed)
+		) {
+			throw new Error("not a chat message");
+		}
+
+		const { author, text } = parsed;
+		if (typeof author !== "string" || typeof text !== "string") {
+			throw new Error("not a chat message");
+		}
+
+		const message = { author, text };
+		return message;
+	},
+});
+
+async function typedRoundTrip(
+	url: string,
+	idText: string,
+	order: number,
+	author: string,
+	text: string,
+): Promise<TypedRoundTripResult> {
+	const response = await withEchoClient(url, async (client) => {
+		const built = await frame()
+			.withId(idText)
+			.withOrder(order)
+			.withMessage(Chat, { author, text })
+			.build();
+
+		return emitFrame(client, built);
+	});
+
+	const message = response.message(Chat);
+	return message;
+}
+
 window.tbRoundTrip = roundTrip;
 window.tbSecureRoundTrip = secureRoundTrip;
 window.tbMutualRoundTrip = mutualRoundTrip;
 window.tbSignedRoundTrip = signedRoundTrip;
 window.tbSealedRoundTrip = sealedRoundTrip;
+window.tbCompressedRoundTrip = compressedRoundTrip;
+window.tbCompressedSealedRoundTrip = compressedSealedRoundTrip;
+window.tbTypedRoundTrip = typedRoundTrip;
 
 const status = document.querySelector("#status");
 if (status) {

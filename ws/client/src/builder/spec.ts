@@ -3,6 +3,7 @@
  * consumed by a {@link FrameCodec}.
  */
 
+import type { BodyCompressor } from "../compress.js";
 import type { BodyEncryptor, Hasher, Signatory } from "../crypto.js";
 import type { MessagePriority } from "./priority.js";
 import type { Version } from "./version.js";
@@ -121,6 +122,11 @@ export interface FrameSpec {
 	 * Witness the envelope with frame integrity under this hasher (V2+).
 	 */
 	readonly frameIntegrity?: Hasher;
+	/**
+	 * Body compression (any version): applied after the message commitment
+	 * and before encryption.
+	 */
+	readonly compressor?: BodyCompressor;
 	/**
 	 * Body encryption (V1+): a symmetric cipher or an asymmetric encryptor
 	 * to a recipient. The frame has a single body-encryption slot.

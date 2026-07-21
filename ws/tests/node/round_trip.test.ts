@@ -11,6 +11,7 @@ import {
 	Sha3_256,
 	TightbeamWsClient,
 	TightbeamWsSecureClient,
+	ZstdCompression,
 	frame,
 	wrapped,
 } from "@wahidgroup/tightbeam-ws-client";
@@ -146,6 +147,30 @@ describe("Node round-trips against the dockerized echo server", () => {
 			const decryptor = EciesDecryptor.fromBytes(recipientSecret);
 			await expect(
 				response.decryptMessage(decryptor, Opaque),
+			).resolves.toEqual(BODY);
+		});
+	});
+
+	it("round-trips a compressed, sealed body and recovers it with the inflator", async () => {
+		const zstd = new ZstdCompression();
+		const cipher = Aes256Gcm.fromKey(new Uint8Array(32).fill(7));
+
+		await withEchoClient(async (client) => {
+			const built = await frame(BODY)
+				.withId("node-packed")
+				.withOrder(7)
+				.withCompressor(zstd)
+				.withEncryptor(cipher)
+				.build();
+
+			const response = await emitOrFail(client, built);
+			expect(response.compressed).toBe(true);
+			expect(response.compactnessInfo?.algorithmOid).toBe(
+				PROFILE_OIDS.zstd,
+			);
+
+			await expect(
+				response.decryptMessage(cipher, Opaque, zstd),
 			).resolves.toEqual(BODY);
 		});
 	});

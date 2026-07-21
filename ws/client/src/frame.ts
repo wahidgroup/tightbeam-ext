@@ -19,6 +19,7 @@ import {
 
 import type { MessagePriority } from "./builder/priority.js";
 import type { Version } from "./builder/version.js";
+import type { BodyInflator } from "./compress.js";
 import type { BodyDecryptor, Hasher, Secp256k1VerifyingKey } from "./crypto.js";
 import type { MessageCodec } from "./message.js";
 import { ValidationError } from "./builder/errors.js";
@@ -80,6 +81,25 @@ export interface ConfidentialityInfo {
 }
 
 /**
+ * The compactness info carried by a compressed frame: how the body was
+ * compressed.
+ */
+export interface CompactnessInfo {
+	/**
+	 * Dotted OID of the body-compression algorithm.
+	 */
+	readonly algorithmOid: string;
+	/**
+	 * The DER-encoded algorithm parameters, when the scheme has any.
+	 */
+	readonly parametersDer?: Uint8Array;
+	/**
+	 * Content-type OID of the uncompressed body.
+	 */
+	readonly contentOid?: string;
+}
+
+/**
  * The non-repudiation signature carried by a signed frame.
  */
 export interface SignatureInfo {
@@ -127,6 +147,7 @@ interface FrameFields {
 	readonly matrix: FrameMatrix | undefined;
 	readonly messageIntegrity: DigestInfo | undefined;
 	readonly frameIntegrity: DigestInfo | undefined;
+	readonly compactness: CompactnessInfo | undefined;
 	readonly confidentiality: ConfidentialityInfo | undefined;
 	readonly signature: SignatureInfo | undefined;
 }
@@ -158,6 +179,23 @@ function matrixOf(view: FrameView): FrameMatrix | undefined {
 
 	const matrix = { n, data };
 	return matrix;
+}
+
+/**
+ * Copy the compactness info out of the wasm view, when present.
+ */
+function compactnessOf(view: FrameView): CompactnessInfo | undefined {
+	const algorithmOid = view.compactnessAlgorithmOid;
+	if (algorithmOid === undefined) {
+		return undefined;
+	}
+
+	const compactness = {
+		algorithmOid,
+		parametersDer: view.compactnessParametersDer,
+		contentOid: view.compactnessContentOid,
+	};
+	return compactness;
 }
 
 /**
@@ -239,6 +277,7 @@ function fieldsOf(view: FrameView): FrameFields {
 			view.frameIntegrityAlgorithmOid,
 			view.frameIntegrityDigest,
 		),
+		compactness: compactnessOf(view),
 		confidentiality: confidentialityOf(view),
 		signature: signatureOf(view),
 	};
@@ -397,6 +436,14 @@ export class Frame {
 	}
 
 	/**
+	 * The body is compressed.
+	 */
+	get compressed(): boolean {
+		const compressed = this.decoded().compactness !== undefined;
+		return compressed;
+	}
+
+	/**
 	 * The body is encrypted.
 	 */
 	get confidential(): boolean {
@@ -418,6 +465,14 @@ export class Frame {
 	get frameIntegrityInfo(): DigestInfo | undefined {
 		const frameIntegrityInfo = this.decoded().frameIntegrity;
 		return frameIntegrityInfo;
+	}
+
+	/**
+	 * The carried compactness info, when compressed.
+	 */
+	get compactnessInfo(): CompactnessInfo | undefined {
+		const compactnessInfo = this.decoded().compactness;
+		return compactnessInfo;
 	}
 
 	/**
@@ -525,8 +580,9 @@ export class Frame {
 	/**
 	 * Check the carried message commitment against the disclosed `salt` by
 	 * recomputing it with `hasher` (profile SHA3-256 by default). The
-	 * commitment is over the plaintext body, so decrypt a confidential frame
-	 * first and check the commitment on the plaintext side.
+	 * commitment is over the plaintext, uncompressed body: decrypt and/or
+	 * decompress a sealed or compressed frame first and check the
+	 * commitment on the recovered body.
 	 */
 	messageCommitmentVerdict(
 		salt: Uint8Array,
@@ -543,8 +599,8 @@ export class Frame {
 	 * profile `Opaque` codec for raw bytes, or the implementor's schema.
 	 * The codec runtime-validates the bytes and throws on mismatch.
 	 *
-	 * @throws ValidationError when the frame is encrypted; use
-	 * {@link decryptMessage} instead.
+	 * @throws ValidationError when the frame is encrypted (use
+	 * {@link decryptMessage}) or compressed (use {@link inflateMessage}).
 	 */
 	message<T>(codec: MessageCodec<T>): T {
 		if (this.confidential) {
@@ -556,8 +612,62 @@ export class Frame {
 				},
 			]);
 		}
+		if (this.compressed) {
+			throw new ValidationError("FRAME_COMPRESSED", [
+				{
+					path: "frame",
+					message:
+						"The frame body is compressed; decode it with inflateMessage",
+				},
+			]);
+		}
 
 		const message = codec.decode(this.bodyDer);
+		return message;
+	}
+
+	/**
+	 * Decompress the cleartext-but-compressed body with any
+	 * {@link BodyInflator} and decode the result into a typed message
+	 * under `codec`.
+	 *
+	 * @throws ValidationError when the frame is not compressed, or is also
+	 * encrypted (use {@link decryptMessage} with the inflator instead).
+	 * @throws when the inflator rejects the carried body or the codec
+	 * rejects the decompressed bytes.
+	 */
+	async inflateMessage<T>(
+		inflator: BodyInflator,
+		codec: MessageCodec<T>,
+	): Promise<T> {
+		if (this.confidential) {
+			throw new ValidationError("FRAME_CONFIDENTIAL", [
+				{
+					path: "frame",
+					message:
+						"The frame body is encrypted; decode it with decryptMessage",
+				},
+			]);
+		}
+
+		const compactness = this.decoded().compactness;
+		if (compactness === undefined) {
+			throw new ValidationError("FRAME_NOT_COMPRESSED", [
+				{
+					path: "frame",
+					message: "The frame body is not compressed",
+				},
+			]);
+		}
+
+		const bodyDer = await inflator.decompress({
+			algorithmOid: compactness.algorithmOid,
+			parametersDer: compactness.parametersDer,
+			contentOid: compactness.contentOid,
+			data: this.bodyDer,
+		});
+
+		const message = codec.decode(bodyDer);
 		return message;
 	}
 
@@ -565,15 +675,19 @@ export class Frame {
 	 * Decrypt the encrypted body with any {@link BodyDecryptor} and decode
 	 * the plaintext into a typed message under `codec`. The profile
 	 * decryptors are `Aes256Gcm` and `EciesDecryptor`; the profile codec
-	 * for raw bytes is `Opaque`.
+	 * for raw bytes is `Opaque`. A compressed-then-sealed body additionally
+	 * needs `inflator` to decompress the decrypted bytes.
 	 *
-	 * @throws ValidationError when the frame is not encrypted.
+	 * @throws ValidationError when the frame is not encrypted, or is
+	 * compressed and no `inflator` is given.
 	 * @throws when the decryptor rejects the sealed body (wrong key or
-	 * algorithm), or the codec rejects the plaintext.
+	 * algorithm), the inflator rejects the plaintext, or the codec rejects
+	 * the decompressed bytes.
 	 */
 	async decryptMessage<T>(
 		decryptor: BodyDecryptor,
 		codec: MessageCodec<T>,
+		inflator?: BodyInflator,
 	): Promise<T> {
 		const confidentiality = this.decoded().confidentiality;
 		if (confidentiality === undefined) {
@@ -585,13 +699,48 @@ export class Frame {
 			]);
 		}
 
-		const plaintextDer = await decryptor.decrypt({
+		const compactness = this.decoded().compactness;
+		if (compactness !== undefined && inflator === undefined) {
+			throw new ValidationError("MISSING_INFLATOR", [
+				{
+					path: "frame",
+					message:
+						"The frame body is compressed; decryptMessage needs an inflator",
+				},
+			]);
+		}
+
+		const plaintext = await decryptor.decrypt({
 			algorithmOid: confidentiality.algorithmOid,
 			parametersDer: confidentiality.parametersDer,
 			ciphertext: this.decoded().bodyDer,
 		});
 
-		const message = codec.decode(plaintextDer);
+		const bodyDer = await inflate(plaintext, compactness, inflator);
+		const message = codec.decode(bodyDer);
 		return message;
 	}
+}
+
+/**
+ * Decompress decrypted plaintext when the frame carries compactness info;
+ * pass uncompressed plaintext through unchanged. The missing-inflator case
+ * is rejected before decryption runs.
+ */
+async function inflate(
+	plaintext: Uint8Array,
+	compactness: CompactnessInfo | undefined,
+	inflator: BodyInflator | undefined,
+): Promise<Uint8Array> {
+	if (compactness === undefined || inflator === undefined) {
+		return plaintext;
+	}
+
+	const bodyDer = await inflator.decompress({
+		algorithmOid: compactness.algorithmOid,
+		parametersDer: compactness.parametersDer,
+		contentOid: compactness.contentOid,
+		data: plaintext,
+	});
+	return bodyDer;
 }

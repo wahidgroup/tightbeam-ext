@@ -8,6 +8,7 @@ import {
 	attachWitness,
 	bodyPreimage,
 	commitmentPreimage,
+	setCompactness,
 	setConfidentiality,
 	setMessageIntegrity,
 	tbsBytes,
@@ -35,8 +36,23 @@ export class WasmFrameCodec implements FrameCodec {
 			der = setMessageIntegrity(der, hasher.algorithmOid, digest);
 		}
 
+		// The bytes the encryptor seals: the compressed body when a
+		// compressor is configured (peers decompress after decrypting).
+		let sealInput = bodyDer;
+		if (spec.compressor !== undefined) {
+			const compressed = await spec.compressor.compress(bodyDer);
+			der = setCompactness(
+				der,
+				compressed.contentOid,
+				compressed.algorithmOid,
+				compressed.parametersDer,
+				compressed.data,
+			);
+			sealInput = compressed.data;
+		}
+
 		if (spec.encryptor !== undefined) {
-			const sealed = await spec.encryptor.encrypt(bodyDer);
+			const sealed = await spec.encryptor.encrypt(sealInput);
 			der = setConfidentiality(
 				der,
 				spec.contentOid ?? spec.message?.contentOid,

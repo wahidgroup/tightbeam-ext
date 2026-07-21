@@ -2,6 +2,7 @@
  * A fluent, immutable builder for tightbeam frames.
  */
 
+import type { BodyCompressor } from "../compress.js";
 import type { BodyEncryptor, Hasher, Signatory } from "../crypto.js";
 import type { MessageCodec } from "../message.js";
 import type { FrameCodec } from "./codec.js";
@@ -373,6 +374,19 @@ export class FrameBuilder {
 	 */
 	withWitnessHasher(hasher: Hasher): FrameBuilder {
 		const next = this.with({ frameIntegrity: hasher });
+		return next;
+	}
+
+	/**
+	 * Compress the message body with any `BodyCompressor` (any version).
+	 * Compression runs after the message commitment (the commitment is over
+	 * the uncompressed body) and before encryption (peers encrypt the
+	 * compressed bytes). Inflate the received body with
+	 * `Frame.inflateMessage(inflator, codec)` or pass an inflator to
+	 * `Frame.decryptMessage`.
+	 */
+	withCompressor(compressor: BodyCompressor): FrameBuilder {
+		const next = this.with({ compressor });
 		return next;
 	}
 

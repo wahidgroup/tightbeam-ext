@@ -13,6 +13,7 @@ export { InternalError } from "./errors.js";
 export { WasmFrameCodec } from "./codec.js";
 export { Frame, INTEGRITY_VERDICTS } from "./frame.js";
 export type {
+	CompactnessInfo,
 	ConfidentialityInfo,
 	DigestInfo,
 	FrameMatrix,
@@ -20,6 +21,14 @@ export type {
 	PreviousFrame,
 	SignatureInfo,
 } from "./frame.js";
+export { Opening } from "./commitment.js";
+export type { ProvenCommitment } from "./commitment.js";
+export { ZstdCompression } from "./compress.js";
+export type {
+	BodyCompressor,
+	BodyInflator,
+	CompressedBody,
+} from "./compress.js";
 export {
 	Aes256Gcm,
 	EciesDecryptor,

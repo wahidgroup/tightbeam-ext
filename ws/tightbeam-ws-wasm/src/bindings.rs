@@ -190,6 +190,29 @@ pub fn set_confidentiality(
 		.map_err(|error| JsError::new(&error.to_string()))
 }
 
+/// Replace the frame body with `compressed` and record the compactness info
+/// (any version): the caller's compression algorithm OID, its DER-encoded
+/// parameters (pass `undefined` when the scheme has none), and the
+/// content-type OID of the uncompressed body (defaults to
+/// `id-ct-compressedData`).
+#[wasm_bindgen(js_name = setCompactness)]
+pub fn set_compactness(
+	frame_der: Vec<u8>,
+	content_oid: Option<String>,
+	algorithm_oid: &str,
+	parameters_der: Option<Vec<u8>>,
+	compressed: Vec<u8>,
+) -> Result<Vec<u8>, JsError> {
+	let content_oid = match content_oid {
+		Some(dotted) => Some(oid_from(&dotted, "contentOid")?),
+		None => None,
+	};
+	let algorithm_oid = oid_from(algorithm_oid, "compactness.algorithmOid")?;
+
+	build::set_compactness(frame_der, content_oid, algorithm_oid, parameters_der, compressed)
+		.map_err(|error| JsError::new(&error.to_string()))
+}
+
 /// The frame-integrity (witness) preimage bytes: hash them with any digest
 /// and install the result via `attachWitness`. Call after all metadata
 /// mutations; the witness covers the final envelope.
@@ -328,6 +351,25 @@ impl FrameView {
 	#[wasm_bindgen(getter, js_name = frameIntegrityDigest)]
 	pub fn frame_integrity_digest(&self) -> Option<Vec<u8>> {
 		self.summary.frame_integrity_digest.clone()
+	}
+
+	/// Body-compression algorithm OID, when compressed.
+	#[wasm_bindgen(getter, js_name = compactnessAlgorithmOid)]
+	pub fn compactness_algorithm_oid(&self) -> Option<String> {
+		self.summary.compactness_algorithm_oid.clone()
+	}
+
+	/// Body-compression algorithm parameters DER, when compressed and
+	/// present.
+	#[wasm_bindgen(getter, js_name = compactnessParametersDer)]
+	pub fn compactness_parameters_der(&self) -> Option<Vec<u8>> {
+		self.summary.compactness_parameters_der.clone()
+	}
+
+	/// Content-type OID of the uncompressed body, when compressed.
+	#[wasm_bindgen(getter, js_name = compactnessContentOid)]
+	pub fn compactness_content_oid(&self) -> Option<String> {
+		self.summary.compactness_content_oid.clone()
 	}
 
 	/// Body-encryption algorithm OID, when confidential.

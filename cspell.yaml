@@ -53,6 +53,17 @@ words:
   - bindgen
   - oids
   - CBOR
+  - zstd
+  - libzstd
+  - Zstandard
+  - encap
+  - econtent
+  - zeekstd
+  - inflator
+  - inflators
+  - compactness
+  - bokuweb
+  - seekable
 ignorePaths:
   - node_modules/**
   - "**/node_modules/**"

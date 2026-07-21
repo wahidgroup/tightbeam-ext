@@ -4,8 +4,10 @@ use der::asn1::OctetString;
 use der::{Decode, Sequence};
 
 use tightbeam::builder::{FrameBuilder, TypeBuilder};
+use tightbeam::cms::compressed_data::CompressedData;
+use tightbeam::cms::content_info::CmsVersion;
 use tightbeam::cms::enveloped_data::EncryptedContentInfo;
-use tightbeam::cms::signed_data::SignerIdentifier;
+use tightbeam::cms::signed_data::{EncapsulatedContentInfo, SignerIdentifier};
 use tightbeam::crypto::aead::{AeadCore, Aes256Gcm, Decryptor, Encryptor, KeyInit};
 use tightbeam::crypto::ecies::{EciesDecryptor, EciesEncryptor, EciesSecp256k1Oid};
 use tightbeam::crypto::hash::{Digest as _, Sha3_256};
@@ -16,7 +18,7 @@ use tightbeam::crypto::sign::{secp256k1_signer_identifier, sign_canonical, Signe
 use tightbeam::der::oid::AssociatedOid;
 use tightbeam::der::{Any, Encode, EncodeValue, FixedTag, Length, Tag, Writer};
 use tightbeam::matrix::MatrixDyn;
-use tightbeam::oids::DATA;
+use tightbeam::oids::{COMPRESSION_CONTENT, DATA};
 use tightbeam::random::OsRng;
 use tightbeam::{
 	AlgorithmIdentifierOwned, Beamable, DigestInfo, Frame, MessagePriority, ObjectIdentifier, SignerInfo,
@@ -200,6 +202,39 @@ pub fn set_confidentiality(
 	})
 }
 
+/// Replace the frame body with `compressed` and record the compactness info
+/// (any version): the caller's compression algorithm OID, its DER-encoded
+/// parameters when the scheme has any, and the content type of the
+/// uncompressed body (defaults to `id-ct-compressedData`).
+///
+/// Call before [`set_confidentiality`]: peers encrypt the compressed bytes
+/// and decompress after decrypting.
+pub fn set_compactness(
+	frame_der: impl AsRef<[u8]>,
+	content_oid: Option<ObjectIdentifier>,
+	algorithm_oid: ObjectIdentifier,
+	parameters_der: Option<Vec<u8>>,
+	compressed: Vec<u8>,
+) -> Result<Vec<u8>, TightBeamError> {
+	let parameters = match parameters_der {
+		Some(der) => Some(Any::from_der(&der)?),
+		None => None,
+	};
+
+	rewrite_frame(frame_der, move |frame| {
+		frame.metadata.compactness = Some(CompressedData {
+			version: CmsVersion::V0,
+			compression_alg: AlgorithmIdentifierOwned { oid: algorithm_oid, parameters },
+			encap_content_info: EncapsulatedContentInfo {
+				econtent_type: content_oid.unwrap_or(COMPRESSION_CONTENT),
+				econtent: None,
+			},
+		});
+		frame.message = compressed;
+		Ok(())
+	})
+}
+
 /// The frame-integrity preimage: the envelope (version + metadata, message
 /// excluded), encoded exactly as tightbeam's witness scaffold. Borrowing the
 /// frame's own derived encoders keeps the preimage from drifting.
@@ -307,6 +342,12 @@ pub struct FrameSummary {
 	pub matrix_n: Option<u8>,
 	/// Control-matrix row-major bytes, when present (V3+).
 	pub matrix_data: Option<Vec<u8>>,
+	/// Body-compression algorithm OID, when compressed.
+	pub compactness_algorithm_oid: Option<String>,
+	/// Body-compression algorithm parameters DER, when compressed and present.
+	pub compactness_parameters_der: Option<Vec<u8>>,
+	/// Content-type OID of the uncompressed body, when compressed.
+	pub compactness_content_oid: Option<String>,
 	/// Message-commitment digest algorithm OID, when committed.
 	pub message_integrity_algorithm_oid: Option<String>,
 	/// Message-commitment digest octets, when committed.
@@ -333,9 +374,15 @@ pub fn inspect_frame(frame_der: impl AsRef<[u8]>) -> Result<FrameSummary, TightB
 	let frame = Frame::from_der(frame_der.as_ref())?;
 	let metadata = &frame.metadata;
 	let confidentiality = metadata.confidentiality.as_ref();
+	let compactness = metadata.compactness.as_ref();
 
 	let confidentiality_parameters_der = confidentiality
 		.and_then(|info| info.content_enc_alg.parameters.as_ref())
+		.map(Encode::to_der)
+		.transpose()?;
+
+	let compactness_parameters_der = compactness
+		.and_then(|info| info.compression_alg.parameters.as_ref())
 		.map(Encode::to_der)
 		.transpose()?;
 
@@ -350,6 +397,9 @@ pub fn inspect_frame(frame_der: impl AsRef<[u8]>) -> Result<FrameSummary, TightB
 		previous_hash_digest: metadata.previous_frame.as_ref().map(|digest| digest.digest.as_bytes().to_vec()),
 		matrix_n: metadata.matrix.as_ref().map(|matrix| matrix.n),
 		matrix_data: metadata.matrix.as_ref().map(|matrix| matrix.data.clone()),
+		compactness_algorithm_oid: compactness.map(|info| info.compression_alg.oid.to_string()),
+		compactness_parameters_der,
+		compactness_content_oid: compactness.map(|info| info.encap_content_info.econtent_type.to_string()),
 		message_integrity_algorithm_oid: metadata.integrity.as_ref().map(|info| info.algorithm.oid.to_string()),
 		message_integrity_digest: metadata.integrity.as_ref().map(|info| info.digest.as_bytes().to_vec()),
 		frame_integrity_algorithm_oid: frame.integrity.as_ref().map(|info| info.algorithm.oid.to_string()),
@@ -524,11 +574,13 @@ mod tests {
 		Version,
 	};
 
+	use tightbeam::compress::{Compressor, Inflator, ZstdCompression};
+
 	use super::{
 		attach_signature, attach_witness, body_preimage, commitment_preimage, decode_body, derive_public_key,
 		inspect_frame, open_aes_256_gcm, open_ecies_secp256k1, profile_signer_id, seal_aes_256_gcm,
-		seal_ecies_secp256k1, set_confidentiality, set_message_integrity, sha3_256_digest, sign_tbs, tbs_bytes,
-		verify_signature, witness_input, FrameConfig, OpaqueBody,
+		seal_ecies_secp256k1, set_compactness, set_confidentiality, set_message_integrity, sha3_256_digest, sign_tbs,
+		tbs_bytes, verify_signature, witness_input, FrameConfig, OpaqueBody,
 	};
 
 	type TestResult = core::result::Result<(), Box<dyn core::error::Error>>;
@@ -698,6 +750,7 @@ mod tests {
 		let summary = inspect_frame(seal_frame(b"bare", 1)?)?;
 		assert_eq!(summary.priority, None);
 		assert_eq!(summary.lifetime, None);
+		assert_eq!(summary.compactness_algorithm_oid, None);
 		assert_eq!(summary.previous_hash_algorithm_oid, None);
 		assert_eq!(summary.previous_hash_digest, None);
 		assert_eq!(summary.matrix_n, None);
@@ -930,6 +983,128 @@ mod tests {
 	fn body_preimage_round_trips_through_decode() -> TestResult {
 		let preimage = body_preimage(sample_message())?;
 		assert_eq!(decode_body(preimage)?, sample_message());
+		Ok(())
+	}
+
+	/// A caller-side zstd compression (compress + install) must carry the
+	/// exact compactness info tightbeam's own compressor emits, and inflate
+	/// with tightbeam's inflator: pins the compactness wire layout.
+	#[test]
+	fn caller_side_compression_inflates_with_tightbeam() -> TestResult {
+		let der = seal_frame(b"packed", 5)?;
+
+		let compressor = ZstdCompression::default();
+		let (compressed, info) = compressor.compress(&sample_body()?, None)?;
+		let der = set_compactness(&der, None, info.compression_alg.oid, None, compressed)?;
+
+		let mut frame = Frame::from_der(&der)?;
+		assert_eq!(frame.metadata.compactness.as_ref(), Some(&info));
+
+		frame.inflate_in_place(&compressor)?;
+		assert_eq!(decode_body(&frame.message)?, sample_message());
+		Ok(())
+	}
+
+	/// A body compressed by the TypeScript profile `ZstdCompression` must
+	/// inflate with tightbeam's zeekstd-backed inflator: pins the
+	/// cross-layer zstd wire format.
+	///
+	/// Fixture: `new ZstdCompression().compress(payload)` from
+	/// `ws/client/src/compress.ts` over [`interop_payload`].
+	#[test]
+	fn typescript_zstd_stream_inflates_with_tightbeam() -> TestResult {
+		const FIXTURE_HEX: &str = "28b52ffd6020006d0100440274696768746265616d207a73746420696e746572\
+			6f70206669787475726520626f6479200100cc1f4a3d015e2a4d18110000003700\
+			0000200100000100000000b1ea928f";
+
+		let compressed = bytes_from_hex(FIXTURE_HEX)?;
+		let inflated = ZstdCompression::default().decompress(&compressed)?;
+		assert_eq!(inflated, interop_payload());
+		Ok(())
+	}
+
+	/// The shared payload of the TypeScript/Rust zstd interop fixtures.
+	fn interop_payload() -> Vec<u8> {
+		"tightbeam zstd interop fixture body ".repeat(8).into_bytes()
+	}
+
+	/// The commitment `Opening::prove::<Sha3_256>` publishes over the
+	/// shared opening fixture: pins the detached-commitment digest the TS.
+	#[test]
+	fn opening_commitment_matches_typescript_fixture() -> TestResult {
+		const FIXTURE_HEX: &str = "60b6ac6b45c68572acafa88fa74257e84fc9dc71397a1a99265ecb454bf5e639";
+
+		let body = OpaqueBody { body: OctetString::new(opening_payload())? };
+		let (commitment, opening) = Opening::prove::<Sha3_256, _>(&body, opening_salt())?;
+
+		let digest = commitment.digest.as_bytes();
+		let published: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+		assert_eq!(published, FIXTURE_HEX);
+		assert!(opening.verify::<Sha3_256>(&commitment)?);
+		Ok(())
+	}
+
+	/// The shared payload of the TypeScript/Rust opening interop fixture.
+	fn opening_payload() -> Vec<u8> {
+		b"tightbeam opening interop fixture body".to_vec()
+	}
+
+	/// The shared salt of the TypeScript/Rust opening interop fixture.
+	fn opening_salt() -> Vec<u8> {
+		b"opening-interop-salt".to_vec()
+	}
+
+	/// Decode a fixture hex string (whitespace tolerated).
+	fn bytes_from_hex(hex: &str) -> AnyResult<Vec<u8>> {
+		let compact: String = hex.chars().filter(|character| !character.is_whitespace()).collect();
+		let mut bytes = Vec::with_capacity(compact.len() / 2);
+		for index in (0..compact.len()).step_by(2) {
+			bytes.push(u8::from_str_radix(&compact[index..index + 2], 16)?);
+		}
+
+		Ok(bytes)
+	}
+
+	/// A compressed-then-sealed body must open through tightbeam's own
+	/// decrypt-and-inflate pipeline: pins the compress-before-encrypt order.
+	#[test]
+	fn compressed_then_sealed_body_decrypts_with_tightbeam() -> TestResult {
+		let key = [0x42u8; 32];
+		let der = FrameConfig { version: Some(Version::V1), ..base_config(b"packed-sealed", 6)? }.build()?;
+
+		let compressor = ZstdCompression::default();
+		let (compressed, info) = compressor.compress(&sample_body()?, None)?;
+		let der = set_compactness(&der, None, info.compression_alg.oid, None, compressed.clone())?;
+
+		let sealed = seal_aes_256_gcm(key, &compressed)?;
+		let der = set_confidentiality(
+			&der,
+			None,
+			sealed.algorithm_oid.parse::<ObjectIdentifier>()?,
+			sealed.parameters_der,
+			sealed.ciphertext,
+		)?;
+
+		let cipher = Aes256Gcm::new_from_slice(&key)?;
+		let mut frame = Frame::from_der(&der)?;
+		frame.decrypt_in_place(&cipher, Some(&compressor))?;
+		assert_eq!(decode_body(&frame.message)?, sample_message());
+		Ok(())
+	}
+
+	#[test]
+	fn inspect_reports_compactness() -> TestResult {
+		let der = seal_frame(b"packed-view", 7)?;
+
+		let compressor = ZstdCompression::default();
+		let (compressed, info) = compressor.compress(&sample_body()?, None)?;
+		let der = set_compactness(&der, None, info.compression_alg.oid, None, compressed.clone())?;
+
+		let summary = inspect_frame(&der)?;
+		assert_eq!(summary.compactness_algorithm_oid.as_deref(), Some("1.3.6.1.4.1.55555.2.1"));
+		assert_eq!(summary.compactness_content_oid.as_deref(), Some("1.2.840.113549.1.9.16.1.9"));
+		assert_eq!(summary.compactness_parameters_der, None);
+		assert_eq!(summary.body_der, compressed);
 		Ok(())
 	}
 

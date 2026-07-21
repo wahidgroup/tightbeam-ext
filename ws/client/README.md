@@ -6,7 +6,7 @@ The frame codec (ASN.1 DER structure engine) is the actual Rust implementation (
 
 Same builder methods as tightbeam-rs (`withSigner`, `withEncryptor`, `withMessageHasher`), the same `Frame` type with the same verification methods (`verify`, `frameIntegrityVerdict`, `messageCommitmentVerdict`, `decryptMessage`), the same enums with the same ordinals (`Version`, `MessagePriority`), and `emit` returning the response frame.
 
-Cryptography is bring-your-own: every security operation goes through a capability interface (`Hasher`, `BodyEncryptor`, `BodyDecryptor`, `Signatory`) identified by the dotted algorithm OID it writes into the frame. The tightbeam profile (SHA3-256 / secp256k1 ECDSA / AES-256-GCM / ECIES) ships as ready-made wasm-backed implementations; any hash, cipher, or signing library plugs in the same way.
+Cryptography is bring-your-own: every security operation goes through a capability interface (`Hasher`, `BodyEncryptor`, `BodyDecryptor`, `Signatory`, `BodyCompressor`, `BodyInflator`) identified by the dotted algorithm OID it writes into the frame. The tightbeam profile (SHA3-256 / secp256k1 ECDSA / AES-256-GCM / ECIES / zstd) ships as ready-made wasm-backed implementations; any hash, cipher, signing, or compression library plugs in the same way.
 
 ## Install
 
@@ -172,6 +172,62 @@ const built = await frame(body)
 
 `BodyEncryptor` / `BodyDecryptor` work the same way: `encrypt(bodyDer)` resolves with `{ algorithmOid, parametersDer, ciphertext }`, and `decrypt(sealed)` receives the carried pieces and resolves with the plaintext body DER. The `PROFILE_OIDS` constant exports the profile identifiers.
 
+## Compression
+
+Compression is a capability too: a `BodyCompressor` shrinks the body DER and names its algorithm by OID, a `BodyInflator` reverses it. The builder compresses after the message commitment (the commitment is over the uncompressed body) and before encryption (peers encrypt the compressed bytes), matching tightbeam-rs.
+
+The profile compression ships ready-made: `ZstdCompression` (zstd in the seekable format, `PROFILE_OIDS.zstd`) is wire-compatible with tightbeam-rs `ZstdCompression` and backed by a lazily loaded wasm build of libzstd - clients that never compress never load it. Its decompression output is capped (16 MiB by default, matching tightbeam-rs; tune with `new ZstdCompression(maxOutput)`), and the cap is enforced against the stream's declared size before anything is allocated.
+
+```ts
+import {
+	Opaque,
+	ZstdCompression,
+	frame,
+} from "@wahidgroup/tightbeam-ws-client";
+
+const zstd = new ZstdCompression();
+
+const built = await frame(body).withCompressor(zstd).build();
+
+// Cleartext + compressed: inflate and decode in one step.
+const message = await received.inflateMessage(zstd, Opaque);
+
+// Compressed then sealed: pass the inflator to decryptMessage.
+const opened = await sealed.decryptMessage(cipher, Opaque, zstd);
+```
+
+Any other algorithm plugs in the same way. The platform-native `CompressionStream` gives a dependency-free zlib alternative (`PROFILE_OIDS.zlib`, RFC 3274):
+
+```ts
+import type {
+	BodyCompressor,
+	BodyInflator,
+	CompressedBody,
+} from "@wahidgroup/tightbeam-ws-client";
+import { Opaque, PROFILE_OIDS, frame } from "@wahidgroup/tightbeam-ws-client";
+
+async function pump(
+	transform: ReadableWritablePair<Uint8Array, BufferSource>,
+	bytes: Uint8Array,
+): Promise<Uint8Array> {
+	const source = new Blob([bytes]).stream().pipeThrough(transform);
+	return new Uint8Array(await new Response(source).arrayBuffer());
+}
+
+const zlib: BodyCompressor & BodyInflator = {
+	compress: async (bodyDer) => ({
+		algorithmOid: PROFILE_OIDS.zlib,
+		data: await pump(new CompressionStream("deflate"), bodyDer),
+	}),
+	decompress: (compressed) =>
+		pump(new DecompressionStream("deflate"), compressed.data),
+};
+
+const built = await frame(body).withCompressor(zlib).build();
+```
+
+A compressed frame reports `compressed: true` and carries `compactnessInfo` (`{ algorithmOid, parametersDer?, contentOid? }`); reading it without an inflator rejects with a `ValidationError`. Inflators SHOULD cap their output size - a wire-supplied body can be a decompression bomb.
+
 ## Verification and decryption
 
 Verification is on the `Frame` itself. Verdicts are `"verified" | "absent" | "algorithm-mismatch" | "mismatch"`. The verdict methods recompute under any `Hasher` (profile SHA3-256 by default); for frames signed under non-profile schemes, verify `signatureInfo.signature` over `tbs()` with your own library.
@@ -197,6 +253,27 @@ response.tbs(); // to-be-signed bytes
 response.witnessInput(); // frame-integrity preimage
 response.signatureInfo; // { algorithmOid, digestAlgorithmOid, signature }
 ```
+
+## Detached commitments
+
+A commitment can also live outside a frame (`tightbeam::crypto::commitment::Opening`): publish a hiding digest now, disclose the opening `(salt, body)` later, and any holder of the digest verifies the disclosure. The preimage is the same length-framed `salt || body` the in-frame message commitment uses, so a detached commitment and a frame-carried one are interchangeable.
+
+```ts
+import { Opening, Sha3_256 } from "@wahidgroup/tightbeam-ws-client";
+
+// Prover: publish `commitment`, keep `opening` secret until disclosure.
+const { commitment, opening } = await Opening.prove(
+	new Sha3_256(),
+	bodyDer,
+	crypto.getRandomValues(new Uint8Array(32)), // high-entropy salt hides the body
+);
+
+// Verifier: reassemble the disclosed parts and check in constant time.
+const disclosed = Opening.fromParts(opening.salt, opening.bodyDer);
+const verified = await disclosed.verify(new Sha3_256(), commitment);
+```
+
+`verify` resolves with `false` on an algorithm mismatch or a digest mismatch. An empty salt reproduces the plain body digest (binding, not hiding). Any `Hasher` works on both sides.
 
 ## License
 
