@@ -65,8 +65,8 @@ describe.each(CAPPED_DIALS)("$name stream cap guard", ({ dial }) => {
 });
 
 /*
- * Models an untyped JavaScript caller: method-syntax members compare
- * bivariantly, so the loose signature compiles without assertions.
+ * Models an untyped JavaScript caller: method-syntax members compare the
+ * bivariant, so the loose signature compiles without assertions.
  */
 interface LooseMutualDialer {
 	dialMutual(
