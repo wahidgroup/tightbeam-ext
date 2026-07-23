@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 
+import { profileOids } from "#wasm";
+
 import { ValidationError } from "./builder/errors.js";
 import { MessagePriority, priorityFromOrdinal } from "./builder/priority.js";
 import { Version, versionFromOrdinal } from "./builder/version.js";
@@ -109,6 +111,10 @@ describe("key wrappers", () => {
 });
 
 describe("profile algorithm identifiers", () => {
+	it("PROFILE_OIDS matches the OIDs the wasm engine reports", () => {
+		expect(profileOids()).toEqual(PROFILE_OIDS);
+	});
+
 	it("Sha3_256 declares the profile digest OID", () => {
 		expect(new Sha3_256().algorithmOid).toBe(PROFILE_OIDS.sha3_256);
 	});

@@ -2,7 +2,7 @@
 name = "tightbeam-ws"
 description = "WebSocket transport for the tightbeam messaging protocol"
 authors.workspace = true
-version.workspace = true
+version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -24,11 +24,20 @@ name = "gen_certs"
 required-features = ["testing"]
 
 [[example]]
-name = "echo_server_secure"
+name = "echo_server_mux"
+required-features = ["testing"]
+
+[[example]]
+name = "echo_server_mux_clear"
 required-features = ["testing"]
 
 [dependencies]
-tightbeam-rs = { workspace = true, features = ["tcp", "tokio", "transport-ecies"] }
+tightbeam-rs = { workspace = true, features = [
+    "tcp",
+    "tokio",
+    "transport-ecies",
+    "transport-multiplex",
+] }
 tokio = { workspace = true, features = ["net", "rt", "io-util", "macros"] }
 tokio-tungstenite = { workspace = true, features = ["connect", "handshake"] }
 futures-util = { workspace = true, features = ["std", "sink"] }

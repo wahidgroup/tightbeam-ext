@@ -23,24 +23,24 @@ function requireEnv(name: string): string {
 }
 
 /**
- * The cleartext echo server.
+ * The multiplexed encrypted echo server: serves concurrent streams,
+ * calls the client back when a frame id starts with `call-me`, accepts
+ * without a response frame on a `sink` id, and drains the session on a
+ * `drain-calm` id.
  */
-export const wsEndpoint = requireEnv("E2E_ECHO_WS_ENDPOINT");
+export const muxEndpoint = requireEnv("E2E_ECHO_WS_MUX_ENDPOINT");
 
 /**
- * The server-authenticated encrypted echo server.
+ * The multiplexed cleartext echo server: same behavior as the encrypted
+ * one, with a symmetric stream cap of 8 in place of negotiation.
  */
-export const secureEndpoint = requireEnv("E2E_ECHO_WS_SECURE_ENDPOINT");
+export const muxClearEndpoint = requireEnv("E2E_ECHO_WS_MUX_CLEAR_ENDPOINT");
 
 /**
- * The mutually-authenticated encrypted echo server.
+ * The mutually-authenticated multiplexed encrypted echo server: as the
+ * encrypted one, additionally requiring the pinned client certificate.
  */
-export const mutualEndpoint = requireEnv("E2E_ECHO_WS_MUTUAL_ENDPOINT");
-
-/**
- * The sink server: accepts every frame without a response message.
- */
-export const sinkEndpoint = requireEnv("E2E_ECHO_WS_SINK_ENDPOINT");
+export const muxMutualEndpoint = requireEnv("E2E_ECHO_WS_MUX_MUTUAL_ENDPOINT");
 
 /**
  * Read an identity fixture as raw bytes.

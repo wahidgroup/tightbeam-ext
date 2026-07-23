@@ -52,7 +52,7 @@ async fn cleartext_round_trip_drives_ws_macros() -> Result<(), BoxError> {
 
 	let received = rx
 		.recv_timeout(Duration::from_secs(5))
-		.map_err(|_| TransportError::OperationFailed(TransportFailure::Timeout))?;
+		.map_err(|_| TransportError::OperationFailed(TransportFailure::DeadlineExceeded))?;
 	assert_eq!(message, received, "server should receive the frame sent over the WebSocket");
 
 	server_handle.abort();

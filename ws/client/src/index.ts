@@ -2,14 +2,22 @@
  * Client for the tightbeam WebSocket transport (browser and Node).
  */
 
-import init, { SecureWsClient, WsClient } from "#wasm";
+import init, { MuxWsClient } from "#wasm";
+import type { GoAwayReason, SocketCloseInfo, TransportSigner } from "#wasm";
 
 import { FrameBuilder } from "./builder/index.js";
 import { WasmFrameCodec } from "./codec.js";
 import { Frame } from "./frame.js";
 
-export { SecureWsClient, WsClient };
-export { InternalError } from "./errors.js";
+export type { MuxWsClient };
+export type { GoAwayReason, SocketCloseInfo, TransportSigner } from "#wasm";
+export {
+	InternalError,
+	StreamRefusal,
+	TRANSPORT_ERROR_NAME,
+	isTransportError,
+} from "./errors.js";
+export type { TransitCode, TransportError } from "./errors.js";
 export { WasmFrameCodec } from "./codec.js";
 export { Frame, INTEGRITY_VERDICTS } from "./frame.js";
 export type {
@@ -47,6 +55,8 @@ export type {
 } from "./crypto.js";
 export { Opaque, wrapped } from "./message.js";
 export type { MessageCodec, PayloadCodec } from "./message.js";
+export { UnroutedTopicError, route, router } from "./router.js";
+export type { Route, RouteHandler } from "./router.js";
 export {
 	FrameBuilder,
 	MessagePriority,
@@ -71,8 +81,8 @@ export type {
 const sharedCodec = new WasmFrameCodec();
 
 /**
- * Begin building a tightbeam frame with the fluent, Rust-parity builder,
- * backed by the WebAssembly codec.
+ * Begin building a tightbeam frame with the fluent builder (same API as
+ * the tightbeam-rs `compose!` surface), backed by the WebAssembly codec.
  *
  * The wasm module MUST be initialized via {@link initClient} before calling
  * {@link FrameBuilder.build}.
@@ -88,11 +98,66 @@ export function frame(message?: Uint8Array): FrameBuilder {
 }
 
 /**
- * The request surface shared by the cleartext and encrypted wasm sockets.
+ * The lifecycle surface shared by every wasm socket.
  */
-interface FrameSocket {
-	request(frameDer: Uint8Array): Promise<Uint8Array | undefined>;
+interface LifecycleSocket {
+	readonly closed: Promise<SocketCloseInfo>;
+	readonly readyState: number;
+	close(): void;
 	free(): void;
+}
+
+/**
+ * Base for the wasm-socket clients: lifecycle observation and idempotent
+ * release.
+ */
+abstract class SocketLifecycle<TSocket extends LifecycleSocket> {
+	private released = false;
+
+	protected constructor(protected readonly socket: TSocket) {}
+
+	/**
+	 * A promise resolving when the socket closes, however that happens.
+	 */
+	get closed(): Promise<SocketCloseInfo> {
+		return this.socket.closed;
+	}
+
+	/**
+	 * The socket's readyState (0 CONNECTING, 1 OPEN, 2 CLOSING, 3 CLOSED).
+	 */
+	get readyState(): number {
+		return this.socket.readyState;
+	}
+
+	/**
+	 * Close the underlying socket and release its wasm resources. The
+	 * {@link closed} promise resolves once the close completes.
+	 * Idempotent, and safe with emits in flight: they settle with
+	 * `ConnectionClosed`.
+	 */
+	close(): void {
+		if (this.released) {
+			return;
+		}
+
+		this.released = true;
+		this.socket.close();
+		this.socket.free();
+	}
+}
+
+/**
+ * Decode a response frame's DER: `undefined` means the peer returned no
+ * response frame.
+ */
+function decodeResponse(response: Uint8Array | undefined): Frame | undefined {
+	if (response === undefined) {
+		return undefined;
+	}
+
+	const result = Frame.fromDer(response);
+	return result;
 }
 
 /**
@@ -100,16 +165,59 @@ interface FrameSocket {
  * `undefined` when the peer returns no response frame.
  */
 async function emitFrame(
-	socket: FrameSocket,
+	socket: MuxWsClient,
 	frame: Frame,
+	options?: EmitOptions,
 ): Promise<Frame | undefined> {
-	const response = await socket.request(frame.toDer());
-	if (response === undefined) {
-		return undefined;
+	let response: Uint8Array | undefined;
+	if (options?.signal === undefined) {
+		response = await socket.request(frame.toDer());
+	} else {
+		response = await socket.requestWithSignal(
+			frame.toDer(),
+			options.signal,
+		);
 	}
 
-	const result = Frame.fromDer(response);
+	const result = decodeResponse(response);
 	return result;
+}
+
+/**
+ * Options accepted by {@link TightbeamWsClient.emit}.
+ */
+export interface EmitOptions {
+	/**
+	 * Abort the emit: the stream is cancelled (best-effort MuxCancel to
+	 * the peer, cap slot freed) and the promise rejects with the signal's
+	 * abort reason. Timeouts compose as `AbortSignal.timeout(ms)`.
+	 */
+	signal?: AbortSignal;
+}
+
+/**
+ * Options accepted by the {@link TightbeamWsClient} connectors.
+ */
+export interface ConnectOptions {
+	/**
+	 * Abort the dial and handshake: the socket closes and the promise
+	 * rejects with the signal's abort reason. Timeouts compose as
+	 * `AbortSignal.timeout(ms)`.
+	 */
+	signal?: AbortSignal;
+}
+
+/**
+ * Options accepted by the waiting surfaces ({@link TightbeamWsClient.ping},
+ * {@link TightbeamWsClient.waitForStreamSlot}).
+ */
+export interface WaitOptions {
+	/**
+	 * Give up waiting: the promise rejects with the signal's abort
+	 * reason. The connection is untouched. Deadlines compose as
+	 * `AbortSignal.timeout(ms)`.
+	 */
+	signal?: AbortSignal;
 }
 
 let initialization: Promise<void> | undefined;
@@ -136,123 +244,269 @@ export async function initClient(
 }
 
 /**
- * A tightbeam client over a single WebSocket connection. Frames are
- * assembled with the fluent {@link frame} builder.
+ * Answers one server-initiated stream: receives the decoded request frame
+ * and returns the response frame, or `undefined` for a bodiless acceptance.
  */
-export class TightbeamWsClient {
-	private readonly socket: WsClient;
-
-	private constructor(socket: WsClient) {
-		this.socket = socket;
-	}
-
-	/**
-	 * Initialize the module (if needed) and open a socket to `url`.
-	 *
-	 * @param url - The WebSocket URL to connect to.
-	 * @returns A new {@link TightbeamWsClient} instance.
-	 */
-	static async connect(url: string): Promise<TightbeamWsClient> {
-		await initClient();
-
-		const client = new TightbeamWsClient(WsClient.connect(url));
-		return client;
-	}
-
-	/**
-	 * Send a built {@link Frame} and resolve with the decoded response
-	 * frame. Resolves with `undefined` when the peer returns no response frame.
-	 */
-	async emit(frame: Frame): Promise<Frame | undefined> {
-		const result = await emitFrame(this.socket, frame);
-		return result;
-	}
-
-	/*
-	 * Close the underlying socket and release its wasm resources.
-	 */
-	close(): void {
-		this.socket.free();
-	}
-}
+export type MuxStreamHandler = (
+	frame: Frame,
+) => Promise<Frame | undefined> | Frame | undefined;
 
 /**
- * A tightbeam client over a single ECIES-encrypted WebSocket session.
- *
- * The server is authenticated by pinning its DER certificate as the sole
- * trust anchor. {@link connectMutual} presents a client identity so the server
- * can authenticate this client.
+ * A multiplexed tightbeam client over a single WebSocket session,
+ * ECIES-encrypted ({@link connect}, {@link connectMutual}) or cleartext
+ * ({@link connectCleartext}).
  */
-export class TightbeamWsSecureClient {
-	private readonly socket: SecureWsClient;
-
-	private constructor(socket: SecureWsClient) {
-		this.socket = socket;
+export class TightbeamWsClient extends SocketLifecycle<MuxWsClient> {
+	private constructor(socket: MuxWsClient) {
+		super(socket);
 	}
 
 	/**
 	 * Initialize the module (if needed) and open a server-authenticated
-	 * encrypted session to `url`.
+	 * multiplexed session to `url`. Resolves once the handshake completes
+	 * and multiplexing is negotiated.
 	 *
 	 * @param url - The WebSocket URL to connect to.
 	 * @param serverCertDer - DER certificate pinned as the trusted server.
+	 * @param maxPeerStreams - Concurrency cap granted to server-initiated
+	 * streams (default 8). The server's advertisement caps this client's
+	 * concurrent emits.
+	 * @param options - A {@link ConnectOptions.signal} aborts the dial and handshake.
 	 */
 	static async connect(
 		url: string,
 		serverCertDer: Uint8Array,
-	): Promise<TightbeamWsSecureClient> {
+		maxPeerStreams = 8,
+		options?: ConnectOptions,
+	): Promise<TightbeamWsClient> {
 		await initClient();
 
-		const client = new TightbeamWsSecureClient(
-			SecureWsClient.connect(url, serverCertDer),
+		const socket = await MuxWsClient.connect(
+			url,
+			serverCertDer,
+			maxPeerStreams,
+			options?.signal,
 		);
+		const client = new TightbeamWsClient(socket);
+		return client;
+	}
+
+	/**
+	 * Initialize the module (if needed) and open a cleartext multiplexed
+	 * session to `url`.
+	 *
+	 * Cleartext multiplexing has no handshake negotiation: `streams` is a
+	 * symmetric concurrency cap and both endpoints MUST configure the
+	 * same value. The connection carries NO confidentiality or integrity
+	 * protection.
+	 *
+	 * @param url - The WebSocket URL to connect to.
+	 * @param streams - Symmetric concurrency cap, matching the server's configuration.
+	 * @param options - A {@link ConnectOptions.signal} already aborted
+	 * rejects the dial. With no handshake there is nothing async to
+	 * interrupt afterwards.
+	 */
+	static async connectCleartext(
+		url: string,
+		streams = 8,
+		options?: ConnectOptions,
+	): Promise<TightbeamWsClient> {
+		await initClient();
+
+		const socket = MuxWsClient.connectCleartext(
+			url,
+			streams,
+			options?.signal,
+		);
+		const client = new TightbeamWsClient(socket);
 		return client;
 	}
 
 	/**
 	 * As {@link connect}, additionally presenting a client identity for
-	 * mutual authentication.
+	 * mutual authentication. Possession of the certificate key is proven
+	 * either by the raw 32-byte secp256k1 signing scalar or by an external
+	 * {@link TransportSigner} (WebAuthn, wallet, KMS bridge), in which case
+	 * the private key never leaves its backend.
 	 *
 	 * @param url - The WebSocket URL to connect to.
 	 * @param serverCertDer - DER certificate pinned as the trusted server.
 	 * @param clientCertDer - DER certificate presented to the server.
-	 * @param clientSigningKey - Raw 32-byte secp256k1 signing scalar.
+	 * @param clientKey - secp256k1 signing scalar, or an external signer.
+	 * @param maxPeerStreams - Concurrency cap granted to server-initiated streams.
+	 * @param options - A {@link ConnectOptions.signal} aborts the dial and handshake.
 	 */
 	static async connectMutual(
 		url: string,
 		serverCertDer: Uint8Array,
 		clientCertDer: Uint8Array,
-		clientSigningKey: Uint8Array,
-	): Promise<TightbeamWsSecureClient> {
+		clientKey: Uint8Array | TransportSigner,
+		maxPeerStreams = 8,
+		options?: ConnectOptions,
+	): Promise<TightbeamWsClient> {
 		await initClient();
 
-		const client = new TightbeamWsSecureClient(
-			SecureWsClient.connectMutual(
+		let socket: MuxWsClient;
+		if (clientKey instanceof Uint8Array) {
+			socket = await MuxWsClient.connectMutual(
 				url,
 				serverCertDer,
 				clientCertDer,
-				clientSigningKey,
-			),
-		);
+				clientKey,
+				maxPeerStreams,
+				options?.signal,
+			);
+		} else {
+			socket = await MuxWsClient.connectMutualWithSigner(
+				url,
+				serverCertDer,
+				clientCertDer,
+				clientKey,
+				maxPeerStreams,
+				options?.signal,
+			);
+		}
+
+		const client = new TightbeamWsClient(socket);
 		return client;
 	}
 
 	/**
-	 * Send a built {@link Frame} over the encrypted session and resolve
-	 * with the decoded response frame. The first call performs the ECIES
-	 * handshake.
+	 * Send a built {@link Frame} on a fresh stream and resolve with the
+	 * decoded response frame. Concurrent emits interleave on the
+	 * connection. Responses correlate by stream.
 	 *
 	 * Resolves with `undefined` when the peer returns no response frame.
+	 * An {@link EmitOptions.signal} abort cancels the stream and rejects
+	 * with the signal's abort reason.
 	 */
-	async emit(frame: Frame): Promise<Frame | undefined> {
-		const result = await emitFrame(this.socket, frame);
+	async emit(
+		frame: Frame,
+		options?: EmitOptions,
+	): Promise<Frame | undefined> {
+		const result = await emitFrame(this.socket, frame, options);
 		return result;
 	}
 
 	/**
-	 * Close the underlying socket and release its wasm resources.
+	 * Serve server-initiated streams with `handler`. Callable repeatedly:
+	 * the latest handler serves every stream dispatched after the call,
+	 * and streams already in flight finish on the handler they started
+	 * with. Handlers for distinct streams run concurrently.
 	 */
-	close(): void {
-		this.socket.free();
+	serve(handler: MuxStreamHandler): void {
+		this.socket.serve(
+			(requestDer: Uint8Array): Promise<Uint8Array | undefined> => {
+				const respond = async (): Promise<Uint8Array | undefined> => {
+					const request = Frame.fromDer(requestDer);
+					const response = await handler(request);
+					if (response === undefined) {
+						return undefined;
+					}
+
+					const responseDer = response.toDer();
+					return responseDer;
+				};
+
+				const settled = respond();
+				return settled;
+			},
+		);
+	}
+
+	/**
+	 * The negotiated cap on concurrent locally-initiated streams.
+	 */
+	get maxConcurrentStreams(): number {
+		return this.socket.maxConcurrentStreams;
+	}
+
+	/**
+	 * Whether a new stream would be admitted now: cap headroom, live ID
+	 * space, and no GoAway either way.
+	 *
+	 * Advisory: a concurrent emit can take the last slot after this
+	 * returns, so callers still handle the `StreamsExhausted` rejection.
+	 */
+	get hasStreamHeadroom(): boolean {
+		return this.socket.hasStreamHeadroom;
+	}
+
+	/**
+	 * Whether any emit still awaits its response. A pre-close check:
+	 * {@link shutdown} drains these, {@link close} settles them with
+	 * `ConnectionClosed`.
+	 *
+	 * Advisory: like {@link hasStreamHeadroom}: a concurrent emit or
+	 * response can flip it after the read.
+	 */
+	get hasPendingStreams(): boolean {
+		return this.socket.hasPendingStreams;
+	}
+
+	/**
+	 * Resolves once a new stream would be admitted. Replaces polling
+	 * {@link hasStreamHeadroom} in a loop, with the same advisory caveat.
+	 *
+	 * Rejects with `Draining` once no stream will ever be admitted again,
+	 * or with the abort reason of {@link WaitOptions.signal} when the
+	 * caller gives up first.
+	 */
+	async waitForStreamSlot(options?: WaitOptions): Promise<void> {
+		await this.socket.waitForStreamSlot(options?.signal);
+	}
+
+	/**
+	 * Reason carried by the peer's GoAway, or `undefined` while the
+	 * connection is live or was shut down locally.
+	 *
+	 * Reconnect policies branch on this: `Shutdown` invites an immediate
+	 * reconnect, `EnhanceYourCalm` calls for backoff, and `ProtocolError`
+	 * points at a bug rather than a transient fault.
+	 */
+	get goawayReason(): GoAwayReason | undefined {
+		return this.socket.goawayReason;
+	}
+
+	/**
+	 * Numeric code behind {@link goawayReason}, or `undefined` while that
+	 * getter is. Distinguishes application-defined codes that all label
+	 * as `"Application"`.
+	 */
+	get goawayCode(): number | undefined {
+		return this.socket.goawayCode;
+	}
+
+	/**
+	 * Connection-level liveness probe: resolves when the peer's ack
+	 * arrives. No stream is allocated and the peer's application handler
+	 * never runs, so a periodic ping doubles as an idle keepalive.
+	 *
+	 * Rejects with `Draining` while the connection winds down,
+	 * `ConnectionClosed` when it is gone, and the abort reason of
+	 * {@link WaitOptions.signal} when a deadline fires first
+	 * (`AbortSignal.timeout(ms)`).
+	 */
+	async ping(options?: WaitOptions): Promise<void> {
+		await this.socket.ping(options?.signal);
+	}
+
+	/**
+	 * Gracefully shut the session down: sends GoAway, drains in-flight
+	 * streams, then stops the writer. Follow with {@link close} to close
+	 * the socket itself.
+	 */
+	async shutdown(): Promise<void> {
+		await this.socket.shutdown();
+	}
+
+	/**
+	 * As {@link shutdown}, advertising `reason` in the GoAway so the
+	 * peer's reconnect policy can branch on it: a label (`"Shutdown"`,
+	 * `"ProtocolError"`, `"EnhanceYourCalm"`) or a numeric code.
+	 * Codes outside the reserved range are application-defined.
+	 */
+	async shutdownWith(reason: GoAwayReason | number): Promise<void> {
+		await this.socket.shutdownWith(reason);
 	}
 }

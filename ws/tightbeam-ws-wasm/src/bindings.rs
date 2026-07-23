@@ -1,9 +1,15 @@
 //! The `wasm-bindgen` surface for the browser and Node.
 
+use js_sys::{Object, Reflect};
 use wasm_bindgen::prelude::*;
 
+use tightbeam::crypto::ecies::EciesSecp256k1Oid;
 use tightbeam::der::asn1::OctetString;
+use tightbeam::der::oid::AssociatedOid;
 use tightbeam::matrix::MatrixDyn;
+use tightbeam::oids::{
+	AES_256_GCM, COMPRESSION_CONTENT, COMPRESSION_ZLIB, COMPRESSION_ZSTD, HASH_SHA3_256, SIGNER_ECDSA_WITH_SHA3_256,
+};
 use tightbeam::{AlgorithmIdentifierOwned, DigestInfo, MessagePriority, ObjectIdentifier, Version};
 
 use crate::build::{self, FrameConfig, FrameSummary};
@@ -192,9 +198,7 @@ pub fn set_confidentiality(
 
 /// Replace the frame body with `compressed` and record the compactness info
 /// (any version): the caller's compression algorithm OID, its DER-encoded
-/// parameters (pass `undefined` when the scheme has none), and the
-/// content-type OID of the uncompressed body (defaults to
-/// `id-ct-compressedData`).
+/// parameters, and the content-type OID of the uncompressed body .
 #[wasm_bindgen(js_name = setCompactness)]
 pub fn set_compactness(
 	frame_der: Vec<u8>,
@@ -214,8 +218,7 @@ pub fn set_compactness(
 }
 
 /// The frame-integrity (witness) preimage bytes: hash them with any digest
-/// and install the result via `attachWitness`. Call after all metadata
-/// mutations; the witness covers the final envelope.
+/// and install the result via `attachWitness`.
 #[wasm_bindgen(js_name = witnessInput)]
 pub fn witness_input(frame_der: Vec<u8>) -> Result<Vec<u8>, JsError> {
 	build::witness_input(frame_der).map_err(|error| JsError::new(&error.to_string()))
@@ -415,6 +418,57 @@ pub fn inspect_frame(frame_der: Vec<u8>) -> Result<FrameView, JsError> {
 // Tightbeam profile primitives (SHA3-256 / secp256k1 / AES-256-GCM / ECIES).
 // ---------------------------------------------------------------------------
 
+/// TypeScript shape of the [`profile_oids`] table.
+#[wasm_bindgen(typescript_custom_section)]
+const PROFILE_OIDS_TS: &'static str = r#"
+/**
+ * The dotted OIDs of the tightbeam profile (`tightbeam::oids`).
+ */
+export interface ProfileOids {
+	/** SHA3-256, the profile digest. */
+	readonly sha3_256: string;
+	/** secp256k1 ECDSA over SHA3-256, the profile signature. */
+	readonly ecdsaWithSha3_256: string;
+	/** AES-256-GCM, the profile symmetric cipher. */
+	readonly aes256Gcm: string;
+	/** ECIES over secp256k1 (HKDF-SHA3-256 + AES-256-GCM). */
+	readonly eciesSecp256k1: string;
+	/** Zstandard (RFC 8878), the profile compression. */
+	readonly zstd: string;
+	/** zlib (RFC 3274), interoperable with `CompressionStream("deflate")`. */
+	readonly zlib: string;
+	/**
+	 * id-ct-compressedData (RFC 3274): the content type recorded in the
+	 * compactness info when the compressor names none.
+	 */
+	readonly compressedContent: string;
+}
+"#;
+
+/// The dotted OIDs of the tightbeam profile, read from the `tightbeam`
+/// crate's constants so downstream copies of the table can be checked
+/// against the engine instead of restated by hand.
+#[wasm_bindgen(js_name = profileOids, unchecked_return_type = "ProfileOids")]
+pub fn profile_oids() -> Result<JsValue, JsValue> {
+	let entries: [(&str, ObjectIdentifier); 7] = [
+		("sha3_256", HASH_SHA3_256),
+		("ecdsaWithSha3_256", SIGNER_ECDSA_WITH_SHA3_256),
+		("aes256Gcm", AES_256_GCM),
+		("eciesSecp256k1", EciesSecp256k1Oid::OID),
+		("zstd", COMPRESSION_ZSTD),
+		("zlib", COMPRESSION_ZLIB),
+		("compressedContent", COMPRESSION_CONTENT),
+	];
+
+	let table = Object::new();
+	for (key, oid) in entries {
+		let dotted = JsValue::from_str(&oid.to_string());
+		Reflect::set(&table, &JsValue::from_str(key), &dotted)?;
+	}
+
+	Ok(table.into())
+}
+
 /// SHA3-256 digest of `data` - the profile hasher.
 #[wasm_bindgen(js_name = sha3_256)]
 pub fn sha3_256(data: Vec<u8>) -> Vec<u8> {
@@ -455,7 +509,7 @@ pub fn profile_signer_id(public_key_sec1: Vec<u8>) -> Result<Vec<u8>, JsError> {
 /// secp256k1 public key (33-byte compressed or 65-byte uncompressed) under
 /// the profile scheme (ECDSA over SHA3-256).
 ///
-/// Resolves on a valid signature; a missing signature, an algorithm
+/// Resolves on a valid signature: a missing signature, an algorithm
 /// mismatch, or a bad signature all throw. Frames signed under other schemes
 /// verify caller-side from `tbsBytes` and the carried signature.
 #[wasm_bindgen(js_name = verifySignature)]

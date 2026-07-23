@@ -16,7 +16,10 @@ import {
 import { ValidationError } from "./builder/errors.js";
 
 /**
- * The dotted algorithm OIDs of the tightbeam profile (`tightbeam::oids`).
+ * The dotted OIDs of the tightbeam profile (`tightbeam::oids`).
+ *
+ * Literal values rather than reads from the wasm `profileOids()` binding,
+ * so the table is usable before the (web-build) wasm module initializes.
  */
 export const PROFILE_OIDS = {
 	/** SHA3-256, the profile digest. */
@@ -31,6 +34,11 @@ export const PROFILE_OIDS = {
 	zstd: "1.3.6.1.4.1.55555.2.1",
 	/** zlib (RFC 3274), interoperable with `CompressionStream("deflate")`. */
 	zlib: "1.2.840.113549.1.9.16.3.8",
+	/**
+	 * id-ct-compressedData (RFC 3274): the content type recorded in the
+	 * compactness info when the compressor names none.
+	 */
+	compressedContent: "1.2.840.113549.1.9.16.1.9",
 } as const;
 
 /**

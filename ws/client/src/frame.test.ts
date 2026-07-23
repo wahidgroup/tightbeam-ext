@@ -123,7 +123,7 @@ describe("Frame metadata round-trip", () => {
 	});
 });
 
-describe("version-floor parity with tightbeam-rs", () => {
+describe("version floor matches tightbeam-rs", () => {
 	interface FloorCase {
 		field: string;
 		expected: Version;
@@ -375,8 +375,8 @@ describe("external Signatory across the wasm boundary", () => {
 			.withOrder(11)
 			.withSigner(signatory)
 			.build();
-
 		expect(built.signed).toBe(true);
+
 		const verifyingKey = Secp256k1VerifyingKey.fromSec1Bytes(
 			signatory.publicKey(),
 		);
@@ -386,7 +386,6 @@ describe("external Signatory across the wasm boundary", () => {
 	it("rejects verification of the external signature under another key", async () => {
 		const signatory = new NobleSignatory(new Uint8Array(32).fill(5));
 		const built = await frame(BODY).withSigner(signatory).build();
-
 		expect(() => built.verify(SIGNING_KEY.verifyingKey())).toThrow();
 	});
 
@@ -513,7 +512,9 @@ describe("bring-your-own encryption across the wasm boundary", () => {
 		}
 
 		async decrypt(sealed: EncryptedBody): Promise<Uint8Array> {
-			// Strip the 2-octet OCTET STRING header to recover the nonce.
+			/*
+			 * Strip the 2-octet OCTET STRING header to recover the nonce.
+			 */
 			const parameters = sealed.parametersDer ?? new Uint8Array();
 			const nonce = new Uint8Array(parameters.slice(2));
 			const algorithm = { name: "AES-GCM", iv: nonce };
@@ -555,12 +556,6 @@ describe("bring-your-own encryption across the wasm boundary", () => {
 });
 
 describe("bring-your-own compression", () => {
-	/**
-	 * The `id-ct-compressedData` OID the engine records when the
-	 * compressor declares no content type.
-	 */
-	const COMPRESSED_CONTENT_OID = "1.2.840.113549.1.9.16.1.9";
-
 	/**
 	 * Run `bytes` through a compression or decompression transform stream.
 	 */
@@ -614,7 +609,9 @@ describe("bring-your-own compression", () => {
 		const built = await frame(BODY).withCompressor(zlib).build();
 		expect(built.compressed).toBe(true);
 		expect(built.compactnessInfo?.algorithmOid).toBe(PROFILE_OIDS.zlib);
-		expect(built.compactnessInfo?.contentOid).toBe(COMPRESSED_CONTENT_OID);
+		expect(built.compactnessInfo?.contentOid).toBe(
+			PROFILE_OIDS.compressedContent,
+		);
 		expect(built.bodyDer).not.toEqual(uncompressedBodyDer);
 
 		await expect(built.inflateMessage(zlib, Opaque)).resolves.toEqual(BODY);

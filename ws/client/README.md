@@ -1,12 +1,42 @@
 # tightbeam-ws-client
 
-Hybrid TypeScript/WebAssembly client for the [tightbeam](https://crates.io/crates/tightbeam-rs) WebSocket transport: build tightbeam frames with a fluent, Rust-parity builder and ship them over a socket from the browser or Node.
+TypeScript/WebAssembly client for the [tightbeam](https://crates.io/crates/tightbeam-rs) WebSocket transport: build tightbeam frames in the browser or Node and exchange them over multiplexed sessions.
 
-The frame codec (ASN.1 DER structure engine) is the actual Rust implementation (`tightbeam-ws-wasm`) compiled with `wasm-pack`; the TypeScript layer adds the builder, validation, and connection ergonomics. Two wasm bundles ship in the package - a `web` build and a `nodejs` build - selected automatically via the package's `imports` map. Node ≥ 24 uses its global `WebSocket`; no shim required.
+## Status
 
-Same builder methods as tightbeam-rs (`withSigner`, `withEncryptor`, `withMessageHasher`), the same `Frame` type with the same verification methods (`verify`, `frameIntegrityVerdict`, `messageCommitmentVerdict`, `decryptMessage`), the same enums with the same ordinals (`Version`, `MessagePriority`), and `emit` returning the response frame.
+> Warning: This project is under active development. Public APIs MAY change without notice.
 
-Cryptography is bring-your-own: every security operation goes through a capability interface (`Hasher`, `BodyEncryptor`, `BodyDecryptor`, `Signatory`, `BodyCompressor`, `BodyInflator`) identified by the dotted algorithm OID it writes into the frame. The tightbeam profile (SHA3-256 / secp256k1 ECDSA / AES-256-GCM / ECIES / zstd) ships as ready-made wasm-backed implementations; any hash, cipher, signing, or compression library plugs in the same way.
+**Security Disclaimer:** A SECURITY AUDIT HAS NOT BEEN CONDUCTED. USE AT YOUR OWN RISK.
+
+## Abstract
+
+This package is tightbeam in TypeScript. The frame codec (the ASN.1 DER structure engine) is the actual Rust implementation, compiled from [`tightbeam-ws-wasm`](../tightbeam-ws-wasm) with `wasm-pack`. The TypeScript layer adds the builder, validation, and connection handling. What tightbeam-rs offers, this client offers under the same names:
+
+- The builder: `withSigner`, `withEncryptor`, `withMessageHasher`, the version floor rules, `assertVersion`.
+- The `Frame`: `verify`, `frameIntegrityVerdict`, `messageCommitmentVerdict`, `decryptMessage`, and the same enums with the same ordinals (`Version`, `MessagePriority`).
+- The transport: multiplexed bidirectional streams, ECIES sessions, GoAway semantics, gRPC status codes on refusals.
+
+Cryptography is caller-supplied. Every security operation goes through a capability interface (`Hasher`, `BodyEncryptor`, `BodyDecryptor`, `Signatory`, `BodyCompressor`, `BodyInflator`) identified by the dotted algorithm OID it writes into the frame. The tightbeam profile (SHA3-256, secp256k1 ECDSA, AES-256-GCM, ECIES, zstd) is included as wasm-backed implementations. Any other hash, cipher, signer, or compressor plugs in through the same interfaces.
+
+Two wasm bundles ship in the package, a `web` build and a `nodejs` build, selected automatically through the package `imports` map. Node ≥ 24 uses its global `WebSocket`, no shim required.
+
+## Table of Contents
+
+- [Install](#install)
+- [Cleartext round-trip](#cleartext-round-trip)
+- [Encrypted sessions (ECIES)](#encrypted-sessions-ecies)
+- [Two-way streams](#two-way-streams)
+- [Cancellation and timeouts](#cancellation-and-timeouts)
+- [Connection lifecycle](#connection-lifecycle)
+- [Transport errors](#transport-errors)
+- [Keepalive](#keepalive)
+- [Frame builder](#frame-builder)
+- [Typed messages](#typed-messages)
+- [Custom cryptography](#custom-cryptography)
+- [Compression](#compression)
+- [Verification and decryption](#verification-and-decryption)
+- [Detached commitments](#detached-commitments)
+- [License](#license)
 
 ## Install
 
@@ -14,13 +44,15 @@ Cryptography is bring-your-own: every security operation goes through a capabili
 npm install @wahidgroup/tightbeam-ws-client
 ```
 
-The package is published to GitHub Packages; point the `@wahidgroup` scope there in `.npmrc`:
+The package is published to GitHub Packages. Point the `@wahidgroup` scope there in `.npmrc`:
 
 ```ini
 @wahidgroup:registry=https://npm.pkg.github.com
 ```
 
 ## Cleartext round-trip
+
+Every connection is a multiplexed tightbeam session: one socket carries concurrent, bidirectional streams. Cleartext sessions have no handshake to negotiate over, so the stream cap is symmetric and both endpoints MUST configure the same value (default 8). Cleartext carries no confidentiality or integrity protection.
 
 ```ts
 import {
@@ -29,7 +61,7 @@ import {
 	frame,
 } from "@wahidgroup/tightbeam-ws-client";
 
-const client = await TightbeamWsClient.connect("ws://localhost:9100");
+const client = await TightbeamWsClient.connectCleartext("ws://localhost:9101");
 
 const built = await frame(new TextEncoder().encode("hello"))
 	.withId("greeting")
@@ -42,20 +74,25 @@ console.log(response?.message(Opaque), response?.order, response?.signed);
 client.close();
 ```
 
-`emit` resolves with the response `Frame`, or `undefined` when the peer returns no response (`client.emit(frame) -> Option<Frame>`). A `Frame` exposes the typed body via `message(codec)` (the raw DER via `bodyDer`), metadata (`version`, `id`, `order`, and the V2+/V3+ fields `priority`, `lifetime`, `previousFrame`, `matrix` when present), the security markers (`signed`, `messageIntegrity`, `frameIntegrity`, `confidential`) with their carried infos (`signatureInfo`, `messageIntegrityInfo`, `frameIntegrityInfo`, `confidentialityInfo`), the raw bytes via `toDer()`, and the verification methods below.
+`emit` resolves with the response `Frame`, or `undefined` when the peer answers without a body. A `Frame` exposes:
+
+- the typed body via `message(codec)`, the raw body DER via `bodyDer`, the raw frame via `toDer()`
+- metadata: `version`, `id`, `order`, plus the V2+/V3+ fields `priority`, `lifetime`, `previousFrame`, `matrix` when present
+- the security markers (`signed`, `messageIntegrity`, `frameIntegrity`, `confidential`) with their carried infos (`signatureInfo`, `messageIntegrityInfo`, `frameIntegrityInfo`, `confidentialityInfo`)
+- the methods under [Verification and decryption](#verification-and-decryption)
 
 ## Encrypted sessions (ECIES)
 
-The server is authenticated by pinning its DER certificate; the ECIES handshake runs over the cleartext socket on the first `emit`.
+The server is authenticated by pinning its DER certificate. The ECIES handshake also negotiates stream multiplexing (HTTP/2-style, tightbeam's `transport-multiplex`): the `maxPeerStreams` argument caps concurrent server-initiated streams (default 8), the server's advertisement caps this client's concurrent emits, and connecting to a server that does not offer multiplexing rejects.
 
 ```ts
-import { TightbeamWsSecureClient } from "@wahidgroup/tightbeam-ws-client";
+import { TightbeamWsClient } from "@wahidgroup/tightbeam-ws-client";
 
 // Server-authenticated:
-const secure = await TightbeamWsSecureClient.connect(url, serverCertDer);
+const secure = await TightbeamWsClient.connect(url, serverCertDer);
 
 // Mutually authenticated (32-byte secp256k1 signing key):
-const mutual = await TightbeamWsSecureClient.connectMutual(
+const mutual = await TightbeamWsClient.connectMutual(
 	url,
 	serverCertDer,
 	clientCertDer,
@@ -63,9 +100,212 @@ const mutual = await TightbeamWsSecureClient.connectMutual(
 );
 ```
 
+When the certificate key lives in an external key store (WebAuthn, a wallet, a KMS bridge), pass a `TransportSigner` instead of the raw scalar. The handshake hands it the transcript prehash to sign, so the private key never crosses into wasm. The contract is algorithm-agnostic: the signer signs the prehash directly (no rehash) and returns whatever signature encoding the session profile verifies. Under the default-profile build that is a secp256k1 signature as 64-byte `r || s`. A custom-profile build expects its own profile's encoding (see the [`tightbeam-ws-wasm` README](../tightbeam-ws-wasm/README.md)).
+
+```ts
+import type { TransportSigner } from "@wahidgroup/tightbeam-ws-client";
+
+const signer: TransportSigner = {
+	algorithmOid: "1.2.840.10045.4.3.2",
+	publicKeyDer: spkiFromKeyStore,
+	signPrehash: (prehash) => keyStore.signDigest(prehash),
+};
+
+const external = await TightbeamWsClient.connectMutual(
+	url,
+	serverCertDer,
+	clientCertDer,
+	signer,
+);
+```
+
+The session profile (secp256k1 ECIES, AES-256-GCM records, SHA3-256 certificates) is a compile-time choice, the same as for a native tightbeam-rs transport. A deployment on a different provider rebuilds the wasm layer against its own `CryptoProvider` (see the [`tightbeam-ws-wasm` README](../tightbeam-ws-wasm/README.md)). Frame-level cryptography stays caller-supplied regardless.
+
+## Two-way streams
+
+Every `emit` opens its own stream: concurrent emits interleave on the connection and responses correlate by stream ID. `serve` answers streams the _server_ initiates.
+
+```ts
+import {
+	Opaque,
+	TightbeamWsClient,
+	frame,
+} from "@wahidgroup/tightbeam-ws-client";
+
+const mux = await TightbeamWsClient.connect(url, serverCertDer);
+
+// Answer server-initiated streams. Callable repeatedly (the latest
+// handler serves streams dispatched after the call), and handlers for
+// distinct streams run concurrently.
+mux.serve(async (request) => {
+	const reply = await frame(handle(request.message(Opaque)))
+		.withId("reply")
+		.withOrder(1)
+		.build();
+	return reply; // or undefined for a bodiless acceptance
+});
+
+// Concurrent client-initiated streams over the one connection.
+const [first, second] = await Promise.all([
+	mux.emit(builtFirst),
+	mux.emit(builtSecond),
+]);
+
+await mux.shutdown(); // GoAway, drain in-flight streams, stop
+mux.close();
+```
+
+A `serve` handler refuses a stream by throwing `StreamRefusal` with the gRPC status code of its choice (`throw new StreamRefusal("NotFound", "no such order")`). Any other throwing or rejecting handler answers `Unknown`. `maxConcurrentStreams` reports the negotiated local cap. After `shutdown`, new emits reject while in-flight streams drain.
+
+Registering the handler is not racy: server-initiated streams that arrive before `serve()` is called are parked in a bounded queue (the cap granted to the server) and served in order once the handler registers.
+
+### Routing server-initiated streams
+
+Applications that serve more than one kind of stream demultiplex by frame id. The `router` makes that pairing checkable: each `route` binds an id prefix to a codec and a handler whose message type the codec proves, so a codec and its handler cannot disagree at compile time. The longest matching prefix wins. An unmatched id throws `UnroutedTopicError`, answering the stream with an `Unimplemented` status.
+
+```ts
+import { route, router } from "@wahidgroup/tightbeam-ws-client";
+
+mux.serve(
+	router({
+		"tick/": route(TickCodec, (tick) => {
+			store.applyTick(tick); // tick: Tick, inferred from the codec
+			return undefined; // bodiless ack
+		}),
+		"chat/": route(ChatCodec, async (message, request) => {
+			store.appendChat(message);
+			return buildReceipt(request); // response frame
+		}),
+	}),
+);
+```
+
+The server matches on the frame id prefix before decoding in its own stream handler. The router only routes: subscription semantics, ordering, and replay stay with the application.
+
+## Cancellation and timeouts
+
+`emit` takes an `AbortSignal`. Aborting cancels the stream (the cap slot is freed and a best-effort `MuxCancel` tells the peer) and rejects the emit with the signal's abort reason. A timeout is a signal:
+
+```ts
+const response = await mux.emit(built, {
+	signal: AbortSignal.timeout(5_000),
+});
+```
+
+The connectors take a signal the same way. Aborting cancels the dial and handshake, closes the socket, and rejects with the signal's abort reason.
+
+```ts
+const mux = await TightbeamWsClient.connect(url, serverCertDer, 8, {
+	signal: AbortSignal.timeout(5_000),
+});
+```
+
+## Connection lifecycle
+
+Every client exposes `closed`, a promise resolving with the close frame's `{ code, reason, wasClean }` when the socket ends, however that happens, plus a `readyState` getter with the WebSocket constants. Reconnect logic starts here:
+
+```ts
+void client.closed.then((info) => {
+	if (!info.wasClean) {
+		scheduleReconnect(info.code);
+	}
+});
+```
+
+`close()` closes the socket and releases the client's wasm resources (idempotent, safe with emits in flight). Call `shutdown()` first for a graceful GoAway drain, or `shutdownWith(reason)` to advertise why: a label (`"Shutdown"`, `"ProtocolError"`, `"EnhanceYourCalm"`) or an application-defined numeric code the peer reads back through its own GoAway surface.
+
+When the peer drains the session, the client records why. `goawayReason` reads the reason from the peer's GoAway (`undefined` while the connection is live or after a local shutdown), and reconnect policies branch on it. `goawayCode` exposes the raw numeric code for application-defined reasons, which all label as `"Application"`.
+
+Reconnection belongs to the application: the client supplies the policy inputs (`closed`, `goawayReason`, `wasClean`) and only the application knows what state to replay. The complete pattern: branch on the reason, back off, re-register `serve`.
+
+```ts
+async function connectLoop(
+	handle: (client: TightbeamWsClient) => void,
+): Promise<void> {
+	let delay = 500;
+
+	for (;;) {
+		let client: TightbeamWsClient;
+		try {
+			client = await TightbeamWsClient.connect(url, serverCertDer, 8, {
+				signal: AbortSignal.timeout(5_000),
+			});
+		} catch {
+			await sleep((delay = Math.min(delay * 2, 30_000)));
+			continue;
+		}
+
+		delay = 500;
+		// Re-establish per-connection state: serve is per connection.
+		handle(client);
+
+		const info = await client.closed;
+		switch (client.goawayReason) {
+			case "Shutdown":
+				break; // orderly drain: rotation, redeploy; go right back
+			case "EnhanceYourCalm":
+				await sleep((delay = Math.min(delay * 2, 30_000)));
+				break; // the server asked for calm
+			case "ProtocolError":
+				report(info);
+				return; // a bug, not a transient fault
+			default:
+				await sleep(delay); // no GoAway: connection loss
+		}
+	}
+}
+```
+
+## Transport errors
+
+Transport failures reject as `Error` objects carrying a stable machine-readable `code` (the tightbeam-rs error variant name). Narrow them with `isTransportError`:
+
+```ts
+import { isTransportError } from "@wahidgroup/tightbeam-ws-client";
+
+try {
+	await mux.emit(built);
+} catch (error) {
+	if (isTransportError(error) && error.code === "Draining") {
+		// GoAway received: reconnect before emitting again.
+	}
+}
+```
+
+Local conditions carry their variant name: `ConnectionClosed`, `Draining`, and `StreamsExhausted` (local stream cap full, retry after a response frees a slot). Peer refusals carry gRPC canonical status names, with the retry contract each name defines:
+
+- `ResourceExhausted`: peer at capacity, retry with backoff
+- `Unavailable`: peer draining, retry with backoff
+- `Unimplemented`: nothing serves the topic, do not retry
+- `Unknown`: unclassified peer handler failure
+- `DeadlineExceeded`, `Unauthenticated`, `PermissionDenied`: gate policy rejections
+
+Instead of retrying `StreamsExhausted` blind, wait for admission. `waitForStreamSlot()` resolves once a new stream would be admitted, rejects with `Draining` once no stream ever will be again, and takes the same `{ signal }` option as `emit` for callers that give up first. It is advisory like `hasStreamHeadroom`: a concurrent emit can take the slot between wake and use, so the rejection handling stays.
+
+```ts
+await mux.waitForStreamSlot({ signal: AbortSignal.timeout(5_000) });
+const response = await mux.emit(built);
+```
+
+## Keepalive
+
+Multiplexed sessions have a protocol-level liveness probe (RFC 9113 § 6.7 analog): `ping()` resolves when the peer acknowledges. No stream is allocated and no application handler runs on the peer, so a periodic ping doubles as an idle keepalive for browsers, whose sockets cannot send WebSocket protocol pings from JavaScript:
+
+```ts
+const interval = setInterval(() => {
+	void mux.ping({ signal: AbortSignal.timeout(5_000) }).catch(() => {
+		clearInterval(interval);
+		// Draining, ConnectionClosed, or deadline: reconnect via the
+		// closed promise.
+	});
+}, 30_000);
+```
+
+Browsers answer WebSocket protocol pings automatically; this probe covers the application level, where silence is otherwise indistinguishable from idleness.
+
 ## Frame builder
 
-Every `with*` returns a new immutable builder; `build()` validates the spec and resolves with the assembled `Frame`. Algorithms are selected with capability objects:
+Every `with*` returns a new immutable builder. `build()` validates the spec and resolves with the assembled `Frame`. Algorithms are selected with capability objects:
 
 ```ts
 import {
@@ -95,14 +335,14 @@ const built = await frame(body)
 	.build();
 ```
 
-- The version floor is derived from the requested fields, or pinned with `withVersion(Version.V2)`; `assertVersion` makes the build fail when the effective version differs from what you expect.
-- `withMessageHasher` / `withWitnessHasher` take any `Hasher`; the profile hasher is `Sha3_256`.
+- The version floor is derived from the requested fields, or pinned with `withVersion(Version.V2)`. `assertVersion` fails the build when the effective version differs from what you expect.
+- `withMessageHasher` / `withWitnessHasher` take any `Hasher`. The profile hasher is `Sha3_256`.
 - `withEncryptor` takes any `BodyEncryptor`: the profile symmetric cipher (`Aes256Gcm.fromKey(k)`, opened with the shared key), the profile asymmetric encryptor to a recipient (`EciesEncryptor.fromBytes(recipientPublicKey)`, opened with the recipient secret), or your own scheme. The frame has a single body-encryption slot.
 - Structurally invalid specs reject with a `ValidationError` carrying per-field issues.
 
 ## Typed messages
 
-The protocol treats the frame body as opaque DER: what it encodes is your contract with the peer. A `MessageCodec<T>` pairs a TypeScript type with that contract - `encode` produces the body DER, `decode` parses and runtime-validates it - so payloads are typed at every call site while the wire stays schema-agnostic.
+The protocol treats the frame body as opaque DER: what it encodes is your contract with the peer. A `MessageCodec<T>` pairs a TypeScript type with that contract. `encode` produces the body DER, `decode` parses and runtime-validates it, so payloads are typed at every call site while the wire stays schema-agnostic.
 
 For payloads without an ASN.1 schema, `wrapped(inner)` lifts any byte-level serialization (JSON, CBOR, protobuf) into a codec by wrapping it in the profile opaque body:
 
@@ -138,9 +378,9 @@ const reply = await client.emit(built);
 const message = reply?.message(Chat); // ChatMessage
 ```
 
-To interoperate with a peer expecting a specific ASN.1 `Message` schema (e.g. a Rust `der::Sequence`), implement `MessageCodec` directly with the ASN.1 library of your choice; the DER it emits is installed in the frame. `frame(bytes)` / `withMessage(bytes)` are sugar for the profile `Opaque` codec (raw bytes in the opaque wrapper), and a codec's optional `contentOid` is recorded in the confidentiality info when the body is sealed.
+To interoperate with a peer expecting a specific ASN.1 `Message` schema (e.g. a Rust `der::Sequence`), implement `MessageCodec` directly with the ASN.1 library of your choice. The DER it emits is installed in the frame. `frame(bytes)` / `withMessage(bytes)` are sugar for the profile `Opaque` codec (raw bytes in the opaque wrapper), and a codec's optional `contentOid` is recorded in the confidentiality info when the body is sealed.
 
-## Bring your own cryptography
+## Custom cryptography
 
 Each capability interface pairs the operation with the dotted OID recorded in the frame, so implementations are interchangeable across libraries and languages:
 
@@ -170,13 +410,13 @@ const built = await frame(body)
 	.build();
 ```
 
-`BodyEncryptor` / `BodyDecryptor` work the same way: `encrypt(bodyDer)` resolves with `{ algorithmOid, parametersDer, ciphertext }`, and `decrypt(sealed)` receives the carried pieces and resolves with the plaintext body DER. The `PROFILE_OIDS` constant exports the profile identifiers.
+`BodyEncryptor` / `BodyDecryptor` follow the same shape: `encrypt(bodyDer)` resolves with `{ algorithmOid, parametersDer, ciphertext }`, and `decrypt(sealed)` receives the carried pieces and resolves with the plaintext body DER. The `PROFILE_OIDS` constant exports the profile identifiers.
 
 ## Compression
 
 Compression is a capability too: a `BodyCompressor` shrinks the body DER and names its algorithm by OID, a `BodyInflator` reverses it. The builder compresses after the message commitment (the commitment is over the uncompressed body) and before encryption (peers encrypt the compressed bytes), matching tightbeam-rs.
 
-The profile compression ships ready-made: `ZstdCompression` (zstd in the seekable format, `PROFILE_OIDS.zstd`) is wire-compatible with tightbeam-rs `ZstdCompression` and backed by a lazily loaded wasm build of libzstd - clients that never compress never load it. Its decompression output is capped (16 MiB by default, matching tightbeam-rs; tune with `new ZstdCompression(maxOutput)`), and the cap is enforced against the stream's declared size before anything is allocated.
+The profile compression is included: `ZstdCompression` (zstd in the seekable format, `PROFILE_OIDS.zstd`) is wire-compatible with tightbeam-rs `ZstdCompression` and backed by a lazily loaded wasm build of libzstd. Clients that never compress never load it. Its decompression output is capped (16 MiB by default, matching tightbeam-rs, tunable with `new ZstdCompression(maxOutput)`), and the cap is enforced against the stream's declared size before anything is allocated.
 
 ```ts
 import {
@@ -196,7 +436,7 @@ const message = await received.inflateMessage(zstd, Opaque);
 const opened = await sealed.decryptMessage(cipher, Opaque, zstd);
 ```
 
-Any other algorithm plugs in the same way. The platform-native `CompressionStream` gives a dependency-free zlib alternative (`PROFILE_OIDS.zlib`, RFC 3274):
+Any other algorithm works through the same interfaces. The platform-native `CompressionStream` gives a dependency-free zlib alternative (`PROFILE_OIDS.zlib`, RFC 3274):
 
 ```ts
 import type {
@@ -226,11 +466,11 @@ const zlib: BodyCompressor & BodyInflator = {
 const built = await frame(body).withCompressor(zlib).build();
 ```
 
-A compressed frame reports `compressed: true` and carries `compactnessInfo` (`{ algorithmOid, parametersDer?, contentOid? }`); reading it without an inflator rejects with a `ValidationError`. Inflators SHOULD cap their output size - a wire-supplied body can be a decompression bomb.
+A compressed frame reports `compressed: true` and carries `compactnessInfo` (`{ algorithmOid, parametersDer?, contentOid? }`). Reading it without an inflator rejects with a `ValidationError`. Inflators SHOULD cap their output size: a wire-supplied body can be a decompression bomb.
 
 ## Verification and decryption
 
-Verification is on the `Frame` itself. Verdicts are `"verified" | "absent" | "algorithm-mismatch" | "mismatch"`. The verdict methods recompute under any `Hasher` (profile SHA3-256 by default); for frames signed under non-profile schemes, verify `signatureInfo.signature` over `tbs()` with your own library.
+Verification is on the `Frame` itself. Verdicts are `"verified" | "absent" | "algorithm-mismatch" | "mismatch"`. The verdict methods recompute under any `Hasher` (profile SHA3-256 by default). For frames signed under non-profile schemes, verify `signatureInfo.signature` over `tbs()` with your own library.
 
 ```ts
 import { Aes256Gcm, EciesDecryptor } from "@wahidgroup/tightbeam-ws-client";
@@ -277,4 +517,4 @@ const verified = await disclosed.verify(new Sha3_256(), commitment);
 
 ## License
 
-Licensed under either of [MIT](../../LICENSE-MIT) or [Apache-2.0](../../LICENSE-APACHE) at your option.
+Licensed under either of [MIT](./LICENSE-MIT) or [Apache-2.0](./LICENSE-APACHE) at your option.

@@ -22,28 +22,37 @@
 	"files": [
 		"dist",
 		"wasm",
-		"wasm-node"
+		"wasm-node",
+		"README.md",
+		"LICENSE-MIT",
+		"LICENSE-APACHE",
+		"sbom.json"
 	],
 	"engines": {
 		"node": ">=24"
 	},
 	"scripts": {
-		"build:wasm": "wasm-pack build ../tightbeam-ws-wasm --target web --out-dir ../client/wasm --out-name tightbeam_ws_wasm",
-		"build:wasm:node": "wasm-pack build ../tightbeam-ws-wasm --target nodejs --out-dir ../client/wasm-node --out-name tightbeam_ws_wasm",
+		"build:wasm": "wasm-pack build ../tightbeam-ws-wasm --target web --out-dir ../client/wasm --out-name tightbeam_ws_wasm && rm -f wasm/.gitignore",
+		"build:wasm:node": "wasm-pack build ../tightbeam-ws-wasm --target nodejs --out-dir ../client/wasm-node --out-name tightbeam_ws_wasm && rm -f wasm-node/.gitignore",
 		"build": "npm run build:wasm && npm run build:wasm:node && tsc -p tsconfig.build.json",
-		"typecheck": "tsc --noEmit",
+		"typecheck": "tsc --noEmit && tsc --noEmit -p scripts/tsconfig.json",
 		"test": "vitest run",
 		"test:watch": "vitest",
 		"lint": "eslint . && prettier --check .",
 		"lint:fix": "eslint . --fix && prettier --write .",
-		"clean": "rm -rf dist wasm wasm-node"
+		"smoke": "node --experimental-strip-types ./scripts/smoke-exports.ts",
+		"pack:check": "node --experimental-strip-types ./scripts/check-pack.ts",
+		"prepublishOnly": "cd ../.. && make client sbom",
+		"clean": "rm -rf dist wasm wasm-node sbom.json"
 	},
 	"dependencies": {
 		"@bokuweb/zstd-wasm": "0.0.27"
 	},
 	"devDependencies": {
+		"@cyclonedx/cyclonedx-npm": "6.0.0",
 		"@noble/curves": "2.2.0",
 		"@noble/hashes": "2.2.0",
+		"@types/node": "24.0.4",
 		"@wahidgroup/lint-rules": "0.1.2",
 		"typescript": "5.9.3",
 		"vitest": "4.1.1"

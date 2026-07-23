@@ -19,6 +19,7 @@
 		"@wahidgroup/tightbeam-ws-client": "^0.1.0"
 	},
 	"devDependencies": {
+		"@noble/curves": "2.2.0",
 		"@playwright/test": "1.61.1",
 		"@types/node": "24.0.4",
 		"@wahidgroup/lint-rules": "0.1.2",

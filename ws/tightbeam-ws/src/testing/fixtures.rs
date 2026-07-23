@@ -6,8 +6,10 @@
 //! the generator binary, the encrypted echo server, and the integration tests
 //! on one source of truth.
 
+use std::io::{Error as IoError, ErrorKind};
 use std::sync::Arc;
 use std::time::Duration;
+use std::{env, fs};
 
 use tightbeam::cert;
 use tightbeam::crypto::hash::Sha3_256;
@@ -29,6 +31,12 @@ use crate::Result;
 /// Size in bytes of a raw secp256k1 signing scalar.
 pub const SIGNING_KEY_LEN: usize = 32;
 
+/// Environment variable naming the server certificate DER file.
+const SERVER_CERT_ENV: &str = "TBWS_SERVER_CERT";
+
+/// Environment variable naming the raw 32-byte server signing key file.
+const SERVER_KEY_ENV: &str = "TBWS_SERVER_KEY";
+
 /// A self-signed X.509 identity: a certificate paired with its secp256k1
 /// signing key.
 pub struct Identity {
@@ -46,6 +54,20 @@ impl Identity {
 	/// exactly as the generator writes and the server/browser reload it.
 	pub fn from_der(certificate_der: &[u8], signing_key: &[u8; SIGNING_KEY_LEN]) -> Result<Self> {
 		Ok(load(certificate_der, signing_key)?)
+	}
+
+	/// Load the server identity from the files named by `TBWS_SERVER_CERT`
+	/// and `TBWS_SERVER_KEY`, as the echo-server examples are provisioned.
+	pub fn from_env() -> Result<Self> {
+		let certificate_der = fs::read(required_path(SERVER_CERT_ENV)?)?;
+		let key_bytes = fs::read(required_path(SERVER_KEY_ENV)?)?;
+
+		let key: [u8; SIGNING_KEY_LEN] = key_bytes
+			.as_slice()
+			.try_into()
+			.map_err(|_| IoError::new(ErrorKind::InvalidData, "signing key file must hold exactly 32 bytes"))?;
+
+		Self::from_der(&certificate_der, &key)
 	}
 
 	/// Borrow the certificate.
@@ -75,6 +97,11 @@ impl Identity {
 	pub fn trust_anchor(&self) -> Result<Arc<dyn CertificateTrust>> {
 		Ok(trust_anchor(self.certificate.clone())?)
 	}
+}
+
+/// Resolve a required path-valued environment variable.
+fn required_path(name: &str) -> core::result::Result<String, IoError> {
+	env::var(name).map_err(|_| IoError::new(ErrorKind::NotFound, format!("{name} is not set")))
 }
 
 fn mint_root(subject: &str, serial: u32, validity: Duration) -> core::result::Result<Identity, TightBeamError> {
