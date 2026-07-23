@@ -527,8 +527,10 @@ async function muxCallbackRoundTrip(
 			return reply;
 		});
 
-		// The `call-me` id makes the server open its own stream back to
-		// this page. The handler's reply rides the original stream.
+		/*
+		 * The `call-me` id makes the server open its own stream back to
+		 * this page. The handler's reply follows the original stream.
+		 */
 		const callMe = await frame(hexToBytes(payloadHex))
 			.withId("call-me-browser")
 			.withOrder(4)

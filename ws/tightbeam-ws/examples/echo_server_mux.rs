@@ -42,7 +42,7 @@ use tokio_tungstenite::MaybeTlsStream;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// The transport an accepted WebSocket connection rides on.
+/// The transport an accepted WebSocket connection follows.
 type ServerTransport = WsTransport<MaybeTlsStream<TcpStream>>;
 
 /// Handshake message ceiling: ECIES completes in two client messages, so

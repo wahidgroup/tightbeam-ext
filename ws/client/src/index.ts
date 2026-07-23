@@ -304,6 +304,54 @@ function assertOptionsShape(options: unknown): void {
 }
 
 /**
+ * The largest cap the wasm u32 boundary can carry.
+ */
+const MAX_STREAM_CAP = 0xff_ff_ff_ff;
+
+/**
+ * Reject a cap the wasm u32 boundary would silently coerce: negatives
+ * wrap to huge values, fractions truncate, and zero deadlocks the
+ * session before its first stream.
+ */
+function assertStreamCap(field: string, cap: number): void {
+	const representable =
+		Number.isSafeInteger(cap) && cap >= 1 && cap <= MAX_STREAM_CAP;
+	if (representable) {
+		return;
+	}
+
+	throw new TypeError(
+		`${field} is not a usable stream cap: expected an integer between 1 and ${MAX_STREAM_CAP}, got ${cap}`,
+	);
+}
+
+/**
+ * Reject a client key that is neither a raw scalar nor signer-shaped
+ * before it reaches wasm: an ArrayBuffer (the WebCrypto `exportKey`
+ * shape) or any stray object would otherwise follow the signer path and
+ * fail with a misleading signer error.
+ */
+function assertClientKeyShape(clientKey: Uint8Array | TransportSigner): void {
+	if (clientKey instanceof Uint8Array) {
+		return;
+	}
+	if (typeof clientKey === "object" && clientKey !== null) {
+		const algorithmOid: unknown = Reflect.get(clientKey, "algorithmOid");
+		const signPrehash: unknown = Reflect.get(clientKey, "signPrehash");
+		const signerShaped =
+			typeof algorithmOid === "string" &&
+			typeof signPrehash === "function";
+		if (signerShaped) {
+			return;
+		}
+	}
+
+	throw new TypeError(
+		"clientKey must be the raw signing scalar as a Uint8Array (wrap ArrayBuffers) or a TransportSigner exposing algorithmOid, publicKeyDer, and signPrehash",
+	);
+}
+
+/**
  * Options accepted by the waiting surfaces ({@link TightbeamWsClient.ping},
  * {@link TightbeamWsClient.waitForStreamSlot}).
  */
@@ -388,9 +436,10 @@ export class TightbeamWsClient extends SocketLifecycle<MuxWsClient> {
 		options?: ConnectOptions,
 	): Promise<TightbeamWsClient> {
 		assertOptionsShape(options);
+		const maxPeerStreams = options?.maxPeerStreams ?? DEFAULT_STREAM_CAP;
+		assertStreamCap("maxPeerStreams", maxPeerStreams);
 		await initClient();
 
-		const maxPeerStreams = options?.maxPeerStreams ?? DEFAULT_STREAM_CAP;
 		const socket = await MuxWsClient.connect(
 			url,
 			serverCertDer,
@@ -421,9 +470,10 @@ export class TightbeamWsClient extends SocketLifecycle<MuxWsClient> {
 		options?: CleartextConnectOptions,
 	): Promise<TightbeamWsClient> {
 		assertOptionsShape(options);
+		const streams = options?.streams ?? DEFAULT_STREAM_CAP;
+		assertStreamCap("streams", streams);
 		await initClient();
 
-		const streams = options?.streams ?? DEFAULT_STREAM_CAP;
 		const socket = await MuxWsClient.connectCleartext(
 			url,
 			streams,
@@ -456,9 +506,11 @@ export class TightbeamWsClient extends SocketLifecycle<MuxWsClient> {
 		options?: ConnectOptions,
 	): Promise<TightbeamWsClient> {
 		assertOptionsShape(options);
+		assertClientKeyShape(clientKey);
+		const maxPeerStreams = options?.maxPeerStreams ?? DEFAULT_STREAM_CAP;
+		assertStreamCap("maxPeerStreams", maxPeerStreams);
 		await initClient();
 
-		const maxPeerStreams = options?.maxPeerStreams ?? DEFAULT_STREAM_CAP;
 		let socket: MuxWsClient;
 		if (clientKey instanceof Uint8Array) {
 			socket = await MuxWsClient.connectMutual(

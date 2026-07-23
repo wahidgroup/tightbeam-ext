@@ -66,7 +66,7 @@ fn goaway_label(reason: GoAwayReason) -> String {
 
 /// A multiplexed tightbeam client over a single browser WebSocket session.
 ///
-/// Requests are concurrent: every [`request`](Self::request) rides its own
+/// Requests are concurrent: every [`request`](Self::request) follows its own
 /// stream, and a caller-supplied handler ([`serve`](Self::serve)) answers
 /// streams the server initiates.
 ///
