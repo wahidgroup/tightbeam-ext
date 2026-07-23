@@ -110,12 +110,12 @@ describe("connectMutual client key guard", () => {
 	it.each(FOREIGN_KEYS)(
 		"rejects $label with a TypeError",
 		async ({ key }) => {
-		const dialed = loosely.dialMutual(
-			UNREACHED_URL,
-			UNREACHED_CERT,
-			UNREACHED_CERT,
-			key,
-		);
+			const dialed = loosely.dialMutual(
+				UNREACHED_URL,
+				UNREACHED_CERT,
+				UNREACHED_CERT,
+				key,
+			);
 
 			await expect(dialed).rejects.toThrow(TypeError);
 			await expect(dialed).rejects.toThrow("clientKey");
