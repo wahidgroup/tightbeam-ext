@@ -337,9 +337,11 @@ function assertClientKeyShape(clientKey: Uint8Array | TransportSigner): void {
 	}
 	if (typeof clientKey === "object" && clientKey !== null) {
 		const algorithmOid: unknown = Reflect.get(clientKey, "algorithmOid");
+		const publicKeyDer: unknown = Reflect.get(clientKey, "publicKeyDer");
 		const signPrehash: unknown = Reflect.get(clientKey, "signPrehash");
 		const signerShaped =
 			typeof algorithmOid === "string" &&
+			publicKeyDer instanceof Uint8Array &&
 			typeof signPrehash === "function";
 		if (signerShaped) {
 			return;

@@ -236,10 +236,20 @@ async function connectLoop(
 		}
 
 		delay = 500;
-		// Re-establish per-connection state: serve is per connection.
+
+		/*
+		 * Re-establish per-connection state: serve is per connection.
+		 */
 		handle(client);
 
 		const info = await client.closed;
+
+		/*
+		 * Free the dead connection's wasm resources. The GoAway getters
+		 * stay readable from the close snapshot.
+		 */
+		client.close();
+
 		switch (client.goawayReason) {
 			case "Shutdown":
 				break; // orderly drain: rotation, redeploy; go right back

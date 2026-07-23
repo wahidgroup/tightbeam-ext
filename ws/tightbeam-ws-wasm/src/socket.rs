@@ -98,37 +98,60 @@ pub(crate) fn open_observed(url: &str) -> Result<ObservedSocket, JsValue> {
 	Ok(ObservedSocket { socket, monitor })
 }
 
+/// The settlers and listeners pending on one connecting socket, taken as
+/// a unit by whichever lifecycle event fires first.
+struct OpenWatch {
+	resolve: Function,
+	reject: Function,
+	on_open: Closure<dyn FnMut(JsValue)>,
+	on_close: Closure<dyn FnMut(CloseEvent)>,
+}
+
+/// Shared slot the racing `open`/`close` listeners drain the watch from.
+type OpenWatchSlot = Rc<RefCell<Option<OpenWatch>>>;
+
 /// A promise settled by a connecting socket's first lifecycle event:
 /// `open` resolves it, `close` rejects it with a structured
-/// `ConnectionClosed` error. Both listeners register with `once`, and the
-/// shared settler slot keeps whichever event fires second a no-op.
+/// `ConnectionClosed` error. Whichever event fires first takes the watch,
+/// detaching both listeners and freeing both closures; the second event
+/// finds the slot empty.
 fn open_promise(raw: &web_sys::WebSocket) -> Promise {
 	let target = raw.clone();
 	Promise::new(&mut move |resolve: Function, reject: Function| {
-		let settlers = Rc::new(RefCell::new(Some((resolve, reject))));
+		let slot = OpenWatchSlot::default();
 
-		let open_slot = Rc::clone(&settlers);
+		let open_slot = Rc::clone(&slot);
+		let open_target = target.clone();
 		let on_open = Closure::<dyn FnMut(JsValue)>::new(move |_event: JsValue| {
-			if let Some((resolve, _reject)) = open_slot.borrow_mut().take() {
-				let _ = resolve.call0(&JsValue::UNDEFINED);
+			if let Some(watch) = take_watch(&open_slot, &open_target) {
+				let _ = watch.resolve.call0(&JsValue::UNDEFINED);
 			}
 		});
 
-		let close_slot = Rc::clone(&settlers);
+		let close_slot = Rc::clone(&slot);
+		let close_target = target.clone();
 		let on_close = Closure::<dyn FnMut(CloseEvent)>::new(move |event: CloseEvent| {
-			if let Some((_resolve, reject)) = close_slot.borrow_mut().take() {
+			if let Some(watch) = take_watch(&close_slot, &close_target) {
 				let message = format!("the socket closed before it opened (code {})", event.code());
-				let _ = reject.call1(&JsValue::UNDEFINED, &connection_closed(&message));
+				let _ = watch.reject.call1(&JsValue::UNDEFINED, &connection_closed(&message));
 			}
 		});
 
 		listen_once(&target, "open", &on_open);
 		listen_once(&target, "close", &on_close);
 
-		// The connection owns the listeners for its whole lifetime.
-		on_open.forget();
-		on_close.forget();
+		slot.borrow_mut().replace(OpenWatch { resolve, reject, on_open, on_close });
 	})
+}
+
+/// Drain the watch and detach both listeners. The caller settles the
+/// promise and drops the watch; the closure currently executing is freed
+/// once its call returns (the shim defers deallocation while invoked).
+fn take_watch(slot: &OpenWatchSlot, target: &web_sys::WebSocket) -> Option<OpenWatch> {
+	let watch = slot.borrow_mut().take()?;
+	detach(target, "open", &watch.on_open);
+	detach(target, "close", &watch.on_close);
+	Some(watch)
 }
 
 /// Register `listener` for one dispatch of `event` on `target`.
@@ -143,19 +166,31 @@ fn listen_once<E>(target: &web_sys::WebSocket, event: &str, listener: &Closure<d
 	);
 }
 
+/// Detach `listener` from `event` on `target`.
+fn detach<E>(target: &web_sys::WebSocket, event: &str, listener: &Closure<dyn FnMut(E)>) {
+	let _ = target.remove_event_listener_with_callback(event, listener.as_ref().unchecked_ref());
+}
+
+/// Shared slot from which the `close` listener drains itself on dispatch.
+type CloseListenerSlot = Rc<RefCell<Option<Closure<dyn FnMut(CloseEvent)>>>>;
+
 /// A promise resolved with the connection's close info on the `close` event.
 ///
 /// The `close` event reaches this target from two sources: the runtime's
 /// genuine close event, and the synthetic one `gloo` dispatches when the
 /// socket wrapper drops. The listener is registered with `once` so the
-/// platform detaches it after the first dispatch, and the resolver guard
-/// keeps later dispatches no-ops even if that registration changes.
+/// platform detaches it after the first dispatch, which also drains its
+/// own closure from the shared slot to free it.
 fn close_promise(raw: &web_sys::WebSocket) -> Promise {
 	let target = raw.clone();
 	Promise::new(&mut move |resolve: Function, _reject: Function| {
+		let slot = CloseListenerSlot::default();
+
+		let held = Rc::clone(&slot);
 		// The resolver moves out on the first dispatch.
 		let mut resolver = Some(resolve);
 		let listener = Closure::<dyn FnMut(CloseEvent)>::new(move |event: CloseEvent| {
+			drop(held.borrow_mut().take());
 			if let Some(resolve) = resolver.take() {
 				let info = close_info(&event);
 				let _ = resolve.call1(&JsValue::UNDEFINED, &info);
@@ -163,9 +198,7 @@ fn close_promise(raw: &web_sys::WebSocket) -> Promise {
 		});
 
 		listen_once(&target, "close", &listener);
-
-		// The connection owns the listener for its whole lifetime.
-		listener.forget();
+		slot.borrow_mut().replace(listener);
 	})
 }
 

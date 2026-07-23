@@ -96,6 +96,13 @@ const FOREIGN_KEYS = [
 		},
 	},
 	{
+		label: "a signer missing publicKeyDer",
+		key: {
+			algorithmOid: "1.2.840.10045.4.3.2",
+			signPrehash: (): Uint8Array => new Uint8Array(64),
+		},
+	},
+	{
 		label: "a signer with a non-string OID",
 		key: {
 			algorithmOid: 42,
