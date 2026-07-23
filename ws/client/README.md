@@ -52,7 +52,7 @@ The package is published to GitHub Packages. Point the `@wahidgroup` scope there
 
 ## Cleartext round-trip
 
-Every connection is a multiplexed tightbeam session: one socket carries concurrent, bidirectional streams. Cleartext sessions have no handshake to negotiate over, so the stream cap is symmetric and both endpoints MUST configure the same value (default 8). Cleartext carries no confidentiality or integrity protection.
+Every connection is a multiplexed tightbeam session: one socket carries concurrent, bidirectional streams. Cleartext sessions have no handshake to negotiate over, so the stream cap is symmetric and both endpoints MUST configure the same value (default 8). Cleartext carries no confidentiality or integrity protection. Like the encrypted connectors, `connectCleartext` resolves once the session is ready: a failed dial rejects the connect call, not the first emit.
 
 ```ts
 import {
@@ -212,7 +212,7 @@ void client.closed.then((info) => {
 });
 ```
 
-`close()` closes the socket and releases the client's wasm resources (idempotent, safe with emits in flight). Call `shutdown()` first for a graceful GoAway drain, or `shutdownWith(reason)` to advertise why: a label (`"Shutdown"`, `"ProtocolError"`, `"EnhanceYourCalm"`) or an application-defined numeric code the peer reads back through its own GoAway surface.
+`close()` closes the socket and releases the client's wasm resources (idempotent, safe with emits in flight). Call `shutdown()` first for a graceful GoAway drain, or `shutdownWith(reason)` to advertise why: a label (`"Shutdown"`, `"ProtocolError"`, `"EnhanceYourCalm"`) or an application-defined numeric code the peer reads back through its own GoAway surface. After `close()`, operations reject with `ConnectionClosed`, while `closed`, `readyState`, and the GoAway getters stay readable for reconnect policies.
 
 When the peer drains the session, the client records why. `goawayReason` reads the reason from the peer's GoAway (`undefined` while the connection is live or after a local shutdown), and reconnect policies branch on it. `goawayCode` exposes the raw numeric code for application-defined reasons, which all label as `"Application"`.
 

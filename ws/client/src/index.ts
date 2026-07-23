@@ -7,6 +7,7 @@ import type { GoAwayReason, SocketCloseInfo, TransportSigner } from "#wasm";
 
 import { FrameBuilder } from "./builder/index.js";
 import { WasmFrameCodec } from "./codec.js";
+import { connectionClosed } from "./errors.js";
 import { Frame } from "./frame.js";
 
 export type { MuxWsClient };
@@ -108,25 +109,73 @@ interface LifecycleSocket {
 }
 
 /**
+ * The WebSocket CLOSED readyState, reported once the client has released
+ * its socket.
+ */
+const WEBSOCKET_CLOSED = 3;
+
+/**
  * Base for the wasm-socket clients: lifecycle observation and idempotent
  * release.
+ *
+ * {@link close} frees the wasm object, so every later wasm call would
+ * dereference a null pointer. Members guard with {@link requireLive}
+ * (defined `ConnectionClosed` rejection) or serve release-time snapshots
+ * instead of touching the socket.
  */
 abstract class SocketLifecycle<TSocket extends LifecycleSocket> {
 	private released = false;
 
-	protected constructor(protected readonly socket: TSocket) {}
+	/**
+	 * Captured at construction so closure stays observable after
+	 * {@link close} frees the wasm object.
+	 */
+	private readonly closedPromise: Promise<SocketCloseInfo>;
+
+	protected constructor(protected readonly socket: TSocket) {
+		this.closedPromise = socket.closed;
+	}
+
+	/**
+	 * Whether {@link close} has released the wasm resources.
+	 */
+	protected get isReleased(): boolean {
+		return this.released;
+	}
+
+	/**
+	 * Guard for members that call into the wasm object.
+	 *
+	 * @throws A `ConnectionClosed` transport error after {@link close}.
+	 */
+	protected requireLive(operation: string): void {
+		if (this.released) {
+			throw connectionClosed(operation);
+		}
+	}
+
+	/**
+	 * Snapshot the state that stays readable after release. Runs once
+	 * inside {@link close}, while the socket is still live.
+	 */
+	protected abstract snapshot(): void;
 
 	/**
 	 * A promise resolving when the socket closes, however that happens.
 	 */
 	get closed(): Promise<SocketCloseInfo> {
-		return this.socket.closed;
+		return this.closedPromise;
 	}
 
 	/**
 	 * The socket's readyState (0 CONNECTING, 1 OPEN, 2 CLOSING, 3 CLOSED).
+	 * A released client reports CLOSED.
 	 */
 	get readyState(): number {
+		if (this.released) {
+			return WEBSOCKET_CLOSED;
+		}
+
 		return this.socket.readyState;
 	}
 
@@ -134,13 +183,15 @@ abstract class SocketLifecycle<TSocket extends LifecycleSocket> {
 	 * Close the underlying socket and release its wasm resources. The
 	 * {@link closed} promise resolves once the close completes.
 	 * Idempotent, and safe with emits in flight: they settle with
-	 * `ConnectionClosed`.
+	 * `ConnectionClosed`. Operations invoked afterwards reject with the
+	 * same code.
 	 */
 	close(): void {
 		if (this.released) {
 			return;
 		}
 
+		this.snapshot();
 		this.released = true;
 		this.socket.close();
 		this.socket.free();
@@ -257,8 +308,22 @@ export type MuxStreamHandler = (
  * ({@link connectCleartext}).
  */
 export class TightbeamWsClient extends SocketLifecycle<MuxWsClient> {
+	/**
+	 * GoAway facts and the negotiated cap, snapshotted by {@link close}
+	 * so reconnect policies can still read them from a released client.
+	 */
+	private finalGoawayReason: GoAwayReason | undefined;
+	private finalGoawayCode: number | undefined;
+	private finalMaxConcurrentStreams = 0;
+
 	private constructor(socket: MuxWsClient) {
 		super(socket);
+	}
+
+	protected snapshot(): void {
+		this.finalGoawayReason = this.socket.goawayReason;
+		this.finalGoawayCode = this.socket.goawayCode;
+		this.finalMaxConcurrentStreams = this.socket.maxConcurrentStreams;
 	}
 
 	/**
@@ -300,11 +365,12 @@ export class TightbeamWsClient extends SocketLifecycle<MuxWsClient> {
 	 * same value. The connection carries NO confidentiality or integrity
 	 * protection.
 	 *
+	 * Resolves once the socket is open, matching {@link connect}: a
+	 * failed dial rejects here rather than on the first emit.
+	 *
 	 * @param url - The WebSocket URL to connect to.
 	 * @param streams - Symmetric concurrency cap, matching the server's configuration.
-	 * @param options - A {@link ConnectOptions.signal} already aborted
-	 * rejects the dial. With no handshake there is nothing async to
-	 * interrupt afterwards.
+	 * @param options - A {@link ConnectOptions.signal} aborts the dial.
 	 */
 	static async connectCleartext(
 		url: string,
@@ -313,7 +379,7 @@ export class TightbeamWsClient extends SocketLifecycle<MuxWsClient> {
 	): Promise<TightbeamWsClient> {
 		await initClient();
 
-		const socket = MuxWsClient.connectCleartext(
+		const socket = await MuxWsClient.connectCleartext(
 			url,
 			streams,
 			options?.signal,
@@ -384,6 +450,8 @@ export class TightbeamWsClient extends SocketLifecycle<MuxWsClient> {
 		frame: Frame,
 		options?: EmitOptions,
 	): Promise<Frame | undefined> {
+		this.requireLive("emit");
+
 		const result = await emitFrame(this.socket, frame, options);
 		return result;
 	}
@@ -395,6 +463,8 @@ export class TightbeamWsClient extends SocketLifecycle<MuxWsClient> {
 	 * with. Handlers for distinct streams run concurrently.
 	 */
 	serve(handler: MuxStreamHandler): void {
+		this.requireLive("serve");
+
 		this.socket.serve(
 			(requestDer: Uint8Array): Promise<Uint8Array | undefined> => {
 				const respond = async (): Promise<Uint8Array | undefined> => {
@@ -418,6 +488,10 @@ export class TightbeamWsClient extends SocketLifecycle<MuxWsClient> {
 	 * The negotiated cap on concurrent locally-initiated streams.
 	 */
 	get maxConcurrentStreams(): number {
+		if (this.isReleased) {
+			return this.finalMaxConcurrentStreams;
+		}
+
 		return this.socket.maxConcurrentStreams;
 	}
 
@@ -429,6 +503,10 @@ export class TightbeamWsClient extends SocketLifecycle<MuxWsClient> {
 	 * returns, so callers still handle the `StreamsExhausted` rejection.
 	 */
 	get hasStreamHeadroom(): boolean {
+		if (this.isReleased) {
+			return false;
+		}
+
 		return this.socket.hasStreamHeadroom;
 	}
 
@@ -441,6 +519,10 @@ export class TightbeamWsClient extends SocketLifecycle<MuxWsClient> {
 	 * response can flip it after the read.
 	 */
 	get hasPendingStreams(): boolean {
+		if (this.isReleased) {
+			return false;
+		}
+
 		return this.socket.hasPendingStreams;
 	}
 
@@ -453,6 +535,8 @@ export class TightbeamWsClient extends SocketLifecycle<MuxWsClient> {
 	 * caller gives up first.
 	 */
 	async waitForStreamSlot(options?: WaitOptions): Promise<void> {
+		this.requireLive("waitForStreamSlot");
+
 		await this.socket.waitForStreamSlot(options?.signal);
 	}
 
@@ -465,6 +549,10 @@ export class TightbeamWsClient extends SocketLifecycle<MuxWsClient> {
 	 * points at a bug rather than a transient fault.
 	 */
 	get goawayReason(): GoAwayReason | undefined {
+		if (this.isReleased) {
+			return this.finalGoawayReason;
+		}
+
 		return this.socket.goawayReason;
 	}
 
@@ -474,6 +562,10 @@ export class TightbeamWsClient extends SocketLifecycle<MuxWsClient> {
 	 * as `"Application"`.
 	 */
 	get goawayCode(): number | undefined {
+		if (this.isReleased) {
+			return this.finalGoawayCode;
+		}
+
 		return this.socket.goawayCode;
 	}
 
@@ -488,6 +580,8 @@ export class TightbeamWsClient extends SocketLifecycle<MuxWsClient> {
 	 * (`AbortSignal.timeout(ms)`).
 	 */
 	async ping(options?: WaitOptions): Promise<void> {
+		this.requireLive("ping");
+
 		await this.socket.ping(options?.signal);
 	}
 
@@ -497,6 +591,8 @@ export class TightbeamWsClient extends SocketLifecycle<MuxWsClient> {
 	 * the socket itself.
 	 */
 	async shutdown(): Promise<void> {
+		this.requireLive("shutdown");
+
 		await this.socket.shutdown();
 	}
 
@@ -507,6 +603,8 @@ export class TightbeamWsClient extends SocketLifecycle<MuxWsClient> {
 	 * Codes outside the reserved range are application-defined.
 	 */
 	async shutdownWith(reason: GoAwayReason | number): Promise<void> {
+		this.requireLive("shutdownWith");
+
 		await this.socket.shutdownWith(reason);
 	}
 }

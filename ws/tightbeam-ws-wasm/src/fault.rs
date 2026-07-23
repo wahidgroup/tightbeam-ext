@@ -22,6 +22,13 @@ pub(crate) fn to_js<E: Display>(error: E) -> JsValue {
 	JsValue::from_str(&error.to_string())
 }
 
+/// Structured `ConnectionClosed` error for failures detected socket-side,
+/// before a tightbeam [`TransportError`] exists (e.g. a dial that closed
+/// before opening).
+pub(crate) fn connection_closed(message: &str) -> JsValue {
+	coded("ConnectionClosed", &message)
+}
+
 /// Surface a [`TransportError`] as a structured JavaScript error.
 ///
 /// The `code` is the variant name, except operation failures, which

@@ -67,6 +67,35 @@ export class StreamRefusal extends Error {
 export const TRANSPORT_ERROR_NAME = "TightbeamTransportError";
 
 /**
+ * A client-side {@link TransportError}: the shape the wasm layer throws,
+ * for failures detected before a call crosses the boundary.
+ */
+class ClientTransportError extends Error implements TransportError {
+	override readonly name: string = TRANSPORT_ERROR_NAME;
+
+	constructor(
+		readonly code: string,
+		message: string,
+	) {
+		super(message);
+	}
+}
+
+/**
+ * The rejection for an operation on a released client: the same
+ * `ConnectionClosed` code in-flight emits settle with when the
+ * connection drops.
+ */
+export function connectionClosed(operation: string): TransportError {
+	const failure = new ClientTransportError(
+		"ConnectionClosed",
+		`Cannot ${operation}: the client is closed and its wasm resources are released`,
+	);
+
+	return failure;
+}
+
+/**
  * A transport failure thrown from the wasm layer.
  *
  * `code` is the tightbeam-rs error variant name, machine-readable and

@@ -509,3 +509,108 @@ describe.each(LANES)(
 		});
 	},
 );
+
+describe("released client behavior", () => {
+	/**
+	 * Every operation that calls into the wasm socket, expected to reject
+	 * in a defined way once the client has released it.
+	 */
+	const OPERATIONS = [
+		{
+			name: "emit",
+			run: async (client: TightbeamWsClient): Promise<void> => {
+				const built = await frame(new Uint8Array([0xb0, 0x0f]))
+					.withId("post-close")
+					.withOrder(1)
+					.build();
+				await client.emit(built);
+			},
+		},
+		{
+			name: "serve",
+			run: async (client: TightbeamWsClient): Promise<void> => {
+				client.serve(() => undefined);
+			},
+		},
+		{
+			name: "ping",
+			run: async (client: TightbeamWsClient): Promise<void> => {
+				await client.ping();
+			},
+		},
+		{
+			name: "waitForStreamSlot",
+			run: async (client: TightbeamWsClient): Promise<void> => {
+				await client.waitForStreamSlot();
+			},
+		},
+		{
+			name: "shutdown",
+			run: async (client: TightbeamWsClient): Promise<void> => {
+				await client.shutdown();
+			},
+		},
+		{
+			name: "shutdownWith",
+			run: async (client: TightbeamWsClient): Promise<void> => {
+				await client.shutdownWith("Shutdown");
+			},
+		},
+	] as const;
+
+	it.each(OPERATIONS)(
+		"rejects $name on a released client with ConnectionClosed",
+		async ({ run }) => {
+			const client = await TightbeamWsClient.connectCleartext(
+				muxClearEndpoint,
+				8,
+			);
+			client.close();
+
+			await expect(run(client)).rejects.toMatchObject({
+				name: TRANSPORT_ERROR_NAME,
+				code: "ConnectionClosed",
+			});
+		},
+	);
+
+	it("keeps the lifecycle surfaces readable after close", async () => {
+		const client = await TightbeamWsClient.connectCleartext(
+			muxClearEndpoint,
+			8,
+		);
+		const capBeforeClose = client.maxConcurrentStreams;
+
+		client.close();
+
+		expect(client.readyState).toBe(WebSocket.CLOSED);
+		expect(client.maxConcurrentStreams).toBe(capBeforeClose);
+		expect(client.hasStreamHeadroom).toBe(false);
+		expect(client.hasPendingStreams).toBe(false);
+		expect(client.goawayReason).toBeUndefined();
+		expect(client.goawayCode).toBeUndefined();
+
+		await expect(client.closed).resolves.toMatchObject({
+			code: expect.any(Number),
+			reason: expect.any(String),
+			wasClean: expect.any(Boolean),
+		});
+	});
+});
+
+describe("cleartext dial readiness", () => {
+	it("rejects a dial to a dead endpoint with ConnectionClosed", async () => {
+		/*
+		 * The discard port: nothing listens there, so the dial closes
+		 * before it opens.
+		 */
+		const deadEndpoint = "ws://127.0.0.1:9";
+
+		await expect(
+			TightbeamWsClient.connectCleartext(deadEndpoint, 8),
+		).rejects.toMatchObject({
+			name: TRANSPORT_ERROR_NAME,
+			code: "ConnectionClosed",
+		});
+	});
+});

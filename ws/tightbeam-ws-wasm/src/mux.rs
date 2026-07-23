@@ -108,28 +108,55 @@ impl MuxWsClient {
 		Self::establish(transport, monitor, max_peer_streams, signal).await
 	}
 
-	/// Open a cleartext multiplexed session to `url`.
+	/// Open a cleartext multiplexed session to `url`. Resolves once the
+	/// socket is open, so a failed dial rejects here (`ConnectionClosed`)
+	/// rather than on the first emit.
 	///
 	/// Cleartext multiplexing has no handshake negotiation: `streams` is a
 	/// symmetric concurrency cap and both endpoints MUST configure the
 	/// same value, or their enforcement diverges. The connection carries
 	/// NO confidentiality or integrity protection.
 	///
-	/// With no handshake there is nothing async to interrupt: `signal`
-	/// only rejects the dial when already aborted.
+	/// `signal` aborts the dial: the socket closes and the promise
+	/// rejects with the signal's abort reason.
 	#[wasm_bindgen(js_name = connectCleartext)]
-	pub fn connect_cleartext(url: &str, streams: u32, signal: Option<AbortSignal>) -> Result<MuxWsClient, JsValue> {
+	pub async fn connect_cleartext(
+		url: &str,
+		streams: u32,
+		signal: Option<AbortSignal>,
+	) -> Result<MuxWsClient, JsValue> {
 		if let Some(reason) = abort_reason(&signal) {
 			return Err(reason);
 		}
 
 		let observed = open_observed(url)?;
-		let transport = GlooStream::from(observed.socket).into_transport();
+		Self::await_open(&observed.monitor, signal).await?;
 
+		let transport = GlooStream::from(observed.socket).into_transport();
 		let (reader, writer) = transport.into_split_cleartext().map_err(transport_to_js)?;
 		let (handle, responder) = spawn_mux(reader, writer, MuxSettings::symmetric(streams));
 
 		Ok(Self::assemble(handle, responder, observed.monitor))
+	}
+
+	/// Wait for a dial to complete, racing `signal` when given: an abort
+	/// closes the socket and yields the signal's abort reason.
+	async fn await_open(monitor: &SocketMonitor, signal: Option<AbortSignal>) -> Result<(), JsValue> {
+		let opening = async {
+			JsFuture::from(monitor.opened()).await?;
+			Ok(())
+		};
+
+		let Some(signal) = signal else {
+			return opening.await;
+		};
+
+		let outcome = race_abort(&signal, opening).await;
+		if signal.aborted() {
+			monitor.close();
+		}
+
+		outcome
 	}
 
 	/// As [`connect`](Self::connect), additionally presenting

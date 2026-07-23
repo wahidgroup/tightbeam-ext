@@ -7,6 +7,9 @@
 //! the bindings expose, so callers learn about connection loss without
 //! waiting for the next emit to fail.
 
+use core::cell::RefCell;
+use std::rc::Rc;
+
 use gloo_net::websocket::futures::WebSocket;
 use js_sys::{Function, Object, Promise, Reflect};
 use wasm_bindgen::closure::Closure;
@@ -14,7 +17,7 @@ use wasm_bindgen::prelude::wasm_bindgen;
 use wasm_bindgen::{JsCast, JsValue};
 use web_sys::{AddEventListenerOptions, CloseEvent};
 
-use crate::fault::to_js;
+use crate::fault::{connection_closed, to_js};
 
 /// TypeScript shape of the value the `closed` promise resolves with.
 #[wasm_bindgen(typescript_custom_section)]
@@ -66,6 +69,23 @@ impl SocketMonitor {
 	pub(crate) fn close(&self) {
 		let _ = self.raw.close();
 	}
+
+	/// A promise resolving (with `undefined`) once the socket is open,
+	/// rejecting with a structured `ConnectionClosed` error when it
+	/// closes first: a failed dial.
+	///
+	/// Constructed on demand so sessions that never await it hold no
+	/// rejectable promise that would surface as an unhandled rejection.
+	pub(crate) fn opened(&self) -> Promise {
+		const CONNECTING: u16 = 0;
+		const OPEN: u16 = 1;
+
+		match self.raw.ready_state() {
+			OPEN => Promise::resolve(&JsValue::UNDEFINED),
+			CONNECTING => open_promise(&self.raw),
+			_ => Promise::reject(&connection_closed("the socket closed before it opened")),
+		}
+	}
 }
 
 /// Open `url` and attach the close observer before any traffic flows.
@@ -76,6 +96,51 @@ pub(crate) fn open_observed(url: &str) -> Result<ObservedSocket, JsValue> {
 	let socket = WebSocket::try_from(raw.clone()).map_err(to_js)?;
 	let monitor = SocketMonitor { raw, closed };
 	Ok(ObservedSocket { socket, monitor })
+}
+
+/// A promise settled by a connecting socket's first lifecycle event:
+/// `open` resolves it, `close` rejects it with a structured
+/// `ConnectionClosed` error. Both listeners register with `once`, and the
+/// shared settler slot keeps whichever event fires second a no-op.
+fn open_promise(raw: &web_sys::WebSocket) -> Promise {
+	let target = raw.clone();
+	Promise::new(&mut move |resolve: Function, reject: Function| {
+		let settlers = Rc::new(RefCell::new(Some((resolve, reject))));
+
+		let open_slot = Rc::clone(&settlers);
+		let on_open = Closure::<dyn FnMut(JsValue)>::new(move |_event: JsValue| {
+			if let Some((resolve, _reject)) = open_slot.borrow_mut().take() {
+				let _ = resolve.call0(&JsValue::UNDEFINED);
+			}
+		});
+
+		let close_slot = Rc::clone(&settlers);
+		let on_close = Closure::<dyn FnMut(CloseEvent)>::new(move |event: CloseEvent| {
+			if let Some((_resolve, reject)) = close_slot.borrow_mut().take() {
+				let message = format!("the socket closed before it opened (code {})", event.code());
+				let _ = reject.call1(&JsValue::UNDEFINED, &connection_closed(&message));
+			}
+		});
+
+		listen_once(&target, "open", &on_open);
+		listen_once(&target, "close", &on_close);
+
+		// The connection owns the listeners for its whole lifetime.
+		on_open.forget();
+		on_close.forget();
+	})
+}
+
+/// Register `listener` for one dispatch of `event` on `target`.
+fn listen_once<E>(target: &web_sys::WebSocket, event: &str, listener: &Closure<dyn FnMut(E)>) {
+	let options = AddEventListenerOptions::new();
+	options.set_once(true);
+
+	let _ = target.add_event_listener_with_callback_and_add_event_listener_options(
+		event,
+		listener.as_ref().unchecked_ref(),
+		&options,
+	);
 }
 
 /// A promise resolved with the connection's close info on the `close` event.
@@ -97,14 +162,7 @@ fn close_promise(raw: &web_sys::WebSocket) -> Promise {
 			}
 		});
 
-		let options = AddEventListenerOptions::new();
-		options.set_once(true);
-
-		let _ = target.add_event_listener_with_callback_and_add_event_listener_options(
-			"close",
-			listener.as_ref().unchecked_ref(),
-			&options,
-		);
+		listen_once(&target, "close", &listener);
 
 		// The connection owns the listener for its whole lifetime.
 		listener.forget();
