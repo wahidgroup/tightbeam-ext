@@ -35,14 +35,13 @@ const LANES = [
 			TightbeamWsClient.connect(
 				muxEndpoint,
 				certBytes("server.cert.der"),
-				8,
 				options,
 			),
 	},
 	{
 		lane: "cleartext",
 		connect: (options?: ConnectOptions): Promise<TightbeamWsClient> =>
-			TightbeamWsClient.connectCleartext(muxClearEndpoint, 8, options),
+			TightbeamWsClient.connectCleartext(muxClearEndpoint, options),
 	},
 ] as const;
 
@@ -561,10 +560,8 @@ describe("released client behavior", () => {
 	it.each(OPERATIONS)(
 		"rejects $name on a released client with ConnectionClosed",
 		async ({ run }) => {
-			const client = await TightbeamWsClient.connectCleartext(
-				muxClearEndpoint,
-				8,
-			);
+			const client =
+				await TightbeamWsClient.connectCleartext(muxClearEndpoint);
 			client.close();
 
 			await expect(run(client)).rejects.toMatchObject({
@@ -575,10 +572,8 @@ describe("released client behavior", () => {
 	);
 
 	it("keeps the lifecycle surfaces readable after close", async () => {
-		const client = await TightbeamWsClient.connectCleartext(
-			muxClearEndpoint,
-			8,
-		);
+		const client =
+			await TightbeamWsClient.connectCleartext(muxClearEndpoint);
 		const capBeforeClose = client.maxConcurrentStreams;
 
 		client.close();
@@ -598,6 +593,21 @@ describe("released client behavior", () => {
 	});
 });
 
+describe("connector options", () => {
+	it("applies the symmetric cap from cleartext options", async () => {
+		const client = await TightbeamWsClient.connectCleartext(
+			muxClearEndpoint,
+			{ streams: 3 },
+		);
+
+		try {
+			expect(client.maxConcurrentStreams).toBe(3);
+		} finally {
+			client.close();
+		}
+	});
+});
+
 describe("cleartext dial readiness", () => {
 	it("rejects a dial to a dead endpoint with ConnectionClosed", async () => {
 		/*
@@ -607,7 +617,7 @@ describe("cleartext dial readiness", () => {
 		const deadEndpoint = "ws://127.0.0.1:9";
 
 		await expect(
-			TightbeamWsClient.connectCleartext(deadEndpoint, 8),
+			TightbeamWsClient.connectCleartext(deadEndpoint),
 		).rejects.toMatchObject({
 			name: TRANSPORT_ERROR_NAME,
 			code: "ConnectionClosed",

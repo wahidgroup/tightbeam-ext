@@ -52,7 +52,7 @@ The package is published to GitHub Packages. Point the `@wahidgroup` scope there
 
 ## Cleartext round-trip
 
-Every connection is a multiplexed tightbeam session: one socket carries concurrent, bidirectional streams. Cleartext sessions have no handshake to negotiate over, so the stream cap is symmetric and both endpoints MUST configure the same value (default 8). Cleartext carries no confidentiality or integrity protection. Like the encrypted connectors, `connectCleartext` resolves once the session is ready: a failed dial rejects the connect call, not the first emit.
+Every connection is a multiplexed tightbeam session: one socket carries concurrent, bidirectional streams. Cleartext sessions have no handshake to negotiate over, so the stream cap is symmetric and both endpoints MUST configure the same value (the `streams` option, default 8). Cleartext carries no confidentiality or integrity protection. Like the encrypted connectors, `connectCleartext` resolves once the session is ready: a failed dial rejects the connect call, not the first emit.
 
 ```ts
 import {
@@ -83,7 +83,7 @@ client.close();
 
 ## Encrypted sessions (ECIES)
 
-The server is authenticated by pinning its DER certificate. The ECIES handshake also negotiates stream multiplexing (HTTP/2-style, tightbeam's `transport-multiplex`): the `maxPeerStreams` argument caps concurrent server-initiated streams (default 8), the server's advertisement caps this client's concurrent emits, and connecting to a server that does not offer multiplexing rejects.
+The server is authenticated by pinning its DER certificate. The ECIES handshake also negotiates stream multiplexing (HTTP/2-style, tightbeam's `transport-multiplex`): the `maxPeerStreams` option caps concurrent server-initiated streams (default 8), the server's advertisement caps this client's concurrent emits, and connecting to a server that does not offer multiplexing rejects.
 
 ```ts
 import { TightbeamWsClient } from "@wahidgroup/tightbeam-ws-client";
@@ -195,7 +195,7 @@ const response = await mux.emit(built, {
 The connectors take a signal the same way. Aborting cancels the dial and handshake, closes the socket, and rejects with the signal's abort reason.
 
 ```ts
-const mux = await TightbeamWsClient.connect(url, serverCertDer, 8, {
+const mux = await TightbeamWsClient.connect(url, serverCertDer, {
 	signal: AbortSignal.timeout(5_000),
 });
 ```
@@ -227,7 +227,7 @@ async function connectLoop(
 	for (;;) {
 		let client: TightbeamWsClient;
 		try {
-			client = await TightbeamWsClient.connect(url, serverCertDer, 8, {
+			client = await TightbeamWsClient.connect(url, serverCertDer, {
 				signal: AbortSignal.timeout(5_000),
 			});
 		} catch {

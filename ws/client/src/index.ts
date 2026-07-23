@@ -247,7 +247,8 @@ export interface EmitOptions {
 }
 
 /**
- * Options accepted by the {@link TightbeamWsClient} connectors.
+ * Options accepted by the encrypted {@link TightbeamWsClient} connectors
+ * ({@link TightbeamWsClient.connect}, {@link TightbeamWsClient.connectMutual}).
  */
 export interface ConnectOptions {
 	/**
@@ -256,6 +257,50 @@ export interface ConnectOptions {
 	 * `AbortSignal.timeout(ms)`.
 	 */
 	signal?: AbortSignal;
+	/**
+	 * Concurrency cap granted to server-initiated streams (default 8).
+	 * The server's own advertisement caps this client's concurrent emits.
+	 */
+	maxPeerStreams?: number;
+}
+
+/**
+ * Options accepted by {@link TightbeamWsClient.connectCleartext}.
+ */
+export interface CleartextConnectOptions {
+	/**
+	 * Abort the dial: the socket closes and the promise rejects with
+	 * the signal's abort reason. Timeouts compose as `AbortSignal.timeout(ms)`.
+	 */
+	signal?: AbortSignal;
+	/**
+	 * Symmetric concurrency cap (default 8). Cleartext sessions have no
+	 * negotiation, so both endpoints MUST configure the same value.
+	 */
+	streams?: number;
+}
+
+/**
+ * The default stream cap shared by every connector.
+ */
+const DEFAULT_STREAM_CAP = 8;
+
+/**
+ * Reject a non-object options argument loudly: a number here would
+ * otherwise cross into wasm as a bogus stream cap while the intended
+ * options are silently dropped.
+ */
+function assertOptionsShape(options: unknown): void {
+	if (options === undefined) {
+		return;
+	}
+	if (typeof options === "object" && options !== null) {
+		return;
+	}
+
+	throw new TypeError(
+		"connect options must be an object: stream caps are options fields (maxPeerStreams / streams), not positional arguments",
+	);
 }
 
 /**
@@ -333,19 +378,19 @@ export class TightbeamWsClient extends SocketLifecycle<MuxWsClient> {
 	 *
 	 * @param url - The WebSocket URL to connect to.
 	 * @param serverCertDer - DER certificate pinned as the trusted server.
-	 * @param maxPeerStreams - Concurrency cap granted to server-initiated
-	 * streams (default 8). The server's advertisement caps this client's
-	 * concurrent emits.
-	 * @param options - A {@link ConnectOptions.signal} aborts the dial and handshake.
+	 * @param options - {@link ConnectOptions.maxPeerStreams} caps
+	 * server-initiated streams. {@link ConnectOptions.signal} aborts the
+	 * dial and handshake.
 	 */
 	static async connect(
 		url: string,
 		serverCertDer: Uint8Array,
-		maxPeerStreams = 8,
 		options?: ConnectOptions,
 	): Promise<TightbeamWsClient> {
+		assertOptionsShape(options);
 		await initClient();
 
+		const maxPeerStreams = options?.maxPeerStreams ?? DEFAULT_STREAM_CAP;
 		const socket = await MuxWsClient.connect(
 			url,
 			serverCertDer,
@@ -360,25 +405,25 @@ export class TightbeamWsClient extends SocketLifecycle<MuxWsClient> {
 	 * Initialize the module (if needed) and open a cleartext multiplexed
 	 * session to `url`.
 	 *
-	 * Cleartext multiplexing has no handshake negotiation: `streams` is a
-	 * symmetric concurrency cap and both endpoints MUST configure the
-	 * same value. The connection carries NO confidentiality or integrity
-	 * protection.
+	 * Cleartext multiplexing has no handshake negotiation: the cap is
+	 * symmetric and both endpoints MUST configure the same value. The
+	 * connection carries NO confidentiality or integrity protection.
 	 *
 	 * Resolves once the socket is open, matching {@link connect}: a
 	 * failed dial rejects here rather than on the first emit.
 	 *
 	 * @param url - The WebSocket URL to connect to.
-	 * @param streams - Symmetric concurrency cap, matching the server's configuration.
-	 * @param options - A {@link ConnectOptions.signal} aborts the dial.
+	 * @param options - {@link CleartextConnectOptions.streams} sets the
+	 * symmetric cap. {@link CleartextConnectOptions.signal} aborts the dial.
 	 */
 	static async connectCleartext(
 		url: string,
-		streams = 8,
-		options?: ConnectOptions,
+		options?: CleartextConnectOptions,
 	): Promise<TightbeamWsClient> {
+		assertOptionsShape(options);
 		await initClient();
 
+		const streams = options?.streams ?? DEFAULT_STREAM_CAP;
 		const socket = await MuxWsClient.connectCleartext(
 			url,
 			streams,
@@ -399,19 +444,21 @@ export class TightbeamWsClient extends SocketLifecycle<MuxWsClient> {
 	 * @param serverCertDer - DER certificate pinned as the trusted server.
 	 * @param clientCertDer - DER certificate presented to the server.
 	 * @param clientKey - secp256k1 signing scalar, or an external signer.
-	 * @param maxPeerStreams - Concurrency cap granted to server-initiated streams.
-	 * @param options - A {@link ConnectOptions.signal} aborts the dial and handshake.
+	 * @param options - {@link ConnectOptions.maxPeerStreams} caps
+	 * server-initiated streams. {@link ConnectOptions.signal} aborts the
+	 * dial and handshake.
 	 */
 	static async connectMutual(
 		url: string,
 		serverCertDer: Uint8Array,
 		clientCertDer: Uint8Array,
 		clientKey: Uint8Array | TransportSigner,
-		maxPeerStreams = 8,
 		options?: ConnectOptions,
 	): Promise<TightbeamWsClient> {
+		assertOptionsShape(options);
 		await initClient();
 
+		const maxPeerStreams = options?.maxPeerStreams ?? DEFAULT_STREAM_CAP;
 		let socket: MuxWsClient;
 		if (clientKey instanceof Uint8Array) {
 			socket = await MuxWsClient.connectMutual(
