@@ -265,6 +265,20 @@ bump_version() {
 					|| true
 				git add Cargo.lock
 			fi
+			# Repo adaptation: cargo and npm share one workspace version;
+			# the release workflow verifies both against the tag.
+			if [[ -f ws/client/package.json ]]; then
+				(cd ws/client && npm version "$version" \
+					--no-git-tag-version --allow-same-version >/dev/null) \
+					|| fail "Could not bump ws/client/package.json to ${version}"
+				git add ws/client/package.json
+				if [[ -f ws/package-lock.json ]]; then
+					(cd ws && npm install --package-lock-only \
+						--ignore-scripts >/dev/null 2>&1) \
+						|| fail "Could not refresh ws/package-lock.json for ${version}"
+					git add ws/package-lock.json
+				fi
+			fi
 			;;
 		npm)
 			npm version "$version" --no-git-tag-version --allow-same-version

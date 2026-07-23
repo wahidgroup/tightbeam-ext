@@ -4,14 +4,14 @@ import:
   - ./ws/node_modules/@wahidgroup/lint-rules/cspell.base.json
 words:
   - tightbeam
-  - Errorizable
+  - errorizable
   - websocket
   - websockets
   - tungstenite
   - tokio
   - rustfmt
   - clippy
-  - Cargo
+  - cargo
   - crates
   - semver
   - Swatinem
@@ -31,6 +31,7 @@ words:
   - beamable
   - nonrepudiation
   - gloo
+  - goaway
   - ecies
   - encryptor
   - encryptors
@@ -44,18 +45,22 @@ words:
   - parameterless
   - hkdf
   - chacha
+  - keepalive
   - prehash
+  - prehashes
   - ciphertext
   - spki
   - signingkey
   - passthroughs
   - submod
+  - demultiplex
+  - unrouted
   - bindgen
   - oids
-  - CBOR
+  - cbor
   - zstd
   - libzstd
-  - Zstandard
+  - zstandard
   - encap
   - econtent
   - zeekstd
@@ -64,8 +69,16 @@ words:
   - compactness
   - bokuweb
   - seekable
+  - splittable
+  - fract
+  - microtask
+  - monomorphization
+  - handshaken
+  - rlib
+  - thenables
 ignorePaths:
   - node_modules/**
+  - "**/sbom.json"
   - "**/node_modules/**"
   - target/**
   - built/**

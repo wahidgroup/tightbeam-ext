@@ -1,4 +1,4 @@
-.PHONY: all help help-body help-ref version setup check build clean test lint spellcheck wasm client doc audit ci release check-yanked
+.PHONY: all help help-body help-ref version setup check build clean test lint spellcheck wasm client sbom smoke pack doc audit ci release check-yanked
 
 .NOTPARALLEL: ci
 
@@ -62,9 +62,12 @@ help-body:
 	@printf '    spellcheck      Spellcheck the repository with cspell\n'
 	@printf '    wasm            Lint and build the browser client for wasm32\n'
 	@printf '    client          Build the published hybrid TS/wasm client package\n'
+	@printf '    sbom            Generate the client software bill of materials\n'
+	@printf '    smoke           Smoke-load the built client package exports\n'
+	@printf '    pack            Assert npm pack contents (minimal + sbom)\n'
 	@printf '    doc             Build documentation (all features)\n'
 	@printf '    audit           Security audit: cargo audit + npm audit (fix=1 for npm fixes)\n'
-	@printf '    ci              Full pipeline: lint + build + test + wasm + client\n'
+	@printf '    ci              Full pipeline: lint + build + test + wasm + client + smoke + pack\n'
 	@printf '    release         Release workflow (see OPTIONS)\n'
 	@printf '    check-yanked    Check if the current version has been yanked\n\n'
 	@printf 'OPTIONS / VARIABLES:\n'
@@ -168,6 +171,20 @@ client: setup
 	@echo "Building TS workspace (tightbeam-ts + wasm-pack web client)..."
 	cd $(NPM_ROOT) && npm run build
 
+sbom: setup
+	@echo "Generating SBOM..."
+	cd $(NPM_ROOT) && npm run sbom
+
+smoke: setup
+	@echo "Smoking built client exports..."
+	@test -f $(NPM_ROOT)/client/dist/index.js || (echo "client dist missing - run make client first"; exit 1)
+	cd $(NPM_ROOT)/client && npm run smoke
+
+pack: sbom
+	@echo "Checking npm pack contents..."
+	@test -f $(NPM_ROOT)/client/dist/index.js || (echo "client dist missing - run make client first"; exit 1)
+	cd $(NPM_ROOT)/client && npm run pack:check
+
 doc: setup
 	@echo "Building documentation..."
 	cargo doc --no-deps --all-features
@@ -182,6 +199,8 @@ ci:
 	$(MAKE) test
 	$(MAKE) wasm
 	$(MAKE) client
+	$(MAKE) smoke
+	$(MAKE) pack
 
 release: setup
 	@DRY_RUN="$(if $(filter 1,$(dry-run)),1,)" \

@@ -75,6 +75,14 @@ assemble_context() {
 		--exclude 'pkg'
 	)
 	rsync -a "${excludes[@]}" "$ROOT/" "$CONTEXT_DIR/tightbeam-ext/"
+
+	# When Cargo.toml patches tightbeam-rs to the sibling checkout (local
+	# development), stage that checkout too so the in-image build resolves
+	# the same source.
+	if grep -q '^tightbeam-rs = { path = "../tightbeam/tightbeam" }' "$ROOT/Cargo.toml"; then
+		echo "==> Staging local tightbeam checkout (patched Cargo.toml)"
+		rsync -a "${excludes[@]}" "$ROOT/../tightbeam/" "$CONTEXT_DIR/tightbeam/"
+	fi
 }
 
 generate_certs() {
@@ -122,7 +130,7 @@ case "$ACTION" in
 			"$CONTEXT_DIR"
 
 		echo "==> Bringing up '$PROJECT' stack"
-		echo "    echo ws: ws://localhost:$ECHO_WS_HOST_PORT"
+		echo "    echo ws (mux): ws://localhost:$ECHO_WS_MUX_HOST_PORT"
 
 		if ! compose up -d --wait; then
 			echo "==> Stack '$PROJECT' failed to become healthy; recent logs:" >&2
