@@ -1,12 +1,14 @@
 .PHONY: all help help-body help-ref version setup check build clean test lint spellcheck wasm client sbom smoke pack doc audit ci release check-yanked
 
-.NOTPARALLEL: ci
-
 .DEFAULT_GOAL := help
 
+# Extension under release/version inspection (e.g., `make release ext=ws`).
+# Each top-level extension directory versions its crates independently.
+EXT := $(if $(ext),$(ext),ws)
+
 # Project metadata for help/version
-PROJECT := tightbeam-ws
-VERSION := $(shell awk -F\" '/^\s*version\s*=\s*"/{print $$2; exit}' Cargo.toml 2>/dev/null)
+PROJECT := tightbeam-$(EXT)
+VERSION := $(shell awk -F\" '/^[[:space:]]*version[[:space:]]*=[[:space:]]*"/{print $$2; exit}' $(EXT)/tightbeam-$(EXT)/Cargo.toml 2>/dev/null)
 GIT_COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null)
 GIT_DIRTY := $(shell test -n "$$(git status --porcelain 2>/dev/null)" && echo "+dirty")
 
@@ -45,7 +47,8 @@ help:
 help-body:
 	@printf 'USAGE:\n'
 	@printf '    make <target> [fix=1] [debug=1] [features="<comma-separated>"] [no-default=1]\n'
-	@printf '                  [version=vX.Y.Z] [dry-run=1] [allow-staged=1] [yank=1] [ui=1] [trace=1]\n\n'
+	@printf '                  [version=vX.Y.Z] [ext=<name>] [dry-run=1] [allow-staged=1] [yank=1]\n'
+	@printf '                  [ui=1] [trace=1]\n\n'
 	@printf 'DESCRIPTION:\n'
 	@printf '    Build, test, lint, and release %s following POSIX/GNU CLI conventions.\n\n' '$(PROJECT)'
 	@printf 'TARGETS:\n'
@@ -68,14 +71,15 @@ help-body:
 	@printf '    doc             Build documentation (all features)\n'
 	@printf '    audit           Security audit: cargo audit + npm audit (fix=1 for npm fixes)\n'
 	@printf '    ci              Full pipeline: lint + build + test + wasm + client + smoke + pack\n'
-	@printf '    release         Release workflow (see OPTIONS)\n'
-	@printf '    check-yanked    Check if the current version has been yanked\n\n'
+	@printf '    release         Release an extension independently (see OPTIONS)\n'
+	@printf '    check-yanked    Check if the extension version has been yanked\n\n'
 	@printf 'OPTIONS / VARIABLES:\n'
 	@printf '    fix             If set (e.g., fix=1), apply lint/audit fixes\n'
 	@printf '    debug           If set (e.g., debug=1), RUST_LOG=debug + verbose e2e reporter\n'
 	@printf '    features        Comma-separated Cargo feature list passed as --features\n'
 	@printf '    no-default      If set (e.g., 1), passes --no-default-features to Cargo\n'
 	@printf '    version         Release version (e.g., version=v0.2.0)\n'
+	@printf '    ext             Extension to release/version (default: ws)\n'
 	@printf '    dry-run         If set (e.g., dry-run=1), preview release without changes\n'
 	@printf '    allow-staged    If set (e.g., allow-staged=1), include staged files in release\n'
 	@printf '    yank            If set (e.g., yank=1), yank a published version\n'
@@ -91,7 +95,7 @@ help-body:
 	@printf '    make build features="testing"\n'
 	@printf '    make audit fix=1\n'
 	@printf '    make release version=v0.2.0\n'
-	@printf '    make release version=v0.2.0 dry-run=1\n'
+	@printf '    make release version=v0.2.0 ext=ws dry-run=1\n'
 	@printf '    make release yank=1\n\n'
 	@printf 'EXIT STATUS:\n'
 	@printf '    0    Success\n'
@@ -203,10 +207,11 @@ ci:
 	$(MAKE) pack
 
 release: setup
-	@DRY_RUN="$(if $(filter 1,$(dry-run)),1,)" \
+	@EXT="$(EXT)" \
+		DRY_RUN="$(if $(filter 1,$(dry-run)),1,)" \
 		ALLOW_STAGED="$(if $(filter 1,$(allow-staged)),1,)" \
 		YANK="$(if $(filter 1,$(yank)),1,)" \
 		./scripts/release.sh "$(RELEASE_VERSION)"
 
 check-yanked:
-	@./scripts/check-yanked.sh
+	@./scripts/check-yanked.sh "$(EXT)"

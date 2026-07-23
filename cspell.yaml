@@ -32,6 +32,7 @@ words:
   - nonrepudiation
   - gloo
   - goaway
+  - gpgsign
   - ecies
   - encryptor
   - encryptors

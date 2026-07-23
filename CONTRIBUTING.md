@@ -130,12 +130,12 @@ Each PR MUST have:
 
 ## Releasing
 
-The workspace is versioned from `[workspace.package]` in `Cargo.toml`. Maintainers release with:
+Extensions are versioned independently: every crate under an extension directory (e.g. `ws/`) declares its own `[package].version`, kept in lockstep within the extension. Maintainers release with:
 
 ```bash
-make release version=vX.Y.Z
+make release version=vX.Y.Z ext=ws
 ```
 
-Use `dry-run=1`, `allow-staged=1`, or `yank=1` as documented in `make help`.
+Use `dry-run=1`, `allow-staged=1`, or `yank=1` as documented in `make help`. `ext` defaults to `ws`.
 
-A release bumps the manifest, opens a release pull request, and on merge creates a signed `releases/v<version>` tag that publishes to crates.io. The deploy guard `check-yanked.sh` refuses yanked versions (`yanked/v<version>`).
+A release bumps the extension's manifests, opens a release pull request, and on merge creates a signed `releases/<ext>/v<version>` tag that publishes to crates.io. The deploy guard `check-yanked.sh` refuses yanked versions (`yanked/<ext>/v<version>`).

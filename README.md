@@ -2,7 +2,7 @@
 
 Official, canonical extensions for the [tightbeam](https://crates.io/crates/tightbeam-rs) messaging protocol.
 
-tightbeam ships with a raw TCP transport (`tightbeam::transport::tcp`). This repository is the supported home for everything beyond that core: additional transports, browser/WebAssembly clients, and the TypeScript packages that let non-Rust environments speak tightbeam.
+This repository is the supported home for everything beyond the tightbeam core: additional transports, browser/WebAssembly clients, and the various packages that let non-Rust environments speak tightbeam.
 
 ## Extensions
 
@@ -30,13 +30,14 @@ Run `make help` for the full target list.
 ## Releasing
 
 ```sh
-make release version=v0.1.0            # release at an explicit version
+make release version=v0.1.0            # release the default extension (ws)
+make release version=v0.1.0 ext=ws     # release a named extension
 make release                           # prompt for the next version
 make release version=v0.1.0 dry-run=1  # preview without mutations
 make release yank=1                    # yank a published version
 ```
 
-A release bumps the workspace version, opens a release pull request, and on merge creates a signed `releases/v<version>` tag. Pushing that tag publishes `tightbeam-ws` to crates.io and creates the GitHub release. The deploy guard `check-yanked.sh` refuses yanked versions (`yanked/v<version>`).
+Extensions are released independently: each top-level extension directory (e.g. `ws/`) versions its crates on its own. A release bumps that extension's versions, opens a release pull request, and on merge creates a signed `releases/<ext>/v<version>` tag. Pushing that tag publishes the extension's crate (e.g. `tightbeam-ws`) to crates.io and creates the GitHub release. The deploy guard `check-yanked.sh` refuses yanked versions (`yanked/<ext>/v<version>`).
 
 ## License
 

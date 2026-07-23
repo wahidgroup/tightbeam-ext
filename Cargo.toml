@@ -4,7 +4,6 @@ members = ["ws/tightbeam-ws", "ws/tightbeam-ws-wasm"]
 
 [workspace.package]
 authors = ["Tanveer Wahid <tan@wahid.email>"]
-version = "0.1.0"
 edition = "2021"
 rust-version = "1.85.1"
 license = "MIT OR Apache-2.0"
@@ -15,14 +14,16 @@ keywords = ["websocket", "transport", "messaging", "protocol", "tightbeam"]
 categories = ["network-programming", "asynchronous"]
 
 [workspace.dependencies]
-tightbeam-rs = { version = "0.9.0", default-features = false }
-tokio = { version = "1.53.0", default-features = false }
+tightbeam-rs = { version = "0.10.0", default-features = false }
+tokio = { version = "1.53.1", default-features = false }
 tokio-tungstenite = { version = "0.30.0", default-features = false }
 futures-util = { version = "0.3.33", default-features = false }
 
 # Browser (wasm32) client dependencies.
+js-sys = "0.3.83"
 wasm-bindgen = "0.2.126"
 wasm-bindgen-futures = "0.4.76"
+web-sys = { version = "0.3.83", default-features = false }
 gloo-net = { version = "0.7.0", default-features = false }
 
 # Pinned to 0.7 to match the der version the RustCrypto stack (and therefore

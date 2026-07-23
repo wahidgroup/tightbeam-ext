@@ -1,40 +1,31 @@
-# Self-contained e2e stack: cleartext, encrypted, and mutual-auth encrypted
-# tightbeam-ws echo server containers sharing one image.
+# Self-contained e2e stack: multiplexed tightbeam-ws echo servers
+# (encrypted, cleartext, and mutual-auth encrypted) sharing one image.
 #
-# The image is built by scripts/stack.sh; identity fixtures are generated on
+# The image is built by scripts/stack.sh. Identity fixtures are generated on
 # the host (gen_certs) and bind-mounted read-only under /certs.
 
 services:
-  echo-server:
+  echo-server-mux:
     image: ${ECHO_IMAGE:-tightbeam-ws-echo:dev}
     environment:
       ECHO_WS_PORT: "9100"
-    ports:
-      - "${ECHO_WS_HOST_PORT:-9100}:9100"
-
-  echo-server-secure:
-    image: ${ECHO_IMAGE:-tightbeam-ws-echo:dev}
-    command: ["echo-server-secure"]
-    environment:
-      ECHO_WS_PORT: "9101"
       TBWS_SERVER_CERT: /certs/server.cert.der
       TBWS_SERVER_KEY: /certs/server.key
     volumes:
       - ${CERT_DIR:?}:/certs:ro
     ports:
-      - "${ECHO_WS_SECURE_HOST_PORT:-9101}:9101"
+      - "${ECHO_WS_MUX_HOST_PORT:-9100}:9100"
 
-  echo-server-sink:
+  echo-server-mux-clear:
     image: ${ECHO_IMAGE:-tightbeam-ws-echo:dev}
+    command: ["echo-server-mux-clear"]
     environment:
-      ECHO_WS_PORT: "9103"
-      ECHO_WS_MODE: sink
+      ECHO_WS_PORT: "9101"
     ports:
-      - "${ECHO_WS_SINK_HOST_PORT:-9103}:9103"
+      - "${ECHO_WS_MUX_CLEAR_HOST_PORT:-9101}:9101"
 
-  echo-server-secure-mutual:
+  echo-server-mux-mutual:
     image: ${ECHO_IMAGE:-tightbeam-ws-echo:dev}
-    command: ["echo-server-secure"]
     environment:
       ECHO_WS_PORT: "9102"
       TBWS_SERVER_CERT: /certs/server.cert.der
@@ -43,4 +34,4 @@ services:
     volumes:
       - ${CERT_DIR:?}:/certs:ro
     ports:
-      - "${ECHO_WS_MUTUAL_HOST_PORT:-9102}:9102"
+      - "${ECHO_WS_MUX_MUTUAL_HOST_PORT:-9102}:9102"

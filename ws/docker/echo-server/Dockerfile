@@ -10,8 +10,8 @@ WORKDIR /src
 COPY . .
 
 WORKDIR /src/tightbeam-ext
-RUN cargo build --example echo_server -p tightbeam-ws \
-	&& cargo build --example echo_server_secure -p tightbeam-ws --features testing
+RUN cargo build --example echo_server_mux -p tightbeam-ws --features testing \
+	&& cargo build --example echo_server_mux_clear -p tightbeam-ws --features testing
 
 FROM debian:bookworm-slim
 
@@ -20,8 +20,8 @@ RUN apt-get update \
 	&& rm -rf /var/lib/apt/lists/* \
 	&& useradd -r -u 10001 echo
 
-COPY --from=build /src/tightbeam-ext/target/debug/examples/echo_server /usr/local/bin/echo-server
-COPY --from=build /src/tightbeam-ext/target/debug/examples/echo_server_secure /usr/local/bin/echo-server-secure
+COPY --from=build /src/tightbeam-ext/target/debug/examples/echo_server_mux /usr/local/bin/echo-server-mux
+COPY --from=build /src/tightbeam-ext/target/debug/examples/echo_server_mux_clear /usr/local/bin/echo-server-mux-clear
 
 USER echo
 
@@ -34,4 +34,4 @@ EXPOSE 9100
 HEALTHCHECK --interval=3s --timeout=2s --start-period=3s --retries=30 \
 	CMD ss -ltn "sport = :${ECHO_WS_PORT:-9100}" | grep -q LISTEN || exit 1
 
-CMD ["echo-server"]
+CMD ["echo-server-mux"]

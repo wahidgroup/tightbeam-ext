@@ -12,7 +12,8 @@ fi
 # SYNOPSIS
 #	scripts/release.sh [version] [--dry-run] [--allow-staged] [--yank]
 #	                   [--<submodule>]
-#	make release [version=vX.Y.Z] [dry-run=1] [allow-staged=1] [yank=1]
+#	make release [version=vX.Y.Z] [ext=<name>] [dry-run=1]
+#	             [allow-staged=1] [yank=1]
 #
 # DESCRIPTION
 #	Drives a release from version bump to signed tag as a finite state
@@ -23,21 +24,27 @@ fi
 #	  entry states:  fresh | local | pr | poll | tag
 #	  phases:        prepare -> push_pr -> wait_merge -> tag_push -> done
 #
-#	Forward releases cut process/v<version> from main. Versions older
-#	than the latest tag become backports and cut from the matching
-#	release/vX.Y branch (created on demand, commits cherry-picked).
-#	Release notes are compiled from merged PR titles and labels. Release
-#	and yank marker tags are signed (GPG or SSH).
+#	Repo adaptation: releases are per extension. Each top-level
+#	extension directory (e.g. ws/) versions its crates independently;
+#	EXT selects the extension (default: ws). Forward releases cut
+#	process/<ext>/v<version> from main. Versions older than the latest
+#	tag become backports and cut from the matching release/<ext>/vX.Y
+#	branch (created on demand, commits cherry-picked). Release notes
+#	are compiled from merged PR titles and labels. Release and yank
+#	marker tags are signed (GPG or SSH).
 #
 # OPTIONS
 #	version         Release version, X.Y.Z or vX.Y.Z. Prompted if absent.
 #	--dry-run       Preview every action. No workspace mutation.
 #	--allow-staged  Include already-staged changes in the release commit.
 #	--yank          Yank a published release: delete the GitHub release,
-#	                push signed yanked/v* marker. Release tag preserved.
+#	                push signed yanked/<ext>/v* marker. Release tag
+#	                preserved.
 #	--<submodule>   Run against the named submodule from .gitmodules.
 #
 # ENVIRONMENT
+#	EXT             Extension to release (set by make ext=<name>).
+#	                Defaults to ws.
 #	DRY_RUN         Non-empty enables --dry-run (set by make dry-run=1).
 #	ALLOW_STAGED    Non-empty enables --allow-staged (allow-staged=1).
 #	YANK            Non-empty enables --yank (yank=1).
@@ -60,6 +67,12 @@ fi
 # Constants
 # ---------------------------------------------------------------------------
 DEFAULT_BRANCH="master"
+
+# Repo adaptation: the extension under release. Each extension lives in a
+# top-level directory (e.g. ws/) whose crates share one version, declared
+# per crate ([package].version) and released under releases/<ext>/v* tags.
+# The canonical version manifest is <ext>/tightbeam-<ext>/Cargo.toml.
+EXTENSION="${EXT:-ws}"
 
 BOLD='\033[1m'
 RED='\033[0;31m'
@@ -203,19 +216,33 @@ run_release_fsm() {
 # Version helpers
 # ---------------------------------------------------------------------------
 
-# Cargo workspaces version from [workspace.package] in the root Cargo.toml.
-CARGO_VERSION_SECTION="workspace.package"
+# Repo adaptation: versions are per extension. Every crate manifest under
+# <ext>/ carries the extension version in its [package] section; the crate
+# named tightbeam-<ext> is the canonical read source.
+CARGO_VERSION_SECTION="package"
+
+extension_version_manifest() {
+	printf '%s/tightbeam-%s/Cargo.toml' "$EXTENSION" "$EXTENSION"
+}
+
+extension_crate_manifests() {
+	local manifest
+	for manifest in "$EXTENSION"/*/Cargo.toml; do
+		[[ -f "$manifest" ]] && printf '%s\n' "$manifest"
+	done
+}
 
 cargo_read_version() {
 	awk -v section="$CARGO_VERSION_SECTION" -F'"' '
 		$0 ~ "^\\[" section "\\]" { in_section = 1; next }
 		in_section && /^\[/ { in_section = 0 }
 		in_section && /^version[[:space:]]*=/ { print $2; exit }
-	' Cargo.toml 2>/dev/null || true
+	' "$(extension_version_manifest)" 2>/dev/null || true
 }
 
-cargo_write_version() {
+cargo_write_version_manifest() {
 	local version="$1"
+	local manifest="$2"
 	local tmpfile
 	tmpfile=$(mktemp)
 	awk -v section="$CARGO_VERSION_SECTION" -v version="$version" '
@@ -228,13 +255,26 @@ cargo_write_version() {
 		}
 		{ print }
 		END { exit replaced ? 0 : 1 }
-	' Cargo.toml > "$tmpfile" \
-		|| fail "Could not find version field in [${CARGO_VERSION_SECTION}] of Cargo.toml"
-	mv "$tmpfile" Cargo.toml
+	' "$manifest" > "$tmpfile" \
+		|| fail "Could not find version field in [${CARGO_VERSION_SECTION}] of ${manifest}"
+	mv "$tmpfile" "$manifest"
+}
+
+cargo_write_version() {
+	local version="$1"
+	local manifest found=false
+	while IFS= read -r manifest; do
+		found=true
+		cargo_write_version_manifest "$version" "$manifest"
+		git add "$manifest"
+	done < <(extension_crate_manifests)
+	if [[ "$found" == false ]]; then
+		fail "No crate manifests found under ${EXTENSION}/"
+	fi
 }
 
 detect_version_source() {
-	if [[ -f Cargo.toml ]]; then
+	if [[ -f "$(extension_version_manifest)" ]]; then
 		printf "cargo"
 	elif [[ -f package.json ]]; then
 		printf "npm"
@@ -258,25 +298,25 @@ bump_version() {
 	case "$source" in
 		cargo)
 			cargo_write_version "$version"
-			git add Cargo.toml
 			if [[ -f Cargo.lock ]]; then
 				cargo generate-lockfile --offline --quiet 2>/dev/null \
 					|| cargo generate-lockfile --quiet 2>/dev/null \
 					|| true
 				git add Cargo.lock
 			fi
-			# Repo adaptation: cargo and npm share one workspace version;
-			# the release workflow verifies both against the tag.
-			if [[ -f ws/client/package.json ]]; then
-				(cd ws/client && npm version "$version" \
+			# Repo adaptation: an extension's crates and npm client share
+			# one version; the release workflow verifies both against the
+			# tag.
+			if [[ -f "${EXTENSION}/client/package.json" ]]; then
+				(cd "${EXTENSION}/client" && npm version "$version" \
 					--no-git-tag-version --allow-same-version >/dev/null) \
-					|| fail "Could not bump ws/client/package.json to ${version}"
-				git add ws/client/package.json
-				if [[ -f ws/package-lock.json ]]; then
-					(cd ws && npm install --package-lock-only \
+					|| fail "Could not bump ${EXTENSION}/client/package.json to ${version}"
+				git add "${EXTENSION}/client/package.json"
+				if [[ -f "${EXTENSION}/package-lock.json" ]]; then
+					(cd "$EXTENSION" && npm install --package-lock-only \
 						--ignore-scripts >/dev/null 2>&1) \
-						|| fail "Could not refresh ws/package-lock.json for ${version}"
-					git add ws/package-lock.json
+						|| fail "Could not refresh ${EXTENSION}/package-lock.json for ${version}"
+					git add "${EXTENSION}/package-lock.json"
 				fi
 			fi
 			;;
@@ -333,8 +373,10 @@ working_tree_clean() {
 # Version recorded at <ref> (Cargo.toml, package.json, or VERSION); empty if none.
 version_at_ref() {
 	local ref="$1"
-	if git cat-file -e "${ref}:Cargo.toml" 2>/dev/null; then
-		git show "${ref}:Cargo.toml" | awk -v section="$CARGO_VERSION_SECTION" -F'"' '
+	local manifest
+	manifest="$(extension_version_manifest)"
+	if git cat-file -e "${ref}:${manifest}" 2>/dev/null; then
+		git show "${ref}:${manifest}" | awk -v section="$CARGO_VERSION_SECTION" -F'"' '
 			$0 ~ "^\\[" section "\\]" { in_section = 1; next }
 			in_section && /^\[/ { in_section = 0 }
 			in_section && /^version[[:space:]]*=/ { print $2; exit }
@@ -360,13 +402,13 @@ compile_changelog() {
 	fi
 
 	local last_tag
-	last_tag=$(git describe --tags --match "releases/v*" --abbrev=0 "$ref" 2>/dev/null) \
+	last_tag=$(git describe --tags --match "releases/${EXTENSION}/v*" --abbrev=0 "$ref" 2>/dev/null) \
 		|| last_tag=$(git rev-list --max-parents=0 "$ref")
 
 	local date_str
 	date_str=$(date +%Y-%m-%d)
 
-	local changelog_title="## v${VERSION} (${date_str})"
+	local changelog_title="## ${EXTENSION} v${VERSION} (${date_str})"
 
 	local components="" i
 	if [[ -z "$REPO_DIR" && ${#SUBMODULES[@]} -gt 0 ]]; then
@@ -392,7 +434,9 @@ compile_changelog() {
 
 	local body=""
 	local merge_subjects
-	merge_subjects=$(git log "${last_tag}..${ref}" --merges --format="%s")
+	# Repo adaptation: only merges touching the extension belong in its notes.
+	merge_subjects=$(git log "${last_tag}..${ref}" --merges --format="%s" \
+		-- "${EXTENSION}/")
 
 	local labels=""
 
@@ -411,7 +455,7 @@ compile_changelog() {
 
 			local is_release_pr
 			is_release_pr=$(echo "$pr_json" \
-				| jq -r '.headRefName | startswith("process/v")')
+				| jq -r '.headRefName | startswith("process/")')
 			[[ "$is_release_pr" == "true" ]] && continue
 
 			local pr_line
@@ -460,6 +504,7 @@ print_release_notes() {
 print_summary() {
 	printf "\n"
 	printf "  ${BOLD}Project:${RESET}   %s\n" "$PROJECT_NAME"
+	printf "  ${BOLD}Extension:${RESET} %s\n" "$EXTENSION"
 	printf "  ${BOLD}Version:${RESET}   %s\n" "$VERSION"
 	printf "  ${BOLD}Tag:${RESET}       %s\n" "$TAG"
 	printf "  ${BOLD}Branch:${RESET}    %s\n" "$BRANCH"
@@ -636,7 +681,7 @@ ensure_release_branch() {
 
 	local base_tag=""
 	if (( patch > 0 )); then
-		base_tag="releases/v${major}.${minor}.0"
+		base_tag="releases/${EXTENSION}/v${major}.${minor}.0"
 		if ! git rev-parse --verify "${base_tag}^{commit}" &>/dev/null; then
 			fail "Base tag ${base_tag} not found - release v${major}.${minor}.0 first"
 		fi
@@ -653,7 +698,7 @@ ensure_release_branch() {
 				latest_branch="$candidate"
 				break
 			fi
-		done < <(git branch -r --list "origin/release/v${major}.*" --sort=-v:refname 2>/dev/null)
+		done < <(git branch -r --list "origin/release/${EXTENSION}/v${major}.*" --sort=-v:refname 2>/dev/null)
 		if [[ -n "$latest_branch" ]]; then
 			git checkout -b "$branch" "$latest_branch"
 			git push -u origin "$branch" --quiet
@@ -665,7 +710,7 @@ ensure_release_branch() {
 		local tag_candidate tag_minor
 		while IFS= read -r tag_candidate; do
 			[[ -z "$tag_candidate" ]] && continue
-			tag_minor="${tag_candidate#"releases/v${major}."}"
+			tag_minor="${tag_candidate#"releases/${EXTENSION}/v${major}."}"
 			tag_minor="${tag_minor%%.*}"
 			[[ "$tag_minor" =~ ^[0-9]+$ ]] || continue
 			# Never base a new minor line on a higher minor's tag
@@ -673,7 +718,7 @@ ensure_release_branch() {
 				base_tag="$tag_candidate"
 				break
 			fi
-		done < <(git tag --list "releases/v${major}.*" --sort=-v:refname)
+		done < <(git tag --list "releases/${EXTENSION}/v${major}.*" --sort=-v:refname)
 		if [[ -z "$base_tag" ]]; then
 			# No lower minor line exists (always true for a new .0 line):
 			# cut from DEFAULT_BRANCH, per the standard release-lines model
@@ -755,12 +800,12 @@ interactive_cherry_pick() {
 	while IFS= read -r line; do
 		[[ -z "$line" ]] && continue
 		local sha="${line%% *}"
-		if ! git cherry-pick "$sha"; then
+		if ! git cherry-pick -S "$sha"; then
 			printf "\n"
 			fail "Cherry-pick conflict on ${line}
         Resolve the conflict, then resume:
-          git cherry-pick --continue
-          make release version=v${VERSION}"
+          git -c commit.gpgsign=true cherry-pick --continue
+          make release version=v${VERSION} ext=${EXTENSION}"
 		fi
 		ok "Cherry-picked ${line}"
 	done <<< "$selected"
@@ -851,9 +896,9 @@ print_run_header() {
 		kind="Yank"
 	fi
 	if [[ "$DRY_RUN" == true ]]; then
-		header "${kind} (dry run) - ${PROJECT_NAME}"
+		header "${kind} (dry run) - ${PROJECT_NAME} [${EXTENSION}]"
 	else
-		header "${kind} - ${PROJECT_NAME}"
+		header "${kind} - ${PROJECT_NAME} [${EXTENSION}]"
 	fi
 }
 
@@ -871,8 +916,12 @@ resolve_version_interactive() {
 		fi
 		all_tags=$(printf '%s\n' "$all_tags" \
 			| sed -n 's|.*refs/tags/\(.*\)$|\1|p' | grep -v '\^{}' || true)
-		release_vers=$(echo "$all_tags" | grep '^releases/v' | sed 's|releases/v||' || true)
-		yanked_vers=$(echo "$all_tags" | grep '^yanked/v' | sed 's|yanked/v||' || true)
+		release_vers=$(echo "$all_tags" \
+			| grep "^releases/${EXTENSION}/v" \
+			| sed "s|releases/${EXTENSION}/v||" || true)
+		yanked_vers=$(echo "$all_tags" \
+			| grep "^yanked/${EXTENSION}/v" \
+			| sed "s|yanked/${EXTENSION}/v||" || true)
 
 		yankable=""
 		while IFS= read -r ver; do
@@ -912,9 +961,9 @@ detect_release_mode() {
 
 	local latest_tag latest_ver latest_major latest_minor
 	git fetch origin --tags --quiet 2>/dev/null || true
-	latest_tag=$(git tag --list "releases/v*" --sort=-v:refname | head -1)
+	latest_tag=$(git tag --list "releases/${EXTENSION}/v*" --sort=-v:refname | head -1)
 	if [[ -n "$latest_tag" ]]; then
-		latest_ver="${latest_tag#releases/v}"
+		latest_ver="${latest_tag#"releases/${EXTENSION}/v"}"
 		IFS='.' read -r latest_major latest_minor _ <<< "$latest_ver"
 		if (( SV_MAJOR < latest_major )) || \
 		   (( SV_MAJOR == latest_major && SV_MINOR < latest_minor )); then
@@ -923,15 +972,15 @@ detect_release_mode() {
 	fi
 
 	if [[ "$RELEASE_MODE" == "backport" ]]; then
-		RELEASE_BRANCH="release/v${SV_MAJOR}.${SV_MINOR}"
+		RELEASE_BRANCH="release/${EXTENSION}/v${SV_MAJOR}.${SV_MINOR}"
 		PR_BASE="$RELEASE_BRANCH"
 	fi
 
 	ok "Release mode: ${RELEASE_MODE} (base: ${PR_BASE})"
 
-	BRANCH="process/v${VERSION}"
-	TAG="releases/v${VERSION}"
-	YANKED_TAG="yanked/v${VERSION}"
+	BRANCH="process/${EXTENSION}/v${VERSION}"
+	TAG="releases/${EXTENSION}/v${VERSION}"
+	YANKED_TAG="yanked/${EXTENSION}/v${VERSION}"
 }
 
 require_gh() {
@@ -1053,7 +1102,7 @@ detect_resume_state() {
 		fail "Previous release PR #${PR_NUMBER} for ${BRANCH} was closed without merging. Delete the branch (git push origin --delete ${BRANCH}) or reopen PR #${PR_NUMBER}, then retry."
 	elif remote_head_exists "$BRANCH"; then
 		RESUME_STATE="pr"
-		# Need local checkout of process/v* so changelog/PR body use release history.
+		# Need local checkout of process/<ext>/v* so changelog/PR body use release history.
 		RESUME_NEEDS_CHECKOUT=true
 		info "[resume] Branch ${BRANCH} exists on remote, creating PR..."
 	elif git show-ref --verify --quiet "refs/heads/${BRANCH}"; then
@@ -1242,9 +1291,9 @@ assert_version_bump_ok() {
 	fi
 
 	if [[ ( "$RESUME_STATE" == "fresh" || "$RESUME_STATE" == "local" ) && "$RELEASE_MODE" == "backport" ]]; then
-		line_tag=$(git tag --list "releases/v${SV_MAJOR}.${SV_MINOR}.*" --sort=-v:refname | head -1)
+		line_tag=$(git tag --list "releases/${EXTENSION}/v${SV_MAJOR}.${SV_MINOR}.*" --sort=-v:refname | head -1)
 		if [[ -n "$line_tag" ]]; then
-			line_ver="${line_tag#releases/v}"
+			line_ver="${line_tag#"releases/${EXTENSION}/v"}"
 			cmp=$(semver_compare "$VERSION" "$line_ver")
 			if [[ "$cmp" == "eq" ]]; then
 				if remote_tag_exists "$TAG"; then
@@ -1305,6 +1354,8 @@ validate_preconditions() {
 		while IFS= read -r f; do
 			case "$f" in
 				Cargo.toml|Cargo.lock|package.json|package-lock.json|npm-shrinkwrap.json|VERSION) ;;
+				"${EXTENSION}"/*/Cargo.toml) ;;
+				"${EXTENSION}"/client/package.json|"${EXTENSION}"/package-lock.json) ;;
 				*) staged_version_only=false; break ;;
 			esac
 		done < <(git diff --cached --name-only --ignore-submodules)
@@ -1325,7 +1376,7 @@ validate_preconditions() {
 	fi
 
 	# Fresh forward only: must start from up-to-date DEFAULT_BRANCH.
-	# Local resume is already on process/v* with a matching release tip.
+	# Local resume is already on process/<ext>/v* with a matching release tip.
 	if [[ "$RELEASE_MODE" == "forward" && "$RESUME_STATE" == "fresh" ]]; then
 		local current_branch local_sha remote_sha
 		current_branch=$(git branch --show-current)
@@ -1409,11 +1460,11 @@ prepare_release_work() {
 		next_step "Commit release"
 		if git diff --cached --quiet; then
 			info "Nothing staged - creating empty release marker commit"
-			git commit --allow-empty -m "chore(release): v${VERSION}"
+			git commit -S --allow-empty -m "chore(release): ${EXTENSION} v${VERSION}"
 		else
-			git commit -m "chore(release): v${VERSION}"
+			git commit -S -m "chore(release): ${EXTENSION} v${VERSION}"
 		fi
-		ok "Committed chore(release): v${VERSION}"
+		ok "Committed chore(release): ${EXTENSION} v${VERSION}"
 	fi
 }
 
@@ -1464,7 +1515,7 @@ push_and_open_pr() {
 	done < <({ printf 'release\n'; printf '%s\n' "${RELEASE_LABELS:-}"; } | sort -u)
 
 	local -a pr_create_args=(
-		--title "chore(release): v${VERSION}"
+		--title "chore(release): ${EXTENSION} v${VERSION}"
 		--body "$CHANGELOG"
 		--base "$PR_BASE"
 		--head "$BRANCH"
@@ -1482,7 +1533,7 @@ push_and_open_pr() {
 	if [[ -n "$existing_pr" ]]; then
 		read -r PR_NUMBER pr_url <<< "$existing_pr"
 		local -a pr_edit_args=(
-			--title "chore(release): v${VERSION}"
+			--title "chore(release): ${EXTENSION} v${VERSION}"
 			--body "$CHANGELOG"
 		)
 		for label in "${pr_labels[@]}"; do
@@ -1535,6 +1586,10 @@ main() {
 	detect_submodules
 	parse_args "$@"
 	enter_submodule_mode
+
+	if [[ -z "$REPO_DIR" && ! -f "$(extension_version_manifest)" ]]; then
+		fail "Unknown extension '${EXTENSION}' (expected $(extension_version_manifest))"
+	fi
 
 	CURRENT_VERSION=$(detect_version)
 
