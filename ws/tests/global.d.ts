@@ -2,9 +2,15 @@
 // app and the Playwright spec (via `page.evaluate`) share one typed interface.
 import type {
 	CompressedRoundTripResult,
+	MuxCallbackResult,
+	MuxConcurrentResult,
+	MuxDrainResult,
+	MuxLifecycleResult,
+	MuxRefusalResult,
 	RoundTripResult,
 	SealedRoundTripResult,
 	SignedRoundTripResult,
+	SignerRoundTripResult,
 	TypedRoundTripResult,
 } from "./app/main.js";
 
@@ -34,6 +40,15 @@ declare global {
 			idText: string,
 			order: number,
 		) => Promise<RoundTripResult>;
+		tbMutualSignerRoundTrip: (
+			url: string,
+			serverCertB64: string,
+			clientCertB64: string,
+			clientKeyB64: string,
+			payloadHex: string,
+			idText: string,
+			order: number,
+		) => Promise<SignerRoundTripResult>;
 		tbSignedRoundTrip: (
 			url: string,
 			payloadHex: string,
@@ -69,5 +84,39 @@ declare global {
 			author: string,
 			text: string,
 		) => Promise<TypedRoundTripResult>;
+		tbMuxConcurrentRoundTrip: (
+			url: string,
+			serverCertB64: string,
+			payloadHex: string,
+		) => Promise<MuxConcurrentResult>;
+		tbMuxCallbackRoundTrip: (
+			url: string,
+			serverCertB64: string,
+			payloadHex: string,
+			replyHex: string,
+		) => Promise<MuxCallbackResult>;
+		tbMuxClearConcurrentRoundTrip: (
+			url: string,
+			payloadHex: string,
+		) => Promise<MuxConcurrentResult>;
+		tbMuxLifecycleProbe: (
+			url: string,
+			serverCertB64: string,
+		) => Promise<MuxLifecycleResult>;
+		tbMuxDrainReason: (
+			url: string,
+			serverCertB64: string,
+		) => Promise<MuxDrainResult>;
+		tbMuxParkedCallbackRoundTrip: (
+			url: string,
+			serverCertB64: string,
+			payloadHex: string,
+			replyHex: string,
+		) => Promise<MuxCallbackResult>;
+		tbMuxRefusalRoundTrip: (
+			url: string,
+			serverCertB64: string,
+			payloadHex: string,
+		) => Promise<MuxRefusalResult>;
 	}
 }

@@ -13,6 +13,7 @@
 	],
 	"scripts": {
 		"build": "npm run build --workspace @wahidgroup/tightbeam-ws-client",
+		"sbom": "cyclonedx-npm --omit dev --package-lock-only --flatten-components --short-PURLs --output-reproducible --output-file client/sbom.json",
 		"test": "npm run test --workspace @wahidgroup/tightbeam-ws-client",
 		"typecheck": "npm run typecheck --workspaces --if-present",
 		"lint": "npm run lint --workspaces --if-present",
@@ -22,7 +23,7 @@
 	"devDependencies": {
 		"cspell": "10.0.1",
 		"eslint": "9.39.5",
-		"prettier": "3.9.5"
+		"prettier": "3.9.6"
 	},
 	"license": "MIT OR Apache-2.0"
 }

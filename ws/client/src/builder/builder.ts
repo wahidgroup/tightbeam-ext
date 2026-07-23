@@ -285,7 +285,7 @@ export class FrameBuilder {
 	}
 
 	/**
-	 * Set the frame body: raw bytes ride the profile opaque wrapper, while
+	 * Set the frame body: raw bytes follow the profile opaque wrapper, while
 	 * a `MessageCodec<T>` carries a typed message under the implementor's
 	 * schema. Encoding is deferred to `build()`.
 	 */

@@ -1,7 +1,7 @@
-import type { RoundTripResult } from "../app/main.js";
+import type { RoundTripResult, SignerRoundTripResult } from "../app/main.js";
 import { expect, test } from "@playwright/test";
 
-import { certBase64, mutualEndpoint, secureEndpoint } from "../env.js";
+import { certBase64, muxEndpoint, muxMutualEndpoint } from "../env.js";
 import { openApp } from "./helpers.js";
 
 const serverCert = certBase64("server.cert.der");
@@ -40,7 +40,7 @@ for (const testCase of cases) {
 			({ url, cert, payload, id, order }) =>
 				window.tbSecureRoundTrip(url, cert, payload, id, order),
 			{
-				url: secureEndpoint,
+				url: muxEndpoint,
 				cert: serverCert,
 				payload: testCase.payloadHex,
 				id: testCase.id,
@@ -71,7 +71,7 @@ test("round-trips over a mutually-authenticated encrypted session", async ({
 				7,
 			),
 		{
-			url: mutualEndpoint,
+			url: muxMutualEndpoint,
 			cert: serverCert,
 			clientCertB64: clientCert,
 			clientKeyB64: clientKey,
@@ -80,4 +80,32 @@ test("round-trips over a mutually-authenticated encrypted session", async ({
 	expect(result.bodyHex).toBe("0badc0de");
 	expect(result.idText).toBe("e2e-mutual");
 	expect(result.order).toBe("7");
+});
+
+test("authenticates mutually through an external signer in the browser", async ({
+	page,
+}) => {
+	await openApp(page);
+
+	const result: SignerRoundTripResult = await page.evaluate(
+		({ url, cert, clientCertB64, clientKeyB64 }) =>
+			window.tbMutualSignerRoundTrip(
+				url,
+				cert,
+				clientCertB64,
+				clientKeyB64,
+				"0badc1de",
+				"e2e-mutual-signer",
+				8,
+			),
+		{
+			url: muxMutualEndpoint,
+			cert: serverCert,
+			clientCertB64: clientCert,
+			clientKeyB64: clientKey,
+		},
+	);
+	expect(result.bodyHex).toBe("0badc1de");
+	expect(result.idText).toBe("e2e-mutual-signer");
+	expect(result.signatures).toBe(1);
 });

@@ -3,7 +3,7 @@ name = "tightbeam-ws-wasm"
 description = "Browser (WebAssembly) WebSocket client for the tightbeam messaging protocol"
 publish = false
 authors.workspace = true
-version.workspace = true
+version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -22,6 +22,7 @@ crate-type = ["cdylib", "rlib"]
 tightbeam-rs = { workspace = true, features = [
 	"std",
 	"transport-ecies",
+	"transport-multiplex",
 	"async-transport",
 	"wasm",
 	"time",
@@ -30,8 +31,17 @@ tightbeam-rs = { workspace = true, features = [
 der = { workspace = true, features = ["alloc", "derive", "oid"] }
 gloo-net = { workspace = true, features = ["websocket"] }
 futures-util = { workspace = true, features = ["std", "sink"] }
+js-sys = { workspace = true }
 wasm-bindgen = { workspace = true }
 wasm-bindgen-futures = { workspace = true }
+web-sys = { workspace = true, features = [
+	"AbortSignal",
+	"AddEventListenerOptions",
+	"CloseEvent",
+	"Event",
+	"EventTarget",
+	"WebSocket",
+] }
 
 # The zstd feature is host-only (std I/O): it backs the compression interop
 # tests, which run natively, and never enters the wasm32 lib build.

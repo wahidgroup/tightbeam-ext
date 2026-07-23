@@ -1,7 +1,7 @@
 import type { SignedRoundTripResult } from "../app/main.js";
 import { expect, test } from "@playwright/test";
 
-import { wsEndpoint } from "../env.js";
+import { muxClearEndpoint } from "../env.js";
 import { openApp } from "./helpers.js";
 
 test("signs a frame, echoes it, and verifies the round-tripped signature", async ({
@@ -19,7 +19,7 @@ test("signs a frame, echoes it, and verifies the round-tripped signature", async
 				"0101010101010101010101010101010101010101010101010101010101010101",
 				"5a5a5a5a",
 			),
-		{ url: wsEndpoint },
+		{ url: muxClearEndpoint },
 	);
 	expect(result.bodyHex).toBe("cafebabe0042");
 	expect(result.idText).toBe("e2e-signed");

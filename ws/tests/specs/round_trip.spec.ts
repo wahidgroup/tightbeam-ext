@@ -1,7 +1,7 @@
 import type { RoundTripResult } from "../app/main.js";
 import { expect, test } from "@playwright/test";
 
-import { wsEndpoint } from "../env.js";
+import { muxClearEndpoint } from "../env.js";
 import { openApp } from "./helpers.js";
 
 interface RoundTripCase {
@@ -37,7 +37,7 @@ for (const testCase of cases) {
 			({ url, payload, id, order }) =>
 				window.tbRoundTrip(url, payload, id, order),
 			{
-				url: wsEndpoint,
+				url: muxClearEndpoint,
 				payload: testCase.payloadHex,
 				id: testCase.id,
 				order: testCase.order,

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import type { Frame, MessageCodec } from "@wahidgroup/tightbeam-ws-client";
+import type { MessageCodec } from "@wahidgroup/tightbeam-ws-client";
 import {
 	Aes256Gcm,
 	EciesDecryptor,
@@ -10,57 +10,32 @@ import {
 	Secp256k1SigningKey,
 	Sha3_256,
 	TightbeamWsClient,
-	TightbeamWsSecureClient,
 	ZstdCompression,
 	frame,
 	wrapped,
 } from "@wahidgroup/tightbeam-ws-client";
 
-import { certBytes, secureEndpoint, sinkEndpoint, wsEndpoint } from "../env.js";
+import {
+	certBytes,
+	muxClearEndpoint,
+	muxEndpoint,
+	muxMutualEndpoint,
+} from "../env.js";
+import { NobleTransportSigner } from "../signer.js";
+import { emitOrFail, withClient } from "./harness.js";
 
 /**
- * The emit surface shared by the cleartext and encrypted clients.
- */
-interface EmitClient {
-	emit(frame: Frame): Promise<Frame | undefined>;
-}
-
-/**
- * Open a client via `connect`, run the test body, and always release the
- * socket.
- */
-async function withClient<TClient extends { close(): void }>(
-	connect: () => Promise<TClient>,
-	run: (client: TClient) => Promise<void>,
-): Promise<void> {
-	const client = await connect();
-	try {
-		await run(client);
-	} finally {
-		client.close();
-	}
-}
-
-/**
- * Open a cleartext client against the echo server.
+ * Open a cleartext multiplexed client against the echo server. The frame
+ * features under test are transport-agnostic, so the cleartext lane keeps
+ * these round-trips fast; the encrypted lanes are covered explicitly.
  */
 async function withEchoClient(
 	run: (client: TightbeamWsClient) => Promise<void>,
 ): Promise<void> {
-	await withClient(() => TightbeamWsClient.connect(wsEndpoint), run);
-}
-
-/**
- * Emit `built` and return the response frame; a missing response fails the
- * round-trip.
- */
-async function emitOrFail(client: EmitClient, built: Frame): Promise<Frame> {
-	const response = await client.emit(built);
-	if (response === undefined) {
-		throw new Error("the peer returned no response frame");
-	}
-
-	return response;
+	await withClient(
+		() => TightbeamWsClient.connectCleartext(muxClearEndpoint),
+		run,
+	);
 }
 
 const TEXT = new TextDecoder();
@@ -69,7 +44,7 @@ const SIGNING_KEY = Secp256k1SigningKey.fromBytes(new Uint8Array(32).fill(3));
 const SALT = new Uint8Array([0x5a, 0x5a]);
 
 describe("Node round-trips against the dockerized echo server", () => {
-	it("round-trips a cleartext frame over Node's global WebSocket", async () => {
+	it("round-trips a frame over Node's global WebSocket", async () => {
 		await withEchoClient(async (client) => {
 			const built = await frame(BODY)
 				.withId("node-e2e")
@@ -216,25 +191,22 @@ describe("Node round-trips against the dockerized echo server", () => {
 	});
 
 	it("resolves undefined when the server accepts without a response frame", async () => {
-		await withClient(
-			() => TightbeamWsClient.connect(sinkEndpoint),
-			async (client) => {
-				const built = await frame(BODY)
-					.withId("node-sink")
-					.withOrder(10)
-					.build();
+		await withEchoClient(async (client) => {
+			const built = await frame(BODY)
+				.withId("sink-node")
+				.withOrder(10)
+				.build();
 
-				const response = await client.emit(built);
-				expect(response).toBeUndefined();
-			},
-		);
+			const response = await client.emit(built);
+			expect(response).toBeUndefined();
+		});
 	});
 
 	it("round-trips over an ECIES-encrypted session", async () => {
 		const serverCert = certBytes("server.cert.der");
 
 		await withClient(
-			() => TightbeamWsSecureClient.connect(secureEndpoint, serverCert),
+			() => TightbeamWsClient.connect(muxEndpoint, serverCert),
 			async (client) => {
 				const built = await frame(BODY)
 					.withId("node-secure")
@@ -244,6 +216,30 @@ describe("Node round-trips against the dockerized echo server", () => {
 				const response = await emitOrFail(client, built);
 				expect(response.message(Opaque)).toEqual(BODY);
 				expect(TEXT.decode(response.id)).toBe("node-secure");
+			},
+		);
+	});
+
+	it("authenticates mutually through an external transport signer", async () => {
+		const signer = new NobleTransportSigner(certBytes("client.key"));
+
+		await withClient(
+			() =>
+				TightbeamWsClient.connectMutual(
+					muxMutualEndpoint,
+					certBytes("server.cert.der"),
+					certBytes("client.cert.der"),
+					signer,
+				),
+			async (client) => {
+				const built = await frame(BODY)
+					.withId("node-mutual-signer")
+					.withOrder(11)
+					.build();
+
+				const response = await emitOrFail(client, built);
+				expect(response.message(Opaque)).toEqual(BODY);
+				expect(signer.signatures).toBe(1);
 			},
 		);
 	});

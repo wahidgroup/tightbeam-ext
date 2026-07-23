@@ -1,7 +1,7 @@
 import type { SealedRoundTripResult } from "../app/main.js";
 import { expect, test } from "@playwright/test";
 
-import { wsEndpoint } from "../env.js";
+import { muxClearEndpoint } from "../env.js";
 import { openApp } from "./helpers.js";
 
 test("seals a body with AES-256-GCM, echoes it, and opens it with the key", async ({
@@ -18,7 +18,7 @@ test("seals a body with AES-256-GCM, echoes it, and opens it with the key", asyn
 				14,
 				"0707070707070707070707070707070707070707070707070707070707070707",
 			),
-		{ url: wsEndpoint },
+		{ url: muxClearEndpoint },
 	);
 	expect(result.confidential).toBe(true);
 	expect(result.confidentialityOid).toBe("2.16.840.1.101.3.4.1.46");

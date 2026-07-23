@@ -12,11 +12,11 @@ tightbeam frames are DER-encoded and streamed over raw TCP by `tightbeam::transp
 
 ## Features
 
-- `testing` - test-support module with X.509 identity fixtures for encrypted end-to-end tests and examples (`gen_certs`, `echo_server_secure`).
+- `testing` - test-support module with X.509 identity fixtures and the shared multiplexed echo behavior for encrypted end-to-end tests and examples (`gen_certs`, `echo_server_mux`, `echo_server_mux_clear`).
 
 ## Limitations
 
-- Cleartext `ws://` only; `wss://` (TLS) is not implemented yet. Transport privacy is provided by tightbeam's ECIES handshake on top of the cleartext socket.
+- The listener has no native TLS acceptor: it binds `ws://` only. This does not gate security or `wss://` deployments. Authentication and confidentiality come from tightbeam's ECIES handshake above the socket, and browsers on `https://` pages connect over `wss://` by terminating TLS in front (reverse proxy, load balancer) and forwarding `ws://` to this crate.
 
 ## Related
 
@@ -24,4 +24,4 @@ The browser counterpart lives in [tightbeam-ws-wasm](../tightbeam-ws-wasm), pack
 
 ## License
 
-Licensed under either of [MIT](../../LICENSE-MIT) or [Apache-2.0](../../LICENSE-APACHE) at your option.
+Licensed under either of [MIT](./LICENSE-MIT) or [Apache-2.0](./LICENSE-APACHE) at your option.
