@@ -24,6 +24,7 @@ testing = ["tightbeam-rs/aead"]
 [[example]]
 name = "pubsub_demo_server"
 required-features = ["testing"]
+test = true
 
 [[example]]
 name = "pubsub_processor_server"

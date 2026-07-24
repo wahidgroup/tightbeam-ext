@@ -20,6 +20,10 @@
 //!   single consumer task.
 //! - Every attached sink observes every update, including the publishing
 //!   node's own.
+//! - Per-topic counters persist for the backplane's lifetime: dense
+//!   ordering cannot forget a topic's last order. The subscribe and
+//!   publish policies are the boundary that keeps the topic namespace
+//!   (and so the counter set) application-controlled.
 
 use core::fmt;
 use std::collections::HashMap;

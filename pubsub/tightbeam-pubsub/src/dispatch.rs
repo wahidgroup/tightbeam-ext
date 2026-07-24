@@ -101,7 +101,15 @@ impl<P: SubscribePolicy> PubsubCommands<P> {
 			return Err(refusal(TransitStatus::InvalidArgument));
 		};
 
-		let identity = self.registry.identity(connection);
+		/*
+		 * A dropped (or never-admitted) connection has no standing:
+		 * refusing here keeps revocation authoritative instead of
+		 * degrading the caller to anonymous access.
+		 */
+		let Some(identity) = self.registry.member_identity(connection) else {
+			return Err(refusal(TransitStatus::PermissionDenied));
+		};
+
 		let verdict = authorize(identity.as_deref(), &topic);
 		if verdict == AccessVerdict::Forbid {
 			return Err(refusal(TransitStatus::PermissionDenied));
@@ -122,9 +130,9 @@ impl<P: SubscribePolicy> PubsubCommands<P> {
 		match self.registry.register(connection, topic) {
 			Ok(_) => accepted(),
 			Err(RegisterError::Draining) => refusal(TransitStatus::Unavailable),
-			// The connection was never registered with the registry: a
-			// server wiring fault, not something the client caused.
-			Err(RegisterError::UnknownConnection) => refusal(TransitStatus::Internal),
+			// The connection dropped between authorization and
+			// registration: the same no-standing refusal as the preamble.
+			Err(RegisterError::UnknownConnection) => refusal(TransitStatus::PermissionDenied),
 		}
 	}
 
@@ -341,6 +349,17 @@ mod tests {
 
 		let answer = answered(&commands, connection, &tick_publish());
 		assert_eq!(answer.status(), TransitStatus::Ok);
+	}
+
+	#[tokio::test]
+	async fn commands_from_a_dropped_connection_answer_permission_denied() {
+		let (commands, registry, connection, _peer) = publisher(AllowAll, AllowAll);
+		registry.drop_connection(connection);
+
+		let publish = answered(&commands, connection, &tick_publish());
+		let subscribe = answered(&commands, connection, &command("sub/prices"));
+		assert_eq!(publish.status(), TransitStatus::PermissionDenied);
+		assert_eq!(subscribe.status(), TransitStatus::PermissionDenied);
 	}
 
 	#[tokio::test]

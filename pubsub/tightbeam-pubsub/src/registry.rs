@@ -298,7 +298,17 @@ impl TopicRegistry {
 	/// [`register_connection_as`](Self::register_connection_as); `None`
 	/// for an anonymous connection.
 	pub fn identity(&self, connection: ConnectionId) -> Option<Arc<[u8]>> {
-		self.lock_state().connections.get(&connection)?.identity.clone()
+		self.member_identity(connection).flatten()
+	}
+
+	/// The caller's identity while `connection` is registered: `None`
+	/// once the connection was dropped (or never admitted), so a revoked
+	/// caller never degrades to anonymous access, and `Some(None)` for a
+	/// registered anonymous connection.
+	pub fn member_identity(&self, connection: ConnectionId) -> Option<Option<Arc<[u8]>>> {
+		let state = self.lock_state();
+		let connected = state.connections.get(&connection)?;
+		Some(connected.identity.clone())
 	}
 
 	/// Subscribe `connection` to `topic`, spawning its delivery task.
@@ -565,8 +575,13 @@ impl UpdateSink for Inner {
 		}
 
 		let update = Arc::new(update_frame(topic, order, payload)?);
-		let entry = state.topics.entry(topic.clone()).or_default();
-		entry.last_order = entry.last_order.max(order);
+		/*
+		 * Only subscribed topics keep state: the backplane owns the order
+		 * counter, so publishes to arbitrary names never grow the map.
+		 */
+		if let Some(entry) = state.topics.get_mut(topic) {
+			entry.last_order = entry.last_order.max(order);
+		}
 
 		let doomed = self.fan_out(&state, topic, &update);
 		drop(state);
@@ -585,6 +600,13 @@ fn remove_subscriber(state: &mut State, id: SubscriberId) {
 	};
 	if let Some(entry) = state.topics.get_mut(&subscriber.topic) {
 		entry.members.remove(&id);
+		/*
+		 * Prune the emptied topic so churn over unique names never grows
+		 * the map without bound; the backplane keeps the order counter.
+		 */
+		if entry.members.is_empty() {
+			state.topics.remove(&subscriber.topic);
+		}
 	}
 
 	subscriber.close();
@@ -728,6 +750,26 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn member_identity_requires_a_live_registration() {
+		let (registry, connection, _peer) = registered(RegistryOptions::default());
+		assert!(registry.member_identity(connection).is_some());
+
+		registry.drop_connection(connection);
+		assert!(registry.member_identity(connection).is_none());
+	}
+
+	#[tokio::test]
+	async fn unregister_prunes_the_emptied_topic() {
+		let (registry, connection, _peer) = registered(RegistryOptions::default());
+		subscribed(&registry, connection, "prices");
+
+		registry.unregister(connection, &topic("prices"));
+
+		let state = registry.lock_state();
+		assert!(!state.topics.contains_key(&topic("prices")));
+	}
+
+	#[tokio::test]
 	async fn unregister_forgets_the_membership() {
 		let (registry, connection, _peer) = registered(RegistryOptions::default());
 
@@ -753,13 +795,25 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn publish_sequences_topics_without_subscribers() {
-		let registry = TopicRegistry::default();
+	async fn publish_to_a_memberless_topic_retains_no_state() {
+		let (registry, connection, _peer) = registered(RegistryOptions::default());
 		published(&registry, "silence", b"tick");
 		published(&registry, "silence", b"tock");
 
+		{
+			let state = registry.lock_state();
+			assert!(!state.topics.contains_key(&topic("silence")));
+		}
+
+		/*
+		 * The backplane kept the counter: a late subscriber still
+		 * observes the continued dense sequence.
+		 */
+		subscribed(&registry, connection, "silence");
+		published(&registry, "silence", b"third");
+
 		let state = registry.lock_state();
-		assert_eq!(state.topics[&topic("silence")].last_order, 2);
+		assert_eq!(state.topics[&topic("silence")].last_order, 3);
 	}
 
 	/// Delivery policy returning one fixed verdict.
@@ -828,9 +882,12 @@ mod tests {
 		assert_eq!(queued_orders(&subscriber), [1]);
 	}
 
-	#[test]
-	fn publish_stamps_dense_per_topic_orders() {
-		let registry = TopicRegistry::default();
+	#[tokio::test]
+	async fn publish_stamps_dense_per_topic_orders() {
+		let (registry, connection, _peer) = registered(RegistryOptions::default());
+		subscribed(&registry, connection, "prices");
+		subscribed(&registry, connection, "chat");
+
 		published(&registry, "prices", b"one");
 		published(&registry, "prices", b"two");
 		published(&registry, "chat", b"hello");

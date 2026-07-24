@@ -25,6 +25,7 @@
 //!     relay dial pins (required with the endpoint)
 
 use core::fmt;
+use core::time::Duration;
 use std::env::var;
 use std::error::Error;
 use std::fs;
@@ -46,6 +47,7 @@ use tightbeam_ws::protocol::WsListener;
 use tightbeam_ws::testing::{env_u32, pinned_trust, serve_handshake, Identity};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
+use tokio::time::timeout;
 use tokio_tungstenite::{connect_async, MaybeTlsStream};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -76,6 +78,11 @@ impl Error for RelayClosed {}
 /// servlet over the demo server's own tightbeam mux connection, and the
 /// servlet's answer is what gets sequenced and fanned out. Composes the
 /// stock [`Local`] for sequencing and sink management.
+///
+/// A publish acks once enqueued (the distributed-backplane contract, so
+/// relay delivery is at-most-once). A processor failure closes the
+/// relay: every later publish answers `Unavailable` instead of
+/// silently dropping.
 struct RelayBackplane {
 	local: Local,
 	requests: UnboundedSender<(Topic, Vec<u8>)>,
@@ -102,35 +109,58 @@ impl RelayBackplane {
 		tokio::spawn(reader_driver.drive());
 		tokio::spawn(writer_driver.drive());
 
+		Ok(Self::spawned(handle))
+	}
+
+	/// Spawn the relay worker over an established processor `handle`.
+	///
+	/// One worker drains the queue, so deliveries stay serialized per
+	/// topic: the backplane contract.
+	fn spawned(handle: MuxHandle) -> Arc<Self> {
 		let (requests, mut queue) = unbounded_channel::<(Topic, Vec<u8>)>();
 		let backplane = Arc::new(Self { local: Local::default(), requests });
 
-		/*
-		 * One worker drains the queue, so deliveries stay serialized per
-		 * topic: the backplane contract.
-		 */
 		let relay = Arc::clone(&backplane);
 		tokio::spawn(async move {
 			while let Some((topic, payload)) = queue.recv().await {
 				match process(&handle, &topic, &payload).await {
 					Ok(processed) => {
+						/*
+						 * A local refusal is the registry quiescing: an
+						 * orderly end for an update enqueued before it.
+						 */
 						if let Err(error) = relay.local.publish(&topic, &processed) {
-							eprintln!("[pubsub-demo] relay delivery failed: {error}");
+							eprintln!("[pubsub-demo] relay delivery refused: {error}");
 						}
 					}
-					Err(error) => eprintln!("[pubsub-demo] processor request failed: {error}"),
+					Err(error) => {
+						/*
+						 * The processor link is broken: stop the worker so
+						 * the closed queue turns every later publish into
+						 * an Unavailable answer instead of a silent drop.
+						 */
+						eprintln!("[pubsub-demo] processor request failed, closing the relay: {error}");
+						return;
+					}
 				}
 			}
 		});
 
-		Ok(backplane)
+		backplane
 	}
 }
 
-/// One round-trip to the processor: raw payload out, processed back.
+/// How long one processor round-trip may take: an emit on a lost mux
+/// link can hang rather than error, so a timeout means the relay link
+/// is dead.
+const PROCESSOR_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// One bounded round-trip to the processor: raw payload out, processed
+/// back.
 async fn process(handle: &MuxHandle, topic: &Topic, payload: &[u8]) -> Result<Vec<u8>, BoxError> {
 	let request = command_frame(topic.as_str(), 1, payload)?;
-	let answer = handle.emit_on_stream(&request).await?.ok_or(RelayClosed)?;
+	let emitted = timeout(PROCESSOR_TIMEOUT, handle.emit_on_stream(&request)).await?;
+	let answer = emitted?.ok_or(RelayClosed)?;
 	Ok(opaque_payload(&answer)?)
 }
 
@@ -271,5 +301,51 @@ async fn main() -> Result<(), BoxError> {
 				eprintln!("[pubsub-demo] connection from {peer} ended: {error}");
 			}
 		});
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use core::time::Duration;
+
+	use tightbeam_pubsub::testing::memory_mux_pair;
+
+	use super::*;
+
+	fn topic(name: &str) -> Topic {
+		name.parse().expect("test topics should parse")
+	}
+
+	/// Publish until the relay refuses with `Unavailable`, or give up:
+	/// the worker observes the processor failure asynchronously, no
+	/// sooner than [`PROCESSOR_TIMEOUT`] on a hung link.
+	async fn relay_refused(backplane: &RelayBackplane, topic: &Topic) -> bool {
+		for _ in 0..50 {
+			let outcome = backplane.publish(topic, b"tick");
+			if matches!(outcome, Err(BackplaneError::Unavailable(_))) {
+				return true;
+			}
+
+			tokio::time::sleep(Duration::from_millis(100)).await;
+		}
+
+		false
+	}
+
+	#[tokio::test]
+	async fn a_processor_failure_closes_the_relay() {
+		let (client, server) = memory_mux_pair(4);
+		let (handle, reader_driver, writer_driver, _responder) = server.into_parts();
+		tokio::spawn(reader_driver.drive());
+		tokio::spawn(writer_driver.drive());
+		/*
+		 * A dropped peer closes the link: every processor request fails,
+		 * and the first failure the worker observes must close the
+		 * relay instead of acking publishes into a void.
+		 */
+		drop(client);
+
+		let backplane = RelayBackplane::spawned(handle);
+		assert!(relay_refused(&backplane, &topic("prices")).await);
 	}
 }
