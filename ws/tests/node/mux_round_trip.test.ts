@@ -102,11 +102,28 @@ describe.each(LANES)(
 					.withId("call-me-node")
 					.withOrder(1)
 					.build();
-				const response = await emitOrFail(client, built);
 
+				const response = await emitOrFail(client, built);
 				expect(served).toEqual(["call-me-node"]);
 				expect(TEXT.decode(response.id)).toBe("client-reply");
 				expect(response.message(Opaque)).toEqual(REPLY_BODY);
+			});
+		});
+
+		it("accepts a bodiless null answer from the handler", async () => {
+			await withClient(connect, async (client) => {
+				/*
+				 * `null` and `undefined` both mean a bodiless acceptance.
+				 * The server relays it as a response without a frame, so
+				 * the original emit resolves with undefined.
+				 */
+				client.serve(() => null);
+
+				const built = await frame(new Uint8Array([0xb0, 0x24]))
+					.withId("call-me-bodiless")
+					.withOrder(1)
+					.build();
+				await expect(client.emit(built)).resolves.toBeUndefined();
 			});
 		});
 

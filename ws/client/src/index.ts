@@ -391,11 +391,25 @@ export async function initClient(
 
 /**
  * Answers one server-initiated stream: receives the decoded request frame
- * and returns the response frame, or `undefined` for a bodiless acceptance.
+ * and returns the response frame, or `undefined`/`null` for a bodiless
+ * acceptance.
  */
 export type MuxStreamHandler = (
 	frame: Frame,
-) => Promise<Frame | undefined> | Frame | undefined;
+) => Promise<Frame | undefined | null> | Frame | undefined | null;
+
+/**
+ * Options accepted by {@link TightbeamWsClient.serve}.
+ */
+export interface ServeOptions {
+	/**
+	 * Claim stream dispatch exclusively: every later `serve` call on
+	 * this client throws instead of silently replacing the handler.
+	 * For one dispatch owner (the `SubscriptionManager`) composing
+	 * application routes underneath itself.
+	 */
+	readonly exclusive?: boolean;
+}
 
 /**
  * A multiplexed tightbeam client over a single WebSocket session,
@@ -410,6 +424,12 @@ export class TightbeamWsClient extends SocketLifecycle<MuxWsClient> {
 	private finalGoawayReason: GoAwayReason | undefined;
 	private finalGoawayCode: number | undefined;
 	private finalMaxConcurrentStreams = 0;
+
+	/**
+	 * Set by an {@link ServeOptions.exclusive} claim: dispatch belongs
+	 * to one owner and later {@link serve} calls throw.
+	 */
+	private serveClaimed = false;
 
 	private constructor(socket: MuxWsClient) {
 		super(socket);
@@ -563,15 +583,25 @@ export class TightbeamWsClient extends SocketLifecycle<MuxWsClient> {
 	 * and streams already in flight finish on the handler they started
 	 * with. Handlers for distinct streams run concurrently.
 	 */
-	serve(handler: MuxStreamHandler): void {
+	serve(handler: MuxStreamHandler, options?: ServeOptions): void {
 		this.requireLive("serve");
+		if (this.serveClaimed) {
+			throw new Error(
+				"stream dispatch is exclusively claimed on this client " +
+					"(a SubscriptionManager?); route application streams " +
+					"through the claimant instead of calling serve again",
+			);
+		}
+		if (options?.exclusive === true) {
+			this.serveClaimed = true;
+		}
 
 		this.socket.serve(
 			(requestDer: Uint8Array): Promise<Uint8Array | undefined> => {
 				const respond = async (): Promise<Uint8Array | undefined> => {
 					const request = Frame.fromDer(requestDer);
 					const response = await handler(request);
-					if (response === undefined) {
+					if (response === undefined || response === null) {
 						return undefined;
 					}
 

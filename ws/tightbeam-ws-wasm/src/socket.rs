@@ -113,8 +113,7 @@ type OpenWatchSlot = Rc<RefCell<Option<OpenWatch>>>;
 /// A promise settled by a connecting socket's first lifecycle event:
 /// `open` resolves it, `close` rejects it with a structured
 /// `ConnectionClosed` error. Whichever event fires first takes the watch,
-/// detaching both listeners and freeing both closures; the second event
-/// finds the slot empty.
+/// detaching both listeners and freeing both closures.
 fn open_promise(raw: &web_sys::WebSocket) -> Promise {
 	let target = raw.clone();
 	Promise::new(&mut move |resolve: Function, reject: Function| {

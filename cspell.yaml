@@ -18,6 +18,11 @@ words:
   - dtolnay
   - changelog
   - backport
+  - backplane
+  - backplanes
+  - tock
+  - XADD
+  - macrotask
   - Tanveer
   - Wahid
   - wahidgroup
@@ -53,9 +58,11 @@ words:
   - spki
   - signingkey
   - passthroughs
+  - passthru
   - submod
   - demultiplex
   - unrouted
+  - unrouting
   - bindgen
   - oids
   - cbor
@@ -78,6 +85,18 @@ words:
   - rlib
   - thenables
   - bivariant
+  - unsub
+  - unsuback
+  - mqtt
+  - fanout
+  - backpressure
+  - acks
+  - deque
+  - quiesces
+  - quiescing
+  - uppercased
+  - uppercases
+  - baselined
 ignorePaths:
   - node_modules/**
   - "**/sbom.json"

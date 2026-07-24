@@ -1,0 +1,58 @@
+# Pubsub extension services, composed on top of ws/docker-compose.yml by
+# scripts/stack.sh. The demo server shares the echo image and the command
+# selects the pubsub binary.
+
+services:
+  pubsub-demo:
+    image: ${ECHO_IMAGE:-tightbeam-ws-echo:dev}
+    command: ["pubsub-demo-server"]
+    environment:
+      PUBSUB_WS_PORT: "9110"
+      PUBSUB_QUEUE_CAPACITY: "${PUBSUB_QUEUE_CAPACITY:-32}"
+    ports:
+      - "${PUBSUB_WS_HOST_PORT:-9110}:9110"
+    # The image healthcheck probes the echo port.
+    healthcheck:
+      test:
+        ["CMD-SHELL", "ss -ltn 'sport = :9110' | grep -q LISTEN || exit 1"]
+      interval: 3s
+      timeout: 2s
+      start_period: 3s
+      retries: 30
+
+  # Backend-only payload processor: no host port, only the processed demo
+  # server dials it (over tightbeam ws mux on the compose network).
+  pubsub-processor:
+    image: ${ECHO_IMAGE:-tightbeam-ws-echo:dev}
+    command: ["pubsub-processor-server"]
+    environment:
+      PUBSUB_PROCESSOR_PORT: "9111"
+    healthcheck:
+      test:
+        ["CMD-SHELL", "ss -ltn 'sport = :9111' | grep -q LISTEN || exit 1"]
+      interval: 3s
+      timeout: 2s
+      start_period: 3s
+      retries: 30
+
+  # A second demo instance whose RelayBackplane routes every publish
+  # through the processor servlet before fan-out.
+  pubsub-demo-processed:
+    image: ${ECHO_IMAGE:-tightbeam-ws-echo:dev}
+    command: ["pubsub-demo-server"]
+    environment:
+      PUBSUB_WS_PORT: "9110"
+      PUBSUB_QUEUE_CAPACITY: "${PUBSUB_QUEUE_CAPACITY:-32}"
+      PUBSUB_PROCESSOR_ENDPOINT: "ws://pubsub-processor:9111"
+    depends_on:
+      pubsub-processor:
+        condition: service_healthy
+    ports:
+      - "${PUBSUB_PROCESSED_WS_HOST_PORT:-9112}:9110"
+    healthcheck:
+      test:
+        ["CMD-SHELL", "ss -ltn 'sport = :9110' | grep -q LISTEN || exit 1"]
+      interval: 3s
+      timeout: 2s
+      start_period: 3s
+      retries: 30
