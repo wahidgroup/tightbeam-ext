@@ -44,9 +44,6 @@ endef
 # npm root the repo-wide tooling (cspell) resolves from.
 NPM_ROOT := ws
 
-# Cargo feature passthroughs (e.g., `make build features="testing"`).
-CARGO_FLAGS := $(if $(features),--features "$(features)") $(if $(no-default),--no-default-features)
-
 ifneq ($(filter 1,$(fix)),)
 LINT_MODE := fix
 else
@@ -142,12 +139,10 @@ all: build client
 	@echo "Build complete: Rust workspace + client packages."
 
 check: setup
-	@echo "Checking $(PROJECT)..."
-	cargo check --all-targets $(CARGO_FLAGS)
+	$(call EACH_PROJECT,check)
 
 build: setup
-	@echo "Building $(PROJECT)..."
-	cargo build --release $(CARGO_FLAGS)
+	$(call EACH_PROJECT,build)
 
 clean:
 	@echo "Cleaning build artifacts..."
@@ -195,7 +190,7 @@ audit: setup
 
 ci:
 	$(MAKE) lint SCOPE="$(SCOPE)"
-	$(MAKE) build
+	$(MAKE) build SCOPE="$(SCOPE)"
 	$(MAKE) test SCOPE="$(SCOPE)"
 	$(MAKE) wasm SCOPE="$(SCOPE)"
 	$(MAKE) client SCOPE="$(SCOPE)"

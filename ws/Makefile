@@ -2,7 +2,7 @@
 # client. Invoked directly (make -C ws <target>) or through the repo root
 # Makefile, which scopes targets by project (make test ws).
 
-.PHONY: setup test lint wasm client sbom smoke pack
+.PHONY: setup check build test lint wasm client sbom smoke pack
 
 REPO := ..
 CRATES := -p tightbeam-ws -p tightbeam-ws-wasm
@@ -23,6 +23,14 @@ endif
 
 setup:
 	@$(REPO)/scripts/setup.sh ws
+
+check:
+	@echo "Checking ws crates..."
+	cargo check $(CRATES) --all-targets $(CARGO_FLAGS)
+
+build:
+	@echo "Building ws crates..."
+	cargo build --release $(CRATES) $(CARGO_FLAGS)
 
 test: client
 	@echo "Running ws cargo tests..."
