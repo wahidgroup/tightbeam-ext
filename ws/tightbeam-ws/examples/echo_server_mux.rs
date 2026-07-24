@@ -26,17 +26,15 @@ use std::sync::Arc;
 
 use tightbeam::crypto::hash::Sha3_256;
 use tightbeam::crypto::x509::policy::{CertificateValidation, RuntimeCertificatePinning};
-use tightbeam::der::{Decode, Encode};
+use tightbeam::der::Decode;
 use tightbeam::prelude::TightBeamSocketAddr;
 use tightbeam::transport::handshake::negotiation::TransportOffer;
-use tightbeam::transport::handshake::TcpHandshakeState;
 use tightbeam::transport::multiplex::{MuxRole, MuxTransport};
-use tightbeam::transport::state::EncryptedProtocolState;
-use tightbeam::transport::{EncryptedMessageIO, EncryptedProtocol, MessageIO, WireEnvelope};
+use tightbeam::transport::EncryptedProtocol;
 use tightbeam::x509::Certificate;
 use tightbeam_ws::io::WsTransport;
 use tightbeam_ws::protocol::WsListener;
-use tightbeam_ws::testing::{echo_stream, env_u32, Identity};
+use tightbeam_ws::testing::{echo_stream, env_u32, serve_handshake, Identity};
 use tokio::net::TcpStream;
 use tokio_tungstenite::MaybeTlsStream;
 
@@ -44,35 +42,6 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 /// The transport an accepted WebSocket connection follows.
 type ServerTransport = WsTransport<MaybeTlsStream<TcpStream>>;
-
-/// Handshake message ceiling: ECIES completes in two client messages, so
-/// anything beyond a small bound is a protocol violation.
-const MAX_HANDSHAKE_MESSAGES: usize = 4;
-
-/// Drive the server-side ECIES handshake to completion over cleartext
-/// containers, bounded by [`MAX_HANDSHAKE_MESSAGES`].
-async fn serve_handshake(transport: &mut ServerTransport) -> Result<(), BoxError> {
-	for _ in 0..MAX_HANDSHAKE_MESSAGES {
-		if transport.to_handshake_state() == TcpHandshakeState::Complete {
-			return Ok(());
-		}
-
-		let wire_bytes = transport.read_envelope().await?;
-		let wire_envelope = WireEnvelope::from_der(&wire_bytes)?;
-		let WireEnvelope::Cleartext(envelope) = wire_envelope else {
-			return Err("handshake containers must be cleartext".into());
-		};
-
-		let handshake_bytes = envelope.to_der()?;
-		transport.perform_server_handshake(&handshake_bytes).await?;
-	}
-
-	if transport.to_handshake_state() == TcpHandshakeState::Complete {
-		return Ok(());
-	}
-
-	Err("handshake did not complete within the message ceiling".into())
-}
 
 /// Serve one multiplexed connection until it ends.
 async fn serve_connection(mut transport: ServerTransport, peer_cap: u32) -> Result<(), BoxError> {

@@ -1,6 +1,9 @@
 # Pubsub extension services, composed on top of ws/docker-compose.yml by
 # scripts/stack.sh. The demo server shares the echo image and the command
-# selects the pubsub binary.
+# selects the pubsub binary. Every service presents the stack's shared
+# server identity (gen_certs, bind-mounted under /certs), so every hop is
+# ECIES encrypted: browser to demo server, and the processed demo server's
+# relay dial to the processor.
 
 services:
   pubsub-demo:
@@ -9,6 +12,10 @@ services:
     environment:
       PUBSUB_WS_PORT: "9110"
       PUBSUB_QUEUE_CAPACITY: "${PUBSUB_QUEUE_CAPACITY:-32}"
+      TBWS_SERVER_CERT: /certs/server.cert.der
+      TBWS_SERVER_KEY: /certs/server.key
+    volumes:
+      - ${CERT_DIR:?}:/certs:ro
     ports:
       - "${PUBSUB_WS_HOST_PORT:-9110}:9110"
     # The image healthcheck probes the echo port.
@@ -21,12 +28,16 @@ services:
       retries: 30
 
   # Backend-only payload processor: no host port, only the processed demo
-  # server dials it (over tightbeam ws mux on the compose network).
+  # server dials it (over encrypted tightbeam ws mux on the compose network).
   pubsub-processor:
     image: ${ECHO_IMAGE:-tightbeam-ws-echo:dev}
     command: ["pubsub-processor-server"]
     environment:
       PUBSUB_PROCESSOR_PORT: "9111"
+      TBWS_SERVER_CERT: /certs/server.cert.der
+      TBWS_SERVER_KEY: /certs/server.key
+    volumes:
+      - ${CERT_DIR:?}:/certs:ro
     healthcheck:
       test:
         ["CMD-SHELL", "ss -ltn 'sport = :9111' | grep -q LISTEN || exit 1"]
@@ -36,7 +47,8 @@ services:
       retries: 30
 
   # A second demo instance whose RelayBackplane routes every publish
-  # through the processor servlet before fan-out.
+  # through the processor servlet before fan-out, pinning the processor's
+  # certificate for its own encrypted dial.
   pubsub-demo-processed:
     image: ${ECHO_IMAGE:-tightbeam-ws-echo:dev}
     command: ["pubsub-demo-server"]
@@ -44,6 +56,11 @@ services:
       PUBSUB_WS_PORT: "9110"
       PUBSUB_QUEUE_CAPACITY: "${PUBSUB_QUEUE_CAPACITY:-32}"
       PUBSUB_PROCESSOR_ENDPOINT: "ws://pubsub-processor:9111"
+      PUBSUB_PROCESSOR_CERT: /certs/server.cert.der
+      TBWS_SERVER_CERT: /certs/server.cert.der
+      TBWS_SERVER_KEY: /certs/server.key
+    volumes:
+      - ${CERT_DIR:?}:/certs:ro
     depends_on:
       pubsub-processor:
         condition: service_healthy

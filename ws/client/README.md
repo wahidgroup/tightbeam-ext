@@ -10,7 +10,7 @@ TypeScript/WebAssembly client for the [tightbeam](https://crates.io/crates/tight
 
 ## Abstract
 
-This package is tightbeam in TypeScript. The frame codec (the ASN.1 DER structure engine) is the actual Rust implementation, compiled from [`tightbeam-ws-wasm`](../tightbeam-ws-wasm) with `wasm-pack`. The TypeScript layer adds the builder, validation, and connection handling. What tightbeam-rs offers, this client offers under the same names:
+This package is tightbeam in TypeScript. The frame codec (the ASN.1 DER engine) is the Rust implementation itself, compiled from [`tightbeam-ws-wasm`](../tightbeam-ws-wasm) with `wasm-pack`. The TypeScript layer adds the builder, the typed message envelope, validation, and connection handling. The tightbeam-rs surface carries over under the same names:
 
 - The builder: `withSigner`, `withEncryptor`, `withMessageHasher`, the version floor rules, `assertVersion`.
 - The `Frame`: `verify`, `frameIntegrityVerdict`, `messageCommitmentVerdict`, `decryptMessage`, and the same enums with the same ordinals (`Version`, `MessagePriority`).
@@ -35,6 +35,7 @@ Two wasm bundles ship in the package, a `web` build and a `nodejs` build, select
 - [Custom cryptography](#custom-cryptography)
 - [Compression](#compression)
 - [Verification and decryption](#verification-and-decryption)
+- [Envelopes](#envelopes)
 - [Detached commitments](#detached-commitments)
 - [License](#license)
 
@@ -142,7 +143,7 @@ mux.serve(async (request) => {
 		.withId("reply")
 		.withOrder(1)
 		.build();
-	return reply; // or undefined for a bodiless acceptance
+	return reply; // or undefined/null for a bodiless acceptance
 });
 
 // Concurrent client-initiated streams over the one connection.
@@ -159,9 +160,11 @@ A `serve` handler refuses a stream by throwing `StreamRefusal` with the gRPC sta
 
 Registering the handler is not racy: server-initiated streams that arrive before `serve()` is called are parked in a bounded queue (the cap granted to the server) and served in order once the handler registers.
 
+`serve(handler, { exclusive: true })` claims dispatch: every later `serve` call throws instead of silently rerouting streams. The pubsub `SubscriptionManager` claims its client this way. Application routes compose through its `fallback` option.
+
 ### Routing server-initiated streams
 
-Applications that serve more than one kind of stream demultiplex by frame id. The `router` makes that pairing checkable: each `route` binds an id prefix to a codec and a handler whose message type the codec proves, so a codec and its handler cannot disagree at compile time. The longest matching prefix wins. An unmatched id throws `UnroutedTopicError`, answering the stream with an `Unimplemented` status.
+Applications that serve more than one kind of stream demultiplex by frame id. The `router` makes that pairing checkable: each `route` binds an id prefix to a codec and a handler typed by that codec, so the two cannot disagree at compile time. The longest matching prefix wins. An unmatched id throws `UnroutedTopicError`, answering the stream with an `Unimplemented` status.
 
 ```ts
 import { route, router } from "@wahidgroup/tightbeam-ws-client";
@@ -202,7 +205,7 @@ const mux = await TightbeamWsClient.connect(url, serverCertDer, {
 
 ## Connection lifecycle
 
-Every client exposes `closed`, a promise resolving with the close frame's `{ code, reason, wasClean }` when the socket ends, however that happens, plus a `readyState` getter with the WebSocket constants. Reconnect logic starts here:
+Every client exposes `closed`, a promise resolving with the close frame's `{ code, reason, wasClean }` on every close path, plus a `readyState` getter with the WebSocket constants. Reconnect logic starts here:
 
 ```ts
 void client.closed.then((info) => {
@@ -214,7 +217,7 @@ void client.closed.then((info) => {
 
 `close()` closes the socket and releases the client's wasm resources (idempotent, safe with emits in flight). Call `shutdown()` first for a graceful GoAway drain, or `shutdownWith(reason)` to advertise why: a label (`"Shutdown"`, `"ProtocolError"`, `"EnhanceYourCalm"`) or an application-defined numeric code the peer reads back through its own GoAway surface. After `close()`, operations reject with `ConnectionClosed`, while `closed`, `readyState`, and the GoAway getters stay readable for reconnect policies.
 
-When the peer drains the session, the client records why. `goawayReason` reads the reason from the peer's GoAway (`undefined` while the connection is live or after a local shutdown), and reconnect policies branch on it. `goawayCode` exposes the raw numeric code for application-defined reasons, which all label as `"Application"`.
+When the peer drains the session, the client records why. `goawayReason` reads the reason from the peer's GoAway (`undefined` while the connection is live or after a local shutdown), and reconnect policies branch on it. `goawayCode` exposes the raw numeric code for application-defined reasons, which `goawayReason` labels `"Application"`.
 
 Reconnection belongs to the application: the client supplies the policy inputs (`closed`, `goawayReason`, `wasClean`) and only the application knows what state to replay. The complete pattern: branch on the reason, back off, re-register `serve`.
 
@@ -238,7 +241,7 @@ async function connectLoop(
 		delay = 500;
 
 		/*
-		 * Re-establish per-connection state: serve is per connection.
+		 * serve is per connection: re-register handlers here.
 		 */
 		handle(client);
 
@@ -252,7 +255,7 @@ async function connectLoop(
 
 		switch (client.goawayReason) {
 			case "Shutdown":
-				break; // orderly drain: rotation, redeploy; go right back
+				break; // orderly drain (rotation, redeploy): go right back
 			case "EnhanceYourCalm":
 				await sleep((delay = Math.min(delay * 2, 30_000)));
 				break; // the server asked for calm
@@ -311,7 +314,7 @@ const interval = setInterval(() => {
 }, 30_000);
 ```
 
-Browsers answer WebSocket protocol pings automatically; this probe covers the application level, where silence is otherwise indistinguishable from idleness.
+Browsers answer WebSocket protocol pings automatically. This probe covers the application level, where silence is otherwise indistinguishable from idleness.
 
 ## Frame builder
 
@@ -345,7 +348,7 @@ const built = await frame(body)
 	.build();
 ```
 
-- The version floor is derived from the requested fields, or pinned with `withVersion(Version.V2)`. `assertVersion` fails the build when the effective version differs from what you expect.
+- The version floor is derived from the requested fields, or pinned with `withVersion(Version.V2)`. `assertVersion` fails the build when the effective version differs from the assertion.
 - `withMessageHasher` / `withWitnessHasher` take any `Hasher`. The profile hasher is `Sha3_256`.
 - `withEncryptor` takes any `BodyEncryptor`: the profile symmetric cipher (`Aes256Gcm.fromKey(k)`, opened with the shared key), the profile asymmetric encryptor to a recipient (`EciesEncryptor.fromBytes(recipientPublicKey)`, opened with the recipient secret), or your own scheme. The frame has a single body-encryption slot.
 - Structurally invalid specs reject with a `ValidationError` carrying per-field issues.
@@ -389,6 +392,8 @@ const message = reply?.message(Chat); // ChatMessage
 ```
 
 To interoperate with a peer expecting a specific ASN.1 `Message` schema (e.g. a Rust `der::Sequence`), implement `MessageCodec` directly with the ASN.1 library of your choice. The DER it emits is installed in the frame. `frame(bytes)` / `withMessage(bytes)` are sugar for the profile `Opaque` codec (raw bytes in the opaque wrapper), and a codec's optional `contentOid` is recorded in the confidentiality info when the body is sealed.
+
+`Framed` is the frame-in-frame codec: messages that are themselves full tightbeam frames, carried byte-for-byte inside another frame's body. Pub/sub topics use it to relay publisher-signed (or sealed) frames through the registry untouched, so frame-level security survives the broker end to end.
 
 ## Custom cryptography
 
@@ -485,7 +490,7 @@ Verification is on the `Frame` itself. Verdicts are `"verified" | "absent" | "al
 ```ts
 import { Aes256Gcm, EciesDecryptor } from "@wahidgroup/tightbeam-ws-client";
 
-response.verify(signingKey.verifyingKey()); // profile scheme; throws when invalid
+response.verify(signingKey.verifyingKey()); // profile scheme: throws when invalid
 await response.frameIntegrityVerdict(); // "verified" | "absent" | ...
 await response.frameIntegrityVerdict(sha3_512Hasher); // under your own hasher
 await response.messageCommitmentVerdict(salt); // checks the body commitment
@@ -503,6 +508,47 @@ response.tbs(); // to-be-signed bytes
 response.witnessInput(); // frame-integrity preimage
 response.signatureInfo; // { algorithmOid, digestAlgorithmOid, signature }
 ```
+
+## Envelopes
+
+The calls above are per-frame tools. A conversation applies the same layers to every frame, in both directions: `envelope(codec)` declares them once. `frame(message)` begins a builder with the layers applied. `unwrap(frame)` reverses them in protocol order (verify, open, inflate, decode) and enforces them: a received frame missing a declared signature or seal rejects with a `ValidationError`, so a peer cannot downgrade the conversation by omission.
+
+```ts
+import {
+	Aes256Gcm,
+	ZstdCompression,
+	envelope,
+} from "@wahidgroup/tightbeam-ws-client";
+
+const notes = envelope(Notes) // any MessageCodec<T>
+	.signed(signingKey)
+	.sealed(Aes256Gcm.fromKey(topicKey))
+	.compressed(new ZstdCompression());
+
+// Sender: the layers are already applied, the metadata stays yours.
+const sent = await notes.frame(note).withId("note-1").withOrder(1n).build();
+
+// Receiver: a Note, or a rejection.
+const received = await notes.unwrap(relayed);
+```
+
+Envelopes are immutable and reusable across every frame of the conversation. Each declaration takes whichever halves the capability implements:
+
+- `signed(signatory)` signs on build. A profile `Secp256k1SigningKey` derives its own verifying key for unwrap. Any other `Signatory` (wallet, passkey, HSM) needs `verified(key)` alongside it before `unwrap` can check the signature.
+- `verified(key)` is the read-only half for parties without the signing key: `unwrap` requires a signature verifying under `key`, and `frame()` refuses to build (a verify-only envelope MUST NOT silently send unsigned frames).
+- `sealed(keys)` takes a `BodyEncryptor`, a `BodyDecryptor`, or both at once. `Aes256Gcm` is both. An ECIES pair splits: the publisher declares `sealed(EciesEncryptor.fromBytes(recipientPublic))`, the recipient `sealed(EciesDecryptor.fromBytes(recipientSecret))`.
+- `compressed(compression)` is a transport optimization, not a security property: an uncompressed received frame still unwraps.
+
+One-sided parties compose only their half:
+
+```ts
+// A subscriber that verifies and opens, but never signs or sends.
+const readOnly = envelope(Notes)
+	.verified(publisherKey)
+	.sealed(EciesDecryptor.fromBytes(recipientSecret));
+```
+
+The `authenticated` and `confidential` getters report the declarations. Because `unwrap` enforces them, they are proven properties of every unwrapped frame: a UI badges them instead of probing frames. The pubsub manager accepts an envelope wherever it accepts a codec ([`@wahidgroup/tightbeam-pubsub-client`](../../pubsub/client)), publishing frame-in-frame so the layers survive the broker end to end.
 
 ## Detached commitments
 

@@ -31,13 +31,20 @@ fn now_utc_resolves_browser_clock() {
 	);
 }
 
+/// Encrypt `content` for the generator point, expecting every step so
+/// the test body stays assertion-only.
+fn generator_ciphertext(content: &[u8]) -> Vec<u8> {
+	let encryptor = EciesEncryptor::from_bytes(G_COMPRESSED).expect("the recipient public key should parse");
+	let info = encryptor
+		.encrypt_content(content, [0u8; 12], None)
+		.expect("ECIES encrypt should drive OsRng without panicking");
+
+	let ciphertext = info.encrypted_content.expect("the encrypted content should be present");
+	ciphertext.as_bytes().to_vec()
+}
+
 #[wasm_bindgen_test]
 fn ecies_encrypt_resolves_browser_rng() {
-	let encryptor = EciesEncryptor::from_bytes(G_COMPRESSED).expect("recipient pubkey parses");
-	let info = encryptor
-		.encrypt_content(b"wasm-rng-proof", [0u8; 12], None)
-		.expect("ECIES encrypt drives OsRng without panicking");
-
-	let ciphertext = info.encrypted_content.expect("encrypted content present");
-	assert!(!ciphertext.as_bytes().is_empty(), "ECIES ciphertext must be non-empty");
+	let ciphertext = generator_ciphertext(b"wasm-rng-proof");
+	assert!(!ciphertext.is_empty(), "ECIES ciphertext must be non-empty");
 }

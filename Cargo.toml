@@ -18,6 +18,7 @@ tightbeam-rs = { version = "0.10.0", default-features = false }
 tokio = { version = "1.53.1", default-features = false }
 tokio-tungstenite = { version = "0.30.0", default-features = false }
 futures-util = { version = "0.3.33", default-features = false }
+serde_json = { version = "1.0", default-features = false }
 
 # Browser (wasm32) client dependencies.
 js-sys = "0.3.83"

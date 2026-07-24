@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<title>tightbeam pubsub live board</title>
+	</head>
+	<body>
+		<main>
+			<h1>tightbeam pubsub live board</h1>
+			<p id="status">connecting...</p>
+			<p id="gap"></p>
+			<form id="publish-form">
+				<input id="payload" name="payload" type="text" />
+				<button id="publish" type="submit">publish</button>
+			</form>
+			<p id="published">0</p>
+			<ul id="board"></ul>
+		</main>
+		<script type="module" src="./main.ts"></script>
+	</body>
+</html>
