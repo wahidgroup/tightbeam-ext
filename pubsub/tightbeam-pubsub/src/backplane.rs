@@ -167,11 +167,17 @@ impl Backplane for Local {
 			true
 		});
 
-		state.orders.insert(topic.clone(), order);
-
 		match first_refusal {
 			Some(refusal) if !delivered_any => Err(BackplaneError::Refused(refusal)),
-			_ => Ok(()),
+			_ => {
+				/*
+				 * The stamp burns only when the publish stands: a refusal
+				 * everywhere leaves the counter untouched, so subscribers
+				 * never see a gap for an update no node fanned out.
+				 */
+				state.orders.insert(topic.clone(), order);
+				Ok(())
+			}
 		}
 	}
 }
@@ -286,6 +292,22 @@ mod tests {
 
 		let outcome = backplane.publish(&topic("prices"), b"tick");
 		assert!(matches!(outcome, Err(BackplaneError::Refused(DeliverError::Draining))));
+	}
+
+	#[test]
+	fn a_refused_publish_does_not_burn_the_order() {
+		let backplane = Local::default();
+		let draining = attached(&backplane, true);
+
+		let refused = backplane.publish(&topic("prices"), b"tick");
+		assert!(matches!(refused, Err(BackplaneError::Refused(_))));
+
+		drop(draining);
+
+		let node = attached(&backplane, false);
+		published(&backplane, "prices", b"tick");
+
+		assert_eq!(recorded(&node), [(topic("prices"), 1)]);
 	}
 
 	#[test]

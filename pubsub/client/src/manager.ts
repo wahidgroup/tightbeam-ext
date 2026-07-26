@@ -426,20 +426,21 @@ export class SubscriptionManager {
 			return this.unmatched(update, id);
 		}
 
-		await this.admit(id, entry, update);
+		await this.deliverUpdate(id, entry, update);
 		return undefined;
 	}
 
 	/**
-	 * Gate one update, handling a revealed gap, then deliver it.
+	 * Classify one update, report a revealed gap, deliver it, then
+	 * commit the baseline through {@link TopicGate.advance}.
 	 */
-	private async admit(
+	private async deliverUpdate(
 		topic: string,
 		entry: Entry,
 		update: Frame,
 	): Promise<void> {
 		const expected = entry.gate.expected;
-		const verdict = entry.gate.admit(update.order);
+		const verdict = entry.gate.classify(update.order);
 		if (verdict === "stale") {
 			return;
 		}
@@ -447,7 +448,9 @@ export class SubscriptionManager {
 		if (verdict === "gap" && expected !== undefined) {
 			await this.reportGap(topic, entry, expected, update.order);
 		}
+
 		await entry.deliver(update);
+		entry.gate.advance(update.order);
 	}
 
 	/**

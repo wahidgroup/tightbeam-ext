@@ -91,6 +91,7 @@ words:
   - mqtt
   - fanout
   - backpressure
+  - backpressured
   - acks
   - deque
   - memberless

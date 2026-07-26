@@ -110,6 +110,24 @@ async function nextReceived(
 }
 
 /**
+ * An update handler that rejects the `poison` payload and records
+ * every other delivery.
+ */
+function poisonedHandler(
+	poison: string,
+	delivered: string[],
+): (message: Uint8Array) => void {
+	return (message: Uint8Array): void => {
+		const payload = DECODER.decode(message);
+		if (payload === poison) {
+			throw new Error("poisoned update");
+		}
+
+		delivered.push(payload);
+	};
+}
+
+/**
  * Subscribe `manager` to `topic` in iterator mode.
  */
 async function subscribed(
@@ -142,6 +160,34 @@ describe("pub/sub round-trips against the dockerized demo server", () => {
 				{ payload: "two", order: 2n },
 				{ payload: "three", order: 3n },
 			]);
+		});
+	});
+
+	it("reveals a failed delivery as a gap on the next update", async () => {
+		await withClient(connect, async (client) => {
+			const manager = new SubscriptionManager(client);
+			const topic = testTopic("poisoned");
+			const delivered: string[] = [];
+			const gaps: { expected: bigint; received: bigint }[] = [];
+
+			await manager.subscribe(topic, {
+				codec: Opaque,
+				onUpdate: poisonedHandler("two", delivered),
+				onGap: (_topic, expected, received) => {
+					gaps.push({ expected, received });
+				},
+			});
+
+			for (const payload of ["one", "two", "three"]) {
+				await publish(manager, topic, payload);
+			}
+
+			await expect
+				.poll(() => gaps, { timeout: 10_000 })
+				.toEqual([{ expected: 2n, received: 3n }]);
+			await expect
+				.poll(() => delivered, { timeout: 10_000 })
+				.toEqual(["one", "three"]);
 		});
 	});
 

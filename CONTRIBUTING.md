@@ -138,4 +138,4 @@ make release version=vX.Y.Z ext=ws
 
 Use `dry-run=1`, `allow-staged=1`, or `yank=1` as documented in `make help`. `ext` defaults to `ws`.
 
-A release bumps the extension's manifests, opens a release pull request, and on merge creates a signed `releases/<ext>/v<version>` tag that publishes that extension's publishable crates to crates.io (Cargo multi-package, dependency order — not the whole workspace). The deploy guard `check-yanked.sh` refuses yanked versions (`yanked/<ext>/v<version>`).
+A release bumps the extension's manifests, opens a release pull request, and on merge creates a signed `releases/<ext>/v<version>` tag that publishes that extension's publishable crates to crates.io (Cargo multi-package, dependency order - not the whole workspace). The deploy guard `check-yanked.sh` refuses yanked versions (`yanked/<ext>/v<version>`).

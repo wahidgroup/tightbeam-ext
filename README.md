@@ -52,7 +52,7 @@ make release version=v0.1.0 dry-run=1  # preview without mutations
 make release yank=1                    # yank a published version
 ```
 
-Extensions are released independently: each top-level extension directory (e.g. `ws/`) versions its crates on its own. A release bumps that extension's versions, opens a release pull request, and on merge creates a signed `releases/<ext>/v<version>` tag. Pushing that tag publishes that extension's publishable crates to crates.io (Cargo multi-package, dependency order — not the whole workspace) and creates the GitHub release. The deploy guard `check-yanked.sh` refuses yanked versions (`yanked/<ext>/v<version>`).
+Extensions are released independently: each top-level extension directory (e.g. `ws/`) versions its crates on its own. A release bumps that extension's versions, opens a release pull request, and on merge creates a signed `releases/<ext>/v<version>` tag. Pushing that tag publishes that extension's publishable crates to crates.io (Cargo multi-package, dependency order - not the whole workspace) and creates the GitHub release. The deploy guard `check-yanked.sh` refuses yanked versions (`yanked/<ext>/v<version>`).
 
 ## License
 

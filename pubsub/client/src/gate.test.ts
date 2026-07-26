@@ -4,11 +4,19 @@ import type { GateVerdict } from "./gate.js";
 import { TopicGate } from "./gate.js";
 
 /**
- * Feed `orders` through a fresh gate and collect the verdicts.
+ * Feed `orders` through a fresh gate as delivered updates (classify,
+ * then commit) and collect the verdicts. Advance is monotonic, so a
+ * stale stamp never moves the baseline.
  */
 function verdicts(orders: readonly bigint[]): GateVerdict[] {
 	const gate = new TopicGate();
-	return orders.map((order) => gate.admit(order));
+	return orders.map((order) => {
+		const verdict = gate.classify(order);
+
+		gate.advance(order);
+
+		return verdict;
+	});
 }
 
 const SEQUENCES = [
@@ -53,17 +61,29 @@ describe("TopicGate", () => {
 		const gate = new TopicGate();
 		expect(gate.expected).toBeUndefined();
 
-		gate.admit(7n);
+		gate.advance(7n);
 
 		expect(gate.expected).toBe(8n);
 	});
 
 	it("re-baselines after a reset", () => {
 		const gate = new TopicGate();
-		gate.admit(10n);
+		gate.advance(10n);
 		gate.reset();
 
 		expect(gate.expected).toBeUndefined();
-		expect(gate.admit(3n)).toBe("fresh");
+		expect(gate.classify(3n)).toBe("fresh");
+	});
+
+	it("keeps the baseline until advance commits the delivery", () => {
+		const gate = new TopicGate();
+		gate.advance(1n);
+
+		expect(gate.classify(2n)).toBe("fresh");
+		expect(gate.classify(2n)).toBe("fresh");
+		expect(gate.classify(3n)).toBe("gap");
+
+		gate.advance(2n);
+		expect(gate.expected).toBe(3n);
 	});
 });

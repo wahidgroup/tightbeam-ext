@@ -4,52 +4,59 @@
  *
  * The registry stamps 1, 2, 3, ... per topic, and each subscriber's
  * delivery lane emits sequentially, so the gate can classify every
- * arriving update against the last admitted stamp.
+ * arriving update against the last committed stamp.
  */
 
 /**
- * How one update relates to the admitted sequence.
+ * How one update relates to the committed sequence.
  */
 export type GateVerdict = "fresh" | "stale" | "gap";
 
 /**
  * Classifies update stamps for one topic.
  *
- * The first update after construction (or {@link reset}) baselines the
- * sequence: a subscriber joining mid-stream accepts wherever the topic
- * currently is.
+ * Classification is read-only. The baseline commits through
+ * {@link advance} after a delivery settles, so a failed decode or
+ * handler leaves the stamp unclaimed and a later update can surface
+ * the loss as a `gap`.
  */
 export class TopicGate {
 	private last: bigint | undefined;
 
 	/**
-	 * Classify `order` and advance the baseline.
+	 * Classify `order` against the baseline, without moving it.
 	 *
 	 * - `fresh`: the first update, or the next dense stamp.
-	 * - `stale`: at or behind the baseline (a duplicate or reorder);
-	 *   the baseline does not move.
+	 * - `stale`: at or behind the baseline (a duplicate or reorder).
 	 * - `gap`: ahead by more than one, meaning updates were dropped.
-	 *   The baseline advances to `order`, so the stream continues from
-	 *   what actually arrived.
+	 *
+	 * The baseline commits separately through {@link advance}, after
+	 * the update actually delivered: a failed decode or handler leaves
+	 * the stamp unclaimed, so a redelivery stays `fresh` and the next
+	 * stamp reveals the loss as a `gap`.
 	 */
-	admit(order: bigint): GateVerdict {
+	classify(order: bigint): GateVerdict {
 		if (this.last === undefined) {
-			this.last = order;
 			return "fresh";
 		}
 		if (order <= this.last) {
 			return "stale";
 		}
-
-		const expected = this.last + 1n;
-
-		this.last = order;
-
-		if (order === expected) {
+		if (order === this.last + 1n) {
 			return "fresh";
 		}
 
 		return "gap";
+	}
+
+	/**
+	 * Commit `order` as the delivered baseline. Monotonic: an older
+	 * stamp never moves the baseline back.
+	 */
+	advance(order: bigint): void {
+		if (this.last === undefined || order > this.last) {
+			this.last = order;
+		}
 	}
 
 	/**
@@ -65,8 +72,7 @@ export class TopicGate {
 	}
 
 	/**
-	 * Forget the baseline: the next update re-baselines, as on a fresh
-	 * subscription. Called on reattach.
+	 * Clear the baseline so the next stamp classifies as `fresh`.
 	 */
 	reset(): void {
 		this.last = undefined;

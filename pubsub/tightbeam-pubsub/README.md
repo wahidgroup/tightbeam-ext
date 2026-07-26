@@ -79,13 +79,13 @@ Sharing one `Local` spans registries in one process. An implementation over Redi
 
 Topic names travel in `Frame.metadata.id` as UTF-8 bytes. Refusals use tightbeam's gRPC-canonical `TransitStatus`.
 
-| Direction       | Frame id        | Meaning                                      | Answer                                                          |
-| --------------- | --------------- | -------------------------------------------- | --------------------------------------------------------------- |
-| client → server | `sub/<topic>`   | subscribe                                    | `Ok`, or `PermissionDenied` / `Unavailable` / `InvalidArgument` |
-| client → server | `unsub/<topic>` | unsubscribe (idempotent)                     | `Ok`                                                            |
-| client → server | `pub/<topic>`   | publish the body payload (opt-in)            | `Ok`, or `PermissionDenied` / `Unavailable` / `InvalidArgument` |
-| server → client | `<topic>`       | update: payload in body, sequence in `order` | `Ok`, or `ResourceExhausted` / `Unimplemented` (drop-and-count) |
-| server → client | `end/<topic>`   | completion (quiesce)                         | `Ok`                                                            |
+| Direction        | Frame id        | Meaning                                      | Answer                                                          |
+| ---------------- | --------------- | -------------------------------------------- | --------------------------------------------------------------- |
+| client -> server | `sub/<topic>`   | subscribe                                    | `Ok`, or `PermissionDenied` / `Unavailable` / `InvalidArgument` |
+| client -> server | `unsub/<topic>` | unsubscribe (idempotent)                     | `Ok`                                                            |
+| client -> server | `pub/<topic>`   | publish the body payload (opt-in)            | `Ok`, or `PermissionDenied` / `Unavailable` / `InvalidArgument` |
+| server -> client | `<topic>`       | update: payload in body, sequence in `order` | `Ok`, or `ResourceExhausted` / `Unimplemented` (drop-and-count) |
+| server -> client | `end/<topic>`   | completion (quiesce)                         | `Ok`                                                            |
 
 Both sides dispatch on the same prefixes. The Rust server, per accepted connection:
 

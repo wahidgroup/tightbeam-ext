@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 use der::Encode;
 use tightbeam::transport::error::{TransportError, TransportFailure};
-use tightbeam::transport::multiplex::MuxHandle;
+use tightbeam::transport::multiplex::{GoAwayReason, MuxHandle};
 use tightbeam::{Frame, TightBeamError};
 use tokio::sync::Notify;
 
@@ -498,6 +498,28 @@ impl Inner {
 		}
 	}
 
+	/// Drop a connection the delivery policy voted off and drain its
+	/// link: the peer observes an `ENHANCE_YOUR_CALM` GoAway ([RFC 9113
+	/// § 7](https://datatracker.ietf.org/doc/html/rfc9113#section-7)
+	/// analog for a load-generating peer) instead of a silent stall.
+	fn disconnect(&self, connection: ConnectionId) {
+		let handle = {
+			let state = self.lock_state();
+			state.connections.get(&connection).map(|connected| connected.handle.clone())
+		};
+
+		self.drop_connection(connection);
+
+		let Some(handle) = handle else {
+			return;
+		};
+
+		tokio::spawn(async move {
+			// Best effort: a link that already failed has nothing to drain.
+			let _ = handle.shutdown_with(GoAwayReason::EnhanceYourCalm).await;
+		});
+	}
+
 	/// Enqueue `update` to every member, collecting connections the
 	/// delivery policy voted off.
 	fn fan_out(&self, state: &State, topic: &Topic, update: &Arc<Frame>) -> Vec<ConnectionId> {
@@ -587,8 +609,9 @@ impl UpdateSink for Inner {
 		drop(state);
 
 		for connection in doomed {
-			self.drop_connection(connection);
+			self.disconnect(connection);
 		}
+
 		Ok(())
 	}
 }
@@ -686,6 +709,8 @@ async fn deliver(subscriber: &Subscriber, handle: &MuxHandle, update: &Arc<Frame
 
 #[cfg(test)]
 mod tests {
+	use core::time::Duration;
+
 	use super::*;
 	use crate::testing::memory_mux_pair;
 
@@ -869,6 +894,53 @@ mod tests {
 
 		assert_eq!(queued_orders(&subscriber), [1, 2]);
 		assert_eq!(subscriber.dropped.load(Ordering::Relaxed), 1);
+	}
+
+	/// Poll until the peer observes a GoAway, or give up.
+	async fn drained_reason(handle: &MuxHandle) -> Option<GoAwayReason> {
+		for _ in 0..100 {
+			if let Some(reason) = handle.goaway_reason() {
+				return Some(reason);
+			}
+
+			tokio::time::sleep(Duration::from_millis(10)).await;
+		}
+
+		None
+	}
+
+	#[tokio::test]
+	async fn a_disconnect_verdict_drains_the_connection() {
+		let options = RegistryOptions {
+			queue_capacity: 1,
+			delivery: Arc::new(FixedVerdict(DeliveryVerdict::Disconnect)),
+			..RegistryOptions::default()
+		};
+		let registry = TopicRegistry::new(options);
+
+		let (client, server) = memory_mux_pair(4);
+		let (server_handle, server_reader, server_writer, _server_responder) = server.into_parts();
+		let (client_handle, client_reader, client_writer, _client_responder) = client.into_parts();
+		tokio::spawn(server_reader.drive());
+		tokio::spawn(server_writer.drive());
+		tokio::spawn(client_reader.drive());
+		tokio::spawn(client_writer.drive());
+
+		let connection = registry.register_connection(server_handle);
+		subscribed(&registry, connection, "prices");
+
+		/*
+		 * The client never answers update streams, so the first emit
+		 * stays in flight, the second fills the capacity-1 queue, and
+		 * the third makes the delivery policy vote the connection off.
+		 */
+		published(&registry, "prices", b"one");
+		published(&registry, "prices", b"two");
+		published(&registry, "prices", b"three");
+
+		let reason = drained_reason(&client_handle).await;
+		assert_eq!(reason, Some(GoAwayReason::EnhanceYourCalm));
+		assert_eq!(registry.subscriber_count(&topic("prices")), 0);
 	}
 
 	#[test]
