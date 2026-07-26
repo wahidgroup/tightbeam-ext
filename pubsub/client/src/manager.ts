@@ -165,15 +165,31 @@ export interface ManagerOptions {
 }
 
 /**
- * One topic's dispatch state: the ordering gate, the type-erased
- * delivery closure (the codec/handler pairing stays typed inside it),
- * the iteration terminator (iterator-mode subscriptions only), and the
- * lifecycle state.
+ * Per-topic dispatch record while the topic stays desired.
+ *
+ * Map membership is the unsubscribe fence. Dispatch passes a `live`
+ * probe into {@link Entry.deliver}, which re-checks after every await
+ * so in-flight work respects unsub and complete.
+ *
+ * Against {@link TopicGate}, classify before delivery. Advance after
+ * delivery while the entry remains mapped, so a failed decode or
+ * handler leaves the stamp free for a later gap.
  */
 interface Entry {
 	readonly gate: TopicGate;
-	readonly deliver: (update: Frame) => Promise<void>;
+
+	/**
+	 * Type-erased delivery path. `live` is true while this entry remains
+	 * in the manager map. Re-check after every await and return when the
+	 * entry is gone.
+	 */
+	readonly deliver: (update: Frame, live: () => boolean) => Promise<void>;
+
+	/**
+	 * Ends iterator-mode pull. Present only for iterator subscriptions.
+	 */
 	readonly finishIteration: (() => void) | undefined;
+
 	readonly onGap: GapHandler | undefined;
 	readonly onEnd: EndHandler | undefined;
 	state: SubscriptionState;
@@ -187,6 +203,7 @@ function isConnectionLoss(error: unknown): boolean {
 	if (!isTransportError(error)) {
 		return false;
 	}
+
 	return error.code === "ConnectionClosed";
 }
 
@@ -235,6 +252,7 @@ export class SubscriptionManager {
 		options: SubscribeOptions<T>,
 	): Promise<Subscription<T>> {
 		assertTopic(topic);
+
 		if (this.entries.has(topic)) {
 			throw new Error(`already subscribed to topic: ${topic}`);
 		}
@@ -291,15 +309,17 @@ export class SubscriptionManager {
 	/**
 	 * Emit `unsub/<topic>` and stop dispatching the topic locally.
 	 *
-	 * Local removal happens first, so no update dispatches after this
-	 * call regardless of the command's fate. A connection loss counts
-	 * as done: a dropped connection has no subscriptions.
+	 * Local removal happens first and is the fence: an update already
+	 * in flight re-checks it after every await, so no update dispatches
+	 * after this call regardless of the command's fate. A connection
+	 * loss counts as done: a dropped connection has no subscriptions.
 	 */
 	async unsubscribe(topic: string): Promise<void> {
 		const entry = this.entries.get(topic);
 		if (entry === undefined) {
 			return;
 		}
+
 		this.entries.delete(topic);
 		entry.finishIteration?.();
 
@@ -448,9 +468,9 @@ export class SubscriptionManager {
 		}
 
 		/*
-		 * A failing gap observer must not block the update that revealed
-		 * the gap: delivery and the baseline commit run first, and the
-		 * observer's failure surfaces afterwards.
+		 * A failing gap observer leaves the revealing update free to
+		 * deliver and commit first. The observer's failure surfaces
+		 * afterwards.
 		 */
 		let gapReport: { failure: unknown } | undefined;
 		if (verdict === "gap" && expected !== undefined) {
@@ -461,8 +481,23 @@ export class SubscriptionManager {
 			}
 		}
 
-		await entry.deliver(update);
-		entry.gate.advance(update.order);
+		/*
+		 * Map membership is the unsubscribe fence. Every await on the
+		 * delivery path re-checks it, so an update still in flight when
+		 * the topic unsubscribes drops instead of dispatching.
+		 */
+		const live = (): boolean => this.entries.get(topic) === entry;
+		if (live()) {
+			await entry.deliver(update, live);
+
+			/*
+			 * The entry may have been deleted by the time the delivery
+			 * path returns.
+			 */
+			if (live()) {
+				entry.gate.advance(update.order);
+			}
+		}
 
 		if (gapReport !== undefined) {
 			throw gapReport.failure;
@@ -562,8 +597,15 @@ function buildEntry<T>(
 	const decode = decoderOf(options);
 	const onUpdate = options.onUpdate;
 	if (onUpdate !== undefined) {
-		const deliver = async (update: Frame): Promise<void> => {
+		const deliver = async (
+			update: Frame,
+			live: () => boolean,
+		): Promise<void> => {
 			const message = await decode(update);
+			if (!live()) {
+				return;
+			}
+
 			await onUpdate(message, update, topic);
 		};
 
@@ -580,8 +622,15 @@ function buildEntry<T>(
 	}
 
 	const channel = new PullChannel<Update<T>>();
-	const deliver = async (update: Frame): Promise<void> => {
+	const deliver = async (
+		update: Frame,
+		live: () => boolean,
+	): Promise<void> => {
 		const message = await decode(update);
+		if (!live()) {
+			return;
+		}
+
 		await channel.put({ message, frame: update, topic });
 	};
 

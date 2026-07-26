@@ -10,6 +10,7 @@ import {
 	envelope,
 	frame,
 } from "@wahidgroup/tightbeam-ws-client";
+import type { BodyDecryptor } from "@wahidgroup/tightbeam-ws-client";
 import type { Subscription, Update } from "@wahidgroup/tightbeam-pubsub-client";
 import { SubscriptionManager } from "@wahidgroup/tightbeam-pubsub-client";
 
@@ -302,6 +303,61 @@ describe("pub/sub round-trips against the dockerized demo server", () => {
 				});
 				expect((await leaverUpdates.next()).done).toBe(true);
 			});
+		});
+	});
+
+	it("drops an update already in flight when unsubscribe lands", async () => {
+		await withClient(connect, async (client) => {
+			const manager = new SubscriptionManager(client);
+			const topic = testTopic("in-flight");
+			const delivered: string[] = [];
+
+			let releaseDecrypt!: () => void;
+			const parked = new Promise<void>((resolve) => {
+				releaseDecrypt = resolve;
+			});
+
+			let decrypting = false;
+
+			/*
+			 * A BYO decryptor that parks until released: the controllable
+			 * async window an envelope layer opens inside a delivery, so
+			 * unsubscribe can land while the update is in flight.
+			 */
+			const key = Aes256Gcm.fromKey(TOPIC_KEY);
+			const stalled: BodyDecryptor = {
+				decrypt: async (sealed) => {
+					decrypting = true;
+					await parked;
+					return key.decrypt(sealed);
+				},
+			};
+
+			await manager.subscribe(topic, {
+				envelope: envelope(Opaque).sealed(stalled),
+				onUpdate: (message) => {
+					delivered.push(DECODER.decode(message));
+				},
+			});
+			await manager.publish(
+				topic,
+				ENCODER.encode("late"),
+				envelope(Opaque).sealed(key),
+			);
+
+			await expect.poll(() => decrypting).toBe(true);
+			await manager.unsubscribe(topic);
+
+			releaseDecrypt();
+
+			/*
+			 * Give the released delivery every chance to (wrongly) reach
+			 * the handler before asserting the unsubscribe fence held.
+			 */
+			await new Promise((resolve) => {
+				setTimeout(resolve, 100);
+			});
+			expect(delivered).toEqual([]);
 		});
 	});
 
