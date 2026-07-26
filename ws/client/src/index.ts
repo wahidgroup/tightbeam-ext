@@ -5,8 +5,10 @@
 import init, { MuxWsClient } from "#wasm";
 import type { GoAwayReason, SocketCloseInfo, TransportSigner } from "#wasm";
 
+import type { MessageCodec } from "./message.js";
 import { FrameBuilder } from "./builder/index.js";
 import { WasmFrameCodec } from "./codec.js";
+import { Envelope } from "./envelope.js";
 import { connectionClosed } from "./errors.js";
 import { Frame } from "./frame.js";
 
@@ -20,7 +22,7 @@ export {
 } from "./errors.js";
 export type { TransitCode, TransportError } from "./errors.js";
 export { WasmFrameCodec } from "./codec.js";
-export { Frame, INTEGRITY_VERDICTS } from "./frame.js";
+export { Frame, Framed, INTEGRITY_VERDICTS } from "./frame.js";
 export type {
 	CompactnessInfo,
 	ConfidentialityInfo,
@@ -54,6 +56,7 @@ export type {
 	Hasher,
 	Signatory,
 } from "./crypto.js";
+export { Envelope } from "./envelope.js";
 export { Opaque, wrapped } from "./message.js";
 export type { MessageCodec, PayloadCodec } from "./message.js";
 export { UnroutedTopicError, route, router } from "./router.js";
@@ -96,6 +99,17 @@ export function frame(message?: Uint8Array): FrameBuilder {
 
 	const builderWithMessage = builder.withMessage(message);
 	return builderWithMessage;
+}
+
+/**
+ * Begin a typed message {@link Envelope} over `codec`, backed by the
+ * WebAssembly frame codec: declare the layers once (`signed`, `sealed`,
+ * `compressed`), then build with `envelope.frame(message)` and receive
+ * with `envelope.unwrap(frame)`. Declared layers are enforced on unwrap.
+ */
+export function envelope<T>(codec: MessageCodec<T>): Envelope<T> {
+	const begun = Envelope.over(sharedCodec, codec);
+	return begun;
 }
 
 /**
@@ -458,8 +472,10 @@ export class TightbeamWsClient extends SocketLifecycle<MuxWsClient> {
 		options?: ConnectOptions,
 	): Promise<TightbeamWsClient> {
 		assertOptionsShape(options);
+
 		const maxPeerStreams = options?.maxPeerStreams ?? DEFAULT_STREAM_CAP;
 		assertStreamCap("maxPeerStreams", maxPeerStreams);
+
 		await initClient();
 
 		const socket = await MuxWsClient.connect(
@@ -468,6 +484,7 @@ export class TightbeamWsClient extends SocketLifecycle<MuxWsClient> {
 			maxPeerStreams,
 			options?.signal,
 		);
+
 		const client = new TightbeamWsClient(socket);
 		return client;
 	}
@@ -492,8 +509,10 @@ export class TightbeamWsClient extends SocketLifecycle<MuxWsClient> {
 		options?: CleartextConnectOptions,
 	): Promise<TightbeamWsClient> {
 		assertOptionsShape(options);
+
 		const streams = options?.streams ?? DEFAULT_STREAM_CAP;
 		assertStreamCap("streams", streams);
+
 		await initClient();
 
 		const socket = await MuxWsClient.connectCleartext(
@@ -501,6 +520,7 @@ export class TightbeamWsClient extends SocketLifecycle<MuxWsClient> {
 			streams,
 			options?.signal,
 		);
+
 		const client = new TightbeamWsClient(socket);
 		return client;
 	}

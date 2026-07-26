@@ -433,13 +433,21 @@ export interface ProfileOids {
 	readonly aes256Gcm: string;
 	/** ECIES over secp256k1 (HKDF-SHA3-256 + AES-256-GCM). */
 	readonly eciesSecp256k1: string;
-	/** Zstandard (RFC 8878), the profile compression. */
+	/**
+	 * Zstandard ([RFC 8878](https://datatracker.ietf.org/doc/html/rfc8878)),
+	 * the profile compression.
+	 */
 	readonly zstd: string;
-	/** zlib (RFC 3274), interoperable with `CompressionStream("deflate")`. */
+	/**
+	 * zlib ([RFC 3274](https://datatracker.ietf.org/doc/html/rfc3274)),
+	 * interoperable with `CompressionStream("deflate")`.
+	 */
 	readonly zlib: string;
 	/**
-	 * id-ct-compressedData (RFC 3274): the content type recorded in the
-	 * compactness info when the compressor names none.
+	 * id-ct-compressedData
+	 * ([RFC 3274](https://datatracker.ietf.org/doc/html/rfc3274)): the
+	 * content type recorded in the compactness info when the compressor
+	 * names none.
 	 */
 	readonly compressedContent: string;
 }

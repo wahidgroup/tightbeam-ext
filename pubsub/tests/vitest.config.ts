@@ -12,7 +12,7 @@ export default defineConfig({
 		alias: {
 			/*
 			 * The node-lane harness is shared with the ws extension at the
-			 * source level: one file, no copies (see the e2e README section).
+			 * source level: one file, no copies.
 			 */
 			"#ws-harness": resolve(
 				import.meta.dirname,

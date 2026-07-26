@@ -11,9 +11,11 @@ set -euo pipefail
 # Exports (appended to $GITHUB_ENV, stdout when unset for local runs):
 #   EXT       Extension directory (e.g. ws)
 #   VERSION   Release version (e.g. 0.3.0)
-#   CRATE     Crate name (tightbeam-<ext>)
+#   CRATE     Canonical crate name (tightbeam-<ext>)
+#   CRATES    Space-separated publishable crate names under EXT/
 #   TITLE     Release title (<crate> v<version>)
 #   HAS_NPM   true when the extension ships an npm client
+#   HAS_SBOM  true when the npm client ships an SBOM asset
 
 REF_NAME="${1:-${GITHUB_REF_NAME:-}}"
 
@@ -28,6 +30,37 @@ emit_env() {
 	else
 		cat
 	fi
+}
+
+# Read [package].name from a Cargo.toml.
+cargo_package_name() {
+	awk -F'"' '
+		/^\[package\]/ { in_section = 1; next }
+		in_section && /^\[/ { in_section = 0 }
+		in_section && /^name[[:space:]]*=/ { print $2; exit }
+	' "$1"
+}
+
+# Read [package].version from a Cargo.toml.
+cargo_package_version() {
+	awk -F'"' '
+		/^\[package\]/ { in_section = 1; next }
+		in_section && /^\[/ { in_section = 0 }
+		in_section && /^version[[:space:]]*=/ { print $2; exit }
+	' "$1"
+}
+
+# True when [package] does not set publish = false.
+cargo_is_publishable() {
+	! awk '
+		/^\[package\]/ { in_section = 1; next }
+		in_section && /^\[/ { in_section = 0 }
+		in_section && /^publish[[:space:]]*=[[:space:]]*false([[:space:]]|$|#)/ {
+			found = 1
+			exit
+		}
+		END { exit found ? 0 : 1 }
+	' "$1"
 }
 
 if [ -z "$REF_NAME" ]; then
@@ -49,13 +82,39 @@ if [ ! -f "$CRATE_TOML" ]; then
 	fail "Unknown extension '${EXT}' (expected ${CRATE_TOML})"
 fi
 
-CURRENT=$(awk -F'"' '/^\[package\]/{f=1;next} f&&/^\[/{f=0} f&&/^version/{print $2;exit}' "$CRATE_TOML")
-if [ "$CURRENT" != "$VERSION" ]; then
-	printf '  %s version (%s) does not match tag (%s)\n' "$CRATE_TOML" "$CURRENT" "$VERSION" >&2
-	fail "Bump on master via make release version=v${VERSION} ext=${EXT} before tagging."
+CRATES=""
+found_canonical=false
+for manifest in "$EXT"/*/Cargo.toml; do
+	[ -f "$manifest" ] || continue
+	if ! cargo_is_publishable "$manifest"; then
+		continue
+	fi
+	name="$(cargo_package_name "$manifest")"
+	[ -n "$name" ] || fail "Could not read [package].name from ${manifest}"
+	current="$(cargo_package_version "$manifest")"
+	if [ "$current" != "$VERSION" ]; then
+		printf '  %s version (%s) does not match tag (%s)\n' "$manifest" "$current" "$VERSION" >&2
+		fail "Bump on master via make release version=v${VERSION} ext=${EXT} before tagging."
+	fi
+	if [ -n "$CRATES" ]; then
+		CRATES="${CRATES} ${name}"
+	else
+		CRATES="$name"
+	fi
+	if [ "$name" = "$CRATE" ]; then
+		found_canonical=true
+	fi
+done
+
+if [ -z "$CRATES" ]; then
+	fail "No publishable crates found under ${EXT}/"
+fi
+if [ "$found_canonical" != true ]; then
+	fail "Canonical crate ${CRATE} is missing or not publishable under ${EXT}/"
 fi
 
 HAS_NPM=false
+HAS_SBOM=false
 if [ -f "${EXT}/client/package.json" ]; then
 	HAS_NPM=true
 	NPM_CURRENT=$(node -p "require('./${EXT}/client/package.json').version")
@@ -63,12 +122,18 @@ if [ -f "${EXT}/client/package.json" ]; then
 		printf '  %s/client/package.json version (%s) does not match tag (%s)\n' "$EXT" "$NPM_CURRENT" "$VERSION" >&2
 		fail "Bump on master via make release version=v${VERSION} ext=${EXT} before tagging."
 	fi
+	# Client packages that ship an SBOM list sbom.json in "files".
+	if node -e "const p=require('./${EXT}/client/package.json'); process.exit((p.files||[]).includes('sbom.json')?0:1)"; then
+		HAS_SBOM=true
+	fi
 fi
 
 {
 	echo "EXT=$EXT"
 	echo "VERSION=$VERSION"
 	echo "CRATE=$CRATE"
+	echo "CRATES=$CRATES"
 	echo "TITLE=${CRATE} v${VERSION}"
 	echo "HAS_NPM=$HAS_NPM"
+	echo "HAS_SBOM=$HAS_SBOM"
 } | emit_env

@@ -40,7 +40,8 @@ use crate::stream::{GlooStream, WsTransport};
 #[wasm_bindgen(typescript_custom_section)]
 const GOAWAY_REASON_TS: &'static str = r#"
 /**
- * Reason carried by the peer's GoAway (RFC 9113 § 6.8 analog).
+ * Reason carried by the peer's GoAway
+ * ([RFC 9113 § 6.8](https://datatracker.ietf.org/doc/html/rfc9113#section-6.8) analog).
  *
  * "Application" is a code outside the protocol-reserved range. Read the
  * raw value from `goawayCode`.
@@ -253,8 +254,9 @@ impl MuxWsClient {
 		}
 	}
 
-	/// Connection-level liveness probe (RFC 9113 § 6.7 analog): resolves
-	/// when the peer's ack arrives.
+	/// Connection-level liveness probe
+	/// ([RFC 9113 § 6.7](https://datatracker.ietf.org/doc/html/rfc9113#section-6.7)
+	/// analog): resolves when the peer's ack arrives.
 	///
 	/// No stream is allocated and the peer's application handler never
 	/// runs, so this doubles as an idle keepalive for links whose carrier

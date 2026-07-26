@@ -2,7 +2,7 @@
 # manager client. Invoked directly (make -C pubsub <target>) or through
 # the repo root Makefile, which scopes targets by project (make test pubsub).
 
-.PHONY: setup test lint wasm client sbom smoke pack
+.PHONY: setup check build test lint wasm client sbom smoke pack
 
 REPO := ..
 CRATES := -p tightbeam-pubsub
@@ -18,6 +18,14 @@ endif
 
 setup:
 	@$(REPO)/scripts/setup.sh pubsub
+
+check:
+	@echo "Checking pubsub crates..."
+	cargo check $(CRATES) --all-targets $(CARGO_FLAGS)
+
+build:
+	@echo "Building pubsub crates..."
+	cargo build --release $(CRATES) $(CARGO_FLAGS)
 
 test: client
 	@echo "Running pubsub cargo tests..."

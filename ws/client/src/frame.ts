@@ -22,6 +22,7 @@ import type { Version } from "./builder/version.js";
 import type { BodyInflator } from "./compress.js";
 import type { BodyDecryptor, Hasher, Secp256k1VerifyingKey } from "./crypto.js";
 import type { MessageCodec } from "./message.js";
+import { wrapped } from "./message.js";
 import { ValidationError } from "./builder/errors.js";
 import { priorityFromOrdinal } from "./builder/priority.js";
 import { versionFromOrdinal } from "./builder/version.js";
@@ -721,6 +722,25 @@ export class Frame {
 		return message;
 	}
 }
+
+/**
+ * Frame-in-frame payloads: a codec whose messages are full tightbeam
+ * frames, carried untouched inside another frame's body.
+ *
+ * Made for pub/sub topics: the registry stamps its wrapper (topic id,
+ * dense order) while the published inner frame relays byte-for-byte, so
+ * publisher-applied security (signature, commitment, encrypted or
+ * compressed body) survives the broker end to end and verifies on the
+ * subscriber.
+ */
+export const Framed: MessageCodec<Frame> = wrapped({
+	encode(inner: Frame): Uint8Array {
+		return inner.toDer();
+	},
+	decode(payload: Uint8Array): Frame {
+		return Frame.fromDer(payload);
+	},
+});
 
 /**
  * Decompress decrypted plaintext when the frame carries compactness info;

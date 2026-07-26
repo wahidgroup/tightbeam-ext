@@ -24,10 +24,14 @@ use crate::fault::{connection_closed, to_js};
 const SOCKET_CLOSE_INFO_TS: &'static str = r#"
 /**
  * How a WebSocket session ended: the close frame's code and reason, and
- * whether closure was clean (RFC 6455 § 7.1.4).
+ * whether closure was clean
+ * ([RFC 6455 § 7.1.4](https://datatracker.ietf.org/doc/html/rfc6455#section-7.1.4)).
  */
 export interface SocketCloseInfo {
-	/** Close status code (RFC 6455 § 7.4). */
+	/**
+	 * Close status code
+	 * ([RFC 6455 § 7.4](https://datatracker.ietf.org/doc/html/rfc6455#section-7.4)).
+	 */
 	readonly code: number;
 	/** Close reason supplied by the peer, or empty. */
 	readonly reason: string;

@@ -17,11 +17,14 @@ categories.workspace = true
 name = "tightbeam_pubsub"
 
 [features]
-testing = []
+# Test-support code builds frames a client would (including sealed
+# bodies), so it needs tightbeam's AEAD surface.
+testing = ["tightbeam-rs/aead"]
 
 [[example]]
 name = "pubsub_demo_server"
 required-features = ["testing"]
+test = true
 
 [[example]]
 name = "pubsub_processor_server"
@@ -43,6 +46,7 @@ tightbeam-pubsub = { path = ".", features = ["testing"] }
 husky-rs = { workspace = true }
 tightbeam-ws = { path = "../../ws/tightbeam-ws", features = ["testing"] }
 tokio-tungstenite = { workspace = true, features = ["connect", "handshake"] }
+serde_json = { workspace = true, features = ["std"] }
 tokio = { workspace = true, features = [
 	"rt-multi-thread",
 	"macros",

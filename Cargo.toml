@@ -1,6 +1,10 @@
 [workspace]
 resolver = "2"
-members = ["ws/tightbeam-ws", "ws/tightbeam-ws-wasm", "pubsub/tightbeam-pubsub"]
+members = [
+	"ws/tightbeam-ws",
+	"ws/tightbeam-ws-wasm",
+	"pubsub/tightbeam-pubsub",
+]
 
 [workspace.package]
 authors = ["Tanveer Wahid <tan@wahid.email>"]
@@ -18,6 +22,7 @@ tightbeam-rs = { version = "0.10.0", default-features = false }
 tokio = { version = "1.53.1", default-features = false }
 tokio-tungstenite = { version = "0.30.0", default-features = false }
 futures-util = { version = "0.3.33", default-features = false }
+serde_json = { version = "1.0.151", default-features = false }
 
 # Browser (wasm32) client dependencies.
 js-sys = "0.3.83"
@@ -29,9 +34,8 @@ gloo-net = { version = "0.7.0", default-features = false }
 # Pinned to 0.7 to match the der version the RustCrypto stack (and therefore
 # tightbeam-rs) is built against.
 der = { version = "0.7", default-features = false }
-
 # Git hooks manager
-husky-rs = "0.3"
+husky-rs = "0.4.0"
 
 [profile.release]
 lto = true

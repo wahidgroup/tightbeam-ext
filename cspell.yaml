@@ -4,6 +4,7 @@ import:
   - ./ws/node_modules/@wahidgroup/lint-rules/cspell.base.json
 words:
   - tightbeam
+  - acking
   - errorizable
   - websocket
   - websockets
@@ -90,8 +91,10 @@ words:
   - mqtt
   - fanout
   - backpressure
+  - backpressured
   - acks
   - deque
+  - memberless
   - quiesces
   - quiescing
   - uppercased
