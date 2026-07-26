@@ -192,6 +192,39 @@ describe("pub/sub round-trips against the dockerized demo server", () => {
 		});
 	});
 
+	it("reveals a first-delivery failure as a gap on the next update", async () => {
+		await withClient(connect, async (client) => {
+			const manager = new SubscriptionManager(client);
+			const topic = testTopic("poisoned-first");
+			const delivered: string[] = [];
+			const gaps: { expected: bigint; received: bigint }[] = [];
+
+			/*
+			 * The very first update fails, so no baseline exists when
+			 * the second arrives: the witnessed stamp is the only trace
+			 * of the loss.
+			 */
+			await manager.subscribe(topic, {
+				codec: Opaque,
+				onUpdate: poisonedHandler("one", delivered),
+				onGap: (_topic, expected, received) => {
+					gaps.push({ expected, received });
+				},
+			});
+
+			for (const payload of ["one", "two"]) {
+				await publish(manager, topic, payload);
+			}
+
+			await expect
+				.poll(() => gaps, { timeout: 10_000 })
+				.toEqual([{ expected: 1n, received: 2n }]);
+			await expect
+				.poll(() => delivered, { timeout: 10_000 })
+				.toEqual(["two"]);
+		});
+	});
+
 	it("still delivers the gap-revealing update when onGap throws", async () => {
 		await withClient(connect, async (client) => {
 			const manager = new SubscriptionManager(client);
@@ -550,9 +583,23 @@ describe("pub/sub round-trips against the dockerized demo server", () => {
 	});
 
 	/*
-	 * Quiesce drains the shared registry for good, so this runs last.
+	 * Quiesce drains the shared registry for good, so this runs last:
+	 * it owns the suite's only drain moment, including the
+	 * refused-replay reattach that needs a draining registry.
 	 */
 	it("completes subscriptions and drains on quiesce", async () => {
+		/*
+		 * A survivor manager whose connection closes before the drain:
+		 * no end/ push reaches it, so its topic outlives the quiesce
+		 * and its reattach below replays into the draining registry.
+		 */
+		const orphan = await connect();
+		const survivor = new SubscriptionManager(orphan);
+		const parked = testTopic("parked");
+
+		await subscribed(survivor, parked);
+		orphan.close();
+
 		await withClient(connect, async (client) => {
 			const manager = new SubscriptionManager(client);
 			const topic = testTopic("final");
@@ -586,6 +633,19 @@ describe("pub/sub round-trips against the dockerized demo server", () => {
 
 			controller.abort(new Error("drain observed"));
 			await expect(pending).rejects.toThrow("drain observed");
+		});
+
+		/*
+		 * The draining registry refuses every sub/ replay with
+		 * Unavailable: each refused topic ends the way a refused
+		 * subscribe does, and the caller sees one aggregate instead of
+		 * a mixed live-and-pending map.
+		 */
+		await withClient(connect, async (replacement) => {
+			await expect(survivor.reattach(replacement)).rejects.toThrow(
+				AggregateError,
+			);
+			expect(survivor.topics).toEqual([]);
 		});
 	});
 });

@@ -196,6 +196,16 @@ interface Entry {
 }
 
 /**
+ * One refused reattach replay: the topic to end and the failure to
+ * surface.
+ */
+interface Refusal {
+	readonly topic: string;
+	readonly entry: Entry;
+	readonly failure: unknown;
+}
+
+/**
  * Whether a command rejection means "the connection is gone", which the
  * manager treats as "await reattach" rather than a topic-level failure.
  */
@@ -333,23 +343,76 @@ export class SubscriptionManager {
 	}
 
 	/**
-	 * Resume on a replacement connection after the previous one closed:
-	 * install the serve handler, reset every gate (the registry's stamps
-	 * are per-topic, not per-connection, so the next update
-	 * re-baselines), and replay the `sub/` commands for every desired
-	 * topic.
+	 * Resume on a replacement connection after the previous one closed.
+	 * Installs the serve handler, resets every gate (registry stamps are
+	 * per-topic, so the next update re-baselines), and replays `sub/` for
+	 * every desired topic.
+	 *
+	 * Each replay follows {@link subscribe}'s refusal contract. A refused
+	 * replay ends its topic. A connection loss stays pending for the next
+	 * reattach. An acknowledgment goes live. When any replay was refused,
+	 * an `AggregateError` of every refusal throws after all settle. The
+	 * surviving topics are already consistent.
 	 */
 	async reattach(client: TightbeamWsClient): Promise<void> {
 		this.client = client;
 		this.install();
 
-		const replays: Promise<void>[] = [];
+		const replays: Promise<Refusal | undefined>[] = [];
 		for (const [topic, entry] of this.entries) {
 			entry.gate.reset();
 			entry.state = "pending";
-			replays.push(this.resubscribe(topic, entry));
+			replays.push(this.replayed(topic, entry));
 		}
-		await Promise.all(replays);
+
+		const settled = await Promise.all(replays);
+		const refusals: Refusal[] = [];
+		for (const refusal of settled) {
+			if (refusal !== undefined) {
+				refusals.push(refusal);
+			}
+		}
+
+		if (refusals.length > 0) {
+			this.endRefused(refusals);
+		}
+	}
+
+	/**
+	 * Replay one topic, mapping a refusal into a value so every replay
+	 * settles instead of racing the first rejection.
+	 */
+	private async replayed(
+		topic: string,
+		entry: Entry,
+	): Promise<Refusal | undefined> {
+		try {
+			await this.resubscribe(topic, entry);
+			return undefined;
+		} catch (failure) {
+			return { topic, entry, failure };
+		}
+	}
+
+	/**
+	 * End every refused topic the way {@link subscribe} ends a refused
+	 * subscription, then surface the refusals as one `AggregateError`.
+	 */
+	private endRefused(refusals: readonly Refusal[]): never {
+		const failures: unknown[] = [];
+		for (const { topic, entry, failure } of refusals) {
+			if (this.entries.get(topic) === entry) {
+				this.entries.delete(topic);
+				entry.finishIteration?.();
+			}
+
+			failures.push(failure);
+		}
+
+		throw new AggregateError(
+			failures,
+			"some subscriptions were refused on reattach",
+		);
 	}
 
 	/**
@@ -488,7 +551,18 @@ export class SubscriptionManager {
 		 */
 		const live = (): boolean => this.entries.get(topic) === entry;
 		if (live()) {
-			await entry.deliver(update, live);
+			try {
+				await entry.deliver(update, live);
+			} catch (failure) {
+				/*
+				 * A failure before any baseline would otherwise be
+				 * invisible: witness the stamp so the next update
+				 * reveals the loss as a gap.
+				 */
+				entry.gate.witness(update.order);
+
+				throw failure;
+			}
 
 			/*
 			 * The entry may have been deleted by the time the delivery
