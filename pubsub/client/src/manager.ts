@@ -68,8 +68,10 @@ export type UpdateHandler<T> = (
 /**
  * Observes a detected gap: updates between `expected` and `received`
  * were dropped (delivery policy) for this subscriber. The update that
- * revealed the gap is still delivered. When omitted, the manager
- * re-emits the `sub/` command so a replay-capable server can resync.
+ * revealed the gap is still delivered, even when the observer throws:
+ * the failure surfaces only after the delivery settles. When omitted,
+ * the manager re-emits the `sub/` command so a replay-capable server
+ * can resync.
  */
 export type GapHandler = (
 	topic: string,
@@ -445,19 +447,31 @@ export class SubscriptionManager {
 			return;
 		}
 
+		/*
+		 * A failing gap observer must not block the update that revealed
+		 * the gap: delivery and the baseline commit run first, and the
+		 * observer's failure surfaces afterwards.
+		 */
+		let gapReport: { failure: unknown } | undefined;
 		if (verdict === "gap" && expected !== undefined) {
-			await this.reportGap(topic, entry, expected, update.order);
+			try {
+				await this.reportGap(topic, entry, expected, update.order);
+			} catch (failure) {
+				gapReport = { failure };
+			}
 		}
 
 		await entry.deliver(update);
 		entry.gate.advance(update.order);
+
+		if (gapReport !== undefined) {
+			throw gapReport.failure;
+		}
 	}
 
 	/**
-	 * Run the subscription's gap observer, or the default resync: re-emit
-	 * the `sub/` command (idempotent on the Stage A server; a
-	 * replay-capable one can use it to resync). A connection loss during
-	 * the resync defers to reattach.
+	 * Run the subscription's gap observer, or the default resync: re-emit the
+	 * `sub/` command. A connection loss during the resync defers to reattach.
 	 */
 	private async reportGap(
 		topic: string,

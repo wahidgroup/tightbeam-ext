@@ -46,7 +46,8 @@ use tightbeam_ws::io::{WsStream, WsTransport};
 use tightbeam_ws::protocol::WsListener;
 use tightbeam_ws::testing::{env_u32, pinned_trust, serve_handshake, Identity};
 use tokio::net::TcpStream;
-use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::mpsc::{channel, Sender};
 use tokio::time::timeout;
 use tokio_tungstenite::{connect_async, MaybeTlsStream};
 
@@ -74,18 +75,36 @@ impl fmt::Display for RelayClosed {
 
 impl Error for RelayClosed {}
 
+/// The relay queue is full: publishers outpace processor round-trips.
+#[derive(Debug)]
+struct RelaySaturated;
+
+impl fmt::Display for RelaySaturated {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.write_str("the relay queue is full")
+	}
+}
+
+impl Error for RelaySaturated {}
+
+/// How many publishes may wait on the processor before the relay
+/// refuses new ones: the bound that keeps a fast publisher from growing
+/// the queue without limit.
+const RELAY_DEPTH: usize = 64;
+
 /// A custom [`Backplane`]: every publish crosses to the processor
 /// servlet over the demo server's own tightbeam mux connection, and the
 /// servlet's answer is what gets sequenced and fanned out. Composes the
 /// stock [`Local`] for sequencing and sink management.
 ///
 /// A publish acks once enqueued (the distributed-backplane contract, so
-/// relay delivery is at-most-once). A processor failure closes the
-/// relay: every later publish answers `Unavailable` instead of
-/// silently dropping.
+/// relay delivery is at-most-once). The queue is bounded at [`RELAY_DEPTH`]
+/// a saturated relay answers `Unavailable` instead of growing without limit,
+/// and a processor failure closes the relay so every later publish answers
+/// `Unavailable` instead of silently dropping.
 struct RelayBackplane {
 	local: Local,
-	requests: UnboundedSender<(Topic, Vec<u8>)>,
+	requests: Sender<(Topic, Vec<u8>)>,
 }
 
 impl RelayBackplane {
@@ -117,7 +136,7 @@ impl RelayBackplane {
 	/// One worker drains the queue, so deliveries stay serialized per
 	/// topic: the backplane contract.
 	fn spawned(handle: MuxHandle) -> Arc<Self> {
-		let (requests, mut queue) = unbounded_channel::<(Topic, Vec<u8>)>();
+		let (requests, mut queue) = channel::<(Topic, Vec<u8>)>(RELAY_DEPTH);
 		let backplane = Arc::new(Self { local: Local::default(), requests });
 
 		let relay = Arc::clone(&backplane);
@@ -171,11 +190,14 @@ impl Backplane for RelayBackplane {
 
 	fn publish(&self, topic: &Topic, payload: &[u8]) -> Result<(), BackplaneError> {
 		let request = (topic.clone(), payload.to_vec());
-		if self.requests.send(request).is_err() {
-			return Err(BackplaneError::Unavailable(Box::new(RelayClosed)));
-		}
+		self.requests.try_send(request).map_err(|refusal| {
+			let cause: Box<dyn Error + Send + Sync> = match refusal {
+				TrySendError::Full(_) => Box::new(RelaySaturated),
+				TrySendError::Closed(_) => Box::new(RelayClosed),
+			};
 
-		Ok(())
+			BackplaneError::Unavailable(cause)
+		})
 	}
 }
 
@@ -330,6 +352,35 @@ mod tests {
 		}
 
 		false
+	}
+
+	/// Publish `attempts` times without giving the worker room to
+	/// drain, returning the last outcome.
+	fn flooded(backplane: &RelayBackplane, attempts: usize, topic: &Topic) -> Result<(), BackplaneError> {
+		let mut last = Ok(());
+		for _ in 0..attempts {
+			last = backplane.publish(topic, b"tick");
+		}
+
+		last
+	}
+
+	#[tokio::test]
+	async fn a_saturated_relay_refuses_the_publish() {
+		let (client, server) = memory_mux_pair(4);
+		let (handle, _reader, _writer, _responder) = server.into_parts();
+		let backplane = RelayBackplane::spawned(handle);
+
+		/*
+		 * No drivers: the worker stalls inside its first round-trip's
+		 * timeout window, so the queue can only fill. One publish past
+		 * the queue depth (plus the item the worker holds) must refuse
+		 * instead of growing without bound.
+		 */
+		let last = flooded(&backplane, RELAY_DEPTH + 2, &topic("prices"));
+		assert!(matches!(last, Err(BackplaneError::Unavailable(_))));
+
+		drop(client);
 	}
 
 	#[tokio::test]

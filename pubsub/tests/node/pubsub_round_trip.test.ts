@@ -191,6 +191,30 @@ describe("pub/sub round-trips against the dockerized demo server", () => {
 		});
 	});
 
+	it("still delivers the gap-revealing update when onGap throws", async () => {
+		await withClient(connect, async (client) => {
+			const manager = new SubscriptionManager(client);
+			const topic = testTopic("gap-throw");
+			const delivered: string[] = [];
+
+			await manager.subscribe(topic, {
+				codec: Opaque,
+				onUpdate: poisonedHandler("two", delivered),
+				onGap: () => {
+					throw new Error("gap observer failure");
+				},
+			});
+
+			for (const payload of ["one", "two", "three"]) {
+				await publish(manager, topic, payload);
+			}
+
+			await expect
+				.poll(() => delivered, { timeout: 10_000 })
+				.toEqual(["one", "three"]);
+		});
+	});
+
 	it("acknowledged subscriptions report a live state", async () => {
 		await withClient(connect, async (client) => {
 			const manager = new SubscriptionManager(client);

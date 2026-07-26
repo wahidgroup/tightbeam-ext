@@ -167,7 +167,7 @@ The envelope's `authenticated` and `confidential` getters report the declared (a
 The registry stamps each topic's updates 1, 2, 3, ... in `metadata.order`. The per-subscription gate classifies every arrival:
 
 - stale (duplicate or reorder): dropped silently.
-- gap (the server's delivery policy dropped updates for this subscriber): `onGap(topic, expected, received)` runs first, then the update that revealed the gap is still delivered. Without an `onGap`, the manager re-emits `sub/` so a replay-capable server can resync.
+- gap (the server's delivery policy dropped updates for this subscriber): `onGap(topic, expected, received)` runs first, then the update that revealed the gap is still delivered - even when `onGap` throws, the observer's failure surfaces only after the delivery settles. Without an `onGap`, the manager re-emits `sub/` so a replay-capable server can resync.
 
 ```ts
 await manager.subscribe("ticks", {
