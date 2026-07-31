@@ -29,6 +29,7 @@ words:
   - wahidgroup
   - dockerized
   - rustup
+  - RUSTDOCFLAGS
   - tbws
   - buildkit
   - parameterised

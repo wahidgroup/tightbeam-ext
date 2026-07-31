@@ -52,6 +52,12 @@ pub async fn unrouted(_context: ConnectionContext, _frame: Arc<Frame>) -> Respon
 /// Wire commands answer through `commands`; everything else goes to
 /// `app`. The connection registers on entry and drops (with all its
 /// subscriptions) on exit, whatever ended the serve loop.
+///
+/// # Errors
+///
+/// Returns a [`TransportError`](tightbeam::transport::TransportError)
+/// when the mux drivers or responder fail. The connection is unregistered
+/// before the error is returned.
 pub async fn serve_connection<R, W, P, A, F>(
 	mux: MuxTransport<R, W>,
 	commands: PubsubCommands<P>,
@@ -70,6 +76,10 @@ where
 /// [`serve_connection`], registered under `identity` (a mutual-auth
 /// peer certificate DER is the expected source) so the policies can
 /// authorize by caller.
+///
+/// # Errors
+///
+/// Same set as [`serve_connection`].
 pub async fn serve_connection_as<R, W, P, A, F>(
 	mux: MuxTransport<R, W>,
 	commands: PubsubCommands<P>,

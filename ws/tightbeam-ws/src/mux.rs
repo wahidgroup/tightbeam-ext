@@ -4,7 +4,7 @@
 //! settings/rekey/split choreography, this module only pins the
 //! WebSocket half types.
 //!
-//! [`TcpTransport::into_mux`]: tightbeam::transport::tcp::r#async::TcpTransport::into_mux
+//! [`TcpTransport::into_mux`]: tightbeam::transport::TcpTransport::into_mux
 
 use tokio::io::{AsyncRead, AsyncWrite};
 

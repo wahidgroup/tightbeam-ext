@@ -2,11 +2,9 @@
 
 Topic pub/sub extension for the [tightbeam](https://crates.io/crates/tightbeam-rs) messaging protocol.
 
-Core tightbeam mux carries concurrent, bidirectional unary streams. This crate runs on that surface unchanged: subscriptions are ordinary client-initiated command streams, updates are server-initiated pushes, and any process holding a `MuxHandle` can fan out. No new wire protocol, no broker, carrier-agnostic (WebSocket or raw TCP mux alike).
-
 ## Surface
 
-This crate runs on the existing tightbeam mux surface. Subscriptions are ordinary client-initiated command streams, updates are server-initiated pushes, and any process holding a `MuxHandle` can fan out.
+This crate runs on the existing tightbeam mux surface unchanged. Subscriptions are ordinary client-initiated command streams, updates are server-initiated pushes, and any process holding a `MuxHandle` can fan out. There is no new wire protocol and no broker. The design is carrier-agnostic (WebSocket or raw TCP mux alike).
 
 - `Topic` validates names as a `/`-separated hierarchy with exact match semantics. Command prefixes are reserved.
 - `TopicRegistry` owns membership and publishing. The registry builds every update frame itself, so stamps never depend on callers.

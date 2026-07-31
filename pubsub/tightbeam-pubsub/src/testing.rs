@@ -22,6 +22,10 @@ const LINK_DEPTH: usize = 64;
 /// A client-built frame carrying a wire command or payload: the fixture
 /// integration tests and examples send where a TypeScript client would
 /// use its frame builder.
+///
+/// # Errors
+///
+/// Returns [`TightBeamError`] when the opaque body or frame fails to build.
 pub fn command_frame(id: &str, order: u64, payload: &[u8]) -> Result<Frame, TightBeamError> {
 	build(id, order, payload)
 }
@@ -29,6 +33,15 @@ pub fn command_frame(id: &str, order: u64, payload: &[u8]) -> Result<Frame, Tigh
 /// A V1 frame whose opaque body is sealed under the profile AES-256-GCM
 /// cipher with `key`: what a TypeScript client's `sealed` envelope
 /// builds. Only a key holder opens the body.
+///
+/// # Errors
+///
+/// Returns [`TightBeamError`] when the body or AEAD construction fails.
+///
+/// # Sources
+///
+/// - NIST SP 800-38D, Galois/Counter Mode (GCM):
+///   <https://csrc.nist.gov/pubs/sp/800/38/d/final>
 pub fn sealed_command_frame(id: &str, order: u64, payload: &[u8], key: &[u8; 32]) -> Result<Frame, TightBeamError> {
 	let body = OpaqueBody { body: OctetString::new(payload)? };
 	let cipher = Aes256Gcm::new(&(*key).into());

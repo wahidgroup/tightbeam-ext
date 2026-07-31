@@ -1,4 +1,4 @@
-.PHONY: all help help-body help-ref version setup check build clean test lint spellcheck wasm client sbom smoke pack doc audit ci release check-yanked
+.PHONY: all help help-body help-ref version setup check build clean test lint doc-lint spellcheck wasm client sbom smoke pack doc audit ci release check-yanked
 
 .DEFAULT_GOAL := help
 
@@ -80,21 +80,21 @@ help-body:
 	@printf '    build           Build the workspace (honors cargo features)\n'
 	@printf '    clean           Clean build artifacts\n'
 	@printf '    test            Run the suite: cargo tests + TS units + dockerized e2e\n'
-	@printf '    lint            Lint + spellcheck: Rust + TypeScript + cspell (fix=1 to auto-fix)\n'
+	@printf '    lint            Lint + spellcheck + rustdoc (fix=1 to auto-fix)\n'
 	@printf '    spellcheck      Spellcheck the repository with cspell\n'
 	@printf '    wasm            Lint and build the browser client for wasm32\n'
 	@printf '    client          Build the published client packages\n'
 	@printf '    sbom            Generate the client software bill of materials\n'
 	@printf '    smoke           Smoke-load the built client package exports\n'
 	@printf '    pack            Assert npm pack contents\n'
-	@printf '    doc             Build documentation (all features)\n'
+	@printf '    doc             Build documentation (all features; -D warnings)\n'
 	@printf '    audit           Security audit: cargo audit + npm audit (fix=1 for npm fixes)\n'
 	@printf '    ci              Full pipeline: lint + build + test + wasm + client + smoke + pack\n'
 	@printf '    release         Release an extension independently (see OPTIONS)\n'
 	@printf '    check-yanked    Check if the extension version has been yanked\n\n'
 	@printf 'OPTIONS / VARIABLES:\n'
 	@printf '    ws / pubsub     Scope the target to the named project(s)\n'
-	@printf '    fix             If set (e.g., fix=1), apply lint/audit fixes\n'
+	@printf '    fix             If set (e.g., fix=1), apply lint/audit fixes; rustdoc still denies warnings\n'
 	@printf '    debug           If set (e.g., debug=1), RUST_LOG=debug + verbose e2e reporter\n'
 	@printf '    features        Comma-separated Cargo feature list passed as --features\n'
 	@printf '    no-default      If set (e.g., 1), passes --no-default-features to Cargo\n'
@@ -159,7 +159,14 @@ test: setup
 
 lint: setup
 	$(call EACH_PROJECT,lint)
+	@$(MAKE) doc-lint
 	@$(MAKE) spellcheck
+
+# Rustdoc has no cargo --fix path for intra-doc / private-link warnings.
+# Both lint and doc deny them so CI and local builds fail closed the same way.
+doc-lint: setup
+	@echo "Checking rustdoc (RUSTDOCFLAGS=-D warnings)..."
+	RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 
 spellcheck: setup
 	@echo "Checking spelling..."
@@ -180,9 +187,8 @@ smoke: setup
 pack: setup
 	$(call EACH_PROJECT,pack)
 
-doc: setup
-	@echo "Building documentation..."
-	cargo doc --no-deps --all-features
+doc: doc-lint
+	@echo "Documentation build complete."
 
 audit: setup
 	@chmod +x scripts/audit.sh

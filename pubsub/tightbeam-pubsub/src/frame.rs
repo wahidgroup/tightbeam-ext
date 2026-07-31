@@ -1,13 +1,13 @@
 //! Update-frame construction and payload extraction.
 //!
-//! The registry is the single frame authority for updates: it owns
-//! `metadata.id` (the topic) and `metadata.order` (the dense per-topic
-//! stamp) at build time, so no caller-built frame is ever mutated and no
-//! `integrity`/`nonrepudiation` artifact can be invalidated.
+//! The registry alone stamps `metadata.id` (topic) and `metadata.order`
+//! (dense per-topic sequence) when it builds an update. Callers never
+//! mutate a finished frame, so integrity and non-repudiation artifacts
+//! stay valid.
 //!
-//! The body encoding matches the ws client's opaque profile body: an ASN.1
-//! SEQUENCE wrapping one OCTET STRING, so TypeScript subscribers decode
-//! updates with their ordinary codecs.
+//! The body is an ASN.1 SEQUENCE of one OCTET STRING. That matches the
+//! ws client's opaque profile so TypeScript subscribers reuse ordinary
+//! codecs.
 
 use der::asn1::OctetString;
 use der::{Decode, Sequence};
@@ -17,27 +17,23 @@ use tightbeam::{Beamable, Frame, TightBeamError, Version};
 
 use crate::topic::{Topic, END_PREFIX};
 
-/// Opaque payload wrapper carried as the frame body.
+/// Frame body: ASN.1 SEQUENCE wrapping one application OCTET STRING.
 #[derive(Beamable, Clone, Debug, PartialEq, Eq, Sequence)]
 #[beam(min_version = "V0")]
 pub(crate) struct OpaqueBody {
-	/// The wrapped payload octets.
+	/// Application octets inside the opaque SEQUENCE.
 	pub(crate) body: OctetString,
 }
 
-/// Build one topic update: id = topic, order = the dense stamp, body =
-/// the application payload.
 pub(crate) fn update_frame(topic: &Topic, order: u64, payload: &[u8]) -> Result<Frame, TightBeamError> {
 	build(topic.as_str(), order, payload)
 }
 
-/// Build one completion push: id = `end/<topic>`, empty body.
 pub(crate) fn end_frame(topic: &Topic, order: u64) -> Result<Frame, TightBeamError> {
 	let id = format!("{END_PREFIX}{topic}");
 	build(&id, order, &[])
 }
 
-/// Assemble a V0 frame around the opaque body.
 pub(crate) fn build(id: &str, order: u64, payload: &[u8]) -> Result<Frame, TightBeamError> {
 	let body = OpaqueBody { body: OctetString::new(payload)? };
 
@@ -48,11 +44,16 @@ pub(crate) fn build(id: &str, order: u64, payload: &[u8]) -> Result<Frame, Tight
 		.build()
 }
 
-/// The application payload carried by an opaque-body frame.
+/// Recover application octets from an opaque-body frame.
 ///
-/// The inverse of what [`TopicRegistry::publish`](crate::TopicRegistry::publish)
-/// installs; servers relaying client-built frames (the demo's `pub/`
-/// command) use it to lift the payload back out.
+/// Inverse of the body [`TopicRegistry::publish`](crate::TopicRegistry::publish)
+/// installs. Relays that accept client-built `pub/<topic>` frames use this
+/// to lift the payload.
+///
+/// # Errors
+///
+/// Returns [`TightBeamError`] when `frame.message` is not a well-formed
+/// opaque body SEQUENCE wrapping one OCTET STRING.
 pub fn opaque_payload(frame: &Frame) -> Result<Vec<u8>, TightBeamError> {
 	let body = OpaqueBody::from_der(&frame.message)?;
 	Ok(body.body.as_bytes().to_vec())
@@ -66,17 +67,14 @@ mod tests {
 		name.parse().expect("test topics should parse")
 	}
 
-	/// Build one update frame, expecting the builder to accept it.
 	fn built_update(topic: &Topic, order: u64, payload: &[u8]) -> Frame {
 		update_frame(topic, order, payload).expect("the update frame should build")
 	}
 
-	/// Build one completion frame, expecting the builder to accept it.
 	fn built_end(topic: &Topic, order: u64) -> Frame {
 		end_frame(topic, order).expect("the end frame should build")
 	}
 
-	/// Decode the opaque body, expecting a well-formed frame.
 	fn payload_of(frame: &Frame) -> Vec<u8> {
 		opaque_payload(frame).expect("the opaque body should decode")
 	}

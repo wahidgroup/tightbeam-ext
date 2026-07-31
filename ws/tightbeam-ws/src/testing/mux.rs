@@ -35,9 +35,9 @@ pub fn env_u32(name: &str, default: u32) -> u32 {
 
 /// Unary Frame echo plus progressive-body echo for `openStream`.
 ///
-/// [`MuxResponder::serve_streaming`] refuses unary; `emit` stamps unary.
-/// This dispatch serves both kinds so demo echo covers Frame RPC and
-/// streamed bodies on one connection.
+/// [`MuxResponder::serve_streaming`](tightbeam::transport::multiplex::MuxResponder::serve_streaming)
+/// refuses unary; `emit` stamps unary. This dispatch serves both kinds so
+/// demo echo covers Frame RPC and streamed bodies on one connection.
 pub struct EchoFrames {
 	handle: MuxHandle,
 }

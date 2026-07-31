@@ -138,10 +138,13 @@ impl<P: SubscribePolicy> PubsubCommands<P> {
 
 	/// Answer one `unsub/<topic>` command.
 	///
-	/// Idempotent like
-	/// [MQTT 5.0](https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html)
-	/// § 3.11 UNSUBACK: unsubscribing a topic that was never subscribed
-	/// still succeeds.
+	/// Idempotent like MQTT UNSUBACK: unsubscribing a topic that was never
+	/// subscribed still succeeds.
+	///
+	/// # Sources
+	///
+	/// - MQTT 5.0 § 3.11, UNSUBACK:
+	///   <https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html>
 	fn unsubscribe(&self, connection: ConnectionId, name: &[u8]) -> ResponsePackage {
 		let Ok(topic) = Topic::try_from(name) else {
 			return refusal(TransitStatus::InvalidArgument);

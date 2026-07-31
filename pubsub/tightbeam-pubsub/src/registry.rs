@@ -79,11 +79,11 @@ impl Error for RegisterError {}
 /// Why a publish produced no fan-out.
 #[derive(Debug)]
 pub enum PublishError {
-	/// The registry is quiescing: the topic already completed.
+	/// The registry is quiescing: new publishes are refused.
 	Draining,
-	/// The update frame failed to build.
+	/// The update frame failed to encode for delivery.
 	Build(TightBeamError),
-	/// The backplane rejected or lost the publish.
+	/// The backplane rejected or lost the publish after local checks passed.
 	Backplane(BackplaneError),
 }
 
@@ -316,6 +316,11 @@ impl TopicRegistry {
 	///
 	/// Idempotent per connection and topic: re-subscribing returns the
 	/// existing id. MUST be called within a tokio runtime.
+	///
+	/// # Errors
+	///
+	/// - [`RegisterError::Draining`]: [`quiesce`](Self::quiesce) already ran.
+	/// - [`RegisterError::UnknownConnection`]: `connection` was never admitted.
 	pub fn register(&self, connection: ConnectionId, topic: Topic) -> Result<SubscriberId, RegisterError> {
 		let mut state = self.lock_state();
 		/*
@@ -380,6 +385,12 @@ impl TopicRegistry {
 	/// every attached node; each node builds the update frame (id =
 	/// topic) and fans out locally. The stamp advances even with no
 	/// subscribers, so late subscribers observe continuity.
+	///
+	/// # Errors
+	///
+	/// - [`PublishError::Draining`]: the registry is quiescing.
+	/// - [`PublishError::Build`]: a node could not encode the update frame.
+	/// - [`PublishError::Backplane`]: the backplane rejected or lost the publish.
 	pub fn publish(&self, topic: &Topic, payload: impl AsRef<[u8]>) -> Result<(), PublishError> {
 		/*
 		 * Fast-fail only: the authoritative draining check runs under the
@@ -405,6 +416,11 @@ impl TopicRegistry {
 	/// (`metadata.id` = topic, `metadata.order` = dense sequence) and
 	/// never reads the inner frame. Subscribers lift the payload and
 	/// decode it as a frame (the TypeScript client's `Framed` codec).
+	///
+	/// # Errors
+	///
+	/// Same set as [`publish`](Self::publish). Encoding `inner` to DER
+	/// surfaces as [`PublishError::Build`].
 	pub fn publish_frame(&self, topic: &Topic, inner: &Frame) -> Result<(), PublishError> {
 		let payload = inner.to_der().map_err(TightBeamError::from)?;
 		self.publish(topic, payload)
@@ -416,6 +432,10 @@ impl TopicRegistry {
 	/// Returns how many subscribers were signaled. Idempotent: a repeat
 	/// signals nobody. The caller follows with the transport drain
 	/// (`shutdown_with(GoAwayReason::Shutdown)` per connection).
+	///
+	/// # Errors
+	///
+	/// - [`PublishError::Build`]: an `end/<topic>` frame failed to encode.
 	pub fn quiesce(&self) -> Result<usize, PublishError> {
 		if self.inner.draining.swap(true, Ordering::AcqRel) {
 			return Ok(0);

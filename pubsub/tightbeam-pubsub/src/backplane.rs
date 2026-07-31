@@ -99,6 +99,11 @@ impl Error for BackplaneError {
 pub trait UpdateSink: Send + Sync {
 	/// Fan `payload` out to this node's subscribers of `topic` at the
 	/// backplane-assigned `order`.
+	///
+	/// # Errors
+	///
+	/// - [`DeliverError::Draining`]: this node is quiescing.
+	/// - [`DeliverError::Build`]: the update frame failed to encode.
 	fn deliver(&self, topic: &Topic, order: u64, payload: &[u8]) -> Result<(), DeliverError>;
 }
 
@@ -110,6 +115,11 @@ pub trait Backplane: Send + Sync {
 
 	/// Assign the next dense order for `topic` and distribute `payload`
 	/// to every attached node.
+	///
+	/// # Errors
+	///
+	/// - [`BackplaneError::Refused`]: every reachable node refused delivery.
+	/// - [`BackplaneError::Unavailable`]: the distribution fabric failed.
 	fn publish(&self, topic: &Topic, payload: &[u8]) -> Result<(), BackplaneError>;
 }
 
