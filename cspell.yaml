@@ -101,6 +101,8 @@ words:
   - uppercased
   - uppercases
   - baselined
+  - unmetered
+  - subarray
 ignorePaths:
   - node_modules/**
   - "**/sbom.json"
