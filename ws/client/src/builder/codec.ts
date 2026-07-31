@@ -16,7 +16,7 @@ export interface FrameCodec {
 	/**
 	 * Assemble a complete frame from `spec`, resolving with the frame DER.
 	 *
-	 * The builder guarantees `spec` is structurally valid  before calling
+	 * The builder guarantees `spec` is structurally valid before calling
 	 * this method. A codec MAY still reject a spec it cannot honor.
 	 */
 	compose(spec: FrameSpec): Promise<Uint8Array>;

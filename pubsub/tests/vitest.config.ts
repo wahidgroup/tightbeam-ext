@@ -18,6 +18,10 @@ export default defineConfig({
 				import.meta.dirname,
 				"../../ws/tests/node/harness.ts",
 			),
+			"#ws-signer": resolve(
+				import.meta.dirname,
+				"../../ws/tests/signer.ts",
+			),
 		},
 	},
 });

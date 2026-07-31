@@ -32,7 +32,7 @@ pub async fn serve_handshake(transport: &mut WsTransport<MaybeTlsStream<TcpStrea
 			return Ok(());
 		}
 
-		let wire_bytes = transport.read_envelope().await?;
+		let wire_bytes = transport.read_envelope_bytes().await?;
 		let wire_envelope = WireEnvelope::from_der(&wire_bytes).map_err(TightBeamError::from)?;
 		let WireEnvelope::Cleartext(envelope) = wire_envelope else {
 			return Err(Error::HandshakeCiphertext);

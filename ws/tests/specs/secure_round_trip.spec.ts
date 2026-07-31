@@ -107,5 +107,6 @@ test("authenticates mutually through an external signer in the browser", async (
 	);
 	expect(result.bodyHex).toBe("0badc1de");
 	expect(result.idText).toBe("e2e-mutual-signer");
-	expect(result.signatures).toBe(1);
+	// Client-auth + receipt countersignature under the demo paywall.
+	expect(result.signatures).toBe(2);
 });

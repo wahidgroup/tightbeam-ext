@@ -159,6 +159,25 @@ async function secureRoundTrip(
 	return result;
 }
 
+/**
+ * Demo settlement payment matching `tightbeam_ws::testing::DEMO_PAYMENT`.
+ * Mutual echo always runs the demo paywall in compose.
+ */
+const DEMO_PAYMENT = new TextEncoder().encode("tbws-demo-payment-v1");
+
+/**
+ * Mutual dial options for the compose stack's demo budget ceiling.
+ */
+function mutualSessionOffer(): {
+	budgets: { clientToServer: number; serverToClient: number };
+	approveReceipt: () => Uint8Array;
+} {
+	return {
+		budgets: { clientToServer: 4096, serverToClient: 4096 },
+		approveReceipt: (): Uint8Array => DEMO_PAYMENT,
+	};
+}
+
 async function mutualRoundTrip(
 	url: string,
 	serverCertB64: string,
@@ -173,6 +192,7 @@ async function mutualRoundTrip(
 		base64ToBytes(serverCertB64),
 		base64ToBytes(clientCertB64),
 		base64ToBytes(clientKeyB64),
+		mutualSessionOffer(),
 	);
 
 	const result = await emitAndDecode(client, payloadHex, idText, order);
@@ -203,6 +223,7 @@ async function mutualSignerRoundTrip(
 		base64ToBytes(serverCertB64),
 		base64ToBytes(clientCertB64),
 		signer,
+		mutualSessionOffer(),
 	);
 
 	const decoded = await emitAndDecode(client, payloadHex, idText, order);
@@ -772,11 +793,49 @@ async function muxClearConcurrentRoundTrip(
 	return result;
 }
 
+/**
+ * Progressive openStream round-trip: split the Frame DER, push, close.
+ */
+async function streamingRoundTrip(
+	url: string,
+	serverCertB64: string,
+	payloadHex: string,
+	idText: string,
+): Promise<RoundTripResult> {
+	const client = await TightbeamWsClient.connect(
+		url,
+		base64ToBytes(serverCertB64),
+	);
+	try {
+		const built = await frame(hexToBytes(payloadHex))
+			.withId(idText)
+			.withOrder(1)
+			.build();
+
+		const der = built.toDer();
+		const mid = Math.floor(der.length / 2);
+
+		const stream = client.openStream();
+		await stream.push(der.subarray(0, mid));
+		await stream.push(der.subarray(mid));
+
+		const response = await stream.close();
+		if (response === undefined) {
+			throw new Error("streaming peer returned no response frame");
+		}
+
+		return toResult(response);
+	} finally {
+		client.close();
+	}
+}
+
 window.tbMuxConcurrentRoundTrip = muxConcurrentRoundTrip;
 window.tbMuxCallbackRoundTrip = muxCallbackRoundTrip;
 window.tbMuxClearConcurrentRoundTrip = muxClearConcurrentRoundTrip;
 window.tbMuxLifecycleProbe = muxLifecycleProbe;
 window.tbMuxDrainReason = muxDrainReason;
+window.tbStreamingRoundTrip = streamingRoundTrip;
 window.tbMuxParkedCallbackRoundTrip = muxParkedCallbackRoundTrip;
 window.tbMuxRefusalRoundTrip = muxRefusalRoundTrip;
 

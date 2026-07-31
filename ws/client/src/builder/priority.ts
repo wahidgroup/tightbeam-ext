@@ -4,14 +4,35 @@
  */
 
 /**
- * The message priority levels.
+ * Wire ordinals for frame priority (V2+).
+ *
+ * Higher ordinals request earlier scheduling under congestion. The peer
+ * may still reorder within its local policy.
  */
 export const MessagePriority = {
+	/**
+	 * Lowest effort: defer under load.
+	 */
 	LowEffort: 0,
+	/**
+	 * Default application traffic.
+	 */
 	Standard: 1,
+	/**
+	 * Bulk throughput over latency.
+	 */
 	HighThroughput: 2,
+	/**
+	 * Latency-sensitive application traffic.
+	 */
 	LowLatency: 3,
+	/**
+	 * Expedited delivery ahead of ordinary application traffic.
+	 */
 	Expedited: 4,
+	/**
+	 * Highest priority: network control and keep-alive traffic.
+	 */
 	NetworkControl: 5,
 } as const;
 

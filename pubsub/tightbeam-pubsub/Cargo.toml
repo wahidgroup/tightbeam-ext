@@ -34,6 +34,7 @@ required-features = ["testing"]
 tightbeam-rs = { workspace = true, features = [
 	"std",
 	"tokio",
+	"transport-ecies",
 	"transport-multiplex",
 ] }
 der = { workspace = true, features = ["alloc", "derive", "oid"] }

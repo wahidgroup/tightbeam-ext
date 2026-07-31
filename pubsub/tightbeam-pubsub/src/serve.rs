@@ -34,9 +34,12 @@ pub struct ConnectionContext {
 
 /// The application handler for streams no wire command claims. Answer
 /// [`unrouted`] serves a command-only connection.
-pub trait AppRoutes<F>: Fn(ConnectionContext, Arc<Frame>) -> F + Clone + Send {}
+///
+/// `Sync` because the responder shares one handler across the
+/// connection's concurrent streams.
+pub trait AppRoutes<F>: Fn(ConnectionContext, Arc<Frame>) -> F + Clone + Send + Sync + 'static {}
 
-impl<A, F> AppRoutes<F> for A where A: Fn(ConnectionContext, Arc<Frame>) -> F + Clone + Send {}
+impl<A, F> AppRoutes<F> for A where A: Fn(ConnectionContext, Arc<Frame>) -> F + Clone + Send + Sync + 'static {}
 
 /// The command-only application handler: every non-command stream
 /// answers `Unimplemented`.
@@ -57,7 +60,7 @@ pub async fn serve_connection<R, W, P, A, F>(
 where
 	R: EnvelopeSource + Send + 'static,
 	W: EnvelopeSink + Send + 'static,
-	P: SubscribePolicy,
+	P: SubscribePolicy + 'static,
 	A: AppRoutes<F>,
 	F: Future<Output = ResponsePackage> + Send,
 {
@@ -76,7 +79,7 @@ pub async fn serve_connection_as<R, W, P, A, F>(
 where
 	R: EnvelopeSource + Send + 'static,
 	W: EnvelopeSink + Send + 'static,
-	P: SubscribePolicy,
+	P: SubscribePolicy + 'static,
 	A: AppRoutes<F>,
 	F: Future<Output = ResponsePackage> + Send,
 {
@@ -92,7 +95,7 @@ async fn serve<R, W, P, A, F>(
 where
 	R: EnvelopeSource + Send + 'static,
 	W: EnvelopeSink + Send + 'static,
-	P: SubscribePolicy,
+	P: SubscribePolicy + 'static,
 	A: AppRoutes<F>,
 	F: Future<Output = ResponsePackage> + Send,
 {

@@ -1,6 +1,6 @@
 //! Update-frame construction and payload extraction.
 //!
-//! The registry is the single frame authority for updates (D6): it owns
+//! The registry is the single frame authority for updates: it owns
 //! `metadata.id` (the topic) and `metadata.order` (the dense per-topic
 //! stamp) at build time, so no caller-built frame is ever mutated and no
 //! `integrity`/`nonrepudiation` artifact can be invalidated.

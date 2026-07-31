@@ -23,19 +23,26 @@
 //!     processor servlet at this ws:// URL ([`RelayBackplane`])
 //!   - `PUBSUB_PROCESSOR_CERT`      path to the processor certificate DER the
 //!     relay dial pins (required with the endpoint)
+//!   - `TBWS_CLIENT_CERT`           required when `TBWS_PAYWALL=1`
+//!   - `TBWS_PAYWALL`               enable demo session-budget paywall
 
 use core::fmt;
 use core::time::Duration;
-use std::env::var;
+use std::env::{self, var};
 use std::error::Error;
 use std::fs;
 use std::sync::{Arc, Weak};
 
+use tightbeam::crypto::hash::Sha3_256;
+use tightbeam::crypto::x509::policy::{CertificateValidation, RuntimeCertificatePinning};
+use tightbeam::der::Decode;
 use tightbeam::policy::TransitStatus;
 use tightbeam::prelude::TightBeamSocketAddr;
-use tightbeam::transport::handshake::negotiation::TransportOffer;
-use tightbeam::transport::multiplex::{GoAwayReason, MuxHandle, MuxRole, MuxTransport};
+use tightbeam::transport::envelopes::GoAwayReason;
+use tightbeam::transport::handshake::negotiation::{TransportAuthorizer, TransportOffer};
+use tightbeam::transport::multiplex::{MuxHandle, MuxRole};
 use tightbeam::transport::{EncryptedMessageIO, EncryptedProtocol, ResponsePackage, X509ClientConfig};
+use tightbeam::x509::Certificate;
 use tightbeam::Frame;
 use tightbeam_pubsub::testing::command_frame;
 use tightbeam_pubsub::{
@@ -43,8 +50,11 @@ use tightbeam_pubsub::{
 	PubsubCommands, RegistryOptions, SubscribePolicy, Topic, TopicRegistry, UpdateSink,
 };
 use tightbeam_ws::io::{WsStream, WsTransport};
+use tightbeam_ws::mux::assemble_mux;
 use tightbeam_ws::protocol::WsListener;
-use tightbeam_ws::testing::{env_u32, pinned_trust, serve_handshake, Identity};
+use tightbeam_ws::testing::{
+	budget_ceiling, env_u32, paywall_enabled, pinned_trust, serve_handshake, DemoPaywall, FixedWallet, Identity,
+};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{channel, Sender};
@@ -109,21 +119,35 @@ struct RelayBackplane {
 
 impl RelayBackplane {
 	/// Dial the processor over ECIES (pinning `cert_path`) and spawn the
-	/// relay worker.
-	async fn connect(endpoint: &str, cert_path: &str, cap: u32) -> Result<Arc<Self>, BoxError> {
+	/// relay worker. When `paywall` is set, the dial presents `identity`
+	/// as the client and pays demo invoices so renewals stay live.
+	async fn connect(
+		endpoint: &str,
+		cert_path: &str,
+		cap: u32,
+		paywall: bool,
+		identity: &Identity,
+	) -> Result<Arc<Self>, BoxError> {
 		let trust = pinned_trust(&fs::read(cert_path)?)?;
 		let (websocket, _response) = connect_async(endpoint).await?;
 		let transport: ServerTransport = WsTransport::from(WsStream::new(websocket));
-		let mut transport = transport.with_trust_store(trust).with_mux_offer(Some(TransportOffer::mux(cap)));
+
+		let mut offer = TransportOffer::mux(cap);
+		if paywall {
+			offer = offer.with_budgets(budget_ceiling());
+		}
+
+		let mut transport = transport.with_trust_store(trust).with_mux_offer(Some(offer));
+		if paywall {
+			let (cert, keys) = identity.client_identity();
+			transport = transport
+				.with_client_identity(cert, keys)
+				.with_receipt_approver(FixedWallet::shared(1024)?);
+		}
 
 		transport.perform_client_handshake().await?;
 
-		let settings = transport
-			.negotiated_mux()
-			.ok_or("the processor did not negotiate multiplexing")?;
-		let (reader, writer) = transport.into_split()?;
-
-		let mux = MuxTransport::new(reader, writer, MuxRole::Client, settings);
+		let mux = assemble_mux(transport, MuxRole::Client)?;
 		let (handle, reader_driver, writer_driver, _responder) = mux.into_parts();
 		tokio::spawn(reader_driver.drive());
 		tokio::spawn(writer_driver.drive());
@@ -262,17 +286,24 @@ async fn answer_quiesce(registry: &TopicRegistry, handle: &MuxHandle) -> Respons
 
 /// Serve one multiplexed encrypted connection until it ends.
 async fn serve_ws_connection(
-	transport: ServerTransport,
+	mut transport: ServerTransport,
 	commands: PubsubCommands<DenyForbidden>,
 	cap: u32,
+	authorizer: Option<Arc<dyn TransportAuthorizer>>,
 ) -> Result<(), BoxError> {
-	let mut transport = transport.with_mux_offer(Some(TransportOffer::mux(cap)));
+	let mut offer = TransportOffer::mux(cap);
+	if authorizer.is_some() {
+		offer = offer.with_budgets(budget_ceiling());
+	}
+
+	transport = transport.with_mux_offer(Some(offer));
+	if let Some(authorizer) = authorizer {
+		transport = transport.with_transport_authorizer(authorizer);
+	}
+
 	serve_handshake(&mut transport).await?;
 
-	let settings = transport.negotiated_mux().ok_or("the client did not negotiate multiplexing")?;
-	let (reader, writer) = transport.into_split()?;
-	let mux = MuxTransport::new(reader, writer, MuxRole::Server, settings);
-
+	let mux = assemble_mux(transport, MuxRole::Server)?;
 	let registry = commands.registry().clone();
 	serve_connection(mux, commands, move |context, frame| {
 		answer_stream(registry.clone(), context, frame)
@@ -282,6 +313,14 @@ async fn serve_ws_connection(
 	Ok(())
 }
 
+/// Pin the client certificate at `path` as the only accepted client identity.
+fn client_validators(path: &str) -> Result<Vec<Arc<dyn CertificateValidation>>, BoxError> {
+	let cert = Certificate::from_der(&fs::read(path)?)?;
+	let pinning = RuntimeCertificatePinning::<Sha3_256>::from_certificates([cert])?;
+
+	Ok(vec![Arc::new(pinning)])
+}
+
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
 	let port = env_u32("PUBSUB_WS_PORT", 9110);
@@ -289,18 +328,33 @@ async fn main() -> Result<(), BoxError> {
 	let queue_capacity = env_u32("PUBSUB_QUEUE_CAPACITY", 32) as usize;
 	let bind_addr = TightBeamSocketAddr(format!("0.0.0.0:{port}").parse()?);
 
+	let paywall = paywall_enabled();
+	let identity = Identity::from_env()?;
+
 	let mut options = RegistryOptions { queue_capacity, ..RegistryOptions::default() };
 	if let Ok(endpoint) = var("PUBSUB_PROCESSOR_ENDPOINT") {
 		let cert_path = var("PUBSUB_PROCESSOR_CERT")?;
-		options.backplane = RelayBackplane::connect(&endpoint, &cert_path, cap).await?;
+		options.backplane = RelayBackplane::connect(&endpoint, &cert_path, cap, paywall, &identity).await?;
 		println!("[pubsub-demo] publishing through the processor at {endpoint}");
 	}
 
 	let registry = TopicRegistry::new(options);
 	let commands = PubsubCommands::new(registry, DenyForbidden).with_publish(AllowAll);
 
-	let identity = Identity::from_env()?;
-	let (listener, bound) = <WsListener as EncryptedProtocol>::bind_with(bind_addr, identity.server_config()).await?;
+	let mut config = identity.server_config();
+	if paywall {
+		let client_cert =
+			env::var("TBWS_CLIENT_CERT").map_err(|_| "TBWS_PAYWALL requires TBWS_CLIENT_CERT (mutual auth)")?;
+		config = config.with_client_validators(client_validators(&client_cert)?);
+	}
+
+	let authorizer = if paywall {
+		Some(DemoPaywall::shared()?)
+	} else {
+		None
+	};
+
+	let (listener, bound) = <WsListener as EncryptedProtocol>::bind_with(bind_addr, config).await?;
 	println!(
 		"[pubsub-demo] multiplexed encrypted tightbeam pub/sub demo listening on ws://{}",
 		bound.0
@@ -318,8 +372,9 @@ async fn main() -> Result<(), BoxError> {
 		};
 
 		let commands = commands.clone();
+		let authorizer = authorizer.clone();
 		tokio::spawn(async move {
-			if let Err(error) = serve_ws_connection(transport, commands, cap).await {
+			if let Err(error) = serve_ws_connection(transport, commands, cap, authorizer).await {
 				eprintln!("[pubsub-demo] connection from {peer} ended: {error}");
 			}
 		});

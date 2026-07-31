@@ -25,7 +25,7 @@ use tightbeam::transport::X509ClientConfig;
 use tightbeam::x509::Certificate;
 use tightbeam::Frame;
 
-use crate::fault::to_js;
+use crate::fault::{to_js, validation};
 use crate::signer::{JsSigningKeyProvider, TransportSigner};
 use crate::socket::{open_observed, SocketMonitor};
 use crate::stream::{GlooStream, WsTransport};
@@ -65,7 +65,8 @@ where
 	/// Custom-profile builds pair this with [`build_transport_with`].
 	pub fn from_signer(cert_der: &[u8], signer: TransportSigner) -> Result<Self, JsValue> {
 		let certificate = Certificate::from_der(cert_der).map_err(to_js)?;
-		let provider = JsSigningKeyProvider::new(signer)?.into_provider();
+		let cert_spki = certificate.tbs_certificate.subject_public_key_info.to_der().map_err(to_js)?;
+		let provider = JsSigningKeyProvider::new(signer, &cert_spki)?.into_provider();
 		let key_manager = HandshakeKeyManager::new(provider);
 
 		let credentials = Self { certificate: Arc::new(certificate), key_manager: Arc::new(key_manager) };
@@ -165,7 +166,7 @@ pub(crate) fn build_signer_transport(
 fn signing_key_from_bytes(bytes: &[u8]) -> Result<Secp256k1SigningKey, JsValue> {
 	let scalar: [u8; 32] = bytes
 		.try_into()
-		.map_err(|_| JsValue::from_str("secp256k1 signing key must be exactly 32 bytes"))?;
+		.map_err(|_| validation("InvalidSigningKey", "secp256k1 signing key must be exactly 32 bytes"))?;
 
 	Secp256k1SigningKey::from_bytes(&scalar.into()).map_err(to_js)
 }

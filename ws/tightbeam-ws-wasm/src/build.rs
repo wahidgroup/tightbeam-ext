@@ -8,7 +8,7 @@ use tightbeam::cms::compressed_data::CompressedData;
 use tightbeam::cms::content_info::CmsVersion;
 use tightbeam::cms::enveloped_data::EncryptedContentInfo;
 use tightbeam::cms::signed_data::{EncapsulatedContentInfo, SignerIdentifier};
-use tightbeam::crypto::aead::{AeadCore, Aes256Gcm, Decryptor, Encryptor, KeyInit};
+use tightbeam::crypto::aead::{AeadCore, Aes256Gcm, Aes256GcmOid, Decryptor, Encryptor, KeyInit};
 use tightbeam::crypto::ecies::{EciesDecryptor, EciesEncryptor, EciesSecp256k1Oid};
 use tightbeam::crypto::hash::{Digest as _, Sha3_256};
 use tightbeam::crypto::k256::SecretKey;
@@ -510,7 +510,7 @@ fn encrypted_info(
 pub fn seal_aes_256_gcm(key: impl AsRef<[u8]>, plaintext: impl AsRef<[u8]>) -> Result<SealedBody, TightBeamError> {
 	let cipher = Aes256Gcm::new_from_slice(key.as_ref())?;
 	let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
-	let info = Encryptor::<Aes256GcmOidMarker>::encrypt_content(&cipher, plaintext.as_ref(), nonce, None)?;
+	let info = Encryptor::<Aes256GcmOid>::encrypt_content(&cipher, plaintext.as_ref(), nonce, None)?;
 	sealed_body(info)
 }
 
@@ -548,13 +548,6 @@ pub fn open_ecies_secp256k1(
 	let decryptor = EciesDecryptor::new(SecretKey::from_slice(secret_key.as_ref())?);
 	let info = encrypted_info(EciesSecp256k1Oid::OID, parameters_der, ciphertext)?;
 	Ok(decryptor.decrypt_content(&info)?.to_insecure()?.to_vec())
-}
-
-/// Marker binding the profile AEAD OID for the generic [`Encryptor`] call.
-struct Aes256GcmOidMarker;
-
-impl AssociatedOid for Aes256GcmOidMarker {
-	const OID: ObjectIdentifier = tightbeam::oids::AES_256_GCM;
 }
 
 #[cfg(test)]
@@ -1101,7 +1094,7 @@ mod tests {
 		let der = set_compactness(&der, None, info.compression_alg.oid, None, compressed.clone())?;
 
 		let summary = inspect_frame(&der)?;
-		assert_eq!(summary.compactness_algorithm_oid.as_deref(), Some("1.3.6.1.4.1.55555.2.1"));
+		assert_eq!(summary.compactness_algorithm_oid.as_deref(), Some("1.3.6.1.4.1.64586.2.1"));
 		assert_eq!(summary.compactness_content_oid.as_deref(), Some("1.2.840.113549.1.9.16.1.9"));
 		assert_eq!(summary.compactness_parameters_der, None);
 		assert_eq!(summary.body_der, compressed);

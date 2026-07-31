@@ -3,13 +3,19 @@
  */
 
 import init, { MuxWsClient } from "#wasm";
-import type { GoAwayReason, SocketCloseInfo, TransportSigner } from "#wasm";
+import type {
+	GoAwayReason,
+	MuxReplySink,
+	MuxStreamBody,
+	SocketCloseInfo,
+	TransportSigner,
+} from "#wasm";
 
 import type { MessageCodec } from "./message.js";
 import { FrameBuilder } from "./builder/index.js";
 import { WasmFrameCodec } from "./codec.js";
 import { Envelope } from "./envelope.js";
-import { connectionClosed } from "./errors.js";
+import { connectionClosed, InternalError } from "./errors.js";
 import { Frame } from "./frame.js";
 
 export type { MuxWsClient };
@@ -276,6 +282,22 @@ export interface ConnectOptions {
 	 * The server's own advertisement caps this client's concurrent emits.
 	 */
 	maxPeerStreams?: number;
+	/**
+	 * Per-direction session-budget credits to request. Mutual auth only
+	 * ({@link TightbeamWsClient.connectMutual}); rejected on other connectors.
+	 */
+	budgets?: { clientToServer: number; serverToClient: number };
+	/**
+	 * Opaque settlement token for the server's authorizer. Mutual auth only.
+	 */
+	authorization?: Uint8Array;
+	/**
+	 * Pay settlement challenges at handshake and each renewal. Mutual auth only.
+	 */
+	approveReceipt?: (input: {
+		receiptDer: Uint8Array;
+		challenge?: Uint8Array;
+	}) => Uint8Array | undefined | Promise<Uint8Array | undefined>;
 }
 
 /**
@@ -312,9 +334,62 @@ function assertOptionsShape(options: unknown): void {
 		return;
 	}
 
-	throw new TypeError(
+	throw new InternalError(
+		"InvalidConnectOptions",
 		"connect options must be an object: stream caps are options fields (maxPeerStreams / streams), not positional arguments",
 	);
+}
+
+/**
+ * Session budgets and settlement knobs require mutual authentication.
+ * Duck-typed so cleartext options objects can carry foreign fields at
+ * runtime without a cast at the call site.
+ */
+function assertNoSessionOffer(
+	options: object | undefined,
+	connector: string,
+): void {
+	if (options === undefined) {
+		return;
+	}
+	if (
+		("budgets" in options && options.budgets !== undefined) ||
+		("authorization" in options && options.authorization !== undefined) ||
+		("approveReceipt" in options && options.approveReceipt !== undefined)
+	) {
+		throw new InternalError(
+			"SessionOfferRequiresMutual",
+			`${connector} rejects budgets/authorization/approveReceipt: use connectMutual`,
+		);
+	}
+}
+
+/**
+ * Pack mutual-only session knobs for the wasm dial, or omit when unused.
+ */
+function sessionOfferFrom(options: ConnectOptions | undefined):
+	| {
+			budgets?: { clientToServer: number; serverToClient: number };
+			authorization?: Uint8Array;
+			approveReceipt?: ConnectOptions["approveReceipt"];
+	  }
+	| undefined {
+	if (options === undefined) {
+		return undefined;
+	}
+	if (
+		options.budgets === undefined &&
+		options.authorization === undefined &&
+		options.approveReceipt === undefined
+	) {
+		return undefined;
+	}
+
+	return {
+		budgets: options.budgets,
+		authorization: options.authorization,
+		approveReceipt: options.approveReceipt,
+	};
 }
 
 /**
@@ -334,7 +409,8 @@ function assertStreamCap(field: string, cap: number): void {
 		return;
 	}
 
-	throw new TypeError(
+	throw new InternalError(
+		"InvalidStreamCap",
 		`${field} is not a usable stream cap: expected an integer between 1 and ${MAX_STREAM_CAP}, got ${cap}`,
 	);
 }
@@ -362,7 +438,8 @@ function assertClientKeyShape(clientKey: Uint8Array | TransportSigner): void {
 		}
 	}
 
-	throw new TypeError(
+	throw new InternalError(
+		"InvalidClientKey",
 		"clientKey must be the raw signing scalar as a Uint8Array (wrap ArrayBuffers) or a TransportSigner exposing algorithmOid, publicKeyDer, and signPrehash",
 	);
 }
@@ -413,6 +490,87 @@ export type MuxStreamHandler = (
 ) => Promise<Frame | undefined | null> | Frame | undefined | null;
 
 /**
+ * Progressive body source: each yield is one wire chunk; the iterator
+ * ends after the peer's `last` chunk.
+ */
+export type StreamBodySource = AsyncIterable<Uint8Array>;
+
+/**
+ * Answers a progressive request body with a reassembled Frame (or
+ * bodiless acceptance).
+ */
+export type StreamingBodyHandler = (
+	body: StreamBodySource,
+) => Promise<Frame | undefined | null> | Frame | undefined | null;
+
+/**
+ * Reply half for {@link TightbeamWsClient.serveDuplex}.
+ */
+export interface ReplySink {
+	/**
+	 * Push one reply chunk toward the peer. Empty chunks are no-ops.
+	 */
+	push(chunk: Uint8Array): Promise<void>;
+}
+
+/**
+ * Full-duplex body handler: consume request chunks and push reply chunks.
+ * Resolve with a gRPC status name, or `undefined` for `Ok`.
+ */
+export type DuplexBodyHandler = (
+	body: StreamBodySource,
+	reply: ReplySink,
+) => Promise<string | void> | string | void;
+
+/**
+ * Client-initiated progressive request: push chunks, then close for the
+ * Frame response. `closeWith` flags the final chunk itself, spending
+ * one record fewer than push-then-close. Dropping without close
+ * cancels the stream.
+ */
+export interface RequestStream {
+	/**
+	 * Push one request chunk. Empty chunks are no-ops on the wire.
+	 */
+	push(chunk: Uint8Array): Promise<void>;
+	/**
+	 * Finish the request body and resolve with the response Frame, or
+	 * `undefined` when the peer answered without a body.
+	 */
+	close(): Promise<Frame | undefined>;
+	/**
+	 * Push the final request chunk with `last` set, then resolve with the
+	 * response Frame (or `undefined`).
+	 */
+	closeWith(chunk: Uint8Array): Promise<Frame | undefined>;
+}
+
+/**
+ * Client-initiated duplex stream. Pushes reach the wire eagerly, so a
+ * chunk-for-chunk conversation is sound.
+ *
+ * - `closeWith` flags the final chunk itself.
+ */
+export interface DuplexStream {
+	/**
+	 * Push one request chunk toward the peer.
+	 */
+	push(chunk: Uint8Array): Promise<void>;
+	/**
+	 * Finish the request body without a final chunk payload.
+	 */
+	close(): Promise<void>;
+	/**
+	 * Push the final request chunk with `last` set and close the body.
+	 */
+	closeWith(chunk: Uint8Array): Promise<void>;
+	/**
+	 * Progressive reply body from the peer on this stream.
+	 */
+	readonly body: StreamBodySource;
+}
+
+/**
  * Options accepted by {@link TightbeamWsClient.serve}.
  */
 export interface ServeOptions {
@@ -423,6 +581,23 @@ export interface ServeOptions {
 	 * application routes underneath itself.
 	 */
 	readonly exclusive?: boolean;
+}
+
+/**
+ * Yield chunks from a wasm body/duplex handle until `nextChunk` returns
+ * `undefined`.
+ */
+async function* bodyChunks(source: {
+	nextChunk(): Promise<Uint8Array | undefined>;
+}): AsyncGenerator<Uint8Array> {
+	for (;;) {
+		const chunk = await source.nextChunk();
+		if (chunk === undefined) {
+			return;
+		}
+
+		yield chunk;
+	}
 }
 
 /**
@@ -438,6 +613,8 @@ export class TightbeamWsClient extends SocketLifecycle<MuxWsClient> {
 	private finalGoawayReason: GoAwayReason | undefined;
 	private finalGoawayCode: number | undefined;
 	private finalMaxConcurrentStreams = 0;
+	private finalUsableSendBudget: number | undefined;
+	private finalSessionReceiptDer: Uint8Array | undefined;
 
 	/**
 	 * Set by an {@link ServeOptions.exclusive} claim: dispatch belongs
@@ -453,6 +630,8 @@ export class TightbeamWsClient extends SocketLifecycle<MuxWsClient> {
 		this.finalGoawayReason = this.socket.goawayReason;
 		this.finalGoawayCode = this.socket.goawayCode;
 		this.finalMaxConcurrentStreams = this.socket.maxConcurrentStreams;
+		this.finalUsableSendBudget = this.socket.usableSendBudget;
+		this.finalSessionReceiptDer = this.socket.sessionReceiptDer;
 	}
 
 	/**
@@ -472,6 +651,7 @@ export class TightbeamWsClient extends SocketLifecycle<MuxWsClient> {
 		options?: ConnectOptions,
 	): Promise<TightbeamWsClient> {
 		assertOptionsShape(options);
+		assertNoSessionOffer(options, "connect");
 
 		const maxPeerStreams = options?.maxPeerStreams ?? DEFAULT_STREAM_CAP;
 		assertStreamCap("maxPeerStreams", maxPeerStreams);
@@ -509,6 +689,7 @@ export class TightbeamWsClient extends SocketLifecycle<MuxWsClient> {
 		options?: CleartextConnectOptions,
 	): Promise<TightbeamWsClient> {
 		assertOptionsShape(options);
+		assertNoSessionOffer(options, "connectCleartext");
 
 		const streams = options?.streams ?? DEFAULT_STREAM_CAP;
 		assertStreamCap("streams", streams);
@@ -549,10 +730,13 @@ export class TightbeamWsClient extends SocketLifecycle<MuxWsClient> {
 	): Promise<TightbeamWsClient> {
 		assertOptionsShape(options);
 		assertClientKeyShape(clientKey);
+
 		const maxPeerStreams = options?.maxPeerStreams ?? DEFAULT_STREAM_CAP;
 		assertStreamCap("maxPeerStreams", maxPeerStreams);
+
 		await initClient();
 
+		const session = sessionOfferFrom(options);
 		let socket: MuxWsClient;
 		if (clientKey instanceof Uint8Array) {
 			socket = await MuxWsClient.connectMutual(
@@ -562,6 +746,7 @@ export class TightbeamWsClient extends SocketLifecycle<MuxWsClient> {
 				clientKey,
 				maxPeerStreams,
 				options?.signal,
+				session,
 			);
 		} else {
 			socket = await MuxWsClient.connectMutualWithSigner(
@@ -571,6 +756,7 @@ export class TightbeamWsClient extends SocketLifecycle<MuxWsClient> {
 				clientKey,
 				maxPeerStreams,
 				options?.signal,
+				session,
 			);
 		}
 
@@ -598,15 +784,13 @@ export class TightbeamWsClient extends SocketLifecycle<MuxWsClient> {
 	}
 
 	/**
-	 * Serve server-initiated streams with `handler`. Callable repeatedly:
-	 * the latest handler serves every stream dispatched after the call,
-	 * and streams already in flight finish on the handler they started
-	 * with. Handlers for distinct streams run concurrently.
+	 * Claim exclusive stream dispatch when {@link ServeOptions.exclusive}
+	 * is set, or throw when a prior claim already owns the client.
 	 */
-	serve(handler: MuxStreamHandler, options?: ServeOptions): void {
-		this.requireLive("serve");
+	private claimServe(options: ServeOptions | undefined): void {
 		if (this.serveClaimed) {
-			throw new Error(
+			throw new InternalError(
+				"ServeDispatchClaimed",
 				"stream dispatch is exclusively claimed on this client " +
 					"(a SubscriptionManager?); route application streams " +
 					"through the claimant instead of calling serve again",
@@ -615,6 +799,20 @@ export class TightbeamWsClient extends SocketLifecycle<MuxWsClient> {
 		if (options?.exclusive === true) {
 			this.serveClaimed = true;
 		}
+	}
+
+	/**
+	 * Serve server-initiated streams with `handler`. Callable repeatedly:
+	 * the latest handler serves every stream dispatched after the call,
+	 * and streams already in flight finish on the handler they started
+	 * with. Handlers for distinct streams run concurrently.
+	 *
+	 * Mutually exclusive with {@link serveStreaming} / {@link serveDuplex}:
+	 * the first call consumes the wasm responder.
+	 */
+	serve(handler: MuxStreamHandler, options?: ServeOptions): void {
+		this.requireLive("serve");
+		this.claimServe(options);
 
 		this.socket.serve(
 			(requestDer: Uint8Array): Promise<Uint8Array | undefined> => {
@@ -631,6 +829,104 @@ export class TightbeamWsClient extends SocketLifecycle<MuxWsClient> {
 
 				const settled = respond();
 				return settled;
+			},
+		);
+	}
+
+	/**
+	 * Progressive client request: push body chunks, then close for a
+	 * Frame response (or `undefined`). Cancel-on-drop when abandoned
+	 * without {@link RequestStream.close}.
+	 */
+	openStream(): RequestStream {
+		this.requireLive("openStream");
+
+		const stream = this.socket.openStream();
+		const decodeResponse = (
+			der: Uint8Array | undefined,
+		): Frame | undefined => {
+			if (der === undefined) {
+				return undefined;
+			}
+
+			return Frame.fromDer(der);
+		};
+		return {
+			push: (chunk: Uint8Array): Promise<void> => stream.push(chunk),
+			close: async (): Promise<Frame | undefined> => {
+				const der = await stream.close();
+				return decodeResponse(der);
+			},
+			closeWith: async (
+				chunk: Uint8Array,
+			): Promise<Frame | undefined> => {
+				const der = await stream.closeWith(chunk);
+				return decodeResponse(der);
+			},
+		};
+	}
+
+	/**
+	 * Full-duplex body streaming on one stream id.
+	 *
+	 * Pushes reach the wire eagerly: awaiting the next chunk of
+	 * {@link DuplexStream.body} between pushes (a chunk-for-chunk
+	 * conversation) is sound. {@link DuplexStream.closeWith} flags
+	 * the final chunk itself.
+	 */
+	openDuplex(): DuplexStream {
+		this.requireLive("openDuplex");
+
+		const stream = this.socket.openDuplex();
+		return {
+			push: (chunk: Uint8Array): Promise<void> => stream.push(chunk),
+			close: (): Promise<void> => stream.close(),
+			closeWith: (chunk: Uint8Array): Promise<void> =>
+				stream.closeWith(chunk),
+			body: bodyChunks(stream),
+		};
+	}
+
+	/**
+	 * Serve peer streams as progressive bodies. Mutually exclusive with
+	 * {@link serve} / {@link serveDuplex}.
+	 */
+	serveStreaming(
+		handler: StreamingBodyHandler,
+		options?: ServeOptions,
+	): void {
+		this.requireLive("serveStreaming");
+		this.claimServe(options);
+
+		this.socket.serveStreaming(async (body: MuxStreamBody) => {
+			const response = await handler(bodyChunks(body));
+			if (response === undefined || response === null) {
+				return undefined;
+			}
+
+			return response.toDer();
+		});
+	}
+
+	/**
+	 * Serve peer streams as duplex bodies. Mutually exclusive with
+	 * {@link serve} / {@link serveStreaming}.
+	 */
+	serveDuplex(handler: DuplexBodyHandler, options?: ServeOptions): void {
+		this.requireLive("serveDuplex");
+		this.claimServe(options);
+
+		this.socket.serveDuplex(
+			async (body: MuxStreamBody, reply: MuxReplySink) => {
+				const status = await handler(bodyChunks(body), {
+					push: (chunk: Uint8Array): Promise<void> =>
+						reply.push(chunk),
+				});
+				if (status === undefined) {
+					return undefined;
+				}
+
+				return status;
 			},
 		);
 	}
@@ -721,6 +1017,32 @@ export class TightbeamWsClient extends SocketLifecycle<MuxWsClient> {
 	}
 
 	/**
+	 * Usable outbound session-budget credits for this epoch, or
+	 * `undefined` when unmetered. Invoice sizing uses this figure;
+	 * there is no live remaining-balance getter.
+	 */
+	get usableSendBudget(): number | undefined {
+		if (this.isReleased) {
+			return this.finalUsableSendBudget;
+		}
+
+		return this.socket.usableSendBudget;
+	}
+
+	/**
+	 * DER of the current epoch's dual-signed session receipt, or
+	 * `undefined` on unmetered sessions. Rotates after each successful
+	 * in-band renewal. Snapshotted by {@link close} like GoAway.
+	 */
+	get sessionReceiptDer(): Uint8Array | undefined {
+		if (this.isReleased) {
+			return this.finalSessionReceiptDer;
+		}
+
+		return this.socket.sessionReceiptDer;
+	}
+
+	/**
 	 * Connection-level liveness probe: resolves when the peer's ack
 	 * arrives. No stream is allocated and the peer's application handler
 	 * never runs, so a periodic ping doubles as an idle keepalive.
@@ -749,8 +1071,7 @@ export class TightbeamWsClient extends SocketLifecycle<MuxWsClient> {
 
 	/**
 	 * As {@link shutdown}, advertising `reason` in the GoAway so the
-	 * peer's reconnect policy can branch on it: a label (`"Shutdown"`,
-	 * `"ProtocolError"`, `"EnhanceYourCalm"`) or a numeric code.
+	 * peer's reconnect policy can branch on it: a label or a numeric code.
 	 * Codes outside the reserved range are application-defined.
 	 */
 	async shutdownWith(reason: GoAwayReason | number): Promise<void> {

@@ -14,8 +14,8 @@ import type {
 	MessageSlot,
 	PreviousHashSpec,
 } from "./spec.js";
-import { Frame } from "../frame.js";
 import { InternalError } from "../errors.js";
+import { Frame } from "../frame.js";
 import { Opaque } from "../message.js";
 import { ValidationError } from "./errors.js";
 import { Version } from "./version.js";

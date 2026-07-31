@@ -12,10 +12,14 @@
 
 import type { FrameCodec } from "./builder/codec.js";
 import type { BodyCompressor, BodyInflator } from "./compress.js";
-import type { BodyDecryptor, BodyEncryptor, Signatory } from "./crypto.js";
-import type { MessageCodec } from "./message.js";
-import type { Secp256k1VerifyingKey } from "./crypto.js";
+import type {
+	BodyDecryptor,
+	BodyEncryptor,
+	Secp256k1VerifyingKey,
+	Signatory,
+} from "./crypto.js";
 import type { Frame } from "./frame.js";
+import type { MessageCodec } from "./message.js";
 import { FrameBuilder } from "./builder/builder.js";
 import { ValidationError } from "./builder/errors.js";
 import { Secp256k1SigningKey } from "./crypto.js";

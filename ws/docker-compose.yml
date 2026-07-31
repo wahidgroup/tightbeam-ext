@@ -31,7 +31,20 @@ services:
       TBWS_SERVER_CERT: /certs/server.cert.der
       TBWS_SERVER_KEY: /certs/server.key
       TBWS_CLIENT_CERT: /certs/client.cert.der
+      TBWS_PAYWALL: "1"
+      TBWS_MUX_BUDGET_C2S: "4096"
+      TBWS_MUX_BUDGET_S2C: "4096"
     volumes:
       - ${CERT_DIR:?}:/certs:ro
     ports:
       - "${ECHO_WS_MUX_MUTUAL_HOST_PORT:-9102}:9102"
+
+  # Cleartext duplex body echo for openDuplex e2e (TBWS_ECHO_BODY=duplex).
+  echo-server-mux-duplex:
+    image: ${ECHO_IMAGE:-tightbeam-ws-echo:dev}
+    command: ["echo-server-mux-clear"]
+    environment:
+      ECHO_WS_PORT: "9103"
+      TBWS_ECHO_BODY: duplex
+    ports:
+      - "${ECHO_WS_MUX_DUPLEX_HOST_PORT:-9103}:9103"

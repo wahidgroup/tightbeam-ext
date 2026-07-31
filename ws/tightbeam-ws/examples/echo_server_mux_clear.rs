@@ -15,12 +15,15 @@
 //! Environment:
 //!   - `ECHO_WS_PORT`     listen port (default `9101`)
 //!   - `MUX_STREAMS`      symmetric concurrency cap (default `8`)
+//!   - `TBWS_ECHO_BODY`   `streaming` (default) | `duplex` | `unary`
+
+use std::env;
 
 use tightbeam::transport::handshake::negotiation::MuxSettings;
 use tightbeam::transport::multiplex::{MuxRole, MuxTransport};
 use tightbeam_ws::io::WsTransport;
 use tightbeam_ws::protocol::WsListener;
-use tightbeam_ws::testing::{echo_stream, env_u32};
+use tightbeam_ws::testing::{echo_duplex, echo_stream, env_u32, EchoFrames};
 use tokio::net::TcpStream;
 use tokio_tungstenite::MaybeTlsStream;
 
@@ -39,7 +42,12 @@ async fn serve_connection(transport: ServerTransport, cap: u32) -> Result<(), Bo
 	let reader_task = tokio::spawn(reader_driver.drive());
 	let writer_task = tokio::spawn(writer_driver.drive());
 
-	let outcome = responder.serve(move |frame| echo_stream(handle.clone(), frame)).await;
+	let body_mode = env::var("TBWS_ECHO_BODY").unwrap_or_else(|_| "streaming".into());
+	let outcome = match body_mode.as_str() {
+		"unary" => responder.serve(move |frame| echo_stream(handle.clone(), frame)).await,
+		"duplex" => responder.serve_duplex(echo_duplex).await,
+		_ => responder.serve_with(EchoFrames::new(handle)).await,
+	};
 
 	reader_task.abort();
 	writer_task.abort();

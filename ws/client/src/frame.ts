@@ -22,12 +22,12 @@ import type { Version } from "./builder/version.js";
 import type { BodyInflator } from "./compress.js";
 import type { BodyDecryptor, Hasher, Secp256k1VerifyingKey } from "./crypto.js";
 import type { MessageCodec } from "./message.js";
-import { wrapped } from "./message.js";
 import { ValidationError } from "./builder/errors.js";
 import { priorityFromOrdinal } from "./builder/priority.js";
 import { versionFromOrdinal } from "./builder/version.js";
 import { Sha3_256 } from "./crypto.js";
 import { InternalError } from "./errors.js";
+import { wrapped } from "./message.js";
 
 /**
  * The integrity-check outcomes.

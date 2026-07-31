@@ -1,8 +1,9 @@
 /**
  * Live board example app for the pubsub extension.
  *
- * Connects over ECIES to the demo server named in the `endpoint` query
- * parameter (pinning the `cert` parameter's certificate), subscribes to
+ * Connects over mutual-auth ECIES to the demo server named in the
+ * `endpoint` query parameter (pinning `cert`, presenting `clientCert` /
+ * `clientKey`, paying the demo session-budget invoice), subscribes to
  * the `topic` query parameter, and renders every update into the DOM as
  * it arrives.
  *
@@ -103,9 +104,9 @@ const publishForm = element<HTMLFormElement>("publish-form");
 const payloadInput = element<HTMLInputElement>("payload");
 
 /**
- * Decode the `cert` query parameter (base64 DER).
+ * Decode a base64 DER / key query parameter.
  */
-function certFromParam(encoded: string): Uint8Array {
+function bytesFromParam(encoded: string): Uint8Array {
 	const binary = atob(encoded);
 	const bytes = new Uint8Array(binary.length);
 	for (let index = 0; index < binary.length; index += 1) {
@@ -114,6 +115,11 @@ function certFromParam(encoded: string): Uint8Array {
 
 	return bytes;
 }
+
+/**
+ * Demo settlement payment matching `tightbeam_ws::testing::DEMO_PAYMENT`.
+ */
+const DEMO_PAYMENT = new TextEncoder().encode("tbws-demo-payment-v1");
 
 /**
  * The envelope this page publishes under: always signed, sealed when
@@ -181,8 +187,17 @@ async function main(): Promise<void> {
 	const endpoint = params.get("endpoint");
 	const topic = params.get("topic");
 	const cert = params.get("cert");
-	if (endpoint === null || topic === null || cert === null) {
-		status.textContent = "missing endpoint, topic, or cert query parameter";
+	const clientCert = params.get("clientCert");
+	const clientKey = params.get("clientKey");
+	if (
+		endpoint === null ||
+		topic === null ||
+		cert === null ||
+		clientCert === null ||
+		clientKey === null
+	) {
+		status.textContent =
+			"missing endpoint, topic, cert, clientCert, or clientKey query parameter";
 		return;
 	}
 
@@ -191,9 +206,15 @@ async function main(): Promise<void> {
 	const publishing = publishEnvelope(seal);
 	const receiving = receiveEnvelope(seal, processed);
 
-	const client = await TightbeamWsClient.connect(
+	const client = await TightbeamWsClient.connectMutual(
 		endpoint,
-		certFromParam(cert),
+		bytesFromParam(cert),
+		bytesFromParam(clientCert),
+		bytesFromParam(clientKey),
+		{
+			budgets: { clientToServer: 4096, serverToClient: 4096 },
+			approveReceipt: (): Uint8Array => DEMO_PAYMENT,
+		},
 	);
 
 	const manager = new SubscriptionManager(client);

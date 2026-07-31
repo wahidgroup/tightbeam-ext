@@ -14,6 +14,10 @@ services:
       PUBSUB_QUEUE_CAPACITY: "${PUBSUB_QUEUE_CAPACITY:-32}"
       TBWS_SERVER_CERT: /certs/server.cert.der
       TBWS_SERVER_KEY: /certs/server.key
+      TBWS_CLIENT_CERT: /certs/client.cert.der
+      TBWS_PAYWALL: "1"
+      TBWS_MUX_BUDGET_C2S: "4096"
+      TBWS_MUX_BUDGET_S2C: "4096"
     volumes:
       - ${CERT_DIR:?}:/certs:ro
     ports:
@@ -36,6 +40,10 @@ services:
       PUBSUB_PROCESSOR_PORT: "9111"
       TBWS_SERVER_CERT: /certs/server.cert.der
       TBWS_SERVER_KEY: /certs/server.key
+      TBWS_CLIENT_CERT: /certs/client.cert.der
+      TBWS_PAYWALL: "1"
+      TBWS_MUX_BUDGET_C2S: "4096"
+      TBWS_MUX_BUDGET_S2C: "4096"
     volumes:
       - ${CERT_DIR:?}:/certs:ro
     healthcheck:
@@ -59,6 +67,10 @@ services:
       PUBSUB_PROCESSOR_CERT: /certs/server.cert.der
       TBWS_SERVER_CERT: /certs/server.cert.der
       TBWS_SERVER_KEY: /certs/server.key
+      TBWS_CLIENT_CERT: /certs/client.cert.der
+      TBWS_PAYWALL: "1"
+      TBWS_MUX_BUDGET_C2S: "4096"
+      TBWS_MUX_BUDGET_S2C: "4096"
     volumes:
       - ${CERT_DIR:?}:/certs:ro
     depends_on:

@@ -6,8 +6,13 @@
  * platform-native `CompressionStream("deflate")` pairs with
  * `PROFILE_OIDS.zlib` for a dependency-free alternative.
  *
- * Inflators SHOULD cap their output size: a wire-supplied body can be a
- * decompression bomb (CWE-409).
+ * Inflators SHOULD cap their output size. A wire-supplied body can be a
+ * decompression bomb.
+ *
+ * # Sources
+ *
+ * - CWE-409, Improper Handling of Highly Compressed Data (Data Amplification):
+ *   {@link https://cwe.mitre.org/data/definitions/409.html CWE-409}
  */
 
 import { ValidationError } from "./builder/errors.js";
@@ -248,10 +253,15 @@ function serializeSeekTable(frames: SeekFrame[]): Uint8Array {
  * `ZstdCompression` (zeekstd). Backed by a lazily loaded wasm build of
  * libzstd.
  *
- * Decompression is bounded: the seek table's declared output size is
+ * Decompression is bounded. The seek table's declared output size is
  * checked against `maxOutput` (default 16 MiB, matching tightbeam-rs)
  * before any allocation, so a wire-supplied decompression bomb is rejected
- * up front (CWE-409).
+ * up front.
+ *
+ * # Sources
+ *
+ * - CWE-409, Improper Handling of Highly Compressed Data (Data Amplification):
+ *   {@link https://cwe.mitre.org/data/definitions/409.html CWE-409}
  */
 export class ZstdCompression implements BodyCompressor, BodyInflator {
 	constructor(private readonly maxOutput: number = DEFAULT_MAX_OUTPUT) {}

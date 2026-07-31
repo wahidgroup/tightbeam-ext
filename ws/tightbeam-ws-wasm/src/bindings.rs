@@ -423,31 +423,42 @@ pub fn inspect_frame(frame_der: Vec<u8>) -> Result<FrameView, JsError> {
 const PROFILE_OIDS_TS: &'static str = r#"
 /**
  * The dotted OIDs of the tightbeam profile (`tightbeam::oids`).
+ *
+ * # Sources
+ *
+ * - RFC 8878, Zstandard compression:
+ *   <https://datatracker.ietf.org/doc/html/rfc8878>
+ * - RFC 3274, Compressed Data Content Type:
+ *   <https://datatracker.ietf.org/doc/html/rfc3274>
  */
 export interface ProfileOids {
-	/** SHA3-256, the profile digest. */
+	/**
+	 * SHA3-256, the profile digest.
+	 */
 	readonly sha3_256: string;
-	/** secp256k1 ECDSA over SHA3-256, the profile signature. */
+	/**
+	 * secp256k1 ECDSA over SHA3-256, the profile signature.
+	 */
 	readonly ecdsaWithSha3_256: string;
-	/** AES-256-GCM, the profile symmetric cipher. */
+	/**
+	 * AES-256-GCM, the profile symmetric cipher.
+	 */
 	readonly aes256Gcm: string;
-	/** ECIES over secp256k1 (HKDF-SHA3-256 + AES-256-GCM). */
+	/**
+	 * ECIES over secp256k1 (HKDF-SHA3-256 + AES-256-GCM).
+	 */
 	readonly eciesSecp256k1: string;
 	/**
-	 * Zstandard ([RFC 8878](https://datatracker.ietf.org/doc/html/rfc8878)),
-	 * the profile compression.
+	 * Zstandard, the profile compression.
 	 */
 	readonly zstd: string;
 	/**
-	 * zlib ([RFC 3274](https://datatracker.ietf.org/doc/html/rfc3274)),
-	 * interoperable with `CompressionStream("deflate")`.
+	 * zlib, interoperable with `CompressionStream("deflate")`.
 	 */
 	readonly zlib: string;
 	/**
-	 * id-ct-compressedData
-	 * ([RFC 3274](https://datatracker.ietf.org/doc/html/rfc3274)): the
-	 * content type recorded in the compactness info when the compressor
-	 * names none.
+	 * id-ct-compressedData: the content type recorded in the compactness
+	 * info when the compressor names none.
 	 */
 	readonly compressedContent: string;
 }

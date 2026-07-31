@@ -22,7 +22,12 @@
 //!   fallthrough, cleanup.
 //! - [`quiesce`](TopicRegistry::quiesce): completes every topic with an
 //!   `end/<topic>` push, then refuses new work, so the caller can drain
-//!   connections (RFC 6455 § 5.5.1-style orderly closure).
+//!   connections with an orderly closure analog.
+//!
+//! # Sources
+//!
+//! - RFC 6455 § 5.5.1, Close frame semantics (orderly closure analog):
+//!   <https://datatracker.ietf.org/doc/html/rfc6455#section-5.5.1>
 //!
 //! The TypeScript counterpart (`@wahidgroup/tightbeam-pubsub-client`)
 //! consumes updates with the same conventions: see the extension README

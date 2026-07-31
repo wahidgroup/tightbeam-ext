@@ -41,8 +41,14 @@ export interface Route {
 export class UnroutedTopicError extends StreamRefusal {
 	override readonly name: string = "UnroutedTopicError";
 
-	constructor(readonly topic: string) {
+	/**
+	 * Frame id prefix that no registered route claimed.
+	 */
+	readonly topic: string;
+
+	constructor(topic: string) {
 		super("Unimplemented", `no route matches topic: ${topic}`);
+		this.topic = topic;
 	}
 }
 

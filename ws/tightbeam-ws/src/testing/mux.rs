@@ -3,12 +3,15 @@
 //! Compiled only under the `testing` feature.
 
 use std::env;
+use std::future::Future;
 use std::sync::Arc;
 
 use tightbeam::policy::TransitStatus;
+use tightbeam::transport::envelopes::GoAwayReason;
 use tightbeam::transport::error::TransportError;
-use tightbeam::transport::multiplex::{GoAwayReason, MuxHandle};
+use tightbeam::transport::multiplex::{MuxDispatch, MuxHandle, ReplySink, StreamBody};
 use tightbeam::transport::ResponsePackage;
+use tightbeam::utils::marker::MaybeSend;
 use tightbeam::Frame;
 
 /// Frame-id prefix that asks the server to call the client back.
@@ -28,6 +31,60 @@ pub fn env_u32(name: &str, default: u32) -> u32 {
 		.ok()
 		.and_then(|value| value.parse::<u32>().ok())
 		.unwrap_or(default)
+}
+
+/// Unary Frame echo plus progressive-body echo for `openStream`.
+///
+/// [`MuxResponder::serve_streaming`] refuses unary; `emit` stamps unary.
+/// This dispatch serves both kinds so demo echo covers Frame RPC and
+/// streamed bodies on one connection.
+pub struct EchoFrames {
+	handle: MuxHandle,
+}
+
+impl EchoFrames {
+	/// Pin the connection handle used for call-back / drain commands.
+	pub fn new(handle: MuxHandle) -> Self {
+		Self { handle }
+	}
+}
+
+impl MuxDispatch for EchoFrames {
+	fn unary(&self, frame: Arc<Frame>) -> impl Future<Output = ResponsePackage> + MaybeSend {
+		let handle = self.handle.clone();
+		async move { echo_stream(handle, frame).await }
+	}
+
+	fn streaming(&self, body: StreamBody) -> impl Future<Output = ResponsePackage> + MaybeSend {
+		let handle = self.handle.clone();
+		async move { echo_streaming(handle, body).await }
+	}
+}
+
+/// Progressive-body echo: reassemble via [`StreamBody::into_frame`], then
+/// run [`echo_stream`]. Transport drain failures answer `Cancelled`;
+/// invalid DER answers `InvalidArgument`.
+pub async fn echo_streaming(handle: MuxHandle, body: StreamBody) -> ResponsePackage {
+	match body.into_frame().await {
+		Ok(frame) => echo_stream(handle, Arc::new(frame)).await,
+		Err(TransportError::DerError(_)) => ResponsePackage::new(TransitStatus::InvalidArgument, None),
+		Err(_) => ResponsePackage::new(TransitStatus::Cancelled, None),
+	}
+}
+
+/// Duplex chunk echo: every request chunk is pushed straight back.
+pub async fn echo_duplex(mut body: StreamBody, mut reply: ReplySink) -> TransitStatus {
+	loop {
+		match body.chunk().await {
+			Ok(Some(chunk)) => {
+				if reply.push(&chunk).await.is_err() {
+					return TransitStatus::Cancelled;
+				}
+			}
+			Ok(None) => return TransitStatus::Ok,
+			Err(_) => return TransitStatus::Cancelled,
+		}
+	}
 }
 
 /// Echo `frame`, or run the command its id selects: `call-me` answers the
@@ -58,7 +115,7 @@ pub async fn echo_stream(handle: MuxHandle, frame: Arc<Frame>) -> ResponsePackag
 /// A peer refusal keeps its status so the requester observes the exact code
 /// the call-back handler answered with. Everything else (transport faults,
 /// local failures) is the server's own trouble and answers `Internal`.
-fn relayed_status(error: &TransportError) -> TransitStatus {
+pub(crate) fn relayed_status(error: &TransportError) -> TransitStatus {
 	let TransportError::OperationFailed(failure) = error else {
 		return TransitStatus::Internal;
 	};
@@ -76,4 +133,29 @@ async fn drain_session(handle: MuxHandle) -> ResponsePackage {
 	}
 
 	ResponsePackage::new(TransitStatus::Ok, None)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use tightbeam::transport::error::TransportFailure;
+
+	#[test]
+	fn relayed_status_keeps_peer_refusal_code() {
+		let error = TransportError::OperationFailed(TransportFailure::Unavailable);
+		assert_eq!(relayed_status(&error), TransitStatus::Unavailable);
+	}
+
+	#[test]
+	fn relayed_status_maps_non_operation_to_internal() {
+		let error = TransportError::ConnectionClosed;
+		assert_eq!(relayed_status(&error), TransitStatus::Internal);
+	}
+
+	#[test]
+	fn echo_command_prefixes_do_not_overlap() {
+		assert!(!CALL_ME.starts_with(DRAIN_CALM));
+		assert!(!DRAIN_CALM.starts_with(CALL_ME));
+		assert!(!SINK.starts_with(CALL_ME));
+	}
 }

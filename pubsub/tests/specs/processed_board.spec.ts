@@ -40,6 +40,8 @@ function boardUrl(topic: string): string {
 		endpoint: pubsubProcessedEndpoint,
 		topic,
 		cert: certBase64("server.cert.der"),
+		clientCert: certBase64("client.cert.der"),
+		clientKey: certBase64("client.key"),
 		processed: "1",
 	});
 	return `/?${params.toString()}`;

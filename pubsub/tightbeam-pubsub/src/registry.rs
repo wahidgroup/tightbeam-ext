@@ -13,8 +13,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 use der::Encode;
+use tightbeam::transport::envelopes::GoAwayReason;
 use tightbeam::transport::error::{TransportError, TransportFailure};
-use tightbeam::transport::multiplex::{GoAwayReason, MuxHandle};
+use tightbeam::transport::multiplex::MuxHandle;
 use tightbeam::{Frame, TightBeamError};
 use tokio::sync::Notify;
 
@@ -499,9 +500,15 @@ impl Inner {
 	}
 
 	/// Drop a connection the delivery policy voted off and drain its
-	/// link: the peer observes an `ENHANCE_YOUR_CALM` GoAway ([RFC 9113
-	/// § 7](https://datatracker.ietf.org/doc/html/rfc9113#section-7)
-	/// analog for a load-generating peer) instead of a silent stall.
+	/// link so the peer observes an orderly GoAway instead of a silent stall.
+	///
+	/// The registry sends `EnhanceYourCalm`, the analog for a load-generating
+	/// peer that cannot keep pace with delivery.
+	///
+	/// # Sources
+	///
+	/// - RFC 9113 § 7, GOAWAY frame:
+	///   <https://datatracker.ietf.org/doc/html/rfc9113#section-7>
 	fn disconnect(&self, connection: ConnectionId) {
 		let handle = {
 			let state = self.lock_state();
