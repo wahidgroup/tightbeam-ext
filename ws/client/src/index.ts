@@ -496,11 +496,27 @@ export type MuxStreamHandler = (
 export type StreamBodySource = AsyncIterable<Uint8Array>;
 
 /**
+ * Open route stamped on a progressive or duplex stream: optional
+ * servlet URN and remaining hop budget.
+ */
+export interface StreamRoute {
+	/**
+	 * Servlet target as `urn:<nid>:<nss>`, when the Open named one.
+	 */
+	target?: string;
+	/**
+	 * Remaining hop budget on this Open.
+	 */
+	hopsRemaining: number;
+}
+
+/**
  * Answers a progressive request body with a reassembled Frame (or
- * bodiless acceptance).
+ * bodiless acceptance). `route` carries the Open's target and hop budget.
  */
 export type StreamingBodyHandler = (
 	body: StreamBodySource,
+	route: StreamRoute,
 ) => Promise<Frame | undefined | null> | Frame | undefined | null;
 
 /**
@@ -515,11 +531,13 @@ export interface ReplySink {
 
 /**
  * Full-duplex body handler: consume request chunks and push reply chunks.
- * Resolve with a gRPC status name, or `undefined` for `Ok`.
+ * Resolve with a gRPC status name, or `undefined` for `Ok`. `route`
+ * carries the Open's target and hop budget.
  */
 export type DuplexBodyHandler = (
 	body: StreamBodySource,
 	reply: ReplySink,
+	route: StreamRoute,
 ) => Promise<string | void> | string | void;
 
 /**
@@ -598,6 +616,51 @@ async function* bodyChunks(source: {
 
 		yield chunk;
 	}
+}
+
+interface WasmRequestStream {
+	push(chunk: Uint8Array): Promise<void>;
+	close(): Promise<Uint8Array | undefined>;
+	closeWith(chunk: Uint8Array): Promise<Uint8Array | undefined>;
+}
+
+interface WasmDuplexStream {
+	push(chunk: Uint8Array): Promise<void>;
+	close(): Promise<void>;
+	closeWith(chunk: Uint8Array): Promise<void>;
+	nextChunk(): Promise<Uint8Array | undefined>;
+}
+
+function wrapRequestStream(stream: WasmRequestStream): RequestStream {
+	const decodeResponse = (der: Uint8Array | undefined): Frame | undefined => {
+		if (der === undefined) {
+			return undefined;
+		}
+
+		return Frame.fromDer(der);
+	};
+
+	return {
+		push: (chunk: Uint8Array): Promise<void> => stream.push(chunk),
+		close: async (): Promise<Frame | undefined> => {
+			const der = await stream.close();
+			return decodeResponse(der);
+		},
+		closeWith: async (chunk: Uint8Array): Promise<Frame | undefined> => {
+			const der = await stream.closeWith(chunk);
+			return decodeResponse(der);
+		},
+	};
+}
+
+function wrapDuplexStream(stream: WasmDuplexStream): DuplexStream {
+	return {
+		push: (chunk: Uint8Array): Promise<void> => stream.push(chunk),
+		close: (): Promise<void> => stream.close(),
+		closeWith: (chunk: Uint8Array): Promise<void> =>
+			stream.closeWith(chunk),
+		body: bodyChunks(stream),
+	};
 }
 
 /**
@@ -842,28 +905,19 @@ export class TightbeamWsClient extends SocketLifecycle<MuxWsClient> {
 		this.requireLive("openStream");
 
 		const stream = this.socket.openStream();
-		const decodeResponse = (
-			der: Uint8Array | undefined,
-		): Frame | undefined => {
-			if (der === undefined) {
-				return undefined;
-			}
+		return wrapRequestStream(stream);
+	}
 
-			return Frame.fromDer(der);
-		};
-		return {
-			push: (chunk: Uint8Array): Promise<void> => stream.push(chunk),
-			close: async (): Promise<Frame | undefined> => {
-				const der = await stream.close();
-				return decodeResponse(der);
-			},
-			closeWith: async (
-				chunk: Uint8Array,
-			): Promise<Frame | undefined> => {
-				const der = await stream.closeWith(chunk);
-				return decodeResponse(der);
-			},
-		};
+	/**
+	 * Progressive client request routed to a servlet URN
+	 * (`urn:<nid>:<nss>`). The Open carries the origin hop-budget
+	 * sentinel so the first gateway applies its `max_hops` clamp.
+	 */
+	openStreamTo(target: string): RequestStream {
+		this.requireLive("openStreamTo");
+
+		const stream = this.socket.openStreamTo(target);
+		return wrapRequestStream(stream);
 	}
 
 	/**
@@ -878,13 +932,17 @@ export class TightbeamWsClient extends SocketLifecycle<MuxWsClient> {
 		this.requireLive("openDuplex");
 
 		const stream = this.socket.openDuplex();
-		return {
-			push: (chunk: Uint8Array): Promise<void> => stream.push(chunk),
-			close: (): Promise<void> => stream.close(),
-			closeWith: (chunk: Uint8Array): Promise<void> =>
-				stream.closeWith(chunk),
-			body: bodyChunks(stream),
-		};
+		return wrapDuplexStream(stream);
+	}
+
+	/**
+	 * Duplex stream routed to a servlet URN (`urn:<nid>:<nss>`).
+	 */
+	openDuplexTo(target: string): DuplexStream {
+		this.requireLive("openDuplexTo");
+
+		const stream = this.socket.openDuplexTo(target);
+		return wrapDuplexStream(stream);
 	}
 
 	/**
@@ -898,14 +956,16 @@ export class TightbeamWsClient extends SocketLifecycle<MuxWsClient> {
 		this.requireLive("serveStreaming");
 		this.claimServe(options);
 
-		this.socket.serveStreaming(async (body: MuxStreamBody) => {
-			const response = await handler(bodyChunks(body));
-			if (response === undefined || response === null) {
-				return undefined;
-			}
+		this.socket.serveStreaming(
+			async (body: MuxStreamBody, route: StreamRoute) => {
+				const response = await handler(bodyChunks(body), route);
+				if (response === undefined || response === null) {
+					return undefined;
+				}
 
-			return response.toDer();
-		});
+				return response.toDer();
+			},
+		);
 	}
 
 	/**
@@ -917,11 +977,19 @@ export class TightbeamWsClient extends SocketLifecycle<MuxWsClient> {
 		this.claimServe(options);
 
 		this.socket.serveDuplex(
-			async (body: MuxStreamBody, reply: MuxReplySink) => {
-				const status = await handler(bodyChunks(body), {
-					push: (chunk: Uint8Array): Promise<void> =>
-						reply.push(chunk),
-				});
+			async (
+				body: MuxStreamBody,
+				reply: MuxReplySink,
+				route: StreamRoute,
+			) => {
+				const status = await handler(
+					bodyChunks(body),
+					{
+						push: (chunk: Uint8Array): Promise<void> =>
+							reply.push(chunk),
+					},
+					route,
+				);
 				if (status === undefined) {
 					return undefined;
 				}

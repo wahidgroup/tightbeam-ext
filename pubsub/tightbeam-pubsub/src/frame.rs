@@ -56,7 +56,7 @@ pub(crate) fn build(id: &str, order: u64, payload: &[u8]) -> Result<Frame, Tight
 /// opaque body SEQUENCE wrapping one OCTET STRING.
 pub fn opaque_payload(frame: &Frame) -> Result<Vec<u8>, TightBeamError> {
 	let body = OpaqueBody::from_der(&frame.message)?;
-	Ok(body.body.as_bytes().to_vec())
+	Ok(body.body.into_bytes())
 }
 
 #[cfg(test)]

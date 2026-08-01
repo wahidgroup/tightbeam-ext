@@ -12,12 +12,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use tightbeam::policy::SessionContext;
 use tightbeam::prelude::TightBeamSocketAddr;
 use tightbeam::testing::create_v0_tightbeam;
 use tightbeam::transport::handshake::negotiation::TransportOffer;
 use tightbeam::transport::multiplex::{ReplySink, StreamBody};
-use tightbeam::transport::serve::MuxService;
+use tightbeam::transport::serve::{CallContext, MuxService};
 use tightbeam::transport::{ConnectionBuilder, ConnectionPool, EncryptedProtocol, PoolConfig};
 use tightbeam::{encode, server, Frame, TightBeamError};
 use tightbeam_ws::protocol::WsListener;
@@ -31,11 +30,11 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 struct PooledEchoService;
 
 impl MuxService for PooledEchoService {
-	async fn unary(&self, frame: Frame, _session: SessionContext) -> Result<Option<Frame>, TightBeamError> {
+	async fn unary(&self, frame: Frame, _ctx: CallContext) -> Result<Option<Frame>, TightBeamError> {
 		Ok(Some(frame))
 	}
 
-	async fn streaming(&self, body: StreamBody, _session: SessionContext) -> Result<Option<Frame>, TightBeamError> {
+	async fn streaming(&self, body: StreamBody, _ctx: CallContext) -> Result<Option<Frame>, TightBeamError> {
 		Ok(Some(body.into_frame().await?))
 	}
 
@@ -43,7 +42,7 @@ impl MuxService for PooledEchoService {
 		&self,
 		mut body: StreamBody,
 		mut reply: ReplySink,
-		_session: SessionContext,
+		_ctx: CallContext,
 	) -> Result<(), TightBeamError> {
 		while let Some(chunk) = body.chunk().await? {
 			reply.push(&chunk).await?;

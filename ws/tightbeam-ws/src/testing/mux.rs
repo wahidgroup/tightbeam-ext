@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tightbeam::policy::TransitStatus;
 use tightbeam::transport::envelopes::GoAwayReason;
 use tightbeam::transport::error::TransportError;
-use tightbeam::transport::multiplex::{MuxDispatch, MuxHandle, ReplySink, StreamBody};
+use tightbeam::transport::multiplex::{MuxDispatch, MuxHandle, ReplySink, StreamBody, StreamRoute};
 use tightbeam::transport::ResponsePackage;
 use tightbeam::utils::marker::MaybeSend;
 use tightbeam::Frame;
@@ -55,7 +55,7 @@ impl MuxDispatch for EchoFrames {
 		async move { echo_stream(handle, frame).await }
 	}
 
-	fn streaming(&self, body: StreamBody) -> impl Future<Output = ResponsePackage> + MaybeSend {
+	fn streaming(&self, body: StreamBody, _route: StreamRoute) -> impl Future<Output = ResponsePackage> + MaybeSend {
 		let handle = self.handle.clone();
 		async move { echo_streaming(handle, body).await }
 	}

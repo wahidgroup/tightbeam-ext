@@ -168,7 +168,10 @@ doc-lint: setup
 	@echo "Checking rustdoc (RUSTDOCFLAGS=-D warnings)..."
 	RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 
-spellcheck: setup
+# cspell is installed under NPM_ROOT. Always set that project up,
+# even when lint/ci is scoped to another extension.
+spellcheck:
+	@$(MAKE) setup SCOPE="$(NPM_ROOT)"
 	@echo "Checking spelling..."
 	$(NPM_ROOT)/node_modules/.bin/cspell "**/*" --no-progress
 

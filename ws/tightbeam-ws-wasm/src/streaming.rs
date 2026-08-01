@@ -11,20 +11,25 @@
 use core::cell::RefCell;
 use core::future::Future;
 use core::pin::Pin;
+use core::str::FromStr;
 use std::rc::Rc;
 
-use js_sys::{Function, Promise, Reflect, Uint8Array};
+use js_sys::{Function, Object, Promise, Reflect, Uint8Array};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::{future_to_promise, JsFuture};
 
 use tightbeam::der::Decode;
 use tightbeam::policy::TransitStatus;
-use tightbeam::transport::multiplex::{MuxHandle, MuxResponder, ReplySink, RequestSink, StreamBody};
+use tightbeam::transport::multiplex::{
+	MuxDispatch, MuxHandle, MuxResponder, ReplySink, RequestSink, StreamBody, StreamRoute,
+};
 use tightbeam::transport::{ResponsePackage, TransportResult};
+use tightbeam::utils::marker::MaybeSend;
+use tightbeam::utils::urn::Urn;
 use tightbeam::Frame;
 
-use crate::fault::transport_to_js;
+use crate::fault::{transport_to_js, validation};
 use crate::mux::status_from_code;
 use crate::promise::bytes_or_undefined;
 use crate::secure::response_der;
@@ -48,12 +53,22 @@ impl MuxRequestStream {
 	/// Open a progressive request stream on `handle`.
 	pub(crate) fn open(handle: &MuxHandle) -> Result<MuxRequestStream, JsValue> {
 		let (sink, response) = handle.open_stream().map_err(transport_to_js)?;
-		Ok(Self {
-			inner: Rc::new(RefCell::new(RequestInner {
-				sink: Some(sink),
-				response: Some(Box::pin(response)),
-			})),
-		})
+		Ok(Self::from_parts(sink, Box::pin(response)))
+	}
+
+	/// Open a progressive request routed to a servlet URN
+	/// (`urn:<nid>:<nss>`). The Open carries the origin hop-budget
+	/// sentinel so the first gateway applies its `max_hops` clamp.
+	pub(crate) fn open_to(handle: &MuxHandle, target: &str) -> Result<MuxRequestStream, JsValue> {
+		let urn = parse_stream_target(target)?;
+		let (sink, response) = handle.open_stream_to(urn).map_err(transport_to_js)?;
+		Ok(Self::from_parts(sink, Box::pin(response)))
+	}
+
+	fn from_parts(sink: RequestSink, response: FrameResponseFut) -> Self {
+		Self {
+			inner: Rc::new(RefCell::new(RequestInner { sink: Some(sink), response: Some(response) })),
+		}
 	}
 
 	/// Push one request chunk. Empty chunks are no-ops on the wire.
@@ -124,7 +139,18 @@ pub struct MuxDuplexStream {
 impl MuxDuplexStream {
 	pub(crate) fn open(handle: &MuxHandle) -> Result<MuxDuplexStream, JsValue> {
 		let (sink, body) = handle.open_duplex().map_err(transport_to_js)?;
-		Ok(Self { inner: Rc::new(RefCell::new(DuplexInner { sink: Some(sink), body: Some(body) })) })
+		Ok(Self::from_parts(sink, body))
+	}
+
+	/// Open a duplex stream routed to a servlet URN (`urn:<nid>:<nss>`).
+	pub(crate) fn open_to(handle: &MuxHandle, target: &str) -> Result<MuxDuplexStream, JsValue> {
+		let urn = parse_stream_target(target)?;
+		let (sink, body) = handle.open_duplex_to(urn).map_err(transport_to_js)?;
+		Ok(Self::from_parts(sink, body))
+	}
+
+	fn from_parts(sink: RequestSink, body: StreamBody) -> Self {
+		Self { inner: Rc::new(RefCell::new(DuplexInner { sink: Some(sink), body: Some(body) })) }
 	}
 
 	/// Push one request chunk. Chunks go out eagerly, so awaiting a
@@ -256,28 +282,44 @@ impl MuxReplySink {
 }
 
 /// Drive `serve_streaming` through a JS handler that receives a
-/// [`MuxStreamBody`] and returns a Frame DER (or `undefined`).
-pub(crate) async fn respond_streaming_via_js(handler: Function, body: StreamBody) -> ResponsePackage {
-	let wrapped = MuxStreamBody::wrap(body);
-	let argument: JsValue = wrapped.into();
-	match call_streaming_handler(&handler, &argument).await {
+/// [`MuxStreamBody`] plus the Open's [`StreamRoute`], and returns a
+/// Frame DER (or `undefined`).
+pub(crate) async fn respond_streaming_via_js(
+	handler: Function,
+	body: StreamBody,
+	route: StreamRoute,
+) -> ResponsePackage {
+	let body_arg: JsValue = MuxStreamBody::wrap(body).into();
+	let route_arg = route_to_js(&route);
+	match call_streaming_handler(&handler, &body_arg, &route_arg).await {
 		Ok(response) => response,
 		Err(_) => ResponsePackage::new(TransitStatus::Unknown, None),
 	}
 }
 
-/// Drive `serve_duplex` through a JS handler that receives body + reply.
-pub(crate) async fn respond_duplex_via_js(handler: Function, body: StreamBody, reply: ReplySink) -> TransitStatus {
+/// Drive `serve_duplex` through a JS handler that receives body, reply,
+/// and the Open's [`StreamRoute`].
+pub(crate) async fn respond_duplex_via_js(
+	handler: Function,
+	body: StreamBody,
+	reply: ReplySink,
+	route: StreamRoute,
+) -> TransitStatus {
 	let body_arg: JsValue = MuxStreamBody::wrap(body).into();
 	let reply_arg: JsValue = MuxReplySink::wrap(reply).into();
-	match call_duplex_handler(&handler, &body_arg, &reply_arg).await {
+	let route_arg = route_to_js(&route);
+	match call_duplex_handler(&handler, &body_arg, &reply_arg, &route_arg).await {
 		Ok(status) => status,
 		Err(rejection) => refusal_status(&rejection),
 	}
 }
 
-async fn call_streaming_handler(handler: &Function, body: &JsValue) -> Result<ResponsePackage, JsValue> {
-	let returned = handler.call1(&JsValue::UNDEFINED, body)?;
+async fn call_streaming_handler(
+	handler: &Function,
+	body: &JsValue,
+	route: &JsValue,
+) -> Result<ResponsePackage, JsValue> {
+	let returned = handler.call2(&JsValue::UNDEFINED, body, route)?;
 	let settled = match returned.dyn_into::<Promise>() {
 		Ok(promise) => JsFuture::from(promise).await?,
 		Err(value) => value,
@@ -292,8 +334,13 @@ async fn call_streaming_handler(handler: &Function, body: &JsValue) -> Result<Re
 	Ok(ResponsePackage::new(TransitStatus::Ok, Some(response)))
 }
 
-async fn call_duplex_handler(handler: &Function, body: &JsValue, reply: &JsValue) -> Result<TransitStatus, JsValue> {
-	let returned = handler.call2(&JsValue::UNDEFINED, body, reply)?;
+async fn call_duplex_handler(
+	handler: &Function,
+	body: &JsValue,
+	reply: &JsValue,
+	route: &JsValue,
+) -> Result<TransitStatus, JsValue> {
+	let returned = handler.call3(&JsValue::UNDEFINED, body, reply, route)?;
 	let settled = match returned.dyn_into::<Promise>() {
 		Ok(promise) => JsFuture::from(promise).await?,
 		Err(value) => value,
@@ -304,7 +351,7 @@ async fn call_duplex_handler(handler: &Function, body: &JsValue, reply: &JsValue
 	}
 
 	let label = settled.as_string().ok_or_else(|| {
-		crate::fault::validation(
+		validation(
 			"InvalidDuplexStatus",
 			"serveDuplex handler must resolve with a status name or undefined",
 		)
@@ -327,7 +374,74 @@ fn refusal_status(rejection: &JsValue) -> TransitStatus {
 }
 
 fn stream_closed() -> JsValue {
-	crate::fault::validation("StreamClosed", "the streaming handle is closed")
+	validation("StreamClosed", "the streaming handle is closed")
+}
+
+/// Parse a servlet target URN for routed stream opens.
+fn parse_stream_target(target: &str) -> Result<Urn<'static>, JsValue> {
+	Urn::from_str(target).map_err(|error| {
+		validation(
+			"InvalidStreamRoute",
+			&format!("stream target must be a URN (urn:<nid>:<nss>): {error}"),
+		)
+	})
+}
+
+/// Format a servlet URN for JS without going through [`Display`].
+fn urn_target_string(urn: &Urn<'_>) -> String {
+	let mut target = String::with_capacity(4 + urn.nid.len() + 1 + urn.nss.len());
+	target.push_str("urn:");
+	target.push_str(urn.nid.as_ref());
+	target.push(':');
+	target.push_str(urn.nss.as_ref());
+	target
+}
+
+/// JS view of the Open's [`StreamRoute`]: optional target string and
+/// remaining hop budget.
+fn route_to_js(route: &StreamRoute) -> JsValue {
+	let object = Object::new();
+	if let Some(target) = route.target() {
+		let _ = Reflect::set(&object, &JsValue::from_str("target"), &JsValue::from(urn_target_string(target)));
+	}
+
+	let _ = Reflect::set(
+		&object,
+		&JsValue::from_str("hopsRemaining"),
+		&JsValue::from(f64::from(route.hops_remaining())),
+	);
+
+	object.into()
+}
+
+/// Streaming-only dispatch: forwards body + Open route to JS. Other
+/// kinds refuse through [`MuxDispatch`] defaults.
+struct JsStreamingDispatch {
+	handler: Rc<RefCell<Function>>,
+}
+
+impl MuxDispatch for JsStreamingDispatch {
+	fn streaming(&self, body: StreamBody, route: StreamRoute) -> impl Future<Output = ResponsePackage> + MaybeSend {
+		let current = self.handler.borrow().clone();
+		async move { respond_streaming_via_js(current, body, route).await }
+	}
+}
+
+/// Duplex-only dispatch: forwards body, reply, and Open route to JS.
+struct JsDuplexDispatch {
+	handler: Rc<RefCell<Function>>,
+}
+
+impl MuxDispatch for JsDuplexDispatch {
+	fn duplex(
+		&self,
+		body: StreamBody,
+		reply: ReplySink,
+		route: StreamRoute,
+	) -> impl Future<Output = TransitStatus> + MaybeSend {
+		let current = self.handler.borrow().clone();
+		async move { respond_duplex_via_js(current, body, reply, route).await }
+	}
 }
 
 /// Spawn the streaming serve loop once, swapping out the responder.
@@ -335,14 +449,7 @@ pub(crate) fn start_serve_streaming(responder: MuxResponder, handler: Rc<RefCell
 	use wasm_bindgen_futures::spawn_local;
 
 	spawn_local(async move {
-		let _ = responder
-			.serve_streaming(move |body| {
-				// Clone out of the cell before the await: a swapped
-				// handler applies from the next dispatch
-				let current = handler.borrow().clone();
-				async move { respond_streaming_via_js(current, body).await }
-			})
-			.await;
+		let _ = responder.serve_with(JsStreamingDispatch { handler }).await;
 	});
 }
 
@@ -351,13 +458,6 @@ pub(crate) fn start_serve_duplex(responder: MuxResponder, handler: Rc<RefCell<Fu
 	use wasm_bindgen_futures::spawn_local;
 
 	spawn_local(async move {
-		let _ = responder
-			.serve_duplex(move |body, reply| {
-				// Clone out of the cell before the await: a swapped
-				// handler applies from the next dispatch
-				let current = handler.borrow().clone();
-				async move { respond_duplex_via_js(current, body, reply).await }
-			})
-			.await;
+		let _ = responder.serve_with(JsDuplexDispatch { handler }).await;
 	});
 }

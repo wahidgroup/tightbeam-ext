@@ -332,6 +332,15 @@ impl MuxWsClient {
 		crate::streaming::MuxRequestStream::open(&self.handle)
 	}
 
+	/// Progressive request routed to a servlet URN (`urn:<nid>:<nss>`).
+	///
+	/// The Open carries the origin hop-budget sentinel so the first
+	/// gateway applies its `max_hops` clamp.
+	#[wasm_bindgen(js_name = openStreamTo)]
+	pub fn open_stream_to(&self, target: &str) -> Result<crate::streaming::MuxRequestStream, JsValue> {
+		crate::streaming::MuxRequestStream::open_to(&self.handle, target)
+	}
+
 	/// Full-duplex body streaming on one stream id.
 	///
 	/// Pushes reach the wire eagerly, so awaiting a reply chunk
@@ -341,9 +350,16 @@ impl MuxWsClient {
 		crate::streaming::MuxDuplexStream::open(&self.handle)
 	}
 
+	/// Duplex stream routed to a servlet URN (`urn:<nid>:<nss>`).
+	#[wasm_bindgen(js_name = openDuplexTo)]
+	pub fn open_duplex_to(&self, target: &str) -> Result<crate::streaming::MuxDuplexStream, JsValue> {
+		crate::streaming::MuxDuplexStream::open_to(&self.handle, target)
+	}
+
 	/// Serve peer streams as progressive bodies. The handler receives a
-	/// [`MuxStreamBody`](crate::streaming::MuxStreamBody) and returns a
-	/// Frame DER (or `undefined`). Consumes the responder on first call.
+	/// [`MuxStreamBody`](crate::streaming::MuxStreamBody) and the Open's
+	/// route (`{ target?, hopsRemaining }`), and returns a Frame DER
+	/// (or `undefined`). Consumes the responder on first call.
 	#[wasm_bindgen(js_name = serveStreaming)]
 	pub fn serve_streaming(&mut self, handler: Function) {
 		self.handler.replace(handler);
@@ -354,9 +370,10 @@ impl MuxWsClient {
 	}
 
 	/// Serve peer streams as duplex bodies. The handler receives a
-	/// [`MuxStreamBody`](crate::streaming::MuxStreamBody) and
-	/// [`MuxReplySink`](crate::streaming::MuxReplySink), and resolves with
-	/// a gRPC status name or `undefined` (`Ok`). Consumes the responder.
+	/// [`MuxStreamBody`](crate::streaming::MuxStreamBody),
+	/// [`MuxReplySink`](crate::streaming::MuxReplySink), and the Open's
+	/// route, and resolves with a gRPC status name or `undefined` (`Ok`).
+	/// Consumes the responder.
 	#[wasm_bindgen(js_name = serveDuplex)]
 	pub fn serve_duplex(&mut self, handler: Function) {
 		self.handler.replace(handler);

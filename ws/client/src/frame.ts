@@ -8,10 +8,10 @@
  * exact bytes to check signatures and digests with any external library.
  */
 
-import type { FrameView } from "#wasm";
+import type { InspectedFrame } from "#wasm";
 import {
 	commitmentPreimage,
-	inspectFrame,
+	inspectFrameFields,
 	tbsBytes,
 	verifySignature as wasmVerifySignature,
 	witnessInput as wasmWitnessInput,
@@ -169,11 +169,11 @@ function digestInfoFrom(
 }
 
 /**
- * Copy the control matrix out of the wasm view, when present.
+ * Build the control matrix from an inspected payload, when present.
  */
-function matrixOf(view: FrameView): FrameMatrix | undefined {
-	const n = view.matrixN;
-	const data = view.matrixData;
+function matrixOf(inspected: InspectedFrame): FrameMatrix | undefined {
+	const n = inspected.matrixN;
+	const data = inspected.matrixData;
 	if (n === undefined || data === undefined) {
 		return undefined;
 	}
@@ -183,45 +183,47 @@ function matrixOf(view: FrameView): FrameMatrix | undefined {
 }
 
 /**
- * Copy the compactness info out of the wasm view, when present.
+ * Build compactness info from an inspected payload, when present.
  */
-function compactnessOf(view: FrameView): CompactnessInfo | undefined {
-	const algorithmOid = view.compactnessAlgorithmOid;
+function compactnessOf(inspected: InspectedFrame): CompactnessInfo | undefined {
+	const algorithmOid = inspected.compactnessAlgorithmOid;
 	if (algorithmOid === undefined) {
 		return undefined;
 	}
 
 	const compactness = {
 		algorithmOid,
-		parametersDer: view.compactnessParametersDer,
-		contentOid: view.compactnessContentOid,
+		parametersDer: inspected.compactnessParametersDer,
+		contentOid: inspected.compactnessContentOid,
 	};
 	return compactness;
 }
 
 /**
- * Copy the confidentiality info out of the wasm view, when present.
+ * Build confidentiality info from an inspected payload, when present.
  */
-function confidentialityOf(view: FrameView): ConfidentialityInfo | undefined {
-	const algorithmOid = view.confidentialityAlgorithmOid;
+function confidentialityOf(
+	inspected: InspectedFrame,
+): ConfidentialityInfo | undefined {
+	const algorithmOid = inspected.confidentialityAlgorithmOid;
 	if (algorithmOid === undefined) {
 		return undefined;
 	}
 
 	const confidentiality = {
 		algorithmOid,
-		parametersDer: view.confidentialityParametersDer,
+		parametersDer: inspected.confidentialityParametersDer,
 	};
 	return confidentiality;
 }
 
 /**
- * Copy the signature info out of the wasm view, when present.
+ * Build signature info from an inspected payload, when present.
  */
-function signatureOf(view: FrameView): SignatureInfo | undefined {
-	const algorithmOid = view.signatureAlgorithmOid;
-	const digestAlgorithmOid = view.signatureDigestAlgorithmOid;
-	const signature = view.signature;
+function signatureOf(inspected: InspectedFrame): SignatureInfo | undefined {
+	const algorithmOid = inspected.signatureAlgorithmOid;
+	const digestAlgorithmOid = inspected.signatureDigestAlgorithmOid;
+	const signature = inspected.signature;
 	if (
 		algorithmOid === undefined ||
 		digestAlgorithmOid === undefined ||
@@ -235,19 +237,19 @@ function signatureOf(view: FrameView): SignatureInfo | undefined {
 }
 
 /**
- * Copy a wasm {@link FrameView} into plain {@link FrameFields}.
+ * Map a one-shot wasm inspect payload into plain {@link FrameFields}.
  */
-function fieldsOf(view: FrameView): FrameFields {
-	const version = versionFromOrdinal(view.version);
+function fieldsOf(inspected: InspectedFrame): FrameFields {
+	const version = versionFromOrdinal(inspected.version);
 	if (version === undefined) {
 		throw new InternalError(
 			"UNKNOWN_VERSION",
-			`the wasm module returned an unknown version ordinal: ${view.version}`,
+			`the wasm module returned an unknown version ordinal: ${inspected.version}`,
 		);
 	}
 
 	let priority: MessagePriority | undefined = undefined;
-	const priorityOrdinal = view.priority;
+	const priorityOrdinal = inspected.priority;
 	if (priorityOrdinal !== undefined) {
 		priority = priorityFromOrdinal(priorityOrdinal);
 		if (priority === undefined) {
@@ -260,27 +262,27 @@ function fieldsOf(view: FrameView): FrameFields {
 
 	const fields = {
 		version,
-		id: view.id,
-		order: view.order,
-		bodyDer: view.bodyDer,
+		id: inspected.id,
+		order: inspected.order,
+		bodyDer: inspected.bodyDer,
 		priority,
-		lifetime: view.lifetime,
+		lifetime: inspected.lifetime,
 		previousFrame: digestInfoFrom(
-			view.previousHashAlgorithmOid,
-			view.previousHashDigest,
+			inspected.previousHashAlgorithmOid,
+			inspected.previousHashDigest,
 		),
-		matrix: matrixOf(view),
+		matrix: matrixOf(inspected),
 		messageIntegrity: digestInfoFrom(
-			view.messageIntegrityAlgorithmOid,
-			view.messageIntegrityDigest,
+			inspected.messageIntegrityAlgorithmOid,
+			inspected.messageIntegrityDigest,
 		),
 		frameIntegrity: digestInfoFrom(
-			view.frameIntegrityAlgorithmOid,
-			view.frameIntegrityDigest,
+			inspected.frameIntegrityAlgorithmOid,
+			inspected.frameIntegrityDigest,
 		),
-		compactness: compactnessOf(view),
-		confidentiality: confidentialityOf(view),
-		signature: signatureOf(view),
+		compactness: compactnessOf(inspected),
+		confidentiality: confidentialityOf(inspected),
+		signature: signatureOf(inspected),
 	};
 	return fields;
 }
@@ -368,13 +370,8 @@ export class Frame {
 			return this.fields;
 		}
 
-		const view = inspectFrame(this.der);
-		try {
-			this.fields = fieldsOf(view);
-		} finally {
-			view.free();
-		}
-
+		const inspected = inspectFrameFields(this.der);
+		this.fields = fieldsOf(inspected);
 		return this.fields;
 	}
 

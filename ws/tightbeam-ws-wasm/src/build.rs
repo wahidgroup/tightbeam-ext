@@ -1,5 +1,7 @@
 //! Frame assembly and structural security operations over opaque message bytes.
 
+use std::borrow::Cow;
+
 use der::asn1::OctetString;
 use der::{Decode, Sequence};
 
@@ -130,20 +132,22 @@ pub fn decode_body(body_der: impl AsRef<[u8]>) -> Result<Vec<u8>, TightBeamError
 /// `len(salt) as u64 BE || salt || body DER` otherwise (length framing keeps
 /// distinct `(salt, body)` pairs from colliding).
 ///
-/// Hash this with any digest and install the result via
-/// [`set_message_integrity`].
-pub fn commitment_preimage(salt: impl AsRef<[u8]>, body_der: impl AsRef<[u8]>) -> Vec<u8> {
+/// An empty salt returns `body_der` without copying. Hash this with any
+/// digest and install the result via [`set_message_integrity`].
+pub fn commitment_preimage<'a>(salt: impl AsRef<[u8]>, body_der: impl Into<Cow<'a, [u8]>>) -> Cow<'a, [u8]> {
 	let salt = salt.as_ref();
-	let body_der = body_der.as_ref();
+	let body_der = body_der.into();
 	if salt.is_empty() {
-		return body_der.to_vec();
+		return body_der;
 	}
 
-	let mut buffer = Vec::with_capacity(8 + salt.len() + body_der.len());
+	let body = body_der.as_ref();
+	let mut buffer = Vec::with_capacity(8 + salt.len() + body.len());
 	buffer.extend_from_slice(&(salt.len() as u64).to_be_bytes());
 	buffer.extend_from_slice(salt);
-	buffer.extend_from_slice(body_der);
-	buffer
+	buffer.extend_from_slice(body);
+
+	Cow::Owned(buffer)
 }
 
 /// Decode a frame DER, apply `mutate`, and re-encode.
@@ -370,48 +374,63 @@ pub struct FrameSummary {
 }
 
 /// Decode a frame DER into a [`FrameSummary`].
+///
+/// Owned octets (`id`, body, digests, matrix, signature) are taken out of
+/// the decoded [`Frame`] (`ZeroizeOnDrop` forbids a full destructure).
 pub fn inspect_frame(frame_der: impl AsRef<[u8]>) -> Result<FrameSummary, TightBeamError> {
-	let frame = Frame::from_der(frame_der.as_ref())?;
-	let metadata = &frame.metadata;
-	let confidentiality = metadata.confidentiality.as_ref();
-	let compactness = metadata.compactness.as_ref();
+	let mut frame = Frame::from_der(frame_der.as_ref())?;
 
-	let confidentiality_parameters_der = confidentiality
+	let confidentiality_parameters_der = frame
+		.metadata
+		.confidentiality
+		.as_ref()
 		.and_then(|info| info.content_enc_alg.parameters.as_ref())
 		.map(Encode::to_der)
 		.transpose()?;
 
-	let compactness_parameters_der = compactness
+	let compactness_parameters_der = frame
+		.metadata
+		.compactness
+		.as_ref()
 		.and_then(|info| info.compression_alg.parameters.as_ref())
 		.map(Encode::to_der)
 		.transpose()?;
 
+	let previous_frame = frame.metadata.previous_frame.take();
+	let message_integrity = frame.metadata.integrity.take();
+	let integrity = frame.integrity.take();
+	let nonrepudiation = frame.nonrepudiation.take();
+	let compactness = frame.metadata.compactness.take();
+	let confidentiality = frame.metadata.confidentiality.take();
+	let mut matrix = frame.metadata.matrix.take();
+	let matrix_n = matrix.as_ref().map(|entry| entry.n);
+	let matrix_data = matrix.as_mut().map(|entry| core::mem::take(&mut entry.data));
+
 	Ok(FrameSummary {
 		version: frame.version as u8,
-		id: metadata.id.clone(),
-		order: metadata.order,
-		body_der: frame.message.clone(),
-		priority: metadata.priority.map(|priority| priority as u8),
-		lifetime: metadata.lifetime,
-		previous_hash_algorithm_oid: metadata.previous_frame.as_ref().map(|digest| digest.algorithm.oid.to_string()),
-		previous_hash_digest: metadata.previous_frame.as_ref().map(|digest| digest.digest.as_bytes().to_vec()),
-		matrix_n: metadata.matrix.as_ref().map(|matrix| matrix.n),
-		matrix_data: metadata.matrix.as_ref().map(|matrix| matrix.data.clone()),
-		compactness_algorithm_oid: compactness.map(|info| info.compression_alg.oid.to_string()),
+		id: core::mem::take(&mut frame.metadata.id),
+		order: frame.metadata.order,
+		body_der: core::mem::take(&mut frame.message),
+		priority: frame.metadata.priority.map(|priority| priority as u8),
+		lifetime: frame.metadata.lifetime,
+		previous_hash_algorithm_oid: previous_frame.as_ref().map(|digest| digest.algorithm.oid.to_string()),
+		previous_hash_digest: previous_frame.map(|digest| digest.digest.into_bytes()),
+		matrix_n,
+		matrix_data,
+		compactness_algorithm_oid: compactness.as_ref().map(|info| info.compression_alg.oid.to_string()),
 		compactness_parameters_der,
-		compactness_content_oid: compactness.map(|info| info.encap_content_info.econtent_type.to_string()),
-		message_integrity_algorithm_oid: metadata.integrity.as_ref().map(|info| info.algorithm.oid.to_string()),
-		message_integrity_digest: metadata.integrity.as_ref().map(|info| info.digest.as_bytes().to_vec()),
-		frame_integrity_algorithm_oid: frame.integrity.as_ref().map(|info| info.algorithm.oid.to_string()),
-		frame_integrity_digest: frame.integrity.as_ref().map(|info| info.digest.as_bytes().to_vec()),
-		confidentiality_algorithm_oid: confidentiality.map(|info| info.content_enc_alg.oid.to_string()),
-		confidentiality_parameters_der,
-		signature_algorithm_oid: frame
-			.nonrepudiation
+		compactness_content_oid: compactness
 			.as_ref()
-			.map(|info| info.signature_algorithm.oid.to_string()),
-		signature_digest_algorithm_oid: frame.nonrepudiation.as_ref().map(|info| info.digest_alg.oid.to_string()),
-		signature: frame.nonrepudiation.as_ref().map(|info| info.signature.as_bytes().to_vec()),
+			.map(|info| info.encap_content_info.econtent_type.to_string()),
+		message_integrity_algorithm_oid: message_integrity.as_ref().map(|info| info.algorithm.oid.to_string()),
+		message_integrity_digest: message_integrity.map(|info| info.digest.into_bytes()),
+		frame_integrity_algorithm_oid: integrity.as_ref().map(|info| info.algorithm.oid.to_string()),
+		frame_integrity_digest: integrity.map(|info| info.digest.into_bytes()),
+		confidentiality_algorithm_oid: confidentiality.as_ref().map(|info| info.content_enc_alg.oid.to_string()),
+		confidentiality_parameters_der,
+		signature_algorithm_oid: nonrepudiation.as_ref().map(|info| info.signature_algorithm.oid.to_string()),
+		signature_digest_algorithm_oid: nonrepudiation.as_ref().map(|info| info.digest_alg.oid.to_string()),
+		signature: nonrepudiation.map(|info| info.signature.into_bytes()),
 	})
 }
 

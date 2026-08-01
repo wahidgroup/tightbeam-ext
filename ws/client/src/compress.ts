@@ -282,8 +282,8 @@ export class ZstdCompression implements BodyCompressor, BodyInflator {
 		const frames: SeekFrame[] = [];
 		const parts: Uint8Array[] = [];
 		for (const chunk of chunks) {
-			const frameInput = new Uint8Array(chunk);
-			const part = zstd.compress(frameInput);
+			const part = zstd.compress(chunk);
+
 			parts.push(part);
 			frames.push({ cSize: part.length, dSize: chunk.length });
 		}
@@ -319,8 +319,9 @@ export class ZstdCompression implements BodyCompressor, BodyInflator {
 		let inOffset = 0;
 		let outOffset = 0;
 		for (const frame of frames) {
-			const frameBytes = new Uint8Array(
-				compressed.data.subarray(inOffset, inOffset + frame.cSize),
+			const frameBytes = compressed.data.subarray(
+				inOffset,
+				inOffset + frame.cSize,
 			);
 			const heapSize = Math.max(frame.dSize, 1);
 			const part = zstd.decompress(frameBytes, {
