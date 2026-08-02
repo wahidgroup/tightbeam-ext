@@ -3,12 +3,11 @@
 //! Every connection completes the ECIES handshake (negotiating
 //! multiplexing inside it) and shares one [`TopicRegistry`]. The wire
 //! commands (`sub/`, `unsub/`, and client `pub/` publish) answer through
-//! [`PubsubCommands`] inside [`serve_connection`], plus two demo
-//! commands that let a test client drive the server side of the
+//! [`PubsubCommands`] inside [`serve_connection`], plus one demo
+//! command that lets a test client drive the server side of the
 //! contract:
 //!
-//!   - `poke`     push one non-topic stream (id `notice`) back
-//!   - `quiesce`  complete every topic, then drain this connection
+//!   - `poke`  push one non-topic stream (id `notice`) back
 //!
 //! The subscribe policy forbids every topic under `forbidden/`,
 //! exercising the `PermissionDenied` answer.
@@ -43,7 +42,6 @@ use tightbeam::crypto::x509::policy::{CertificateValidation, RuntimeCertificateP
 use tightbeam::der::Decode;
 use tightbeam::policy::TransitStatus;
 use tightbeam::prelude::TightBeamSocketAddr;
-use tightbeam::transport::envelopes::GoAwayReason;
 use tightbeam::transport::handshake::negotiation::{TransportAuthorizer, TransportOffer};
 use tightbeam::transport::multiplex::{MuxHandle, MuxRole};
 use tightbeam::transport::{EncryptedMessageIO, EncryptedProtocol, ResponsePackage, X509ClientConfig};
@@ -74,9 +72,6 @@ type ServerTransport = WsTransport<MaybeTlsStream<TcpStream>>;
 /// Frame id that pushes one non-topic stream back at the client, so a
 /// subscriber's fallback routing can be exercised end to end.
 const POKE: &[u8] = b"poke";
-
-/// Frame id that quiesces the registry and drains the connection.
-const QUIESCE: &[u8] = b"quiesce";
 
 /// The relay worker is gone: its channel closed.
 #[derive(Debug)]
@@ -267,14 +262,10 @@ impl SubscribePolicy for DenyForbidden {
 	}
 }
 
-/// Answer one non-command stream: the demo's `poke` and `quiesce`.
-async fn answer_stream(registry: TopicRegistry, context: ConnectionContext, frame: Arc<Frame>) -> ResponsePackage {
-	let id = frame.metadata.id.as_slice();
-	if id == POKE {
+/// Answer one non-command stream: the demo's `poke`.
+async fn answer_stream(context: ConnectionContext, frame: Arc<Frame>) -> ResponsePackage {
+	if frame.metadata.id.as_slice() == POKE {
 		return answer_poke(&context.handle).await;
-	}
-	if id == QUIESCE {
-		return answer_quiesce(&registry, &context.handle).await;
 	}
 
 	ResponsePackage::new(TransitStatus::Unimplemented, None)
@@ -293,27 +284,6 @@ async fn answer_poke(handle: &MuxHandle) -> ResponsePackage {
 			ResponsePackage::new(TransitStatus::Unavailable, None)
 		}
 	}
-}
-
-/// Complete every topic, wait for the completion pushes to leave, then
-/// drain this connection with an orderly `Shutdown` GoAway.
-///
-/// This demo path is open to any connected peer. A production surface
-/// MUST authorize the caller before it exposes an equivalent command.
-/// Use [`serve_connection_as`] with a policy check when identity matters.
-async fn answer_quiesce(registry: &TopicRegistry, handle: &MuxHandle) -> ResponsePackage {
-	if let Err(error) = registry.quiesce() {
-		eprintln!("[pubsub-demo] quiesce failed: {error}");
-		return ResponsePackage::new(TransitStatus::Internal, None);
-	}
-
-	registry.flushed().await;
-
-	if let Err(error) = handle.shutdown_with(GoAwayReason::Shutdown).await {
-		eprintln!("[pubsub-demo] drain failed: {error}");
-	}
-
-	ResponsePackage::new(TransitStatus::Ok, None)
 }
 
 /// Serve one multiplexed encrypted connection until it ends.
@@ -336,11 +306,7 @@ async fn serve_ws_connection(
 	serve_handshake(&mut transport).await?;
 
 	let mux = assemble_mux(transport, MuxRole::Server)?;
-	let registry = commands.registry().clone();
-	serve_connection(mux, commands, move |context, frame| {
-		answer_stream(registry.clone(), context, frame)
-	})
-	.await?;
+	serve_connection(mux, commands, move |context, frame| answer_stream(context, frame)).await?;
 
 	Ok(())
 }

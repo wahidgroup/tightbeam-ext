@@ -26,9 +26,9 @@ function requireEnv(name: string): string {
 /**
  * The multiplexed encrypted pub/sub demo server: answers the `sub/` and
  * `unsub/` commands, publishes a frame's payload on a `pub/<topic>` id,
- * pushes a non-topic `notice` stream on a `poke` id, quiesces the
- * registry on a `quiesce` id, and forbids every topic under `forbidden/`.
- * Compose always enables the demo session-budget paywall.
+ * pushes a non-topic `notice` stream on a `poke` id, and forbids every
+ * topic under `forbidden/`. Compose always enables the demo
+ * session-budget paywall.
  */
 export const pubsubEndpoint = requireEnv("E2E_PUBSUB_WS_ENDPOINT");
 
