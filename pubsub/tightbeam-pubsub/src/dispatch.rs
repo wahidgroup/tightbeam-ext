@@ -130,6 +130,7 @@ impl<P: SubscribePolicy> PubsubCommands<P> {
 		match self.registry.register(connection, topic) {
 			Ok(_) => accepted(),
 			Err(RegisterError::Draining) => refusal(TransitStatus::Unavailable),
+			Err(RegisterError::LimitReached) => refusal(TransitStatus::ResourceExhausted),
 			// The connection dropped between authorization and
 			// registration: the same no-standing refusal as the preamble.
 			Err(RegisterError::UnknownConnection) => refusal(TransitStatus::PermissionDenied),
@@ -197,6 +198,7 @@ mod tests {
 	use super::*;
 	use crate::frame::build;
 	use crate::policy::AllowAll;
+	use crate::registry::RegistryOptions;
 	use crate::testing::memory_mux_pair;
 
 	/// Forbid every topic under `secrets/`.
@@ -252,10 +254,18 @@ mod tests {
 	/// A dispatcher over one registered in-memory connection. The guard
 	/// keeps the peer transport alive.
 	fn dispatcher<P: SubscribePolicy>(policy: P) -> (PubsubCommands<P>, TopicRegistry, ConnectionId, impl Sized) {
+		dispatcher_with(policy, RegistryOptions::default())
+	}
+
+	/// As [`dispatcher`], with explicit registry options.
+	fn dispatcher_with<P: SubscribePolicy>(
+		policy: P,
+		options: RegistryOptions,
+	) -> (PubsubCommands<P>, TopicRegistry, ConnectionId, impl Sized) {
 		let (client, server) = memory_mux_pair(4);
 		let (handle, _reader, _writer, _responder) = server.into_parts();
 
-		let registry = TopicRegistry::default();
+		let registry = TopicRegistry::new(options);
 		let connection = registry.register_connection(handle);
 		let commands = PubsubCommands::new(registry.clone(), policy);
 		(commands, registry, connection, client)
@@ -328,6 +338,21 @@ mod tests {
 
 		let answer = answered(&commands, connection, &command("sub/prices"));
 		assert_eq!(answer.status(), TransitStatus::Unavailable);
+	}
+
+	#[tokio::test]
+	async fn over_quota_subscribe_answers_resource_exhausted() {
+		let options = RegistryOptions { max_subscriptions_per_connection: 1, ..RegistryOptions::default() };
+		let (commands, _registry, connection, _peer) = dispatcher_with(AllowAll, options);
+
+		assert_eq!(
+			answered(&commands, connection, &command("sub/prices")).status(),
+			TransitStatus::Ok
+		);
+		assert_eq!(
+			answered(&commands, connection, &command("sub/chat")).status(),
+			TransitStatus::ResourceExhausted
+		);
 	}
 
 	#[tokio::test]

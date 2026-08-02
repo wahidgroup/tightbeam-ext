@@ -27,6 +27,10 @@ use crate::topic::Topic;
 /// Updates one subscriber queue holds before the delivery policy decides.
 const DEFAULT_QUEUE_CAPACITY: usize = 32;
 
+/// Live subscriptions one connection may hold before further `sub/`
+/// commands are refused.
+const DEFAULT_MAX_SUBSCRIPTIONS_PER_CONNECTION: usize = 64;
+
 /// One registered connection, allocated by
 /// [`TopicRegistry::register_connection`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -40,6 +44,12 @@ pub struct SubscriberId(u64);
 pub struct RegistryOptions {
 	/// Bounded queue length per subscriber.
 	pub queue_capacity: usize,
+	/// Cap on live subscriptions one connection may hold.
+	///
+	/// A new `sub/` for a topic the connection does not already hold is
+	/// refused once this many subscriptions are live. Re-subscribe of an
+	/// existing topic stays idempotent and does not count again.
+	pub max_subscriptions_per_connection: usize,
 	/// Consulted when a subscriber queue is full.
 	pub delivery: Arc<dyn DeliveryPolicy>,
 	/// Sequencing and distribution: [`Local`] (single node) by default.
@@ -50,6 +60,7 @@ impl Default for RegistryOptions {
 	fn default() -> Self {
 		Self {
 			queue_capacity: DEFAULT_QUEUE_CAPACITY,
+			max_subscriptions_per_connection: DEFAULT_MAX_SUBSCRIPTIONS_PER_CONNECTION,
 			delivery: Arc::new(DropOldest),
 			backplane: Arc::new(Local::default()),
 		}
@@ -63,6 +74,9 @@ pub enum RegisterError {
 	UnknownConnection,
 	/// The registry is quiescing: no new subscriptions.
 	Draining,
+	/// The connection already holds
+	/// [`RegistryOptions::max_subscriptions_per_connection`] subscriptions.
+	LimitReached,
 }
 
 impl fmt::Display for RegisterError {
@@ -70,6 +84,7 @@ impl fmt::Display for RegisterError {
 		match self {
 			Self::UnknownConnection => f.write_str("the connection is not registered"),
 			Self::Draining => f.write_str("the registry is draining"),
+			Self::LimitReached => f.write_str("the connection holds too many subscriptions"),
 		}
 	}
 }
@@ -321,6 +336,8 @@ impl TopicRegistry {
 	///
 	/// - [`RegisterError::Draining`]: [`quiesce`](Self::quiesce) already ran.
 	/// - [`RegisterError::UnknownConnection`]: `connection` was never admitted.
+	/// - [`RegisterError::LimitReached`]: the connection already holds
+	///   [`RegistryOptions::max_subscriptions_per_connection`] subscriptions.
 	pub fn register(&self, connection: ConnectionId, topic: Topic) -> Result<SubscriberId, RegisterError> {
 		let mut state = self.lock_state();
 		/*
@@ -335,6 +352,9 @@ impl TopicRegistry {
 		let connected = state.connections.get(&connection).ok_or(RegisterError::UnknownConnection)?;
 		if let Some(existing) = connected.topics.get(&topic) {
 			return Ok(*existing);
+		}
+		if connected.topics.len() >= self.inner.options.max_subscriptions_per_connection {
+			return Err(RegisterError::LimitReached);
 		}
 
 		let id = SubscriberId(self.inner.next_subscriber.fetch_add(1, Ordering::Relaxed));
@@ -795,6 +815,23 @@ mod tests {
 		let second = subscribed(&registry, connection, "prices");
 		assert_eq!(first, second);
 		assert_eq!(registry.subscriber_count(&topic("prices")), 1);
+	}
+
+	#[tokio::test]
+	async fn register_refuses_past_the_per_connection_subscription_cap() {
+		let options = RegistryOptions { max_subscriptions_per_connection: 2, ..RegistryOptions::default() };
+		let (registry, connection, _peer) = registered(options);
+
+		let first = subscribed(&registry, connection, "a");
+		subscribed(&registry, connection, "b");
+
+		assert_eq!(registry.register(connection, topic("c")), Err(RegisterError::LimitReached));
+		assert_eq!(subscribed(&registry, connection, "a"), first);
+
+		registry.unregister(connection, &topic("a"));
+
+		subscribed(&registry, connection, "c");
+		assert_eq!(registry.subscriber_count(&topic("c")), 1);
 	}
 
 	#[tokio::test]

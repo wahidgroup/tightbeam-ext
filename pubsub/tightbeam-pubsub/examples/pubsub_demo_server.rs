@@ -19,6 +19,8 @@
 //!   - `PUBSUB_WS_PORT`             listen port (default `9110`)
 //!   - `MUX_STREAMS`                client-initiated concurrency cap (default `8`)
 //!   - `PUBSUB_QUEUE_CAPACITY`      per-subscriber queue bound (default `32`)
+//!   - `PUBSUB_MAX_SUBSCRIPTIONS`   live subscriptions per connection
+//!     (default `64`)
 //!   - `PUBSUB_PROCESSOR_ENDPOINT`  when set, publishes relay through the
 //!     processor servlet at this ws:// URL ([`RelayBackplane`])
 //!   - `PUBSUB_PROCESSOR_CERT`      path to the processor certificate DER the
@@ -370,12 +372,14 @@ async fn main() -> Result<(), BoxError> {
 	let port = env_u32("PUBSUB_WS_PORT", 9110);
 	let cap = env_u32("MUX_STREAMS", 8);
 	let queue_capacity = env_u32("PUBSUB_QUEUE_CAPACITY", 32) as usize;
+	let max_subscriptions_per_connection = env_u32("PUBSUB_MAX_SUBSCRIPTIONS", 64) as usize;
 	let bind_addr = TightBeamSocketAddr(format!("0.0.0.0:{port}").parse()?);
 
 	let paywall = paywall_enabled();
 	let identity = Identity::from_env()?;
 
-	let mut options = RegistryOptions { queue_capacity, ..RegistryOptions::default() };
+	let mut options =
+		RegistryOptions { queue_capacity, max_subscriptions_per_connection, ..RegistryOptions::default() };
 	if let Ok(endpoint) = var("PUBSUB_PROCESSOR_ENDPOINT") {
 		let cert_path = var("PUBSUB_PROCESSOR_CERT")?;
 		/*
