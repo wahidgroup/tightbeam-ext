@@ -7,6 +7,8 @@
 pub mod build;
 
 #[cfg(target_arch = "wasm32")]
+mod approver;
+#[cfg(target_arch = "wasm32")]
 mod bindings;
 #[cfg(target_arch = "wasm32")]
 mod fault;
@@ -22,6 +24,8 @@ mod signer;
 mod socket;
 #[cfg(target_arch = "wasm32")]
 pub mod stream;
+#[cfg(target_arch = "wasm32")]
+mod streaming;
 
 #[cfg(target_arch = "wasm32")]
 pub use mux::{split_mux, MuxWsClient};
@@ -31,3 +35,5 @@ pub use secure::{build_transport_with, profile_trust_store, ClientCredentials};
 pub use signer::{JsSigningKeyProvider, TransportSigner};
 #[cfg(target_arch = "wasm32")]
 pub use stream::{GlooStream, WsTransport};
+#[cfg(target_arch = "wasm32")]
+pub use streaming::{MuxDuplexStream, MuxReplySink, MuxRequestStream, MuxStreamBody};

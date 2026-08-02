@@ -6,8 +6,13 @@
  * platform-native `CompressionStream("deflate")` pairs with
  * `PROFILE_OIDS.zlib` for a dependency-free alternative.
  *
- * Inflators SHOULD cap their output size: a wire-supplied body can be a
- * decompression bomb (CWE-409).
+ * Inflators SHOULD cap their output size. A wire-supplied body can be a
+ * decompression bomb.
+ *
+ * # Sources
+ *
+ * - CWE-409, Improper Handling of Highly Compressed Data (Data Amplification):
+ *   {@link https://cwe.mitre.org/data/definitions/409.html CWE-409}
  */
 
 import { ValidationError } from "./builder/errors.js";
@@ -27,7 +32,7 @@ export interface CompressedBody {
 	 */
 	readonly parametersDer?: Uint8Array;
 	/**
-	 * Content-type OID of the uncompressed body; defaults to
+	 * Content-type OID of the uncompressed body. Defaults to
 	 * `id-ct-compressedData` when omitted.
 	 */
 	readonly contentOid?: string;
@@ -109,9 +114,9 @@ interface ZstdModule {
 let zstdLoading: Promise<ZstdModule> | undefined;
 
 /**
- * Load and initialize the bundled libzstd wasm module once; subsequent
- * calls await the same load. Lazy, so clients that never compress never
- * pay for it.
+ * Load and initialize the bundled libzstd wasm module once. Subsequent
+ * calls await the same load. The load is lazy, so clients that never
+ * compress never pay for it.
  */
 function zstdModule(): Promise<ZstdModule> {
 	if (zstdLoading === undefined) {
@@ -244,14 +249,17 @@ function serializeSeekTable(frames: SeekFrame[]): Uint8Array {
 
 /**
  * The tightbeam profile compression: zstd in the seekable format
- * (`PROFILE_OIDS.zstd`), wire-compatible with tightbeam-rs
- * `ZstdCompression` (zeekstd). Backed by a lazily loaded wasm build of
- * libzstd.
+ * (`PROFILE_OIDS.zstd`), wire-compatible with tightbeam-rs `ZstdCompression`
+ * (zeekstd). Backed by a lazily loaded wasm build of libzstd.
  *
- * Decompression is bounded: the seek table's declared output size is
- * checked against `maxOutput` (default 16 MiB, matching tightbeam-rs)
- * before any allocation, so a wire-supplied decompression bomb is rejected
- * up front (CWE-409).
+ * Decompression is bounded. The seek table's declared output size is checked
+ * against `maxOutput` (default 16 MiB, matching tightbeam-rs) before any
+ * allocation, so a wire-supplied decompression bomb is rejected up front.
+ *
+ * # Sources
+ *
+ * - CWE-409, Improper Handling of Highly Compressed Data (Data Amplification):
+ *   {@link https://cwe.mitre.org/data/definitions/409.html CWE-409}
  */
 export class ZstdCompression implements BodyCompressor, BodyInflator {
 	constructor(private readonly maxOutput: number = DEFAULT_MAX_OUTPUT) {}
@@ -272,8 +280,8 @@ export class ZstdCompression implements BodyCompressor, BodyInflator {
 		const frames: SeekFrame[] = [];
 		const parts: Uint8Array[] = [];
 		for (const chunk of chunks) {
-			const frameInput = new Uint8Array(chunk);
-			const part = zstd.compress(frameInput);
+			const part = zstd.compress(chunk);
+
 			parts.push(part);
 			frames.push({ cSize: part.length, dSize: chunk.length });
 		}
@@ -309,8 +317,9 @@ export class ZstdCompression implements BodyCompressor, BodyInflator {
 		let inOffset = 0;
 		let outOffset = 0;
 		for (const frame of frames) {
-			const frameBytes = new Uint8Array(
-				compressed.data.subarray(inOffset, inOffset + frame.cSize),
+			const frameBytes = compressed.data.subarray(
+				inOffset,
+				inOffset + frame.cSize,
 			);
 			const heapSize = Math.max(frame.dSize, 1);
 			const part = zstd.decompress(frameBytes, {

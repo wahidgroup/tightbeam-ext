@@ -3,10 +3,9 @@
 use std::sync::Arc;
 
 use tightbeam::crypto::x509::store::CertificateTrust;
+use tightbeam::policy::TransitStatus;
 use tightbeam::prelude::TightBeamSocketAddr;
-use tightbeam::transport::{
-	AsyncListenerTrait, MessageCollector, MessageEmitter, Protocol, ResponseHandler, X509ClientConfig,
-};
+use tightbeam::transport::{AsyncListenerTrait, MessageCollector, MessageEmitter, Protocol, X509ClientConfig};
 use tightbeam::Frame;
 use tightbeam_ws::protocol::WsListener;
 
@@ -24,10 +23,14 @@ pub async fn echo_round_trip(
 	expected: Frame,
 ) -> Result<(), BoxError> {
 	let server_handle = tokio::spawn(async move {
-		let (transport, _addr) = AsyncListenerTrait::accept(&server).await?;
-		let mut transport = transport.with_handler(Box::new(move |msg: Frame| Some(msg)));
+		let (mut transport, _addr) = AsyncListenerTrait::accept(&server).await?;
+		let (request, status) = transport.collect_message().await?;
+		let message = match status {
+			TransitStatus::Ok => Some(Arc::try_unwrap(request).unwrap_or_else(|shared| (*shared).clone())),
+			_ => None,
+		};
 
-		transport.handle_request().await
+		transport.send_response(status, message).await
 	});
 
 	let stream = <WsListener as Protocol>::connect(addr).await?;

@@ -35,7 +35,7 @@ jobs:
         with:
           node-version-file: .nvmrc
           cache: npm
-          cache-dependency-path: ws/package-lock.json
+          cache-dependency-path: "*/package-lock.json"
           registry-url: https://npm.pkg.github.com
           scope: "@wahidgroup"
 
@@ -54,11 +54,16 @@ jobs:
         run: ./scripts/check-yanked.sh "$EXT"
 
       - name: Generate SBOM
-        if: env.HAS_NPM == 'true'
-        run: make sbom
+        if: env.HAS_SBOM == 'true'
+        run: make sbom "$EXT"
 
-      - name: Publish crate to crates.io
-        run: cargo publish --package "$CRATE"
+      - name: Publish crates to crates.io
+        run: |
+          set --
+          for crate in $CRATES; do
+            set -- "$@" -p "$crate"
+          done
+          cargo publish "$@"
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
@@ -70,6 +75,14 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Create GitHub Release
+        if: env.HAS_SBOM != 'true'
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          name: ${{ env.TITLE }}
+          generate_release_notes: true
+
+      - name: Create GitHub Release
+        if: env.HAS_SBOM == 'true'
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           name: ${{ env.TITLE }}

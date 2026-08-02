@@ -1,0 +1,27 @@
+{
+	"name": "@wahidgroup/tightbeam-pubsub-workspace",
+	"version": "0.0.0",
+	"private": true,
+	"description": "npm workspace for the tightbeam pubsub extension: subscription manager client and dockerized e2e harness.",
+	"type": "module",
+	"engines": {
+		"node": ">=24"
+	},
+	"workspaces": [
+		"client",
+		"tests"
+	],
+	"scripts": {
+		"build": "npm run build --workspace @wahidgroup/tightbeam-pubsub-client",
+		"test": "npm run test --workspace @wahidgroup/tightbeam-pubsub-client",
+		"typecheck": "npm run typecheck --workspaces --if-present",
+		"lint": "npm run lint --workspaces --if-present",
+		"lint:fix": "npm run lint:fix --workspaces --if-present",
+		"clean": "npm run clean --workspaces --if-present"
+	},
+	"devDependencies": {
+		"eslint": "9.39.5",
+		"prettier": "3.9.6"
+	},
+	"license": "MIT OR Apache-2.0"
+}

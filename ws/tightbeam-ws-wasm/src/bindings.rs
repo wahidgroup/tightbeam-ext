@@ -1,6 +1,6 @@
 //! The `wasm-bindgen` surface for the browser and Node.
 
-use js_sys::{Object, Reflect};
+use js_sys::{Object, Reflect, Uint8Array};
 use wasm_bindgen::prelude::*;
 
 use tightbeam::crypto::ecies::EciesSecp256k1Oid;
@@ -13,6 +13,67 @@ use tightbeam::oids::{
 use tightbeam::{AlgorithmIdentifierOwned, DigestInfo, MessagePriority, ObjectIdentifier, Version};
 
 use crate::build::{self, FrameConfig, FrameSummary};
+
+/// Move `bytes` into a JS `Uint8Array` (one boundary copy).
+fn bytes_to_js(bytes: Vec<u8>) -> JsValue {
+	Uint8Array::from(bytes.as_slice()).into()
+}
+
+/// Set an owned byte field on `object` when `value` is `Some`.
+fn set_bytes(object: &Object, key: &str, value: Option<Vec<u8>>) {
+	if let Some(bytes) = value {
+		let _ = Reflect::set(object, &JsValue::from_str(key), &bytes_to_js(bytes));
+	}
+}
+
+/// Set an owned string field on `object` when `value` is `Some`.
+fn set_string(object: &Object, key: &str, value: Option<String>) {
+	if let Some(text) = value {
+		let _ = Reflect::set(object, &JsValue::from_str(key), &JsValue::from(text));
+	}
+}
+
+/// Consume a [`FrameSummary`] into one JS object. Field names match the
+/// legacy [`FrameView`] getters (`bodyDer`, `matrixN`, ...).
+fn summary_into_js(summary: FrameSummary) -> JsValue {
+	let object = Object::new();
+	let _ = Reflect::set(
+		&object,
+		&JsValue::from_str("version"),
+		&JsValue::from(f64::from(summary.version)),
+	);
+	let _ = Reflect::set(&object, &JsValue::from_str("id"), &bytes_to_js(summary.id));
+	let _ = Reflect::set(&object, &JsValue::from_str("order"), &JsValue::from(summary.order));
+	let _ = Reflect::set(&object, &JsValue::from_str("bodyDer"), &bytes_to_js(summary.body_der));
+	if let Some(priority) = summary.priority {
+		let _ = Reflect::set(&object, &JsValue::from_str("priority"), &JsValue::from(f64::from(priority)));
+	}
+	if let Some(lifetime) = summary.lifetime {
+		let _ = Reflect::set(&object, &JsValue::from_str("lifetime"), &JsValue::from(lifetime));
+	}
+
+	set_string(&object, "previousHashAlgorithmOid", summary.previous_hash_algorithm_oid);
+	set_bytes(&object, "previousHashDigest", summary.previous_hash_digest);
+
+	if let Some(matrix_n) = summary.matrix_n {
+		let _ = Reflect::set(&object, &JsValue::from_str("matrixN"), &JsValue::from(f64::from(matrix_n)));
+	}
+
+	set_bytes(&object, "matrixData", summary.matrix_data);
+	set_string(&object, "messageIntegrityAlgorithmOid", summary.message_integrity_algorithm_oid);
+	set_bytes(&object, "messageIntegrityDigest", summary.message_integrity_digest);
+	set_string(&object, "frameIntegrityAlgorithmOid", summary.frame_integrity_algorithm_oid);
+	set_bytes(&object, "frameIntegrityDigest", summary.frame_integrity_digest);
+	set_string(&object, "compactnessAlgorithmOid", summary.compactness_algorithm_oid);
+	set_bytes(&object, "compactnessParametersDer", summary.compactness_parameters_der);
+	set_string(&object, "compactnessContentOid", summary.compactness_content_oid);
+	set_string(&object, "confidentialityAlgorithmOid", summary.confidentiality_algorithm_oid);
+	set_bytes(&object, "confidentialityParametersDer", summary.confidentiality_parameters_der);
+	set_string(&object, "signatureAlgorithmOid", summary.signature_algorithm_oid);
+	set_string(&object, "signatureDigestAlgorithmOid", summary.signature_digest_algorithm_oid);
+	set_bytes(&object, "signature", summary.signature);
+	object.into()
+}
 
 /// secp256k1 private keys are 32 octets.
 const SECP256K1_KEY_LEN: usize = 32;
@@ -90,7 +151,11 @@ impl FrameComposer {
 		self.config.id = id;
 	}
 
-	/// Set the monotonic order (Unix seconds).
+	/// Set the frame order stamp.
+	///
+	/// The value is protocol-opaque. Any monotonic scheme works, such as a
+	/// Unix timestamp or a dense per-channel counter. When omitted, the
+	/// build defaults it to the current Unix time in seconds.
 	#[wasm_bindgen(js_name = withOrder)]
 	pub fn with_order(&mut self, order: u64) {
 		self.config.order = order;
@@ -160,10 +225,10 @@ pub fn decode_body(body_der: Vec<u8>) -> Result<Vec<u8>, JsError> {
 
 /// The message-commitment preimage over `body_der` under `salt` (tightbeam's
 /// commitment framing). Hash it with any digest and install the result via
-/// `setMessageIntegrity`.
+/// `setMessageIntegrity`. An empty salt returns `body_der` by move.
 #[wasm_bindgen(js_name = commitmentPreimage)]
 pub fn commitment_preimage(salt: Vec<u8>, body_der: Vec<u8>) -> Vec<u8> {
-	build::commitment_preimage(salt, body_der)
+	build::commitment_preimage(salt, body_der).into_owned()
 }
 
 /// Install a message-integrity commitment: the digest of
@@ -176,8 +241,9 @@ pub fn set_message_integrity(frame_der: Vec<u8>, algorithm_oid: &str, digest: Ve
 
 /// Replace the frame body with `ciphertext` and record the confidentiality
 /// info (V1+ frames): the caller's encryption algorithm OID, its DER-encoded
-/// parameters (e.g. the nonce; pass `undefined` when the scheme has none),
-/// and the plaintext content-type OID (defaults to `id-data`).
+/// parameters (for example the nonce), and the plaintext content-type OID
+/// (defaults to `id-data`). Pass `undefined` for parameters when the scheme
+/// has none.
 #[wasm_bindgen(js_name = setConfidentiality)]
 pub fn set_confidentiality(
 	frame_der: Vec<u8>,
@@ -234,7 +300,7 @@ pub fn attach_witness(frame_der: Vec<u8>, algorithm_oid: &str, digest: Vec<u8>) 
 
 /// The to-be-signed bytes of a frame (everything but the signature field).
 /// Sign them with any scheme and install the result via `attachSignature`.
-/// Call after `attachWitness`; the signature covers the witness.
+/// Call after `attachWitness`. The signature covers the witness.
 #[wasm_bindgen(js_name = tbsBytes)]
 pub fn tbs_bytes(frame_der: Vec<u8>) -> Result<Vec<u8>, JsError> {
 	build::tbs_bytes(frame_der).map_err(|error| JsError::new(&error.to_string()))
@@ -261,31 +327,48 @@ pub fn attach_signature(
 /// Read-only view of a decoded frame: body, metadata, and the carried
 /// security infos (algorithm OIDs + artifacts) for caller-side verification.
 ///
-/// Returned by [`inspect_frame`]. The fields are copied out of the frame;
-/// the view owns its bytes.
+/// Prefer [`FrameView::take_fields`] (or [`inspect_frame_fields`]) so the
+/// summary moves into JS once. Getters clone and are for ad-hoc inspection.
 #[wasm_bindgen]
 pub struct FrameView {
-	summary: FrameSummary,
+	summary: Option<FrameSummary>,
 }
 
 #[wasm_bindgen]
 impl FrameView {
+	/// Move every field into one plain object and empty this view.
+	///
+	/// Field names match the getters (`bodyDer`, `matrixN`, ...). A second
+	/// call rejects with `FrameViewConsumed`.
+	#[wasm_bindgen(js_name = takeFields, unchecked_return_type = "InspectedFrame")]
+	pub fn take_fields(&mut self) -> Result<JsValue, JsError> {
+		let summary = self
+			.summary
+			.take()
+			.ok_or_else(|| JsError::new("FrameViewConsumed: fields already taken"))?;
+		Ok(summary_into_js(summary))
+	}
+
 	/// Protocol version ordinal (`V0` -> 0, ..., `V3` -> 3).
 	#[wasm_bindgen(getter)]
 	pub fn version(&self) -> u8 {
-		self.summary.version
+		self.summary.as_ref().map(|summary| summary.version).unwrap_or(0)
 	}
 
 	/// Opaque message identifier.
 	#[wasm_bindgen(getter)]
 	pub fn id(&self) -> Vec<u8> {
-		self.summary.id.clone()
+		self.summary.as_ref().map(|summary| summary.id.clone()).unwrap_or_default()
 	}
 
-	/// Monotonic order (Unix seconds).
+	/// Frame order stamp.
+	///
+	/// The value is protocol-opaque. Any monotonic scheme works, such as a
+	/// Unix timestamp or a dense per-channel counter. When omitted at build
+	/// time, the profile defaults to the current Unix time in seconds.
 	#[wasm_bindgen(getter)]
 	pub fn order(&self) -> u64 {
-		self.summary.order
+		self.summary.as_ref().map(|summary| summary.order).unwrap_or(0)
 	}
 
 	/// The raw frame body: the sender's body DER when cleartext, the
@@ -293,117 +376,142 @@ impl FrameView {
 	/// `decodeBody`. Typed bodies decode under the caller's schema.
 	#[wasm_bindgen(getter, js_name = bodyDer)]
 	pub fn body_der(&self) -> Vec<u8> {
-		self.summary.body_der.clone()
+		self.summary
+			.as_ref()
+			.map(|summary| summary.body_der.clone())
+			.unwrap_or_default()
 	}
 
 	/// Message priority ordinal (`LowEffort` -> 0, ...), when present (V2+).
 	#[wasm_bindgen(getter)]
 	pub fn priority(&self) -> Option<u8> {
-		self.summary.priority
+		self.summary.as_ref().and_then(|summary| summary.priority)
 	}
 
 	/// Time-to-live in seconds, when present (V2+).
 	#[wasm_bindgen(getter)]
 	pub fn lifetime(&self) -> Option<u64> {
-		self.summary.lifetime
+		self.summary.as_ref().and_then(|summary| summary.lifetime)
 	}
 
 	/// Parent-link digest algorithm OID (dotted form), when present (V2+).
 	#[wasm_bindgen(getter, js_name = previousHashAlgorithmOid)]
 	pub fn previous_hash_algorithm_oid(&self) -> Option<String> {
-		self.summary.previous_hash_algorithm_oid.clone()
+		self.summary
+			.as_ref()
+			.and_then(|summary| summary.previous_hash_algorithm_oid.clone())
 	}
 
 	/// Parent-link digest octets, when present (V2+).
 	#[wasm_bindgen(getter, js_name = previousHashDigest)]
 	pub fn previous_hash_digest(&self) -> Option<Vec<u8>> {
-		self.summary.previous_hash_digest.clone()
+		self.summary.as_ref().and_then(|summary| summary.previous_hash_digest.clone())
 	}
 
 	/// Control-matrix dimension N, when present (V3+).
 	#[wasm_bindgen(getter, js_name = matrixN)]
 	pub fn matrix_n(&self) -> Option<u8> {
-		self.summary.matrix_n
+		self.summary.as_ref().and_then(|summary| summary.matrix_n)
 	}
 
 	/// Control-matrix row-major bytes, when present (V3+).
 	#[wasm_bindgen(getter, js_name = matrixData)]
 	pub fn matrix_data(&self) -> Option<Vec<u8>> {
-		self.summary.matrix_data.clone()
+		self.summary.as_ref().and_then(|summary| summary.matrix_data.clone())
 	}
 
 	/// Message-commitment digest algorithm OID, when committed.
 	#[wasm_bindgen(getter, js_name = messageIntegrityAlgorithmOid)]
 	pub fn message_integrity_algorithm_oid(&self) -> Option<String> {
-		self.summary.message_integrity_algorithm_oid.clone()
+		self.summary
+			.as_ref()
+			.and_then(|summary| summary.message_integrity_algorithm_oid.clone())
 	}
 
 	/// Message-commitment digest octets, when committed.
 	#[wasm_bindgen(getter, js_name = messageIntegrityDigest)]
 	pub fn message_integrity_digest(&self) -> Option<Vec<u8>> {
-		self.summary.message_integrity_digest.clone()
+		self.summary
+			.as_ref()
+			.and_then(|summary| summary.message_integrity_digest.clone())
 	}
 
 	/// Witness digest algorithm OID, when witnessed.
 	#[wasm_bindgen(getter, js_name = frameIntegrityAlgorithmOid)]
 	pub fn frame_integrity_algorithm_oid(&self) -> Option<String> {
-		self.summary.frame_integrity_algorithm_oid.clone()
+		self.summary
+			.as_ref()
+			.and_then(|summary| summary.frame_integrity_algorithm_oid.clone())
 	}
 
 	/// Witness digest octets, when witnessed.
 	#[wasm_bindgen(getter, js_name = frameIntegrityDigest)]
 	pub fn frame_integrity_digest(&self) -> Option<Vec<u8>> {
-		self.summary.frame_integrity_digest.clone()
+		self.summary.as_ref().and_then(|summary| summary.frame_integrity_digest.clone())
 	}
 
 	/// Body-compression algorithm OID, when compressed.
 	#[wasm_bindgen(getter, js_name = compactnessAlgorithmOid)]
 	pub fn compactness_algorithm_oid(&self) -> Option<String> {
-		self.summary.compactness_algorithm_oid.clone()
+		self.summary
+			.as_ref()
+			.and_then(|summary| summary.compactness_algorithm_oid.clone())
 	}
 
 	/// Body-compression algorithm parameters DER, when compressed and
 	/// present.
 	#[wasm_bindgen(getter, js_name = compactnessParametersDer)]
 	pub fn compactness_parameters_der(&self) -> Option<Vec<u8>> {
-		self.summary.compactness_parameters_der.clone()
+		self.summary
+			.as_ref()
+			.and_then(|summary| summary.compactness_parameters_der.clone())
 	}
 
 	/// Content-type OID of the uncompressed body, when compressed.
 	#[wasm_bindgen(getter, js_name = compactnessContentOid)]
 	pub fn compactness_content_oid(&self) -> Option<String> {
-		self.summary.compactness_content_oid.clone()
+		self.summary
+			.as_ref()
+			.and_then(|summary| summary.compactness_content_oid.clone())
 	}
 
 	/// Body-encryption algorithm OID, when confidential.
 	#[wasm_bindgen(getter, js_name = confidentialityAlgorithmOid)]
 	pub fn confidentiality_algorithm_oid(&self) -> Option<String> {
-		self.summary.confidentiality_algorithm_oid.clone()
+		self.summary
+			.as_ref()
+			.and_then(|summary| summary.confidentiality_algorithm_oid.clone())
 	}
 
 	/// Body-encryption algorithm parameters DER (e.g. the nonce), when
 	/// confidential and present.
 	#[wasm_bindgen(getter, js_name = confidentialityParametersDer)]
 	pub fn confidentiality_parameters_der(&self) -> Option<Vec<u8>> {
-		self.summary.confidentiality_parameters_der.clone()
+		self.summary
+			.as_ref()
+			.and_then(|summary| summary.confidentiality_parameters_der.clone())
 	}
 
 	/// Signature algorithm OID, when signed.
 	#[wasm_bindgen(getter, js_name = signatureAlgorithmOid)]
 	pub fn signature_algorithm_oid(&self) -> Option<String> {
-		self.summary.signature_algorithm_oid.clone()
+		self.summary
+			.as_ref()
+			.and_then(|summary| summary.signature_algorithm_oid.clone())
 	}
 
 	/// Signature digest algorithm OID, when signed.
 	#[wasm_bindgen(getter, js_name = signatureDigestAlgorithmOid)]
 	pub fn signature_digest_algorithm_oid(&self) -> Option<String> {
-		self.summary.signature_digest_algorithm_oid.clone()
+		self.summary
+			.as_ref()
+			.and_then(|summary| summary.signature_digest_algorithm_oid.clone())
 	}
 
 	/// Raw signature octets, when signed.
 	#[wasm_bindgen(getter)]
 	pub fn signature(&self) -> Option<Vec<u8>> {
-		self.summary.signature.clone()
+		self.summary.as_ref().and_then(|summary| summary.signature.clone())
 	}
 }
 
@@ -411,7 +519,45 @@ impl FrameView {
 #[wasm_bindgen(js_name = inspectFrame)]
 pub fn inspect_frame(frame_der: Vec<u8>) -> Result<FrameView, JsError> {
 	let summary = build::inspect_frame(frame_der).map_err(|error| JsError::new(&error.to_string()))?;
-	Ok(FrameView { summary })
+	Ok(FrameView { summary: Some(summary) })
+}
+
+/// TypeScript shape returned by [`inspect_frame_fields`].
+#[wasm_bindgen(typescript_custom_section)]
+const INSPECTED_FRAME_TS: &'static str = r#"
+export interface InspectedFrame {
+	version: number;
+	id: Uint8Array;
+	order: bigint;
+	bodyDer: Uint8Array;
+	priority?: number;
+	lifetime?: bigint;
+	previousHashAlgorithmOid?: string;
+	previousHashDigest?: Uint8Array;
+	matrixN?: number;
+	matrixData?: Uint8Array;
+	messageIntegrityAlgorithmOid?: string;
+	messageIntegrityDigest?: Uint8Array;
+	frameIntegrityAlgorithmOid?: string;
+	frameIntegrityDigest?: Uint8Array;
+	compactnessAlgorithmOid?: string;
+	compactnessParametersDer?: Uint8Array;
+	compactnessContentOid?: string;
+	confidentialityAlgorithmOid?: string;
+	confidentialityParametersDer?: Uint8Array;
+	signatureAlgorithmOid?: string;
+	signatureDigestAlgorithmOid?: string;
+	signature?: Uint8Array;
+}
+"#;
+
+/// Decode a frame DER and return every field in one plain object.
+///
+/// Same shape as [`FrameView::take_fields`], without retaining a view.
+#[wasm_bindgen(js_name = inspectFrameFields, unchecked_return_type = "InspectedFrame")]
+pub fn inspect_frame_fields(frame_der: Vec<u8>) -> Result<JsValue, JsError> {
+	let summary = build::inspect_frame(frame_der).map_err(|error| JsError::new(&error.to_string()))?;
+	Ok(summary_into_js(summary))
 }
 
 // ---------------------------------------------------------------------------
@@ -423,23 +569,42 @@ pub fn inspect_frame(frame_der: Vec<u8>) -> Result<FrameView, JsError> {
 const PROFILE_OIDS_TS: &'static str = r#"
 /**
  * The dotted OIDs of the tightbeam profile (`tightbeam::oids`).
+ *
+ * # Sources
+ *
+ * - RFC 8878, Zstandard compression:
+ *   <https://datatracker.ietf.org/doc/html/rfc8878>
+ * - RFC 3274, Compressed Data Content Type:
+ *   <https://datatracker.ietf.org/doc/html/rfc3274>
  */
 export interface ProfileOids {
-	/** SHA3-256, the profile digest. */
+	/**
+	 * SHA3-256, the profile digest.
+	 */
 	readonly sha3_256: string;
-	/** secp256k1 ECDSA over SHA3-256, the profile signature. */
+	/**
+	 * secp256k1 ECDSA over SHA3-256, the profile signature.
+	 */
 	readonly ecdsaWithSha3_256: string;
-	/** AES-256-GCM, the profile symmetric cipher. */
+	/**
+	 * AES-256-GCM, the profile symmetric cipher.
+	 */
 	readonly aes256Gcm: string;
-	/** ECIES over secp256k1 (HKDF-SHA3-256 + AES-256-GCM). */
+	/**
+	 * ECIES over secp256k1 (HKDF-SHA3-256 + AES-256-GCM).
+	 */
 	readonly eciesSecp256k1: string;
-	/** Zstandard (RFC 8878), the profile compression. */
+	/**
+	 * Zstandard, the profile compression.
+	 */
 	readonly zstd: string;
-	/** zlib (RFC 3274), interoperable with `CompressionStream("deflate")`. */
+	/**
+	 * zlib, interoperable with `CompressionStream("deflate")`.
+	 */
 	readonly zlib: string;
 	/**
-	 * id-ct-compressedData (RFC 3274): the content type recorded in the
-	 * compactness info when the compressor names none.
+	 * id-ct-compressedData: the content type recorded in the compactness
+	 * info when the compressor names none.
 	 */
 	readonly compressedContent: string;
 }

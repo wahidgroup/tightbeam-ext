@@ -10,7 +10,7 @@ TypeScript/WebAssembly client for the [tightbeam](https://crates.io/crates/tight
 
 ## Abstract
 
-This package is tightbeam in TypeScript. The frame codec (the ASN.1 DER structure engine) is the actual Rust implementation, compiled from [`tightbeam-ws-wasm`](../tightbeam-ws-wasm) with `wasm-pack`. The TypeScript layer adds the builder, validation, and connection handling. What tightbeam-rs offers, this client offers under the same names:
+This package is tightbeam in TypeScript. The frame codec (the ASN.1 DER engine) is the Rust implementation itself, compiled from [`tightbeam-ws-wasm`](../tightbeam-ws-wasm) with `wasm-pack`. The TypeScript layer adds the builder, the typed message envelope, validation, and connection handling. The tightbeam-rs surface carries over under the same names:
 
 - The builder: `withSigner`, `withEncryptor`, `withMessageHasher`, the version floor rules, `assertVersion`.
 - The `Frame`: `verify`, `frameIntegrityVerdict`, `messageCommitmentVerdict`, `decryptMessage`, and the same enums with the same ordinals (`Version`, `MessagePriority`).
@@ -25,7 +25,10 @@ Two wasm bundles ship in the package, a `web` build and a `nodejs` build, select
 - [Install](#install)
 - [Cleartext round-trip](#cleartext-round-trip)
 - [Encrypted sessions (ECIES)](#encrypted-sessions-ecies)
+    - [Session budgets (mutual auth only)](#session-budgets-mutual-auth-only)
 - [Two-way streams](#two-way-streams)
+    - [Progressive body streaming](#progressive-body-streaming)
+    - [Routing server-initiated streams](#routing-server-initiated-streams)
 - [Cancellation and timeouts](#cancellation-and-timeouts)
 - [Connection lifecycle](#connection-lifecycle)
 - [Transport errors](#transport-errors)
@@ -35,7 +38,9 @@ Two wasm bundles ship in the package, a `web` build and a `nodejs` build, select
 - [Custom cryptography](#custom-cryptography)
 - [Compression](#compression)
 - [Verification and decryption](#verification-and-decryption)
+- [Envelopes](#envelopes)
 - [Detached commitments](#detached-commitments)
+- [Related](#related)
 - [License](#license)
 
 ## Install
@@ -83,7 +88,7 @@ client.close();
 
 ## Encrypted sessions (ECIES)
 
-The server is authenticated by pinning its DER certificate. The ECIES handshake also negotiates stream multiplexing (HTTP/2-style, tightbeam's `transport-multiplex`): the `maxPeerStreams` option caps concurrent server-initiated streams (default 8), the server's advertisement caps this client's concurrent emits, and connecting to a server that does not offer multiplexing rejects.
+The server is authenticated by pinning its DER certificate. The ECIES handshake also negotiates stream multiplexing (HTTP/2-style, tightbeam's `transport-multiplex`). The `maxPeerStreams` option caps concurrent server-initiated streams (default 8), and the server's advertisement caps this client's concurrent emits. Connecting to a server that does not offer multiplexing rejects.
 
 ```ts
 import { TightbeamWsClient } from "@wahidgroup/tightbeam-ws-client";
@@ -100,13 +105,15 @@ const mutual = await TightbeamWsClient.connectMutual(
 );
 ```
 
-When the certificate key lives in an external key store (WebAuthn, a wallet, a KMS bridge), pass a `TransportSigner` instead of the raw scalar. The handshake hands it the transcript prehash to sign, so the private key never crosses into wasm. The contract is algorithm-agnostic: the signer signs the prehash directly (no rehash) and returns whatever signature encoding the session profile verifies. Under the default-profile build that is a secp256k1 signature as 64-byte `r || s`. A custom-profile build expects its own profile's encoding (see the [`tightbeam-ws-wasm` README](../tightbeam-ws-wasm/README.md)).
+When the certificate key lives in an external key store (WebAuthn, a wallet, a KMS bridge), pass a `TransportSigner` instead of the raw scalar. The handshake hands it the transcript prehash to sign, so the private key never crosses into wasm. The contract is algorithm-agnostic: the signer signs the prehash directly (no rehash) and returns whatever signature encoding the session profile verifies.
+
+Under the default-profile build that is a secp256k1 signature as 64-byte `r || s`. A custom-profile build expects its own profile's encoding (see the [`tightbeam-ws-wasm` README](../tightbeam-ws-wasm/README.md)).
 
 ```ts
 import type { TransportSigner } from "@wahidgroup/tightbeam-ws-client";
 
 const signer: TransportSigner = {
-	algorithmOid: "1.2.840.10045.4.3.2",
+	algorithmOid: "2.16.840.1.101.3.4.3.10", // ecdsa-with-SHA3-256
 	publicKeyDer: spkiFromKeyStore,
 	signPrehash: (prehash) => keyStore.signDigest(prehash),
 };
@@ -120,6 +127,31 @@ const external = await TightbeamWsClient.connectMutual(
 ```
 
 The session profile (secp256k1 ECIES, AES-256-GCM records, SHA3-256 certificates) is a compile-time choice, the same as for a native tightbeam-rs transport. A deployment on a different provider rebuilds the wasm layer against its own `CryptoProvider` (see the [`tightbeam-ws-wasm` README](../tightbeam-ws-wasm/README.md)). Frame-level cryptography stays caller-supplied regardless.
+
+### Session budgets (mutual auth only)
+
+Metered sessions request per-direction credits and settle server invoices through `approveReceipt`. Budgets, `authorization`, and `approveReceipt` are rejected on `connect` / `connectCleartext`.
+
+```ts
+const metered = await TightbeamWsClient.connectMutual(
+	url,
+	serverCertDer,
+	clientCertDer,
+	clientSigningKey,
+	{
+		budgets: { clientToServer: 4096, serverToClient: 4096 },
+		approveReceipt: ({ receiptDer, challenge }) => {
+			// Pay the invoice in `challenge`, or return undefined to refuse.
+			return paymentFor(challenge);
+		},
+	},
+);
+
+metered.usableSendBudget; // epoch usable credits, or undefined when unmetered
+metered.sessionReceiptDer; // dual-signed receipt DER, rotates on renewal
+```
+
+There is no live remaining-balance getter. Reconnect policies MUST treat peer GoAway reasons `"BudgetExhausted"` and `"SettlementFailed"` like other drain signals (backoff / re-auth), not as a protocol bug.
 
 ## Two-way streams
 
@@ -142,7 +174,7 @@ mux.serve(async (request) => {
 		.withId("reply")
 		.withOrder(1)
 		.build();
-	return reply; // or undefined for a bodiless acceptance
+	return reply; // or undefined/null for a bodiless acceptance
 });
 
 // Concurrent client-initiated streams over the one connection.
@@ -159,9 +191,37 @@ A `serve` handler refuses a stream by throwing `StreamRefusal` with the gRPC sta
 
 Registering the handler is not racy: server-initiated streams that arrive before `serve()` is called are parked in a bounded queue (the cap granted to the server) and served in order once the handler registers.
 
+`serve(handler, { exclusive: true })` claims dispatch: every later `serve` call throws instead of silently rerouting streams. The pubsub `SubscriptionManager` claims its client this way. Application routes compose through its `fallback` option.
+
+### Progressive body streaming
+
+Unary `emit` / `serve` stay the default. Progressive body I/O uses the same Open/Data/`last` wire:
+
+- `openStream()`: push request chunks, then `close()` / `closeWith(chunk)` for a Frame response
+- `openDuplex()`: push request chunks; consume `body` as an async iterable of reply chunks
+- `serveStreaming(handler)` / `serveDuplex(handler)`: peer-initiated progressive bodies
+
+Pushes reach the wire eagerly, so a duplex chunk-for-chunk conversation (push, then await the next reply chunk) is sound. `closeWith(chunk)` flags that chunk `last` in one record (one fewer than push-then-close). Dropping a stream without `close` / `closeWith` cancels it.
+
+```ts
+const stream = client.openStream();
+await stream.push(frameDer.subarray(0, mid));
+const response = await stream.closeWith(frameDer.subarray(mid));
+
+const duplex = client.openDuplex();
+await duplex.push(chunkA);
+const first = await duplex.body[Symbol.asyncIterator]().next();
+await duplex.closeWith(chunkB);
+for await (const chunk of duplex.body) {
+	handle(chunk);
+}
+```
+
+`serve`, `serveStreaming`, and `serveDuplex` are mutually exclusive on one client: the first call consumes the responder.
+
 ### Routing server-initiated streams
 
-Applications that serve more than one kind of stream demultiplex by frame id. The `router` makes that pairing checkable: each `route` binds an id prefix to a codec and a handler whose message type the codec proves, so a codec and its handler cannot disagree at compile time. The longest matching prefix wins. An unmatched id throws `UnroutedTopicError`, answering the stream with an `Unimplemented` status.
+Applications that serve more than one kind of stream demultiplex by frame id. The `router` makes that pairing checkable: each `route` binds an id prefix to a codec and a handler typed by that codec, so the two cannot disagree at compile time. The longest matching prefix wins. An unmatched id throws `UnroutedTopicError`, answering the stream with an `Unimplemented` status.
 
 ```ts
 import { route, router } from "@wahidgroup/tightbeam-ws-client";
@@ -202,7 +262,7 @@ const mux = await TightbeamWsClient.connect(url, serverCertDer, {
 
 ## Connection lifecycle
 
-Every client exposes `closed`, a promise resolving with the close frame's `{ code, reason, wasClean }` when the socket ends, however that happens, plus a `readyState` getter with the WebSocket constants. Reconnect logic starts here:
+Every client exposes `closed`, a promise resolving with the close frame's `{ code, reason, wasClean }` on every close path, plus a `readyState` getter with the WebSocket constants. Reconnect logic starts here:
 
 ```ts
 void client.closed.then((info) => {
@@ -212,9 +272,9 @@ void client.closed.then((info) => {
 });
 ```
 
-`close()` closes the socket and releases the client's wasm resources (idempotent, safe with emits in flight). Call `shutdown()` first for a graceful GoAway drain, or `shutdownWith(reason)` to advertise why: a label (`"Shutdown"`, `"ProtocolError"`, `"EnhanceYourCalm"`) or an application-defined numeric code the peer reads back through its own GoAway surface. After `close()`, operations reject with `ConnectionClosed`, while `closed`, `readyState`, and the GoAway getters stay readable for reconnect policies.
+`close()` closes the socket and releases the client's wasm resources (idempotent, safe with emits in flight). Call `shutdown()` first for a graceful GoAway drain, or `shutdownWith(reason)` to advertise why: a label (`"Shutdown"`, `"ProtocolError"`, `"EnhanceYourCalm"`, `"BudgetExhausted"`, `"SettlementFailed"`) or an application-defined numeric code the peer reads back through its own GoAway surface. After `close()`, operations reject with `ConnectionClosed`, while `closed`, `readyState`, and the GoAway getters stay readable for reconnect policies.
 
-When the peer drains the session, the client records why. `goawayReason` reads the reason from the peer's GoAway (`undefined` while the connection is live or after a local shutdown), and reconnect policies branch on it. `goawayCode` exposes the raw numeric code for application-defined reasons, which all label as `"Application"`.
+When the peer drains the session, the client records why. `goawayReason` reads the reason from the peer's GoAway (`undefined` while the connection is live or after a local shutdown), and reconnect policies branch on it. `goawayCode` exposes the raw numeric code for application-defined reasons, which `goawayReason` labels `"Application"`.
 
 Reconnection belongs to the application: the client supplies the policy inputs (`closed`, `goawayReason`, `wasClean`) and only the application knows what state to replay. The complete pattern: branch on the reason, back off, re-register `serve`.
 
@@ -238,7 +298,7 @@ async function connectLoop(
 		delay = 500;
 
 		/*
-		 * Re-establish per-connection state: serve is per connection.
+		 * serve is per connection: re-register handlers here.
 		 */
 		handle(client);
 
@@ -252,7 +312,7 @@ async function connectLoop(
 
 		switch (client.goawayReason) {
 			case "Shutdown":
-				break; // orderly drain: rotation, redeploy; go right back
+				break; // orderly drain (rotation, redeploy): go right back
 			case "EnhanceYourCalm":
 				await sleep((delay = Math.min(delay * 2, 30_000)));
 				break; // the server asked for calm
@@ -290,7 +350,7 @@ Local conditions carry their variant name: `ConnectionClosed`, `Draining`, and `
 - `Unknown`: unclassified peer handler failure
 - `DeadlineExceeded`, `Unauthenticated`, `PermissionDenied`: gate policy rejections
 
-Instead of retrying `StreamsExhausted` blind, wait for admission. `waitForStreamSlot()` resolves once a new stream would be admitted, rejects with `Draining` once no stream ever will be again, and takes the same `{ signal }` option as `emit` for callers that give up first. It is advisory like `hasStreamHeadroom`: a concurrent emit can take the slot between wake and use, so the rejection handling stays.
+Instead of retrying `StreamsExhausted` blind, wait for admission. `waitForStreamSlot()` resolves once a new stream would be admitted, and rejects with `Draining` once no stream ever will be again. It takes the same `{ signal }` option as `emit` for callers that give up first. Like `hasStreamHeadroom`, it is advisory: a concurrent emit can take the slot between wake and use, so the rejection handling stays.
 
 ```ts
 await mux.waitForStreamSlot({ signal: AbortSignal.timeout(5_000) });
@@ -299,7 +359,7 @@ const response = await mux.emit(built);
 
 ## Keepalive
 
-Multiplexed sessions have a protocol-level liveness probe (RFC 9113 § 6.7 analog): `ping()` resolves when the peer acknowledges. No stream is allocated and no application handler runs on the peer, so a periodic ping doubles as an idle keepalive for browsers, whose sockets cannot send WebSocket protocol pings from JavaScript:
+Multiplexed sessions have a protocol-level liveness probe (RFC 9113 § 6.7 analog). `ping()` resolves when the peer acknowledges. No stream is allocated and no application handler runs on the peer, so a periodic ping doubles as an idle keepalive for browsers, whose sockets cannot send WebSocket protocol pings from JavaScript:
 
 ```ts
 const interval = setInterval(() => {
@@ -311,7 +371,12 @@ const interval = setInterval(() => {
 }, 30_000);
 ```
 
-Browsers answer WebSocket protocol pings automatically; this probe covers the application level, where silence is otherwise indistinguishable from idleness.
+Browsers answer WebSocket protocol pings automatically. This probe covers the application level, where silence is otherwise indistinguishable from idleness.
+
+### Sources
+
+- RFC 9113 § 6.7, PING frame:
+  <https://datatracker.ietf.org/doc/html/rfc9113#section-6.7>
 
 ## Frame builder
 
@@ -345,7 +410,7 @@ const built = await frame(body)
 	.build();
 ```
 
-- The version floor is derived from the requested fields, or pinned with `withVersion(Version.V2)`. `assertVersion` fails the build when the effective version differs from what you expect.
+- The version floor is derived from the requested fields, or pinned with `withVersion(Version.V2)`. `assertVersion` fails the build when the effective version differs from the assertion.
 - `withMessageHasher` / `withWitnessHasher` take any `Hasher`. The profile hasher is `Sha3_256`.
 - `withEncryptor` takes any `BodyEncryptor`: the profile symmetric cipher (`Aes256Gcm.fromKey(k)`, opened with the shared key), the profile asymmetric encryptor to a recipient (`EciesEncryptor.fromBytes(recipientPublicKey)`, opened with the recipient secret), or your own scheme. The frame has a single body-encryption slot.
 - Structurally invalid specs reject with a `ValidationError` carrying per-field issues.
@@ -389,6 +454,8 @@ const message = reply?.message(Chat); // ChatMessage
 ```
 
 To interoperate with a peer expecting a specific ASN.1 `Message` schema (e.g. a Rust `der::Sequence`), implement `MessageCodec` directly with the ASN.1 library of your choice. The DER it emits is installed in the frame. `frame(bytes)` / `withMessage(bytes)` are sugar for the profile `Opaque` codec (raw bytes in the opaque wrapper), and a codec's optional `contentOid` is recorded in the confidentiality info when the body is sealed.
+
+`Framed` is the frame-in-frame codec: messages that are themselves full tightbeam frames, carried byte-for-byte inside another frame's body. Pub/sub topics use it to relay publisher-signed (or sealed) frames through the registry untouched, so frame-level security survives the broker end to end.
 
 ## Custom cryptography
 
@@ -485,7 +552,7 @@ Verification is on the `Frame` itself. Verdicts are `"verified" | "absent" | "al
 ```ts
 import { Aes256Gcm, EciesDecryptor } from "@wahidgroup/tightbeam-ws-client";
 
-response.verify(signingKey.verifyingKey()); // profile scheme; throws when invalid
+response.verify(signingKey.verifyingKey()); // profile scheme: throws when invalid
 await response.frameIntegrityVerdict(); // "verified" | "absent" | ...
 await response.frameIntegrityVerdict(sha3_512Hasher); // under your own hasher
 await response.messageCommitmentVerdict(salt); // checks the body commitment
@@ -503,6 +570,47 @@ response.tbs(); // to-be-signed bytes
 response.witnessInput(); // frame-integrity preimage
 response.signatureInfo; // { algorithmOid, digestAlgorithmOid, signature }
 ```
+
+## Envelopes
+
+The calls above are per-frame tools. A conversation applies the same layers to every frame, in both directions: `envelope(codec)` declares them once. `frame(message)` begins a builder with the layers applied. `unwrap(frame)` reverses them in protocol order (verify, open, inflate, decode) and enforces them: a received frame missing a declared signature or seal rejects with a `ValidationError`, so a peer cannot downgrade the conversation by omission.
+
+```ts
+import {
+	Aes256Gcm,
+	ZstdCompression,
+	envelope,
+} from "@wahidgroup/tightbeam-ws-client";
+
+const notes = envelope(Notes) // any MessageCodec<T>
+	.signed(signingKey)
+	.sealed(Aes256Gcm.fromKey(topicKey))
+	.compressed(new ZstdCompression());
+
+// Sender: the layers are already applied, the metadata stays yours.
+const sent = await notes.frame(note).withId("note-1").withOrder(1n).build();
+
+// Receiver: a Note, or a rejection.
+const received = await notes.unwrap(relayed);
+```
+
+Envelopes are immutable and reusable across every frame of the conversation. Each declaration takes whichever halves the capability implements:
+
+- `signed(signatory)` signs on build. A profile `Secp256k1SigningKey` derives its own verifying key for unwrap. Any other `Signatory` (wallet, passkey, HSM) needs `verified(key)` alongside it before `unwrap` can check the signature.
+- `verified(key)` is the read-only half for parties without the signing key: `unwrap` requires a signature verifying under `key`, and `frame()` refuses to build (a verify-only envelope MUST NOT silently send unsigned frames).
+- `sealed(keys)` takes a `BodyEncryptor`, a `BodyDecryptor`, or both at once. `Aes256Gcm` is both. An ECIES pair splits: the publisher declares `sealed(EciesEncryptor.fromBytes(recipientPublic))`, the recipient `sealed(EciesDecryptor.fromBytes(recipientSecret))`.
+- `compressed(compression)` is a transport optimization, not a security property: an uncompressed received frame still unwraps.
+
+One-sided parties compose only their half:
+
+```ts
+// A subscriber that verifies and opens, but never signs or sends.
+const readOnly = envelope(Notes)
+	.verified(publisherKey)
+	.sealed(EciesDecryptor.fromBytes(recipientSecret));
+```
+
+The `authenticated` and `confidential` getters report the declarations. Because `unwrap` enforces them, they are proven properties of every unwrapped frame: a UI badges them instead of probing frames. The pubsub manager accepts an envelope wherever it accepts a codec ([`@wahidgroup/tightbeam-pubsub-client`](../../pubsub/client)), publishing frame-in-frame so the layers survive the broker end to end.
 
 ## Detached commitments
 
@@ -524,6 +632,10 @@ const verified = await disclosed.verify(new Sha3_256(), commitment);
 ```
 
 `verify` resolves with `false` on an algorithm mismatch or a digest mismatch. An empty salt reproduces the plain body digest (binding, not hiding). Any `Hasher` works on both sides.
+
+## Related
+
+The host transport is [tightbeam-ws](../tightbeam-ws). Custom wasm transport profiles are documented in [tightbeam-ws-wasm](../tightbeam-ws-wasm). Topic subscriptions on top of this client live in [`@wahidgroup/tightbeam-pubsub-client`](../../pubsub/client). See the [repository README](../../README.md) for development and release workflows.
 
 ## License
 

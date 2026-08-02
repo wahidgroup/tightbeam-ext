@@ -1,0 +1,56 @@
+[package]
+name = "tightbeam-pubsub"
+description = "Topic pub/sub extension for the tightbeam messaging protocol"
+authors.workspace = true
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/tightbeam-pubsub"
+readme = "README.md"
+keywords = ["pubsub", "messaging", "protocol", "tightbeam", "topics"]
+categories.workspace = true
+
+[lib]
+name = "tightbeam_pubsub"
+
+[features]
+# Test-support code builds frames a client would (including sealed
+# bodies), so it needs tightbeam's AEAD surface.
+testing = ["tightbeam-rs/aead"]
+
+[[example]]
+name = "pubsub_demo_server"
+required-features = ["testing"]
+test = true
+
+[[example]]
+name = "pubsub_processor_server"
+required-features = ["testing"]
+
+[dependencies]
+tightbeam-rs = { workspace = true, features = [
+	"std",
+	"tokio",
+	"transport-ecies",
+	"transport-multiplex",
+] }
+der = { workspace = true, features = ["alloc", "derive", "oid"] }
+tokio = { workspace = true, features = ["rt", "sync", "macros", "time"] }
+
+[dev-dependencies]
+# Self dev-dependency: turns the `testing` feature on for every test
+# and example build, so integration tests need no feature gate.
+tightbeam-pubsub = { path = ".", features = ["testing"] }
+husky-rs = { workspace = true }
+tightbeam-ws = { path = "../../ws/tightbeam-ws", features = ["testing"] }
+tokio-tungstenite = { workspace = true, features = ["connect", "handshake"] }
+serde_json = { workspace = true, features = ["std"] }
+tokio = { workspace = true, features = [
+	"rt-multi-thread",
+	"macros",
+	"sync",
+	"time",
+] }

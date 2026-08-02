@@ -102,11 +102,28 @@ describe.each(LANES)(
 					.withId("call-me-node")
 					.withOrder(1)
 					.build();
-				const response = await emitOrFail(client, built);
 
+				const response = await emitOrFail(client, built);
 				expect(served).toEqual(["call-me-node"]);
 				expect(TEXT.decode(response.id)).toBe("client-reply");
 				expect(response.message(Opaque)).toEqual(REPLY_BODY);
+			});
+		});
+
+		it("accepts a bodiless null answer from the handler", async () => {
+			await withClient(connect, async (client) => {
+				/*
+				 * `null` and `undefined` both mean a bodiless acceptance.
+				 * The server relays it as a response without a frame, so
+				 * the original emit resolves with undefined.
+				 */
+				client.serve(() => null);
+
+				const built = await frame(new Uint8Array([0xb0, 0x24]))
+					.withId("call-me-bodiless")
+					.withOrder(1)
+					.build();
+				await expect(client.emit(built)).resolves.toBeUndefined();
 			});
 		});
 
@@ -136,17 +153,18 @@ describe.each(LANES)(
 		it("parks server-initiated streams until a handler registers", async () => {
 			await withClient(connect, async (client) => {
 				/*
-				 * Fire the call-back trigger with no handler registered and
-				 * give the server's stream time to arrive. No parked-count
-				 * surface exists to poll: a sleep too short degrades this
-				 * into the ordinary served path, never into a flake.
+				 * Fire the call-back with no handler, then wait until the
+				 * local emit occupies a stream slot. That proves the
+				 * request left the client before serve starts. The peer
+				 * Open parks in the responder queue until the handler
+				 * registers.
 				 */
 				const built = await frame(new Uint8Array([0xb0, 0x0f]))
 					.withId("call-me-early")
 					.withOrder(1)
 					.build();
 				const pending = client.emit(built);
-				await new Promise((resolve) => setTimeout(resolve, 100));
+				await expect.poll(() => client.hasPendingStreams).toBe(true);
 
 				const served: string[] = [];
 				client.serve(async (request) => {

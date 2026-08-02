@@ -16,7 +16,7 @@ import type {
 	Hasher,
 	Signatory,
 } from "./crypto.js";
-import type { FrameBuilder, MessageCodec } from "./index.js";
+import type { Frame, FrameBuilder, MessageCodec } from "./index.js";
 import { MessagePriority } from "./builder/priority.js";
 import { Version } from "./builder/version.js";
 import {
@@ -29,6 +29,7 @@ import {
 	Sha3_256,
 } from "./crypto.js";
 import {
+	Framed,
 	Opaque,
 	ValidationError,
 	frame,
@@ -120,6 +121,50 @@ describe("Frame metadata round-trip", () => {
 			.assertVersion(Version.V1)
 			.build();
 		expect(built.version).toBe(Version.V1);
+	});
+});
+
+describe("Framed (frame-in-frame)", () => {
+	/**
+	 * A signed application frame carried through a wrapper body, the way
+	 * a pub/sub update relays it.
+	 */
+	async function relayed(): Promise<{ inner: Frame; relay: Frame }> {
+		const inner = await frame(BODY)
+			.withId("order-42")
+			.withOrder(7)
+			.withPriority(MessagePriority.Expedited)
+			.withLifetime(60)
+			.withSigner(SIGNING_KEY)
+			.build();
+
+		const wrapper = await frame()
+			.withId("orders")
+			.withOrder(1)
+			.withMessage(Framed, inner)
+			.build();
+
+		const relay = wrapper.message(Framed);
+		return { inner, relay };
+	}
+
+	it("relays the inner frame byte-for-byte", async () => {
+		const { inner, relay } = await relayed();
+		expect(relay.toDer()).toEqual(inner.toDer());
+	});
+
+	it("keeps the inner frame verifiable after the trip", async () => {
+		const { relay } = await relayed();
+		expect(() => relay.verify(SIGNING_KEY.verifyingKey())).not.toThrow();
+	});
+
+	it("keeps the application metadata readable after the trip", async () => {
+		const { relay } = await relayed();
+		expect(relay.id).toEqual(new TextEncoder().encode("order-42"));
+		expect(relay.order).toBe(7n);
+		expect(relay.priority).toBe(MessagePriority.Expedited);
+		expect(relay.lifetime).toBe(60n);
+		expect(relay.message(Opaque)).toEqual(BODY);
 	});
 });
 

@@ -37,9 +37,17 @@ CERT_DIR="$INSTANCE_DIR/certs"
 PROJECT="${STACK_PROJECT_PREFIX}-$INSTANCE"
 ECHO_IMAGE="${STACK_PROJECT_PREFIX}-echo:$INSTANCE"
 
+# One stack for every extension: each project fragment (stack-env.sh)
+# contributed its compose file.
+COMPOSE_FILES=()
+for compose_file in "${STACK_COMPOSE_FILES[@]}"; do
+	COMPOSE_FILES+=(-f "$compose_file")
+done
+unset compose_file
+
 compose() {
 	DOCKER_BUILDKIT=1 COMPOSE_DOCKER_CLI_BUILD=1 \
-		docker compose -f "$ROOT/ws/docker-compose.yml" \
+		docker compose "${COMPOSE_FILES[@]}" \
 		--project-name "$PROJECT" --env-file "$ENV_FILE" "$@"
 }
 
@@ -130,7 +138,10 @@ case "$ACTION" in
 			"$CONTEXT_DIR"
 
 		echo "==> Bringing up '$PROJECT' stack"
-		echo "    echo ws (mux): ws://localhost:$ECHO_WS_MUX_HOST_PORT"
+		for spec in "${STACK_PORT_SPECS[@]}"; do
+			key="${spec%%:*}"
+			echo "    ${key%_HOST_PORT}: ws://localhost:${!key}"
+		done
 
 		if ! compose up -d --wait; then
 			echo "==> Stack '$PROJECT' failed to become healthy; recent logs:" >&2
@@ -144,7 +155,7 @@ case "$ACTION" in
 		if [ -f "$ENV_FILE" ]; then
 			compose down --volumes --remove-orphans || true
 		else
-			DOCKER_BUILDKIT=1 docker compose -f "$ROOT/ws/docker-compose.yml" \
+			DOCKER_BUILDKIT=1 docker compose "${COMPOSE_FILES[@]}" \
 				--project-name "$PROJECT" down --volumes --remove-orphans || true
 		fi
 		rm -rf "$INSTANCE_DIR"

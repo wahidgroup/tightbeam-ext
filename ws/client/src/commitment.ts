@@ -67,9 +67,9 @@ export class Opening {
 	/**
 	 * Produce a commitment over `bodyDer` together with its opening.
 	 *
-	 * The returned commitment is the public value to publish; the opening
+	 * The returned commitment is the public value to publish. The opening
 	 * is the secret proof to disclose during verification. A high-entropy
-	 * `salt` makes the commitment hiding; an empty salt yields the plain
+	 * `salt` makes the commitment hiding. An empty salt yields the plain
 	 * body digest (binding only).
 	 */
 	static async prove(

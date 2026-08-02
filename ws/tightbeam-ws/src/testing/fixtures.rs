@@ -12,12 +12,10 @@ use std::time::Duration;
 use std::{env, fs};
 
 use tightbeam::cert;
-use tightbeam::crypto::hash::Sha3_256;
-use tightbeam::crypto::policy::Secp256k1Policy;
 use tightbeam::crypto::profiles::DefaultCryptoProvider;
 use tightbeam::crypto::sign::ecdsa::{Secp256k1SigningKey, Secp256k1VerifyingKey};
 use tightbeam::crypto::sign::Sha3Signer;
-use tightbeam::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
+use tightbeam::crypto::x509::store::CertificateTrust;
 use tightbeam::der::{Decode, Encode};
 use tightbeam::random::OsRng;
 use tightbeam::spki::SubjectPublicKeyInfoOwned;
@@ -92,10 +90,18 @@ impl Identity {
 		TransportEncryptionConfig::new(self.certificate.clone(), key_manager)
 	}
 
+	/// Client materials for mutual-auth dials that reuse this identity
+	/// (demo relay under paywall).
+	pub fn client_identity(&self) -> (Arc<Certificate>, Arc<HandshakeKeyManager<DefaultCryptoProvider>>) {
+		let certificate = Arc::new(self.certificate.clone());
+		let key_manager = Arc::new(HandshakeKeyManager::from(self.signing_key.clone()));
+		(certificate, key_manager)
+	}
+
 	/// Build a single-anchor trust store pinning this identity's certificate,
 	/// for a peer that authenticates this identity.
 	pub fn trust_anchor(&self) -> Result<Arc<dyn CertificateTrust>> {
-		Ok(trust_anchor(self.certificate.clone())?)
+		Ok(super::handshake::pin(self.certificate.clone())?)
 	}
 }
 
@@ -128,11 +134,4 @@ fn load(certificate_der: &[u8], signing_key: &[u8; SIGNING_KEY_LEN]) -> core::re
 	let signing_key = Secp256k1SigningKey::from_bytes(&scalar.into())?;
 
 	Ok(Identity { certificate, signing_key })
-}
-
-fn trust_anchor(certificate: Certificate) -> core::result::Result<Arc<dyn CertificateTrust>, TightBeamError> {
-	let store = CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
-		.with_certificate(certificate)?
-		.build();
-	Ok(Arc::new(store))
 }

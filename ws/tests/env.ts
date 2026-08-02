@@ -7,6 +7,8 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
+import type { ConnectOptions } from "@wahidgroup/tightbeam-ws-client";
+
 /**
  * Read a required stack variable, failing fast when the suite is run
  * without the stack environment.
@@ -38,9 +40,39 @@ export const muxClearEndpoint = requireEnv("E2E_ECHO_WS_MUX_CLEAR_ENDPOINT");
 
 /**
  * The mutually-authenticated multiplexed encrypted echo server: as the
- * encrypted one, additionally requiring the pinned client certificate.
+ * encrypted one, additionally requiring the pinned client certificate
+ * and the demo session-budget paywall.
  */
 export const muxMutualEndpoint = requireEnv("E2E_ECHO_WS_MUX_MUTUAL_ENDPOINT");
+
+/**
+ * Cleartext duplex body echo (`TBWS_ECHO_BODY=duplex`) for `openDuplex`.
+ */
+export const muxDuplexEndpoint = requireEnv("E2E_ECHO_WS_MUX_DUPLEX_ENDPOINT");
+
+/**
+ * Demo settlement payment bytes matching `tightbeam_ws::testing::DEMO_PAYMENT`.
+ */
+export const DEMO_PAYMENT = new TextEncoder().encode("tbws-demo-payment-v1");
+
+/**
+ * Mutual dial options for the compose stack: request the demo budget
+ * ceiling and pay the fixed invoice. `payments` caps how many invoices
+ * the wallet will settle (handshake + renewals).
+ */
+export function mutualSessionOptions(payments = 1024): ConnectOptions {
+	let left = payments;
+	return {
+		budgets: { clientToServer: 4096, serverToClient: 4096 },
+		approveReceipt: () => {
+			if (left <= 0) {
+				return undefined;
+			}
+			left -= 1;
+			return DEMO_PAYMENT;
+		},
+	};
+}
 
 /**
  * Read an identity fixture as raw bytes.

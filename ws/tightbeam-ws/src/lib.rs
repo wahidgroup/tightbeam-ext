@@ -5,6 +5,7 @@
 pub mod testing;
 
 pub mod io;
+pub mod mux;
 pub mod protocol;
 
 mod error;

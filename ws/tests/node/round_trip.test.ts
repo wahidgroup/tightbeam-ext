@@ -20,6 +20,7 @@ import {
 	muxClearEndpoint,
 	muxEndpoint,
 	muxMutualEndpoint,
+	mutualSessionOptions,
 } from "../env.js";
 import { NobleTransportSigner } from "../signer.js";
 import { emitOrFail, withClient } from "./harness.js";
@@ -27,7 +28,7 @@ import { emitOrFail, withClient } from "./harness.js";
 /**
  * Open a cleartext multiplexed client against the echo server. The frame
  * features under test are transport-agnostic, so the cleartext lane keeps
- * these round-trips fast; the encrypted lanes are covered explicitly.
+ * these round-trips fast. The encrypted lanes are covered explicitly.
  */
 async function withEchoClient(
 	run: (client: TightbeamWsClient) => Promise<void>,
@@ -230,6 +231,7 @@ describe("Node round-trips against the dockerized echo server", () => {
 					certBytes("server.cert.der"),
 					certBytes("client.cert.der"),
 					signer,
+					mutualSessionOptions(),
 				),
 			async (client) => {
 				const built = await frame(BODY)
@@ -239,7 +241,8 @@ describe("Node round-trips against the dockerized echo server", () => {
 
 				const response = await emitOrFail(client, built);
 				expect(response.message(Opaque)).toEqual(BODY);
-				expect(signer.signatures).toBe(1);
+				// Client-auth + receipt countersignature.
+				expect(signer.signatures).toBe(2);
 			},
 		);
 	});

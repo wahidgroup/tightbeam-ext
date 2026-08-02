@@ -25,8 +25,8 @@ Contributors MUST:
 
 - Use hard tabs everywhere except YAML (2 spaces), enforced by EditorConfig
 - Pass `make lint` (and preferably `make ci`) before opening a PR
-- Rust: no `unwrap` / `expect` / `panic` in production code; enum error types via tightbeam's `Errorizable`, no string-based errors; prefer `From` / `TryFrom` and `?`
-- Keep test-support Rust code behind the `testing` cargo feature; it MUST NOT compile into a default build
+- Rust: no `unwrap` / `expect` / `panic` in production code. Enum error types via tightbeam's `Errorizable`, no string-based errors. Prefer `From` / `TryFrom` and `?`
+- Keep test-support Rust code behind the `testing` cargo feature. It MUST NOT compile into a default build
 
 ### Architecture notes
 
@@ -124,7 +124,7 @@ Each PR MUST have:
 ### Guidelines
 
 - PRs SHOULD be under 400 lines of diff for fastest review
-- The Summary MUST explain _why_; the diff already shows _what_
+- The Summary MUST explain _why_. The diff already shows _what_
 - Use `Fixes #N` / `Closes #N` to auto-close linked issues on merge
 - Apply GitHub labels for additional categorization (orthogonal to the type prefix)
 
@@ -138,4 +138,4 @@ make release version=vX.Y.Z ext=ws
 
 Use `dry-run=1`, `allow-staged=1`, or `yank=1` as documented in `make help`. `ext` defaults to `ws`.
 
-A release bumps the extension's manifests, opens a release pull request, and on merge creates a signed `releases/<ext>/v<version>` tag that publishes to crates.io. The deploy guard `check-yanked.sh` refuses yanked versions (`yanked/<ext>/v<version>`).
+A release bumps the extension's manifests, opens a release pull request, and on merge creates a signed `releases/<ext>/v<version>` tag that publishes that extension's publishable crates to crates.io (Cargo multi-package, dependency order - not the whole workspace). The deploy guard `check-yanked.sh` refuses yanked versions (`yanked/<ext>/v<version>`).

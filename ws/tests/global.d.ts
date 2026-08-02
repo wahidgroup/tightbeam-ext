@@ -49,6 +49,12 @@ declare global {
 			idText: string,
 			order: number,
 		) => Promise<SignerRoundTripResult>;
+		tbStreamingRoundTrip: (
+			url: string,
+			serverCertB64: string,
+			payloadHex: string,
+			idText: string,
+		) => Promise<RoundTripResult>;
 		tbSignedRoundTrip: (
 			url: string,
 			payloadHex: string,

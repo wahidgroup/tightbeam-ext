@@ -4,6 +4,7 @@ import:
   - ./ws/node_modules/@wahidgroup/lint-rules/cspell.base.json
 words:
   - tightbeam
+  - acking
   - errorizable
   - websocket
   - websockets
@@ -18,11 +19,17 @@ words:
   - dtolnay
   - changelog
   - backport
+  - backplane
+  - backplanes
+  - tock
+  - XADD
+  - macrotask
   - Tanveer
   - Wahid
   - wahidgroup
   - dockerized
   - rustup
+  - RUSTDOCFLAGS
   - tbws
   - buildkit
   - parameterised
@@ -53,9 +60,11 @@ words:
   - spki
   - signingkey
   - passthroughs
+  - passthru
   - submod
   - demultiplex
   - unrouted
+  - unrouting
   - bindgen
   - oids
   - cbor
@@ -78,6 +87,22 @@ words:
   - rlib
   - thenables
   - bivariant
+  - unsub
+  - unsuback
+  - mqtt
+  - fanout
+  - backpressure
+  - backpressured
+  - acks
+  - deque
+  - memberless
+  - quiesces
+  - quiescing
+  - uppercased
+  - uppercases
+  - baselined
+  - unmetered
+  - subarray
 ignorePaths:
   - node_modules/**
   - "**/sbom.json"

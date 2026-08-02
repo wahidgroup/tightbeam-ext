@@ -8,7 +8,7 @@ import { access, readFile } from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
 
-const root = path.resolve(import.meta.dirname, "..");
+const root = process.cwd();
 const pkgPath = path.join(root, "package.json");
 
 const pkgRaw = await readFile(pkgPath, "utf8");

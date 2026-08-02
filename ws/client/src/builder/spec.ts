@@ -31,7 +31,7 @@ export interface MatrixSpec {
 	 */
 	readonly n: number;
 	/**
-	 * Row-major bytes; length MUST equal `n * n`.
+	 * Row-major bytes. Length MUST equal `n * n`.
 	 */
 	readonly data: Uint8Array;
 }
@@ -74,7 +74,7 @@ export interface MessageIntegritySpec {
  */
 export interface FrameSpec {
 	/**
-	 * Explicit protocol version; when omitted the codec derives the floor.
+	 * Explicit protocol version. When omitted, the codec derives the floor.
 	 */
 	readonly version?: Version;
 	/**
@@ -87,7 +87,11 @@ export interface FrameSpec {
 	 */
 	readonly id?: Uint8Array;
 	/**
-	 * Monotonic order (Unix seconds).
+	 * Frame order stamp.
+	 *
+	 * The value is protocol-opaque. Any monotonic scheme works, such as a
+	 * Unix timestamp or a dense per-channel counter. When omitted, the
+	 * build defaults it to the current Unix time in seconds.
 	 */
 	readonly order?: bigint;
 	/**

@@ -22,6 +22,11 @@ pub(crate) fn to_js<E: Display>(error: E) -> JsValue {
 	JsValue::from_str(&error.to_string())
 }
 
+/// Structured validation failure with a stable `code` for JS branching.
+pub(crate) fn validation(code: &str, message: &str) -> JsValue {
+	coded(code, &message)
+}
+
 /// Structured `ConnectionClosed` error for failures detected socket-side,
 /// before a tightbeam [`TransportError`] exists (e.g. a dial that closed
 /// before opening).

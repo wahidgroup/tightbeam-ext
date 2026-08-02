@@ -12,7 +12,7 @@ use std::time::Duration;
 use tightbeam::prelude::TightBeamSocketAddr;
 use tightbeam::testing::create_v0_tightbeam;
 use tightbeam::transport::error::TransportFailure;
-use tightbeam::transport::policy::{PolicyConf, RestartLinearBackoff};
+use tightbeam::transport::policy::{PolicyConfig, RestartLinearBackoff};
 use tightbeam::transport::TransportError;
 use tightbeam::Frame;
 use tightbeam_ws::protocol::WsListener;

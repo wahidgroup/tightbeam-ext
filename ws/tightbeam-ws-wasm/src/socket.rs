@@ -24,14 +24,27 @@ use crate::fault::{connection_closed, to_js};
 const SOCKET_CLOSE_INFO_TS: &'static str = r#"
 /**
  * How a WebSocket session ended: the close frame's code and reason, and
- * whether closure was clean (RFC 6455 § 7.1.4).
+ * whether closure was clean.
+ *
+ * # Sources
+ *
+ * - RFC 6455 § 7.1.4, The WebSocket Connection Close Code:
+ *   <https://datatracker.ietf.org/doc/html/rfc6455#section-7.1.4>
+ * - RFC 6455 § 7.4, Status Codes:
+ *   <https://datatracker.ietf.org/doc/html/rfc6455#section-7.4>
  */
 export interface SocketCloseInfo {
-	/** Close status code (RFC 6455 § 7.4). */
+	/**
+	 * Close status code.
+	 */
 	readonly code: number;
-	/** Close reason supplied by the peer, or empty. */
+	/**
+	 * Close reason supplied by the peer, or empty.
+	 */
 	readonly reason: string;
-	/** Whether the closing handshake completed cleanly. */
+	/**
+	 * Whether the closing handshake completed cleanly.
+	 */
 	readonly wasClean: boolean;
 }
 "#;
@@ -113,8 +126,7 @@ type OpenWatchSlot = Rc<RefCell<Option<OpenWatch>>>;
 /// A promise settled by a connecting socket's first lifecycle event:
 /// `open` resolves it, `close` rejects it with a structured
 /// `ConnectionClosed` error. Whichever event fires first takes the watch,
-/// detaching both listeners and freeing both closures; the second event
-/// finds the slot empty.
+/// detaching both listeners and freeing both closures.
 fn open_promise(raw: &web_sys::WebSocket) -> Promise {
 	let target = raw.clone();
 	Promise::new(&mut move |resolve: Function, reject: Function| {
@@ -145,7 +157,7 @@ fn open_promise(raw: &web_sys::WebSocket) -> Promise {
 }
 
 /// Drain the watch and detach both listeners. The caller settles the
-/// promise and drops the watch; the closure currently executing is freed
+/// promise and drops the watch. The closure currently executing is freed
 /// once its call returns (the shim defers deallocation while invoked).
 fn take_watch(slot: &OpenWatchSlot, target: &web_sys::WebSocket) -> Option<OpenWatch> {
 	let watch = slot.borrow_mut().take()?;

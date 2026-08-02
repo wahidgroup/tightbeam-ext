@@ -11,7 +11,7 @@ import { pathToFileURL } from "node:url";
 import path from "node:path";
 import process from "node:process";
 
-const root = path.resolve(import.meta.dirname, "..");
+const root = process.cwd();
 const distDir = path.join(root, "dist");
 const pkgPath = path.join(root, "package.json");
 

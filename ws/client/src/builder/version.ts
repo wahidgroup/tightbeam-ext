@@ -3,12 +3,27 @@
  */
 
 /**
- * The frame protocol versions.
+ * Wire ordinals for the frame protocol version floor.
+ *
+ * Each version admits a larger metadata field set. Structural fields
+ * below the floor are rejected at build and decode time.
  */
 export const Version = {
+	/**
+	 * Base envelope: id, order, and message body.
+	 */
 	V0: 0,
+	/**
+	 * Adds confidentiality and message integrity.
+	 */
 	V1: 1,
+	/**
+	 * Adds priority, lifetime, previous-frame linkage, and frame integrity.
+	 */
 	V2: 2,
+	/**
+	 * Adds the routing matrix.
+	 */
 	V3: 3,
 } as const;
 
