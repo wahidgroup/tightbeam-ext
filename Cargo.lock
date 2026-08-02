@@ -1349,7 +1349,7 @@ dependencies = [
 
 [[package]]
 name = "tightbeam-ws"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "futures-util",
  "husky-rs",
@@ -1360,7 +1360,7 @@ dependencies = [
 
 [[package]]
 name = "tightbeam-ws-wasm"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "der",
  "futures-util",
