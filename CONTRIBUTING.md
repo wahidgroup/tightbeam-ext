@@ -110,7 +110,7 @@ The PR body MUST contain these five sections, each with non-empty content:
 | `## Testing`          | How a reviewer verifies the change (commands, steps, expected outcomes) |
 | `## Breaking Changes` | Migration path for consumers, or `None`                                 |
 
-The PR template at `.github/PULL_REQUEST_TEMPLATE.md` auto-populates these sections.
+The PR template at `.github/PULL_REQUEST_TEMPLATE.md` auto-populates these sections. Release PRs (head branch `process/<ext>/v*`) are exempt from body validation.
 
 Testing section SHOULD cite `make ci` (or the relevant `make` targets) when behavior changes.
 
