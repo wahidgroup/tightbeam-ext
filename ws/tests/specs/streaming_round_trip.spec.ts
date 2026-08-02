@@ -1,6 +1,6 @@
-import type { RoundTripResult } from "../app/main.js";
 import { expect, test } from "@playwright/test";
 
+import type { RoundTripResult } from "../app/main.js";
 import { certBase64, muxEndpoint } from "../env.js";
 import { openApp } from "./helpers.js";
 
@@ -15,5 +15,6 @@ test("openStream multi-push round-trip in the browser", async ({ page }) => {
 		{ url: muxEndpoint, cert: serverCert },
 	);
 	expect(result.bodyHex).toBe("a1b2c3");
-	expect(result.idText).toBe("e2e-stream");
+	// Progressive echo stamps the Open route (`routed:<target>:<hops>`).
+	expect(result.idText).toBe("routed::255");
 });

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+	InternalError,
 	Opaque,
 	TRANSPORT_ERROR_NAME,
 	TightbeamWsClient,
@@ -116,6 +117,46 @@ describe("Node mux body streaming", () => {
 					expect.objectContaining({
 						name: TRANSPORT_ERROR_NAME,
 						code: "InvalidStreamRoute",
+					}),
+				);
+			},
+		);
+	});
+
+	it("rejects serveStreaming after serve claimed unary mode", async () => {
+		await withClient(
+			() => TightbeamWsClient.connectCleartext(muxClearEndpoint),
+			async (client) => {
+				client.serve(() => undefined);
+
+				expect(() =>
+					client.serveStreaming(async () => undefined),
+				).toThrow(InternalError);
+				expect(() =>
+					client.serveStreaming(async () => undefined),
+				).toThrow(
+					expect.objectContaining({
+						code: "ServeModeConflict",
+						kind: "E_INTERNAL",
+					}),
+				);
+			},
+		);
+	});
+
+	it("rejects serve after serveStreaming claimed streaming mode", async () => {
+		await withClient(
+			() => TightbeamWsClient.connectCleartext(muxClearEndpoint),
+			async (client) => {
+				client.serveStreaming(async () => undefined);
+
+				expect(() => client.serve(() => undefined)).toThrow(
+					InternalError,
+				);
+				expect(() => client.serve(() => undefined)).toThrow(
+					expect.objectContaining({
+						code: "ServeModeConflict",
+						kind: "E_INTERNAL",
 					}),
 				);
 			},

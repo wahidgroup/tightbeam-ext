@@ -696,6 +696,13 @@ export class TightbeamWsClient extends SocketLifecycle<MuxWsClient> {
 	 */
 	private serveClaimed = false;
 
+	/**
+	 * First-chosen peer-serve mode. Same-mode handler swaps stay allowed.
+	 * A later call in a different mode throws {@link InternalError}
+	 * `ServeModeConflict`.
+	 */
+	private serveMode: "unary" | "streaming" | "duplex" | undefined;
+
 	private constructor(socket: MuxWsClient) {
 		super(socket);
 	}
@@ -858,10 +865,13 @@ export class TightbeamWsClient extends SocketLifecycle<MuxWsClient> {
 	}
 
 	/**
-	 * Claim exclusive stream dispatch when {@link ServeOptions.exclusive}
-	 * is set, or throw when a prior claim already owns the client.
+	 * Record `mode` as the peer-serve mode, or throw when a prior exclusive
+	 * claim owns the client or a different mode already started.
 	 */
-	private claimServe(options: ServeOptions | undefined): void {
+	private claimServe(
+		mode: "unary" | "streaming" | "duplex",
+		options: ServeOptions | undefined,
+	): void {
 		if (this.serveClaimed) {
 			throw new InternalError(
 				"ServeDispatchClaimed",
@@ -870,6 +880,14 @@ export class TightbeamWsClient extends SocketLifecycle<MuxWsClient> {
 					"through the claimant instead of calling serve again",
 			);
 		}
+		if (this.serveMode !== undefined && this.serveMode !== mode) {
+			throw new InternalError(
+				"ServeModeConflict",
+				`peer serve mode is ${this.serveMode}. ` +
+					`Cannot switch to ${mode} after the responder started`,
+			);
+		}
+		this.serveMode = mode;
 		if (options?.exclusive === true) {
 			this.serveClaimed = true;
 		}
@@ -882,11 +900,12 @@ export class TightbeamWsClient extends SocketLifecycle<MuxWsClient> {
 	 * with. Handlers for distinct streams run concurrently.
 	 *
 	 * Mutually exclusive with {@link serveStreaming} / {@link serveDuplex}:
-	 * the first call consumes the wasm responder.
+	 * the first call consumes the wasm responder. A later call in a
+	 * different mode throws {@link InternalError} `ServeModeConflict`.
 	 */
 	serve(handler: MuxStreamHandler, options?: ServeOptions): void {
 		this.requireLive("serve");
-		this.claimServe(options);
+		this.claimServe("unary", options);
 
 		this.socket.serve(
 			(requestDer: Uint8Array): Promise<Uint8Array | undefined> => {
@@ -972,14 +991,15 @@ export class TightbeamWsClient extends SocketLifecycle<MuxWsClient> {
 	/**
 	 * Serve peer streams as progressive bodies. The handler receives the
 	 * body chunks and the Open's {@link StreamRoute}. Mutually exclusive
-	 * with {@link serve} / {@link serveDuplex}.
+	 * with {@link serve} / {@link serveDuplex}. A later call in a different
+	 * mode throws {@link InternalError} `ServeModeConflict`.
 	 */
 	serveStreaming(
 		handler: StreamingBodyHandler,
 		options?: ServeOptions,
 	): void {
 		this.requireLive("serveStreaming");
-		this.claimServe(options);
+		this.claimServe("streaming", options);
 
 		this.socket.serveStreaming(
 			async (body: MuxStreamBody, route: StreamRoute) => {
@@ -996,11 +1016,12 @@ export class TightbeamWsClient extends SocketLifecycle<MuxWsClient> {
 
 	/**
 	 * Serve peer streams as duplex bodies. Mutually exclusive with
-	 * {@link serve} / {@link serveStreaming}.
+	 * {@link serve} / {@link serveStreaming}. A later call in a different
+	 * mode throws {@link InternalError} `ServeModeConflict`.
 	 */
 	serveDuplex(handler: DuplexBodyHandler, options?: ServeOptions): void {
 		this.requireLive("serveDuplex");
-		this.claimServe(options);
+		this.claimServe("duplex", options);
 
 		this.socket.serveDuplex(
 			async (

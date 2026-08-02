@@ -30,13 +30,21 @@ use tightbeam::transport::{EncryptedMessageIO, EnvelopeSink, EnvelopeSource, Res
 use tightbeam::Frame;
 
 use crate::approver::{approver_from_js, authorization_from_js, budgets_from_js};
-use crate::fault::{to_js, transport_to_js};
+use crate::fault::{to_js, transport_to_js, validation};
 use crate::promise::{bytes_or_undefined, race_abort, race_optional_abort};
 use crate::secure::{build_signer_transport, build_transport, response_der, ClientIdentity};
 use crate::signer::TransportSigner;
 use crate::socket::{open_observed, SocketMonitor};
 use crate::stream::{GlooStream, WsTransport};
 use crate::streaming::{start_serve_duplex, start_serve_streaming, MuxDuplexStream, MuxRequestStream};
+
+/// Peer-serve dispatch shape claimed by the first `serve*` call.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ServeMode {
+	Unary,
+	Streaming,
+	Duplex,
+}
 
 /// Optional budget / settlement knobs for a mutual-auth dial.
 struct SessionOffer {
@@ -139,6 +147,8 @@ pub struct MuxWsClient {
 	responder: Option<MuxResponder>,
 	handler: Rc<RefCell<Function>>,
 	monitor: SocketMonitor,
+	/// First-chosen peer-serve mode. Same-mode handler swaps stay allowed.
+	serve_mode: Option<ServeMode>,
 	/// Usable outbound credits for this epoch (`None` = unmetered).
 	usable_send_budget: Option<u64>,
 }
@@ -314,9 +324,11 @@ impl MuxWsClient {
 	///
 	/// Mutually exclusive with [`serveStreaming`](Self::serve_streaming) and
 	/// [`serveDuplex`](Self::serve_duplex): the first call consumes the
-	/// responder.
+	/// responder. A later call in a different mode rejects with
+	/// `ServeModeConflict`.
 	#[wasm_bindgen(js_name = serve)]
-	pub fn serve(&mut self, handler: Function) {
+	pub fn serve(&mut self, handler: Function) -> Result<(), JsValue> {
+		self.claim_serve(ServeMode::Unary)?;
 		self.handler.replace(handler);
 
 		// The first call starts the serve loop
@@ -329,6 +341,8 @@ impl MuxWsClient {
 				let _ = responder.serve(move |frame| respond_via_js(slot.borrow().clone(), frame)).await;
 			});
 		}
+
+		Ok(())
 	}
 
 	/// Progressive request body: push chunks, then close for a Frame reply.
@@ -367,28 +381,36 @@ impl MuxWsClient {
 	/// Serve peer streams as progressive bodies. The handler receives a
 	/// [`MuxStreamBody`](crate::streaming::MuxStreamBody) and the Open's
 	/// route (`{ target?, hopsRemaining }`), and returns a Frame DER
-	/// (or `undefined`). Consumes the responder on first call.
+	/// (or `undefined`). Consumes the responder on first call. A later
+	/// call in a different mode rejects with `ServeModeConflict`.
 	#[wasm_bindgen(js_name = serveStreaming)]
-	pub fn serve_streaming(&mut self, handler: Function) {
+	pub fn serve_streaming(&mut self, handler: Function) -> Result<(), JsValue> {
+		self.claim_serve(ServeMode::Streaming)?;
 		self.handler.replace(handler);
 
 		if let Some(responder) = self.responder.take() {
 			start_serve_streaming(responder, Rc::clone(&self.handler));
 		}
+
+		Ok(())
 	}
 
 	/// Serve peer streams as duplex bodies. The handler receives a
 	/// [`MuxStreamBody`](crate::streaming::MuxStreamBody),
 	/// [`MuxReplySink`](crate::streaming::MuxReplySink), and the Open's
 	/// route, and resolves with a gRPC status name or `undefined` (`Ok`).
-	/// Consumes the responder.
+	/// Consumes the responder. A later call in a different mode rejects
+	/// with `ServeModeConflict`.
 	#[wasm_bindgen(js_name = serveDuplex)]
-	pub fn serve_duplex(&mut self, handler: Function) {
+	pub fn serve_duplex(&mut self, handler: Function) -> Result<(), JsValue> {
+		self.claim_serve(ServeMode::Duplex)?;
 		self.handler.replace(handler);
 
 		if let Some(responder) = self.responder.take() {
 			start_serve_duplex(responder, Rc::clone(&self.handler));
 		}
+
+		Ok(())
 	}
 
 	/// Connection-level liveness probe
@@ -607,8 +629,37 @@ impl MuxWsClient {
 			responder: Some(responder),
 			handler: Rc::new(RefCell::new(inert)),
 			monitor,
+			serve_mode: None,
 			usable_send_budget,
 		}
+	}
+
+	/// Record `mode` as the peer-serve mode, or reject a cross-mode swap.
+	fn claim_serve(&mut self, mode: ServeMode) -> Result<(), JsValue> {
+		match self.serve_mode {
+			None => {
+				self.serve_mode = Some(mode);
+				Ok(())
+			}
+			Some(current) if current == mode => Ok(()),
+			Some(current) => Err(validation(
+				"ServeModeConflict",
+				&format!(
+					"peer serve mode is {}. Cannot switch to {} after the responder started",
+					serve_mode_label(current),
+					serve_mode_label(mode),
+				),
+			)),
+		}
+	}
+}
+
+/// Stable label for [`ServeMode`] in error messages.
+fn serve_mode_label(mode: ServeMode) -> &'static str {
+	match mode {
+		ServeMode::Unary => "unary",
+		ServeMode::Streaming => "streaming",
+		ServeMode::Duplex => "duplex",
 	}
 }
 
