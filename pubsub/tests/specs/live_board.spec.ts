@@ -31,6 +31,8 @@ function boardUrl(topic: string): string {
 		endpoint: pubsubEndpoint,
 		topic,
 		cert: certBase64("server.cert.der"),
+		clientCert: certBase64("client.cert.der"),
+		clientKey: certBase64("client.key"),
 		seal: "1",
 	});
 	return `/?${params.toString()}`;

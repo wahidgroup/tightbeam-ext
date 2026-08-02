@@ -25,14 +25,14 @@ use crate::io::WsTransport;
 const MAX_HANDSHAKE_MESSAGES: usize = 4;
 
 /// Drive the server-side ECIES handshake to completion over cleartext
-/// containers, bounded by [`MAX_HANDSHAKE_MESSAGES`].
+/// containers, bounded by four handshake messages.
 pub async fn serve_handshake(transport: &mut WsTransport<MaybeTlsStream<TcpStream>>) -> Result<()> {
 	for _ in 0..MAX_HANDSHAKE_MESSAGES {
 		if transport.to_handshake_state() == TcpHandshakeState::Complete {
 			return Ok(());
 		}
 
-		let wire_bytes = transport.read_envelope().await?;
+		let wire_bytes = transport.read_envelope_bytes().await?;
 		let wire_envelope = WireEnvelope::from_der(&wire_bytes).map_err(TightBeamError::from)?;
 		let WireEnvelope::Cleartext(envelope) = wire_envelope else {
 			return Err(Error::HandshakeCiphertext);
@@ -59,8 +59,8 @@ pub(crate) fn pin(certificate: Certificate) -> core::result::Result<Arc<dyn Cert
 	Ok(Arc::new(store))
 }
 
-/// As [`pin`], from a DER-encoded certificate: what a native client loads
-/// from a provisioned fixture file.
+/// Build a single-anchor trust store from a DER-encoded certificate: what a
+/// native client loads from a provisioned fixture file.
 pub fn pinned_trust(certificate_der: &[u8]) -> Result<Arc<dyn CertificateTrust>> {
 	let certificate = Certificate::from_der(certificate_der).map_err(TightBeamError::from)?;
 	Ok(pin(certificate)?)

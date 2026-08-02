@@ -37,6 +37,7 @@ tightbeam-rs = { workspace = true, features = [
     "tokio",
     "transport-ecies",
     "transport-multiplex",
+    "transport-policy",
 ] }
 tokio = { workspace = true, features = ["net", "rt", "io-util", "macros"] }
 tokio-tungstenite = { workspace = true, features = ["connect", "handshake"] }

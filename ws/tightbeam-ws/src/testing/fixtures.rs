@@ -90,6 +90,14 @@ impl Identity {
 		TransportEncryptionConfig::new(self.certificate.clone(), key_manager)
 	}
 
+	/// Client materials for mutual-auth dials that reuse this identity
+	/// (demo relay under paywall).
+	pub fn client_identity(&self) -> (Arc<Certificate>, Arc<HandshakeKeyManager<DefaultCryptoProvider>>) {
+		let certificate = Arc::new(self.certificate.clone());
+		let key_manager = Arc::new(HandshakeKeyManager::from(self.signing_key.clone()));
+		(certificate, key_manager)
+	}
+
 	/// Build a single-anchor trust store pinning this identity's certificate,
 	/// for a peer that authenticates this identity.
 	pub fn trust_anchor(&self) -> Result<Arc<dyn CertificateTrust>> {

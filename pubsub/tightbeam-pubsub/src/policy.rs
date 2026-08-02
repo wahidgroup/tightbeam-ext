@@ -18,7 +18,7 @@ pub enum DeliveryVerdict {
 
 /// Decides the fate of an update when a subscriber queue is full.
 ///
-/// Stage A has no per-subscription credit, so a full queue is the only
+/// This crate has no per-subscription credit, so a full queue is the only
 /// backpressure signal. Every drop is a guaranteed gap at the client's gate.
 pub trait DeliveryPolicy: Send + Sync {
 	/// One update does not fit `topic`'s queue for a subscriber that has
@@ -28,10 +28,14 @@ pub trait DeliveryPolicy: Send + Sync {
 
 /// The default policy: always drop the oldest queued update.
 ///
-/// Bounded-queue drop-oldest matches
-/// [MQTT 5.0](https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html)
-/// broker practice: the newest state wins, and the client's gap
-/// detection reports what was lost.
+/// Bounded-queue drop-oldest matches common broker practice: the newest
+/// state wins, and the client's gap detection reports what was lost.
+///
+/// # Sources
+///
+/// - MQTT 5.0, broker queueing practice (topic vocabulary and delivery):
+///   <https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html>
+///
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DropOldest;
 

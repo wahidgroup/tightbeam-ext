@@ -1,14 +1,19 @@
 //! Topic names and their validation.
 //!
 //! A topic is a non-empty UTF-8 string with an optional `/`-separated
-//! hierarchy ([MQTT 5.0](https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html)
-//! § 4.7 vocabulary), matched exactly: no wildcards, no shared subscriptions.
+//! hierarchy. Matching is exact: no wildcards, no shared subscriptions.
 //! The wire command prefixes are reserved so a topic can never be mistaken
 //! for a command.
+//!
+//! # Sources
+//!
+//! - MQTT 5.0 § 4.7, Topic Names and Topic Filters:
+//!   <https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html>
+//!
 
+use core::error::Error;
 use core::fmt;
 use core::str::{from_utf8, FromStr, Utf8Error};
-use std::error::Error;
 use std::sync::Arc;
 
 /// Wire prefix a client subscribes with: `sub/<topic>`.
@@ -56,6 +61,12 @@ impl fmt::Display for Topic {
 impl FromStr for Topic {
 	type Err = TopicError;
 
+	/// Parse a topic name from a UTF-8 string.
+	///
+	/// # Errors
+	///
+	/// - [`TopicError::Empty`]: the name has zero length.
+	/// - [`TopicError::ReservedPrefix`]: the name starts with a wire command prefix.
 	fn from_str(name: &str) -> Result<Self, Self::Err> {
 		if name.is_empty() {
 			return Err(TopicError::Empty);
@@ -82,9 +93,21 @@ impl TryFrom<&str> for Topic {
 impl TryFrom<&[u8]> for Topic {
 	type Error = TopicError;
 
+	/// Parse a topic name from raw octets.
+	///
+	/// # Errors
+	///
+	/// - [`TopicError::NotUtf8`]: the octets are not valid UTF-8.
+	/// - [`TopicError::Empty`] / [`TopicError::ReservedPrefix`]: same as [`FromStr`].
 	fn try_from(name: &[u8]) -> Result<Self, Self::Error> {
-		let text = from_utf8(name).map_err(TopicError::NotUtf8)?;
+		let text = from_utf8(name)?;
 		text.parse()
+	}
+}
+
+impl From<Utf8Error> for TopicError {
+	fn from(cause: Utf8Error) -> Self {
+		Self::NotUtf8(cause)
 	}
 }
 

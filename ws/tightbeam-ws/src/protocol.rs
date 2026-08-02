@@ -12,7 +12,7 @@ use tightbeam::crypto::aead::RuntimeAead;
 use tightbeam::crypto::profiles::{CryptoProvider, DefaultCryptoProvider};
 use tightbeam::prelude::TightBeamSocketAddr;
 use tightbeam::transport::{
-	AsyncListenerTrait, EncryptedProtocol, Protocol, TransportEncryptionConfig, TransportError,
+	AsyncListenerTrait, EncryptedProtocol, PersistentConnection, Protocol, TransportEncryptionConfig, TransportError,
 };
 
 use crate::io::{map_ws_error, WsStream, WsTransport};
@@ -90,11 +90,6 @@ impl<P: CryptoProvider + Send + Sync> Protocol for WsListener<P> {
 	fn create_transport(stream: Self::Stream) -> Self::Transport {
 		WsTransport::from(stream)
 	}
-
-	fn to_tightbeam_addr(&self) -> Result<Self::Address, Self::Error> {
-		let addr = self.listener.local_addr().map_err(io_error)?;
-		Ok(TightBeamSocketAddr(addr))
-	}
 }
 
 impl<P: CryptoProvider + Send + Sync> EncryptedProtocol for WsListener<P> {
@@ -116,5 +111,18 @@ impl<P: CryptoProvider + Send + Sync> AsyncListenerTrait for WsListener<P> {
 	async fn accept(&self) -> Result<(Self::Transport, Self::Address), Self::Error> {
 		let (transport, addr) = WsListener::accept(self).await?;
 		Ok((transport, TightBeamSocketAddr(addr)))
+	}
+}
+
+/// Pooling support: lets WebSocket endpoints sit behind tightbeam's
+/// `ConnectionPool` (and therefore the colony stack), reusing one
+/// encrypted, multiplexed connection across leases.
+impl<P: CryptoProvider + Send + Sync> PersistentConnection for WsListener<P> {
+	fn is_connected(transport: &Self::Transport) -> bool {
+		transport.is_alive()
+	}
+
+	fn try_close(_transport: &mut Self::Transport) {
+		// The WebSocket closes when the transport drops.
 	}
 }

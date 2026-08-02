@@ -8,10 +8,10 @@
  * exact bytes to check signatures and digests with any external library.
  */
 
-import type { FrameView } from "#wasm";
+import type { InspectedFrame } from "#wasm";
 import {
 	commitmentPreimage,
-	inspectFrame,
+	inspectFrameFields,
 	tbsBytes,
 	verifySignature as wasmVerifySignature,
 	witnessInput as wasmWitnessInput,
@@ -22,12 +22,12 @@ import type { Version } from "./builder/version.js";
 import type { BodyInflator } from "./compress.js";
 import type { BodyDecryptor, Hasher, Secp256k1VerifyingKey } from "./crypto.js";
 import type { MessageCodec } from "./message.js";
-import { wrapped } from "./message.js";
 import { ValidationError } from "./builder/errors.js";
 import { priorityFromOrdinal } from "./builder/priority.js";
 import { versionFromOrdinal } from "./builder/version.js";
 import { Sha3_256 } from "./crypto.js";
 import { InternalError } from "./errors.js";
+import { wrapped } from "./message.js";
 
 /**
  * The integrity-check outcomes.
@@ -40,8 +40,8 @@ export const INTEGRITY_VERDICTS = [
 ] as const;
 
 /**
- * An integrity-check outcome. Only `"verified"` means the check passed;
- * `"absent"` distinguishes a frame that carries nothing to check.
+ * An integrity-check outcome. Only `"verified"` means the check passed.
+ * The value `"absent"` distinguishes a frame that carries nothing to check.
  */
 export type IntegrityVerdict = (typeof INTEGRITY_VERDICTS)[number];
 
@@ -169,11 +169,11 @@ function digestInfoFrom(
 }
 
 /**
- * Copy the control matrix out of the wasm view, when present.
+ * Build the control matrix from an inspected payload, when present.
  */
-function matrixOf(view: FrameView): FrameMatrix | undefined {
-	const n = view.matrixN;
-	const data = view.matrixData;
+function matrixOf(inspected: InspectedFrame): FrameMatrix | undefined {
+	const n = inspected.matrixN;
+	const data = inspected.matrixData;
 	if (n === undefined || data === undefined) {
 		return undefined;
 	}
@@ -183,45 +183,47 @@ function matrixOf(view: FrameView): FrameMatrix | undefined {
 }
 
 /**
- * Copy the compactness info out of the wasm view, when present.
+ * Build compactness info from an inspected payload, when present.
  */
-function compactnessOf(view: FrameView): CompactnessInfo | undefined {
-	const algorithmOid = view.compactnessAlgorithmOid;
+function compactnessOf(inspected: InspectedFrame): CompactnessInfo | undefined {
+	const algorithmOid = inspected.compactnessAlgorithmOid;
 	if (algorithmOid === undefined) {
 		return undefined;
 	}
 
 	const compactness = {
 		algorithmOid,
-		parametersDer: view.compactnessParametersDer,
-		contentOid: view.compactnessContentOid,
+		parametersDer: inspected.compactnessParametersDer,
+		contentOid: inspected.compactnessContentOid,
 	};
 	return compactness;
 }
 
 /**
- * Copy the confidentiality info out of the wasm view, when present.
+ * Build confidentiality info from an inspected payload, when present.
  */
-function confidentialityOf(view: FrameView): ConfidentialityInfo | undefined {
-	const algorithmOid = view.confidentialityAlgorithmOid;
+function confidentialityOf(
+	inspected: InspectedFrame,
+): ConfidentialityInfo | undefined {
+	const algorithmOid = inspected.confidentialityAlgorithmOid;
 	if (algorithmOid === undefined) {
 		return undefined;
 	}
 
 	const confidentiality = {
 		algorithmOid,
-		parametersDer: view.confidentialityParametersDer,
+		parametersDer: inspected.confidentialityParametersDer,
 	};
 	return confidentiality;
 }
 
 /**
- * Copy the signature info out of the wasm view, when present.
+ * Build signature info from an inspected payload, when present.
  */
-function signatureOf(view: FrameView): SignatureInfo | undefined {
-	const algorithmOid = view.signatureAlgorithmOid;
-	const digestAlgorithmOid = view.signatureDigestAlgorithmOid;
-	const signature = view.signature;
+function signatureOf(inspected: InspectedFrame): SignatureInfo | undefined {
+	const algorithmOid = inspected.signatureAlgorithmOid;
+	const digestAlgorithmOid = inspected.signatureDigestAlgorithmOid;
+	const signature = inspected.signature;
 	if (
 		algorithmOid === undefined ||
 		digestAlgorithmOid === undefined ||
@@ -235,19 +237,19 @@ function signatureOf(view: FrameView): SignatureInfo | undefined {
 }
 
 /**
- * Copy a wasm {@link FrameView} into plain {@link FrameFields}.
+ * Map a one-shot wasm inspect payload into plain {@link FrameFields}.
  */
-function fieldsOf(view: FrameView): FrameFields {
-	const version = versionFromOrdinal(view.version);
+function fieldsOf(inspected: InspectedFrame): FrameFields {
+	const version = versionFromOrdinal(inspected.version);
 	if (version === undefined) {
 		throw new InternalError(
 			"UNKNOWN_VERSION",
-			`the wasm module returned an unknown version ordinal: ${view.version}`,
+			`the wasm module returned an unknown version ordinal: ${inspected.version}`,
 		);
 	}
 
 	let priority: MessagePriority | undefined = undefined;
-	const priorityOrdinal = view.priority;
+	const priorityOrdinal = inspected.priority;
 	if (priorityOrdinal !== undefined) {
 		priority = priorityFromOrdinal(priorityOrdinal);
 		if (priority === undefined) {
@@ -260,27 +262,27 @@ function fieldsOf(view: FrameView): FrameFields {
 
 	const fields = {
 		version,
-		id: view.id,
-		order: view.order,
-		bodyDer: view.bodyDer,
+		id: inspected.id,
+		order: inspected.order,
+		bodyDer: inspected.bodyDer,
 		priority,
-		lifetime: view.lifetime,
+		lifetime: inspected.lifetime,
 		previousFrame: digestInfoFrom(
-			view.previousHashAlgorithmOid,
-			view.previousHashDigest,
+			inspected.previousHashAlgorithmOid,
+			inspected.previousHashDigest,
 		),
-		matrix: matrixOf(view),
+		matrix: matrixOf(inspected),
 		messageIntegrity: digestInfoFrom(
-			view.messageIntegrityAlgorithmOid,
-			view.messageIntegrityDigest,
+			inspected.messageIntegrityAlgorithmOid,
+			inspected.messageIntegrityDigest,
 		),
 		frameIntegrity: digestInfoFrom(
-			view.frameIntegrityAlgorithmOid,
-			view.frameIntegrityDigest,
+			inspected.frameIntegrityAlgorithmOid,
+			inspected.frameIntegrityDigest,
 		),
-		compactness: compactnessOf(view),
-		confidentiality: confidentialityOf(view),
-		signature: signatureOf(view),
+		compactness: compactnessOf(inspected),
+		confidentiality: confidentialityOf(inspected),
+		signature: signatureOf(inspected),
 	};
 	return fields;
 }
@@ -368,13 +370,8 @@ export class Frame {
 			return this.fields;
 		}
 
-		const view = inspectFrame(this.der);
-		try {
-			this.fields = fieldsOf(view);
-		} finally {
-			view.free();
-		}
-
+		const inspected = inspectFrameFields(this.der);
+		this.fields = fieldsOf(inspected);
 		return this.fields;
 	}
 
@@ -395,7 +392,11 @@ export class Frame {
 	}
 
 	/**
-	 * Monotonic order (Unix seconds).
+	 * Frame order stamp.
+	 *
+	 * The value is protocol-opaque. Any monotonic scheme works, such as a
+	 * Unix timestamp or a dense per-channel counter. When omitted at build
+	 * time, the profile defaults to the current Unix time in seconds.
 	 */
 	get order(): bigint {
 		const order = this.decoded().order;
@@ -403,9 +404,11 @@ export class Frame {
 	}
 
 	/**
-	 * The raw frame body DER. When {@link confidential} is true this is
-	 * ciphertext; open it with {@link decryptMessage}. Decode a cleartext
-	 * body into a typed message with {@link message}.
+	 * The raw frame body DER.
+	 *
+	 * When {@link confidential} is true, the octets are ciphertext. Open
+	 * them with {@link decryptMessage}. Decode a cleartext body into a
+	 * typed message with {@link message}.
 	 */
 	get bodyDer(): Uint8Array {
 		const bodyDer = this.decoded().bodyDer;
@@ -543,9 +546,10 @@ export class Frame {
 	}
 
 	/**
-	 * The message-commitment preimage under `salt` (the salt passed to
-	 * `withMessageHasher`; may be empty), computed over the carried body
-	 * DER.
+	 * The message-commitment preimage under `salt`, computed over the
+	 * carried body DER.
+	 *
+	 * Pass the same salt given to `withMessageHasher`. An empty salt is valid.
 	 */
 	commitmentInput(salt: Uint8Array): Uint8Array {
 		const commitmentInput = commitmentPreimage(salt, this.bodyDer);
@@ -609,7 +613,7 @@ export class Frame {
 				{
 					path: "frame",
 					message:
-						"The frame body is encrypted; decode it with decryptMessage",
+						"The frame body is encrypted. Decode it with decryptMessage",
 				},
 			]);
 		}
@@ -618,7 +622,7 @@ export class Frame {
 				{
 					path: "frame",
 					message:
-						"The frame body is compressed; decode it with inflateMessage",
+						"The frame body is compressed. Decode it with inflateMessage",
 				},
 			]);
 		}
@@ -646,7 +650,7 @@ export class Frame {
 				{
 					path: "frame",
 					message:
-						"The frame body is encrypted; decode it with decryptMessage",
+						"The frame body is encrypted. Decode it with decryptMessage",
 				},
 			]);
 		}
@@ -674,10 +678,11 @@ export class Frame {
 
 	/**
 	 * Decrypt the encrypted body with any {@link BodyDecryptor} and decode
-	 * the plaintext into a typed message under `codec`. The profile
-	 * decryptors are `Aes256Gcm` and `EciesDecryptor`; the profile codec
-	 * for raw bytes is `Opaque`. A compressed-then-sealed body additionally
-	 * needs `inflator` to decompress the decrypted bytes.
+	 * the plaintext into a typed message under `codec`.
+	 *
+	 * The profile decryptors are `Aes256Gcm` and `EciesDecryptor`. The
+	 * profile codec for raw bytes is `Opaque`. A compressed-then-sealed
+	 * body also needs `inflator` to decompress the decrypted bytes.
 	 *
 	 * @throws ValidationError when the frame is not encrypted, or is
 	 * compressed and no `inflator` is given.
@@ -706,7 +711,7 @@ export class Frame {
 				{
 					path: "frame",
 					message:
-						"The frame body is compressed; decryptMessage needs an inflator",
+						"The frame body is compressed. decryptMessage needs an inflator.",
 				},
 			]);
 		}
@@ -735,16 +740,18 @@ export class Frame {
  */
 export const Framed: MessageCodec<Frame> = wrapped({
 	encode(inner: Frame): Uint8Array {
-		return inner.toDer();
+		const der = inner.toDer();
+		return der;
 	},
 	decode(payload: Uint8Array): Frame {
-		return Frame.fromDer(payload);
+		const frame = Frame.fromDer(payload);
+		return frame;
 	},
 });
 
 /**
- * Decompress decrypted plaintext when the frame carries compactness info;
- * pass uncompressed plaintext through unchanged. The missing-inflator case
+ * Decompress decrypted plaintext when the frame carries compactness info.
+ * Pass uncompressed plaintext through unchanged. The missing-inflator case
  * is rejected before decryption runs.
  */
 async function inflate(

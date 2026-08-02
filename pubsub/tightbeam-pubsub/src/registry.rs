@@ -6,15 +6,16 @@
 //! owns one bounded queue drained by one task, so one slow client never
 //! stalls another.
 
+use core::error::Error;
 use core::fmt;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::error::Error;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 use der::Encode;
+use tightbeam::transport::envelopes::GoAwayReason;
 use tightbeam::transport::error::{TransportError, TransportFailure};
-use tightbeam::transport::multiplex::{GoAwayReason, MuxHandle};
+use tightbeam::transport::multiplex::MuxHandle;
 use tightbeam::{Frame, TightBeamError};
 use tokio::sync::Notify;
 
@@ -78,11 +79,11 @@ impl Error for RegisterError {}
 /// Why a publish produced no fan-out.
 #[derive(Debug)]
 pub enum PublishError {
-	/// The registry is quiescing: the topic already completed.
+	/// The registry is quiescing: new publishes are refused.
 	Draining,
-	/// The update frame failed to build.
+	/// The update frame failed to encode for delivery.
 	Build(TightBeamError),
-	/// The backplane rejected or lost the publish.
+	/// The backplane rejected or lost the publish after local checks passed.
 	Backplane(BackplaneError),
 }
 
@@ -224,7 +225,7 @@ struct Inner {
 	next_connection: AtomicU64,
 	next_subscriber: AtomicU64,
 	state: Mutex<State>,
-	/// Signaled by drain tasks whenever a queue empties; see
+	/// Signaled by drain tasks whenever a queue empties. See
 	/// [`TopicRegistry::flushed`].
 	flush: Notify,
 }
@@ -295,8 +296,8 @@ impl TopicRegistry {
 	}
 
 	/// The identity attached at
-	/// [`register_connection_as`](Self::register_connection_as); `None`
-	/// for an anonymous connection.
+	/// [`register_connection_as`](Self::register_connection_as).
+	/// Returns `None` for an anonymous connection.
 	pub fn identity(&self, connection: ConnectionId) -> Option<Arc<[u8]>> {
 		self.member_identity(connection).flatten()
 	}
@@ -315,6 +316,11 @@ impl TopicRegistry {
 	///
 	/// Idempotent per connection and topic: re-subscribing returns the
 	/// existing id. MUST be called within a tokio runtime.
+	///
+	/// # Errors
+	///
+	/// - [`RegisterError::Draining`]: [`quiesce`](Self::quiesce) already ran.
+	/// - [`RegisterError::UnknownConnection`]: `connection` was never admitted.
 	pub fn register(&self, connection: ConnectionId, topic: Topic) -> Result<SubscriberId, RegisterError> {
 		let mut state = self.lock_state();
 		/*
@@ -368,7 +374,7 @@ impl TopicRegistry {
 	/// Drop every subscription the connection holds.
 	///
 	/// The serve-side helper calls this when a connection's serve loop
-	/// exits; delivery tasks stop and the topics forget the members.
+	/// exits. Delivery tasks stop and the topics forget the members.
 	pub fn drop_connection(&self, connection: ConnectionId) {
 		self.inner.drop_connection(connection);
 	}
@@ -376,9 +382,15 @@ impl TopicRegistry {
 	/// Publish `payload` to every subscriber of `topic`, through the backplane.
 	///
 	/// The backplane assigns the dense per-topic stamp and distributes to
-	/// every attached node; each node builds the update frame (id =
+	/// every attached node. Each node builds the update frame (id =
 	/// topic) and fans out locally. The stamp advances even with no
 	/// subscribers, so late subscribers observe continuity.
+	///
+	/// # Errors
+	///
+	/// - [`PublishError::Draining`]: the registry is quiescing.
+	/// - [`PublishError::Build`]: a node could not encode the update frame.
+	/// - [`PublishError::Backplane`]: the backplane rejected or lost the publish.
 	pub fn publish(&self, topic: &Topic, payload: impl AsRef<[u8]>) -> Result<(), PublishError> {
 		/*
 		 * Fast-fail only: the authoritative draining check runs under the
@@ -404,6 +416,11 @@ impl TopicRegistry {
 	/// (`metadata.id` = topic, `metadata.order` = dense sequence) and
 	/// never reads the inner frame. Subscribers lift the payload and
 	/// decode it as a frame (the TypeScript client's `Framed` codec).
+	///
+	/// # Errors
+	///
+	/// Same set as [`publish`](Self::publish). Encoding `inner` to DER
+	/// surfaces as [`PublishError::Build`].
 	pub fn publish_frame(&self, topic: &Topic, inner: &Frame) -> Result<(), PublishError> {
 		let payload = inner.to_der().map_err(TightBeamError::from)?;
 		self.publish(topic, payload)
@@ -415,25 +432,43 @@ impl TopicRegistry {
 	/// Returns how many subscribers were signaled. Idempotent: a repeat
 	/// signals nobody. The caller follows with the transport drain
 	/// (`shutdown_with(GoAwayReason::Shutdown)` per connection).
+	///
+	/// End stamps come from
+	/// [`Backplane::reserve_order`](crate::Backplane::reserve_order) with
+	/// no registry lock held. That avoids deadlock against a concurrent
+	/// publish that delivers under the backplane lock.
+	///
+	/// # Errors
+	///
+	/// - [`PublishError::Build`]: an `end/<topic>` frame failed to encode.
 	pub fn quiesce(&self) -> Result<usize, PublishError> {
 		if self.inner.draining.swap(true, Ordering::AcqRel) {
 			return Ok(0);
 		}
 
+		let snapshots: Vec<(Topic, Vec<SubscriberId>)> = {
+			let state = self.lock_state();
+			state
+				.topics
+				.iter()
+				.map(|(topic, entry)| (topic.clone(), entry.members.iter().copied().collect()))
+				.collect()
+		};
+
+		let mut ends = Vec::with_capacity(snapshots.len());
+		for (topic, members) in snapshots {
+			let order = self.inner.options.backplane.reserve_order(&topic);
+			let end = Arc::new(end_frame(&topic, order)?);
+			ends.push((topic, order, members, end));
+		}
+
 		let mut state = self.lock_state();
 		let mut signaled = 0;
+		for (topic, order, members, end) in ends {
+			if let Some(entry) = state.topics.get_mut(&topic) {
+				entry.last_order = order;
+			}
 
-		let topics: Vec<Topic> = state.topics.keys().cloned().collect();
-		for topic in topics {
-			let Some(entry) = state.topics.get_mut(&topic) else {
-				continue;
-			};
-			let order = entry.last_order.saturating_add(1);
-			let end = Arc::new(end_frame(&topic, order)?);
-
-			entry.last_order = order;
-
-			let members: Vec<SubscriberId> = entry.members.iter().copied().collect();
 			for id in members {
 				if let Some(subscriber) = state.subscribers.get(&id) {
 					subscriber.finish(&end);
@@ -499,9 +534,15 @@ impl Inner {
 	}
 
 	/// Drop a connection the delivery policy voted off and drain its
-	/// link: the peer observes an `ENHANCE_YOUR_CALM` GoAway ([RFC 9113
-	/// § 7](https://datatracker.ietf.org/doc/html/rfc9113#section-7)
-	/// analog for a load-generating peer) instead of a silent stall.
+	/// link so the peer observes an orderly GoAway instead of a silent stall.
+	///
+	/// The registry sends `EnhanceYourCalm`, the analog for a load-generating
+	/// peer that cannot keep pace with delivery.
+	///
+	/// # Sources
+	///
+	/// - RFC 9113 § 7, GOAWAY frame:
+	///   <https://datatracker.ietf.org/doc/html/rfc9113#section-7>
 	fn disconnect(&self, connection: ConnectionId) {
 		let handle = {
 			let state = self.lock_state();
@@ -625,7 +666,7 @@ fn remove_subscriber(state: &mut State, id: SubscriberId) {
 		entry.members.remove(&id);
 		/*
 		 * Prune the emptied topic so churn over unique names never grows
-		 * the map without bound; the backplane keeps the order counter.
+		 * the map without bound. The backplane keeps the order counter.
 		 */
 		if entry.members.is_empty() {
 			state.topics.remove(&subscriber.topic);
@@ -987,5 +1028,66 @@ mod tests {
 			registry.publish(&topic("prices"), b"tick"),
 			Err(PublishError::Draining)
 		));
+	}
+
+	#[tokio::test]
+	async fn quiesce_claims_a_dense_end_order_after_topic_prune() {
+		let backplane = Arc::new(Local::default());
+		let options = RegistryOptions {
+			backplane: Arc::clone(&backplane) as Arc<dyn Backplane>,
+			..RegistryOptions::default()
+		};
+		let (registry, connection, _peer) = registered(options);
+
+		subscribed(&registry, connection, "prices");
+		published(&registry, "prices", b"tick");
+		registry.unregister(connection, &topic("prices"));
+		subscribed(&registry, connection, "prices");
+
+		assert_eq!(backplane.last_order(&topic("prices")), 1);
+		assert_eq!(quiesced(&registry), 1);
+		assert_eq!(backplane.last_order(&topic("prices")), 2);
+		assert_eq!(registry.lock_state().topics[&topic("prices")].last_order, 2);
+	}
+
+	#[tokio::test]
+	async fn quiesce_does_not_collide_with_a_sibling_publish() {
+		let backplane = Arc::new(Local::default());
+		let options = || RegistryOptions {
+			backplane: Arc::clone(&backplane) as Arc<dyn Backplane>,
+			..RegistryOptions::default()
+		};
+		let (alpha, alpha_connection, _alpha_peer) = registered(options());
+		let (beta, beta_connection, _beta_peer) = registered(options());
+
+		subscribed(&alpha, alpha_connection, "prices");
+		subscribed(&beta, beta_connection, "prices");
+		published(&alpha, "prices", b"tick");
+		assert_eq!(quiesced(&alpha), 1);
+
+		published(&beta, "prices", b"tock");
+		assert_eq!(beta.lock_state().topics[&topic("prices")].last_order, 3);
+		assert_eq!(backplane.last_order(&topic("prices")), 3);
+	}
+
+	#[tokio::test]
+	async fn quiesce_and_publish_do_not_deadlock() {
+		let (registry, connection, _peer) = registered(RegistryOptions::default());
+		subscribed(&registry, connection, "prices");
+
+		let publisher = registry.clone();
+		let publish = tokio::task::spawn_blocking(move || {
+			for _ in 0..64 {
+				let _ = publisher.publish(&topic("prices"), b"x");
+			}
+		});
+
+		tokio::task::yield_now().await;
+		assert!(registry.quiesce().is_ok());
+
+		tokio::time::timeout(Duration::from_secs(2), publish)
+			.await
+			.expect("quiesce and publish must not deadlock")
+			.expect("the publisher task must join");
 	}
 }

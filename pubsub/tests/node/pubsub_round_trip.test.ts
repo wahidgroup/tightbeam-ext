@@ -15,7 +15,12 @@ import type { Subscription, Update } from "@wahidgroup/tightbeam-pubsub-client";
 import { SubscriptionManager } from "@wahidgroup/tightbeam-pubsub-client";
 
 import { withClient } from "#ws-harness";
-import { certBytes, pubsubEndpoint, pubsubQueueCapacity } from "./env.js";
+import {
+	certBytes,
+	mutualSessionOptions,
+	pubsubEndpoint,
+	pubsubQueueCapacity,
+} from "./env.js";
 
 const ENCODER = new TextEncoder();
 
@@ -42,9 +47,12 @@ function testTopic(name: string): string {
 }
 
 function connect(): Promise<TightbeamWsClient> {
-	return TightbeamWsClient.connect(
+	return TightbeamWsClient.connectMutual(
 		pubsubEndpoint,
 		certBytes("server.cert.der"),
+		certBytes("client.cert.der"),
+		certBytes("client.key"),
+		mutualSessionOptions(),
 	);
 }
 

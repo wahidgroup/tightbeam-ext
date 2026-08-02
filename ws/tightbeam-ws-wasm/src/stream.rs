@@ -11,12 +11,15 @@ use gloo_net::websocket::futures::WebSocket;
 use gloo_net::websocket::{Message, WebSocketError};
 
 use tightbeam::crypto::profiles::DefaultCryptoProvider;
-use tightbeam::transport::tcp::r#async::{AsyncReadStream, AsyncWriteStream, SplittableStream};
-use tightbeam::transport::{AsyncProtocolStream, TcpTransport, TransportError};
+use tightbeam::transport::{
+	AsyncProtocolStream, AsyncReadStream, AsyncWriteStream, SplittableStream, TcpTransport, TransportError,
+};
 
 /// A browser WebSocket carrying tightbeam frames, one DER envelope per message.
 pub struct GlooStream {
 	inner: WebSocket,
+	/// Cleared when a read or write observes a closed peer.
+	alive: bool,
 }
 
 impl GlooStream {
@@ -24,11 +27,17 @@ impl GlooStream {
 	pub fn into_transport(self) -> WsTransport {
 		TcpTransport::from(self)
 	}
+
+	fn mark_dead_on_closed(&mut self, error: &TransportError) {
+		if matches!(error, TransportError::ConnectionClosed) {
+			self.alive = false;
+		}
+	}
 }
 
 impl From<WebSocket> for GlooStream {
 	fn from(inner: WebSocket) -> Self {
-		Self { inner }
+		Self { inner, alive: true }
 	}
 }
 
@@ -83,17 +92,29 @@ impl AsyncProtocolStream for GlooStream {
 	type Error = TransportError;
 
 	async fn read_frame(&mut self, max_len: Option<usize>) -> Result<Vec<u8>, Self::Error> {
-		read_binary_frame(&mut self.inner, max_len).await
+		match read_binary_frame(&mut self.inner, max_len).await {
+			Ok(frame) => Ok(frame),
+			Err(error) => {
+				self.mark_dead_on_closed(&error);
+				Err(error)
+			}
+		}
 	}
 
 	async fn write_frame(&mut self, buffer: &[u8]) -> Result<(), Self::Error> {
-		write_binary_frame(&mut self.inner, buffer).await
+		match write_binary_frame(&mut self.inner, buffer).await {
+			Ok(()) => Ok(()),
+			Err(error) => {
+				self.mark_dead_on_closed(&error);
+				Err(error)
+			}
+		}
 	}
 
 	fn is_alive(&self) -> bool {
-		// `gloo` exposes no cheap, non-blocking liveness probe.
-		// Closure surfaces on the next read as `ConnectionClosed`.
-		true
+		// gloo has no non-blocking probe. Track observed closure from
+		// prior frame I/O so pooling can skip already-dead sockets.
+		self.alive
 	}
 }
 

@@ -16,6 +16,14 @@ else
 LINT_MODE := check
 endif
 
+# Local `make test` skips wasm-opt on the ws client dependency. `make ci`
+# passes wasm_opt=1 so CI still builds release-sized wasm.
+ifneq ($(filter 1,$(wasm_opt)),)
+TEST_WASM_PACK_FLAGS :=
+else
+TEST_WASM_PACK_FLAGS := --no-opt
+endif
+
 setup:
 	@$(REPO)/scripts/setup.sh pubsub
 
@@ -27,7 +35,8 @@ build:
 	@echo "Building pubsub crates..."
 	cargo build --release $(CRATES) $(CARGO_FLAGS)
 
-test: client
+test: setup
+	@$(MAKE) client WASM_PACK_FLAGS="$(TEST_WASM_PACK_FLAGS)"
 	@echo "Running pubsub cargo tests..."
 ifeq ($(strip $(features)$(no-default)),)
 	cargo test $(CRATES) --all-features
@@ -55,7 +64,7 @@ wasm:
 client: setup
 	@echo "Building the pubsub client package..."
 	@# The pubsub client compiles against the ws client's dist (file: link).
-	@$(MAKE) -C $(REPO)/ws client
+	@$(MAKE) -C $(REPO)/ws client WASM_PACK_FLAGS="$(WASM_PACK_FLAGS)"
 	npm run build
 
 sbom:

@@ -5,17 +5,21 @@
  *
  * The frame format fixes the layering, so an envelope takes declarations
  * rather than a free-form pipeline. `frame()` begins a builder with them
- * applied; `unwrap()` reverses them and ENFORCES them: a declared
- * signature or seal that a received frame lacks REJECTS instead of degrading,
- * so a peer cannot downgrade the conversation by omission.
+ * applied. `unwrap()` reverses them and ENFORCES them. A declared
+ * signature or seal that a received frame lacks REJECTS instead of
+ * degrading, so a peer cannot downgrade the conversation by omission.
  */
 
 import type { FrameCodec } from "./builder/codec.js";
 import type { BodyCompressor, BodyInflator } from "./compress.js";
-import type { BodyDecryptor, BodyEncryptor, Signatory } from "./crypto.js";
-import type { MessageCodec } from "./message.js";
-import type { Secp256k1VerifyingKey } from "./crypto.js";
+import type {
+	BodyDecryptor,
+	BodyEncryptor,
+	Secp256k1VerifyingKey,
+	Signatory,
+} from "./crypto.js";
 import type { Frame } from "./frame.js";
+import type { MessageCodec } from "./message.js";
 import { FrameBuilder } from "./builder/builder.js";
 import { ValidationError } from "./builder/errors.js";
 import { Secp256k1SigningKey } from "./crypto.js";

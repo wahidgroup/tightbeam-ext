@@ -25,7 +25,9 @@ Two wasm bundles ship in the package, a `web` build and a `nodejs` build, select
 - [Install](#install)
 - [Cleartext round-trip](#cleartext-round-trip)
 - [Encrypted sessions (ECIES)](#encrypted-sessions-ecies)
+- [Session budgets (mutual auth only)](#session-budgets-mutual-auth-only)
 - [Two-way streams](#two-way-streams)
+- [Progressive body streaming](#progressive-body-streaming)
 - [Cancellation and timeouts](#cancellation-and-timeouts)
 - [Connection lifecycle](#connection-lifecycle)
 - [Transport errors](#transport-errors)
@@ -107,7 +109,7 @@ When the certificate key lives in an external key store (WebAuthn, a wallet, a K
 import type { TransportSigner } from "@wahidgroup/tightbeam-ws-client";
 
 const signer: TransportSigner = {
-	algorithmOid: "1.2.840.10045.4.3.2",
+	algorithmOid: "2.16.840.1.101.3.4.3.10", // ecdsa-with-SHA3-256
 	publicKeyDer: spkiFromKeyStore,
 	signPrehash: (prehash) => keyStore.signDigest(prehash),
 };
@@ -121,6 +123,31 @@ const external = await TightbeamWsClient.connectMutual(
 ```
 
 The session profile (secp256k1 ECIES, AES-256-GCM records, SHA3-256 certificates) is a compile-time choice, the same as for a native tightbeam-rs transport. A deployment on a different provider rebuilds the wasm layer against its own `CryptoProvider` (see the [`tightbeam-ws-wasm` README](../tightbeam-ws-wasm/README.md)). Frame-level cryptography stays caller-supplied regardless.
+
+### Session budgets (mutual auth only)
+
+Metered sessions request per-direction credits and settle server invoices through `approveReceipt`. Budgets, `authorization`, and `approveReceipt` are rejected on `connect` / `connectCleartext`.
+
+```ts
+const metered = await TightbeamWsClient.connectMutual(
+	url,
+	serverCertDer,
+	clientCertDer,
+	clientSigningKey,
+	{
+		budgets: { clientToServer: 4096, serverToClient: 4096 },
+		approveReceipt: ({ receiptDer, challenge }) => {
+			// Pay the invoice in `challenge`, or return undefined to refuse.
+			return paymentFor(challenge);
+		},
+	},
+);
+
+metered.usableSendBudget; // epoch usable credits, or undefined when unmetered
+metered.sessionReceiptDer; // dual-signed receipt DER, rotates on renewal
+```
+
+There is no live remaining-balance getter. Reconnect policies MUST treat peer GoAway reasons `"BudgetExhausted"` and `"SettlementFailed"` like other drain signals (backoff / re-auth), not as a protocol bug.
 
 ## Two-way streams
 
@@ -161,6 +188,32 @@ A `serve` handler refuses a stream by throwing `StreamRefusal` with the gRPC sta
 Registering the handler is not racy: server-initiated streams that arrive before `serve()` is called are parked in a bounded queue (the cap granted to the server) and served in order once the handler registers.
 
 `serve(handler, { exclusive: true })` claims dispatch: every later `serve` call throws instead of silently rerouting streams. The pubsub `SubscriptionManager` claims its client this way. Application routes compose through its `fallback` option.
+
+### Progressive body streaming
+
+Unary `emit` / `serve` stay the default. Progressive body I/O uses the same Open/Data/`last` wire:
+
+- `openStream()`: push request chunks, then `close()` / `closeWith(chunk)` for a Frame response
+- `openDuplex()`: push request chunks; consume `body` as an async iterable of reply chunks
+- `serveStreaming(handler)` / `serveDuplex(handler)`: peer-initiated progressive bodies
+
+Pushes reach the wire eagerly, so a duplex chunk-for-chunk conversation (push, then await the next reply chunk) is sound. `closeWith(chunk)` flags that chunk `last` in one record (one fewer than push-then-close). Dropping a stream without `close` / `closeWith` cancels it.
+
+```ts
+const stream = client.openStream();
+await stream.push(frameDer.subarray(0, mid));
+const response = await stream.closeWith(frameDer.subarray(mid));
+
+const duplex = client.openDuplex();
+await duplex.push(chunkA);
+const first = await duplex.body[Symbol.asyncIterator]().next();
+await duplex.closeWith(chunkB);
+for await (const chunk of duplex.body) {
+	handle(chunk);
+}
+```
+
+`serve`, `serveStreaming`, and `serveDuplex` are mutually exclusive on one client: the first call consumes the responder.
 
 ### Routing server-initiated streams
 
@@ -215,7 +268,7 @@ void client.closed.then((info) => {
 });
 ```
 
-`close()` closes the socket and releases the client's wasm resources (idempotent, safe with emits in flight). Call `shutdown()` first for a graceful GoAway drain, or `shutdownWith(reason)` to advertise why: a label (`"Shutdown"`, `"ProtocolError"`, `"EnhanceYourCalm"`) or an application-defined numeric code the peer reads back through its own GoAway surface. After `close()`, operations reject with `ConnectionClosed`, while `closed`, `readyState`, and the GoAway getters stay readable for reconnect policies.
+`close()` closes the socket and releases the client's wasm resources (idempotent, safe with emits in flight). Call `shutdown()` first for a graceful GoAway drain, or `shutdownWith(reason)` to advertise why: a label (`"Shutdown"`, `"ProtocolError"`, `"EnhanceYourCalm"`, `"BudgetExhausted"`, `"SettlementFailed"`) or an application-defined numeric code the peer reads back through its own GoAway surface. After `close()`, operations reject with `ConnectionClosed`, while `closed`, `readyState`, and the GoAway getters stay readable for reconnect policies.
 
 When the peer drains the session, the client records why. `goawayReason` reads the reason from the peer's GoAway (`undefined` while the connection is live or after a local shutdown), and reconnect policies branch on it. `goawayCode` exposes the raw numeric code for application-defined reasons, which `goawayReason` labels `"Application"`.
 
@@ -302,7 +355,7 @@ const response = await mux.emit(built);
 
 ## Keepalive
 
-Multiplexed sessions have a protocol-level liveness probe (RFC 9113 § 6.7 analog): `ping()` resolves when the peer acknowledges. No stream is allocated and no application handler runs on the peer, so a periodic ping doubles as an idle keepalive for browsers, whose sockets cannot send WebSocket protocol pings from JavaScript:
+Multiplexed sessions have a protocol-level liveness probe (RFC 9113 § 6.7 analog). `ping()` resolves when the peer acknowledges. No stream is allocated and no application handler runs on the peer, so a periodic ping doubles as an idle keepalive for browsers, whose sockets cannot send WebSocket protocol pings from JavaScript:
 
 ```ts
 const interval = setInterval(() => {
@@ -315,6 +368,11 @@ const interval = setInterval(() => {
 ```
 
 Browsers answer WebSocket protocol pings automatically. This probe covers the application level, where silence is otherwise indistinguishable from idleness.
+
+### Sources
+
+- RFC 9113 § 6.7, PING frame:
+  <https://datatracker.ietf.org/doc/html/rfc9113#section-6.7>
 
 ## Frame builder
 

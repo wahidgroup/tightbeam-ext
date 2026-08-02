@@ -20,19 +20,38 @@ import { ValidationError } from "./builder/errors.js";
  *
  * Literal values rather than reads from the wasm `profileOids()` binding,
  * so the table is usable before the (web-build) wasm module initializes.
+ *
+ * # Sources
+ *
+ * - RFC 8878, Zstandard compression:
+ *   {@link https://datatracker.ietf.org/doc/html/rfc8878 RFC 8878}
+ * - RFC 3274, Compressed Data Content Type:
+ *   {@link https://datatracker.ietf.org/doc/html/rfc3274 RFC 3274}
  */
 export const PROFILE_OIDS = {
-	/** SHA3-256, the profile digest. */
+	/**
+	 * SHA3-256, the profile digest.
+	 */
 	sha3_256: "2.16.840.1.101.3.4.2.8",
-	/** secp256k1 ECDSA over SHA3-256, the profile signature. */
+	/**
+	 * secp256k1 ECDSA over SHA3-256, the profile signature.
+	 */
 	ecdsaWithSha3_256: "2.16.840.1.101.3.4.3.10",
-	/** AES-256-GCM, the profile symmetric cipher. */
+	/**
+	 * AES-256-GCM, the profile symmetric cipher.
+	 */
 	aes256Gcm: "2.16.840.1.101.3.4.1.46",
-	/** ECIES over secp256k1 (HKDF-SHA3-256 + AES-256-GCM). */
+	/**
+	 * ECIES over secp256k1 (HKDF-SHA3-256 + AES-256-GCM).
+	 */
 	eciesSecp256k1: "1.3.132.1.12.0",
-	/** Zstandard (RFC 8878), the profile compression. */
-	zstd: "1.3.6.1.4.1.55555.2.1",
-	/** zlib (RFC 3274), interoperable with `CompressionStream("deflate")`. */
+	/**
+	 * Zstandard, the profile compression.
+	 */
+	zstd: "1.3.6.1.4.1.64586.2.1",
+	/**
+	 * zlib, interoperable with `CompressionStream("deflate")`.
+	 */
 	zlib: "1.2.840.113549.1.9.16.3.8",
 	/**
 	 * id-ct-compressedData (RFC 3274): the content type recorded in the
@@ -167,6 +186,9 @@ function requireAlgorithm(sealed: EncryptedBody, expectedOid: string): void {
  * The profile {@link Hasher}: SHA3-256 computed in the wasm module.
  */
 export class Sha3_256 implements Hasher {
+	/**
+	 * Dotted OID of SHA3-256, the profile digest.
+	 */
 	readonly algorithmOid = PROFILE_OIDS.sha3_256;
 
 	/**
@@ -210,7 +232,14 @@ export class Secp256k1VerifyingKey {
  * 32-byte scalar) signing SHA3-256 digests in the wasm module.
  */
 export class Secp256k1SigningKey implements Signatory {
+	/**
+	 * Dotted OID of ECDSA with SHA3-256, the profile signature algorithm.
+	 */
 	readonly signatureAlgorithmOid = PROFILE_OIDS.ecdsaWithSha3_256;
+
+	/**
+	 * Dotted OID of SHA3-256, the digest paired with the profile signature.
+	 */
 	readonly digestAlgorithmOid = PROFILE_OIDS.sha3_256;
 
 	private constructor(private readonly scalar: Uint8Array) {}

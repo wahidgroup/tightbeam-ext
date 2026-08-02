@@ -34,9 +34,12 @@ pub struct ConnectionContext {
 
 /// The application handler for streams no wire command claims. Answer
 /// [`unrouted`] serves a command-only connection.
-pub trait AppRoutes<F>: Fn(ConnectionContext, Arc<Frame>) -> F + Clone + Send {}
+///
+/// `Sync` because the responder shares one handler across the
+/// connection's concurrent streams.
+pub trait AppRoutes<F>: Fn(ConnectionContext, Arc<Frame>) -> F + Clone + Send + Sync + 'static {}
 
-impl<A, F> AppRoutes<F> for A where A: Fn(ConnectionContext, Arc<Frame>) -> F + Clone + Send {}
+impl<A, F> AppRoutes<F> for A where A: Fn(ConnectionContext, Arc<Frame>) -> F + Clone + Send + Sync + 'static {}
 
 /// The command-only application handler: every non-command stream
 /// answers `Unimplemented`.
@@ -46,9 +49,15 @@ pub async fn unrouted(_context: ConnectionContext, _frame: Arc<Frame>) -> Respon
 
 /// Serve one anonymous multiplexed connection until it ends.
 ///
-/// Wire commands answer through `commands`; everything else goes to
+/// Wire commands answer through `commands`. Everything else goes to
 /// `app`. The connection registers on entry and drops (with all its
 /// subscriptions) on exit, whatever ended the serve loop.
+///
+/// # Errors
+///
+/// Returns a [`TransportError`](tightbeam::transport::TransportError)
+/// when the mux drivers or responder fail. The connection is unregistered
+/// before the error is returned.
 pub async fn serve_connection<R, W, P, A, F>(
 	mux: MuxTransport<R, W>,
 	commands: PubsubCommands<P>,
@@ -57,16 +66,24 @@ pub async fn serve_connection<R, W, P, A, F>(
 where
 	R: EnvelopeSource + Send + 'static,
 	W: EnvelopeSink + Send + 'static,
-	P: SubscribePolicy,
+	P: SubscribePolicy + 'static,
 	A: AppRoutes<F>,
 	F: Future<Output = ResponsePackage> + Send,
 {
 	serve(mux, commands, None, app).await
 }
 
-/// [`serve_connection`], registered under `identity` (a mutual-auth
-/// peer certificate DER is the expected source) so the policies can
-/// authorize by caller.
+/// Serve one mux connection as [`serve_connection`], but register the
+/// peer under `identity` so [`crate::SubscribePolicy`] /
+/// [`crate::PublishPolicy`] can authorize by caller.
+///
+/// Pass the mutual-auth peer certificate DER when the application uses
+/// identity-based topic ACL. [`serve_connection`] alone leaves identity
+/// as `None`.
+///
+/// # Errors
+///
+/// Same set as [`serve_connection`].
 pub async fn serve_connection_as<R, W, P, A, F>(
 	mux: MuxTransport<R, W>,
 	commands: PubsubCommands<P>,
@@ -76,7 +93,7 @@ pub async fn serve_connection_as<R, W, P, A, F>(
 where
 	R: EnvelopeSource + Send + 'static,
 	W: EnvelopeSink + Send + 'static,
-	P: SubscribePolicy,
+	P: SubscribePolicy + 'static,
 	A: AppRoutes<F>,
 	F: Future<Output = ResponsePackage> + Send,
 {
@@ -92,7 +109,7 @@ async fn serve<R, W, P, A, F>(
 where
 	R: EnvelopeSource + Send + 'static,
 	W: EnvelopeSink + Send + 'static,
-	P: SubscribePolicy,
+	P: SubscribePolicy + 'static,
 	A: AppRoutes<F>,
 	F: Future<Output = ResponsePackage> + Send,
 {

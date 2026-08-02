@@ -1,5 +1,7 @@
 //! Frame assembly and structural security operations over opaque message bytes.
 
+use std::borrow::Cow;
+
 use der::asn1::OctetString;
 use der::{Decode, Sequence};
 
@@ -8,7 +10,7 @@ use tightbeam::cms::compressed_data::CompressedData;
 use tightbeam::cms::content_info::CmsVersion;
 use tightbeam::cms::enveloped_data::EncryptedContentInfo;
 use tightbeam::cms::signed_data::{EncapsulatedContentInfo, SignerIdentifier};
-use tightbeam::crypto::aead::{AeadCore, Aes256Gcm, Decryptor, Encryptor, KeyInit};
+use tightbeam::crypto::aead::{AeadCore, Aes256Gcm, Aes256GcmOid, Decryptor, Encryptor, KeyInit};
 use tightbeam::crypto::ecies::{EciesDecryptor, EciesEncryptor, EciesSecp256k1Oid};
 use tightbeam::crypto::hash::{Digest as _, Sha3_256};
 use tightbeam::crypto::k256::SecretKey;
@@ -37,13 +39,17 @@ struct OpaqueBody {
 /// operations.
 #[derive(Default)]
 pub struct FrameConfig {
-	/// Protocol version; when `None` uses the floor for the structural
+	/// Protocol version. When `None`, uses the floor for the structural
 	/// fields. Callers configuring security afterwards MUST pin the version
 	/// themselves, since this config never sees those fields.
 	pub version: Option<Version>,
 	/// Opaque message identifier.
 	pub id: Vec<u8>,
-	/// Monotonic order (Unix seconds).
+	/// Frame order stamp.
+	///
+	/// The value is protocol-opaque. Any monotonic scheme works, such as a
+	/// Unix timestamp or a dense per-channel counter. When omitted, the
+	/// build defaults it to the current Unix time in seconds.
 	pub order: u64,
 	/// The frame body as DER: any `Message` encoding the peer expects.
 	/// Callers without an ASN.1 schema wrap raw payload bytes with
@@ -55,14 +61,15 @@ pub struct FrameConfig {
 	pub lifetime: Option<u64>,
 	/// Parent-frame link by content digest (V2+).
 	pub previous_hash: Option<DigestInfo>,
-	/// N×N control matrix (V2+).
+	/// N×N control matrix (V3+).
 	pub matrix: Option<MatrixDyn>,
 }
 
 impl FrameConfig {
-	/// Lowest frame version that admits the structural fields. The matrix is
-	/// a V3 feature; priority, lifetime, and previous-hash are V2 features; a
-	/// bare payload stays at V0.
+	/// Lowest frame version that admits the configured structural fields.
+	///
+	/// The matrix requires V3. Priority, lifetime, and previous-hash require
+	/// V2. A bare payload stays at V0.
 	fn effective_version(&self) -> Version {
 		if let Some(version) = self.version {
 			return version;
@@ -84,7 +91,7 @@ impl FrameConfig {
 	/// `message` is installed as the frame body. The builder never
 	/// re-encodes it, so any `Message` schema round-trips bit-exactly.
 	pub fn build(self) -> Result<Vec<u8>, TightBeamError> {
-		// The upstream builder requires a typed message; build with an
+		// The upstream builder requires a typed message. Build with an
 		// empty placeholder body, then install the caller's body DER.
 		let placeholder = OpaqueBody { body: OctetString::new([])? };
 
@@ -130,20 +137,22 @@ pub fn decode_body(body_der: impl AsRef<[u8]>) -> Result<Vec<u8>, TightBeamError
 /// `len(salt) as u64 BE || salt || body DER` otherwise (length framing keeps
 /// distinct `(salt, body)` pairs from colliding).
 ///
-/// Hash this with any digest and install the result via
-/// [`set_message_integrity`].
-pub fn commitment_preimage(salt: impl AsRef<[u8]>, body_der: impl AsRef<[u8]>) -> Vec<u8> {
+/// An empty salt returns `body_der` without copying. Hash this with any
+/// digest and install the result via [`set_message_integrity`].
+pub fn commitment_preimage<'a>(salt: impl AsRef<[u8]>, body_der: impl Into<Cow<'a, [u8]>>) -> Cow<'a, [u8]> {
 	let salt = salt.as_ref();
-	let body_der = body_der.as_ref();
+	let body_der = body_der.into();
 	if salt.is_empty() {
-		return body_der.to_vec();
+		return body_der;
 	}
 
-	let mut buffer = Vec::with_capacity(8 + salt.len() + body_der.len());
+	let body = body_der.as_ref();
+	let mut buffer = Vec::with_capacity(8 + salt.len() + body.len());
 	buffer.extend_from_slice(&(salt.len() as u64).to_be_bytes());
 	buffer.extend_from_slice(salt);
-	buffer.extend_from_slice(body_der);
-	buffer
+	buffer.extend_from_slice(body);
+
+	Cow::Owned(buffer)
 }
 
 /// Decode a frame DER, apply `mutate`, and re-encode.
@@ -324,11 +333,15 @@ pub struct FrameSummary {
 	pub version: u8,
 	/// Opaque message identifier.
 	pub id: Vec<u8>,
-	/// Monotonic order (Unix seconds).
+	/// Frame order stamp.
+	///
+	/// The value is protocol-opaque. Any monotonic scheme works, such as a
+	/// Unix timestamp or a dense per-channel counter. When omitted at build
+	/// time, the profile defaults to the current Unix time in seconds.
 	pub order: u64,
-	/// The raw frame body: the caller's body DER when cleartext, the
+	/// The raw frame body: the caller's body DER when cleartext, or the
 	/// ciphertext when confidential. Decode a profile opaque body with
-	/// [`decode_body`]; typed bodies decode under the caller's schema.
+	/// [`decode_body`]. Typed bodies decode under the caller's schema.
 	pub body_der: Vec<u8>,
 	/// Message priority ordinal (`LowEffort` -> 0, ...), when present (V2+).
 	pub priority: Option<u8>,
@@ -370,48 +383,63 @@ pub struct FrameSummary {
 }
 
 /// Decode a frame DER into a [`FrameSummary`].
+///
+/// Owned octets (`id`, body, digests, matrix, signature) are taken out of
+/// the decoded [`Frame`] (`ZeroizeOnDrop` forbids a full destructure).
 pub fn inspect_frame(frame_der: impl AsRef<[u8]>) -> Result<FrameSummary, TightBeamError> {
-	let frame = Frame::from_der(frame_der.as_ref())?;
-	let metadata = &frame.metadata;
-	let confidentiality = metadata.confidentiality.as_ref();
-	let compactness = metadata.compactness.as_ref();
+	let mut frame = Frame::from_der(frame_der.as_ref())?;
 
-	let confidentiality_parameters_der = confidentiality
+	let confidentiality_parameters_der = frame
+		.metadata
+		.confidentiality
+		.as_ref()
 		.and_then(|info| info.content_enc_alg.parameters.as_ref())
 		.map(Encode::to_der)
 		.transpose()?;
 
-	let compactness_parameters_der = compactness
+	let compactness_parameters_der = frame
+		.metadata
+		.compactness
+		.as_ref()
 		.and_then(|info| info.compression_alg.parameters.as_ref())
 		.map(Encode::to_der)
 		.transpose()?;
 
+	let previous_frame = frame.metadata.previous_frame.take();
+	let message_integrity = frame.metadata.integrity.take();
+	let integrity = frame.integrity.take();
+	let nonrepudiation = frame.nonrepudiation.take();
+	let compactness = frame.metadata.compactness.take();
+	let confidentiality = frame.metadata.confidentiality.take();
+	let mut matrix = frame.metadata.matrix.take();
+	let matrix_n = matrix.as_ref().map(|entry| entry.n);
+	let matrix_data = matrix.as_mut().map(|entry| core::mem::take(&mut entry.data));
+
 	Ok(FrameSummary {
 		version: frame.version as u8,
-		id: metadata.id.clone(),
-		order: metadata.order,
-		body_der: frame.message.clone(),
-		priority: metadata.priority.map(|priority| priority as u8),
-		lifetime: metadata.lifetime,
-		previous_hash_algorithm_oid: metadata.previous_frame.as_ref().map(|digest| digest.algorithm.oid.to_string()),
-		previous_hash_digest: metadata.previous_frame.as_ref().map(|digest| digest.digest.as_bytes().to_vec()),
-		matrix_n: metadata.matrix.as_ref().map(|matrix| matrix.n),
-		matrix_data: metadata.matrix.as_ref().map(|matrix| matrix.data.clone()),
-		compactness_algorithm_oid: compactness.map(|info| info.compression_alg.oid.to_string()),
+		id: core::mem::take(&mut frame.metadata.id),
+		order: frame.metadata.order,
+		body_der: core::mem::take(&mut frame.message),
+		priority: frame.metadata.priority.map(|priority| priority as u8),
+		lifetime: frame.metadata.lifetime,
+		previous_hash_algorithm_oid: previous_frame.as_ref().map(|digest| digest.algorithm.oid.to_string()),
+		previous_hash_digest: previous_frame.map(|digest| digest.digest.into_bytes()),
+		matrix_n,
+		matrix_data,
+		compactness_algorithm_oid: compactness.as_ref().map(|info| info.compression_alg.oid.to_string()),
 		compactness_parameters_der,
-		compactness_content_oid: compactness.map(|info| info.encap_content_info.econtent_type.to_string()),
-		message_integrity_algorithm_oid: metadata.integrity.as_ref().map(|info| info.algorithm.oid.to_string()),
-		message_integrity_digest: metadata.integrity.as_ref().map(|info| info.digest.as_bytes().to_vec()),
-		frame_integrity_algorithm_oid: frame.integrity.as_ref().map(|info| info.algorithm.oid.to_string()),
-		frame_integrity_digest: frame.integrity.as_ref().map(|info| info.digest.as_bytes().to_vec()),
-		confidentiality_algorithm_oid: confidentiality.map(|info| info.content_enc_alg.oid.to_string()),
-		confidentiality_parameters_der,
-		signature_algorithm_oid: frame
-			.nonrepudiation
+		compactness_content_oid: compactness
 			.as_ref()
-			.map(|info| info.signature_algorithm.oid.to_string()),
-		signature_digest_algorithm_oid: frame.nonrepudiation.as_ref().map(|info| info.digest_alg.oid.to_string()),
-		signature: frame.nonrepudiation.as_ref().map(|info| info.signature.as_bytes().to_vec()),
+			.map(|info| info.encap_content_info.econtent_type.to_string()),
+		message_integrity_algorithm_oid: message_integrity.as_ref().map(|info| info.algorithm.oid.to_string()),
+		message_integrity_digest: message_integrity.map(|info| info.digest.into_bytes()),
+		frame_integrity_algorithm_oid: integrity.as_ref().map(|info| info.algorithm.oid.to_string()),
+		frame_integrity_digest: integrity.map(|info| info.digest.into_bytes()),
+		confidentiality_algorithm_oid: confidentiality.as_ref().map(|info| info.content_enc_alg.oid.to_string()),
+		confidentiality_parameters_der,
+		signature_algorithm_oid: nonrepudiation.as_ref().map(|info| info.signature_algorithm.oid.to_string()),
+		signature_digest_algorithm_oid: nonrepudiation.as_ref().map(|info| info.digest_alg.oid.to_string()),
+		signature: nonrepudiation.map(|info| info.signature.into_bytes()),
 	})
 }
 
@@ -454,7 +482,7 @@ pub fn profile_signer_id(public_key_sec1: impl AsRef<[u8]>) -> Result<Vec<u8>, T
 /// Verify a frame's non-repudiation signature against a SEC1-encoded
 /// secp256k1 public key under the profile scheme (ECDSA over SHA3-256).
 ///
-/// `Ok(())` means the signature is valid; a missing signature, an algorithm
+/// `Ok(())` means the signature is valid. A missing signature, an algorithm
 /// mismatch, or a bad signature are all errors. Frames signed under other
 /// schemes verify caller-side from [`tbs_bytes`] and the carried signature.
 pub fn verify_signature(frame_der: impl AsRef<[u8]>, public_key_sec1: impl AsRef<[u8]>) -> Result<(), TightBeamError> {
@@ -510,7 +538,7 @@ fn encrypted_info(
 pub fn seal_aes_256_gcm(key: impl AsRef<[u8]>, plaintext: impl AsRef<[u8]>) -> Result<SealedBody, TightBeamError> {
 	let cipher = Aes256Gcm::new_from_slice(key.as_ref())?;
 	let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
-	let info = Encryptor::<Aes256GcmOidMarker>::encrypt_content(&cipher, plaintext.as_ref(), nonce, None)?;
+	let info = Encryptor::<Aes256GcmOid>::encrypt_content(&cipher, plaintext.as_ref(), nonce, None)?;
 	sealed_body(info)
 }
 
@@ -548,13 +576,6 @@ pub fn open_ecies_secp256k1(
 	let decryptor = EciesDecryptor::new(SecretKey::from_slice(secret_key.as_ref())?);
 	let info = encrypted_info(EciesSecp256k1Oid::OID, parameters_der, ciphertext)?;
 	Ok(decryptor.decrypt_content(&info)?.to_insecure()?.to_vec())
-}
-
-/// Marker binding the profile AEAD OID for the generic [`Encryptor`] call.
-struct Aes256GcmOidMarker;
-
-impl AssociatedOid for Aes256GcmOidMarker {
-	const OID: ObjectIdentifier = tightbeam::oids::AES_256_GCM;
 }
 
 #[cfg(test)]
@@ -829,8 +850,8 @@ mod tests {
 		Ok(())
 	}
 
-	/// The structure path is algorithm-agnostic, so garbage bytes attach;
-	/// verification is where they must fail.
+	/// The structure path is algorithm-agnostic, so garbage bytes attach.
+	/// Verification is where they must fail.
 	#[test]
 	fn garbage_signature_attaches_but_fails_verification() -> TestResult {
 		let frame_der = seal_frame(b"junk", 1)?;
@@ -1101,7 +1122,7 @@ mod tests {
 		let der = set_compactness(&der, None, info.compression_alg.oid, None, compressed.clone())?;
 
 		let summary = inspect_frame(&der)?;
-		assert_eq!(summary.compactness_algorithm_oid.as_deref(), Some("1.3.6.1.4.1.55555.2.1"));
+		assert_eq!(summary.compactness_algorithm_oid.as_deref(), Some("1.3.6.1.4.1.64586.2.1"));
 		assert_eq!(summary.compactness_content_oid.as_deref(), Some("1.2.840.113549.1.9.16.1.9"));
 		assert_eq!(summary.compactness_parameters_der, None);
 		assert_eq!(summary.body_der, compressed);

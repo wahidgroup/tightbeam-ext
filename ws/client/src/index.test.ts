@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { ConnectOptions } from "./index.js";
-import { TightbeamWsClient } from "./index.js";
+import { InternalError, TightbeamWsClient } from "./index.js";
 
 /*
  * The connector boundary guards reject before any dial, so the URL and
@@ -55,10 +55,10 @@ const CAPPED_DIALS = [
 
 describe.each(CAPPED_DIALS)("$name stream cap guard", ({ dial }) => {
 	it.each(COERCIBLE_CAPS)(
-		"rejects $label with a TypeError",
+		"rejects $label with an InternalError",
 		async ({ cap }) => {
 			const dialed = dial(cap);
-			await expect(dialed).rejects.toThrow(TypeError);
+			await expect(dialed).rejects.toThrow(InternalError);
 			await expect(dialed).rejects.toThrow("stream cap");
 		},
 	);
@@ -115,7 +115,7 @@ const FOREIGN_KEYS = [
 
 describe("connectMutual client key guard", () => {
 	it.each(FOREIGN_KEYS)(
-		"rejects $label with a TypeError",
+		"rejects $label with an InternalError",
 		async ({ key }) => {
 			const dialed = loosely.dialMutual(
 				UNREACHED_URL,
@@ -124,8 +124,31 @@ describe("connectMutual client key guard", () => {
 				key,
 			);
 
-			await expect(dialed).rejects.toThrow(TypeError);
+			await expect(dialed).rejects.toThrow(InternalError);
 			await expect(dialed).rejects.toThrow("clientKey");
 		},
 	);
+});
+
+describe("session offer mutual-only guard", () => {
+	it("rejects budgets on connect", async () => {
+		const dialed = TightbeamWsClient.connect(
+			UNREACHED_URL,
+			UNREACHED_CERT,
+			{
+				budgets: { clientToServer: 4096, serverToClient: 4096 },
+			},
+		);
+		await expect(dialed).rejects.toThrow(InternalError);
+		await expect(dialed).rejects.toThrow("connectMutual");
+	});
+
+	it("rejects approveReceipt on connectCleartext", async () => {
+		const dialed = TightbeamWsClient.connectCleartext(UNREACHED_URL, {
+			// @ts-expect-error foreign paywall field must fail at runtime
+			approveReceipt: () => new Uint8Array(1),
+		});
+		await expect(dialed).rejects.toThrow(InternalError);
+		await expect(dialed).rejects.toThrow("connectMutual");
+	});
 });

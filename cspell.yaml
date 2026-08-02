@@ -29,6 +29,7 @@ words:
   - wahidgroup
   - dockerized
   - rustup
+  - RUSTDOCFLAGS
   - tbws
   - buildkit
   - parameterised
@@ -100,6 +101,8 @@ words:
   - uppercased
   - uppercases
   - baselined
+  - unmetered
+  - subarray
 ignorePaths:
   - node_modules/**
   - "**/sbom.json"

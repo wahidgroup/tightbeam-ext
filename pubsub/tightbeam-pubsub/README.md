@@ -2,17 +2,22 @@
 
 Topic pub/sub extension for the [tightbeam](https://crates.io/crates/tightbeam-rs) messaging protocol.
 
-Core tightbeam mux carries concurrent, bidirectional unary streams. This crate runs on that surface unchanged: subscriptions are ordinary client-initiated command streams, updates are server-initiated pushes, and any process holding a `MuxHandle` can fan out. No new wire protocol, no broker, carrier-agnostic (WebSocket or raw TCP mux alike).
-
 ## Surface
 
-- `Topic` - validated name: `/`-separated hierarchy (MQTT 5.0 vocabulary), exact match, command prefixes reserved.
-- `TopicRegistry` - membership and publishing. The registry builds every update frame itself, so stamps never depend on callers.
-- `PubsubCommands` - answers the wire commands inside an existing serve handler. Everything else falls through to the application's routes.
-- `serve_connection` - the per-connection ceremony in one call: drivers, registration, dispatch, cleanup. `serve_connection_as` attaches an identity, `unrouted` serves command-only.
-- `SubscribePolicy` / `PublishPolicy` - `authorize(identity, &Topic)` owns the `PermissionDenied` decision. Default `AllowAll`.
-- `DeliveryPolicy` - what a full subscriber queue does: `DropOldest` (default, counted), `DropNew`, or `Disconnect`. A slow client never stalls the topic fan-out.
-- `Backplane` - sequencing and cross-node distribution. `Local` (in-process, the default) covers one node. See [Scaling out](#scaling-out).
+This crate runs on the existing tightbeam mux surface unchanged. Subscriptions are ordinary client-initiated command streams, updates are server-initiated pushes, and any process holding a `MuxHandle` can fan out. There is no new wire protocol and no broker. The design is carrier-agnostic (WebSocket or raw TCP mux alike).
+
+- `Topic` validates names as a `/`-separated hierarchy with exact match semantics. Command prefixes are reserved.
+- `TopicRegistry` owns membership and publishing. The registry builds every update frame itself, so stamps never depend on callers.
+- `PubsubCommands` answers the wire commands inside an existing serve handler. Everything else falls through to the application's routes.
+- `serve_connection` performs the per-connection ceremony in one call: drivers, registration, dispatch, and cleanup. `serve_connection_as` attaches an identity; `unrouted` serves command-only.
+- `SubscribePolicy` and `PublishPolicy` expose `authorize(identity, &Topic)` and own the `PermissionDenied` decision. Default is `AllowAll`.
+- `DeliveryPolicy` defines what a full subscriber queue does: `DropOldest` (default, counted), `DropNew`, or `Disconnect`. A slow client never stalls the topic fan-out.
+- `Backplane` provides sequencing and cross-node distribution. `Local` (in-process, the default) covers one node. See [Scaling out](#scaling-out).
+
+### Sources
+
+- MQTT 5.0 § 4.7, Topic names and filters:
+  <https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html>
 
 ### Publish
 

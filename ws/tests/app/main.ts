@@ -159,6 +159,25 @@ async function secureRoundTrip(
 	return result;
 }
 
+/**
+ * Demo settlement payment matching `tightbeam_ws::testing::DEMO_PAYMENT`.
+ * Mutual echo always runs the demo paywall in compose.
+ */
+const DEMO_PAYMENT = new TextEncoder().encode("tbws-demo-payment-v1");
+
+/**
+ * Mutual dial options for the compose stack's demo budget ceiling.
+ */
+function mutualSessionOffer(): {
+	budgets: { clientToServer: number; serverToClient: number };
+	approveReceipt: () => Uint8Array;
+} {
+	return {
+		budgets: { clientToServer: 4096, serverToClient: 4096 },
+		approveReceipt: (): Uint8Array => DEMO_PAYMENT,
+	};
+}
+
 async function mutualRoundTrip(
 	url: string,
 	serverCertB64: string,
@@ -173,6 +192,7 @@ async function mutualRoundTrip(
 		base64ToBytes(serverCertB64),
 		base64ToBytes(clientCertB64),
 		base64ToBytes(clientKeyB64),
+		mutualSessionOffer(),
 	);
 
 	const result = await emitAndDecode(client, payloadHex, idText, order);
@@ -203,6 +223,7 @@ async function mutualSignerRoundTrip(
 		base64ToBytes(serverCertB64),
 		base64ToBytes(clientCertB64),
 		signer,
+		mutualSessionOffer(),
 	);
 
 	const decoded = await emitAndDecode(client, payloadHex, idText, order);
@@ -486,8 +507,8 @@ async function muxConcurrentRoundTrip(
 			const response = await emitFrame(client, built);
 			return response;
 		});
-		const echoed = await Promise.all(emits);
 
+		const echoed = await Promise.all(emits);
 		const result = {
 			echoedIds: echoed.map((response) => TEXT.decode(response.id)),
 			echoedBodiesHex: echoed.map((response) =>
@@ -568,12 +589,14 @@ async function muxLifecycleProbe(
 	return withMuxClient(url, serverCertB64, async (client) => {
 		await client.ping();
 		await client.waitForStreamSlot();
+
 		const headroom = client.hasStreamHeadroom;
 		const pendingIdle = !client.hasPendingStreams;
 		const liveReasonEmpty = client.goawayReason === undefined;
 
 		const abandoned = new AbortController();
 		abandoned.abort(new Error("ping abandoned"));
+
 		let abandonedPingRejection = "";
 		try {
 			await client.ping({ signal: abandoned.signal });
@@ -645,6 +668,7 @@ async function muxDrainReason(
 		}
 
 		controller.abort(new Error("drain observed"));
+
 		let emitRejection = "";
 		try {
 			await pending;
@@ -676,18 +700,25 @@ async function muxParkedCallbackRoundTrip(
 ): Promise<MuxCallbackResult> {
 	return withMuxClient(url, serverCertB64, async (client) => {
 		/*
-		 * Fire the call-back trigger with no handler registered and give
-		 * the server's stream time to arrive and park. No parked-count
-		 * surface exists to poll: a sleep too short degrades this into
-		 * the ordinary served path (still passing, weaker), never into
-		 * a flake.
+		 * Fire the call-back with no handler, then wait until the local
+		 * emit occupies a stream slot so serve registers only after the
+		 * request left the client.
 		 */
 		const callMe = await frame(hexToBytes(payloadHex))
 			.withId("call-me-parked-browser")
 			.withOrder(4)
 			.build();
 		const pending = emitFrame(client, callMe);
-		await new Promise((resolve) => setTimeout(resolve, 100));
+		const deadline = Date.now() + 10_000;
+		while (!client.hasPendingStreams) {
+			if (Date.now() > deadline) {
+				throw new Error("timed out waiting for pending call-back emit");
+			}
+
+			await new Promise<void>((resolve) => {
+				setTimeout(resolve, 0);
+			});
+		}
 
 		const servedIds: string[] = [];
 		client.serve(async (request) => {
@@ -772,11 +803,49 @@ async function muxClearConcurrentRoundTrip(
 	return result;
 }
 
+/**
+ * Progressive openStream round-trip: split the Frame DER, push, close.
+ */
+async function streamingRoundTrip(
+	url: string,
+	serverCertB64: string,
+	payloadHex: string,
+	idText: string,
+): Promise<RoundTripResult> {
+	const client = await TightbeamWsClient.connect(
+		url,
+		base64ToBytes(serverCertB64),
+	);
+	try {
+		const built = await frame(hexToBytes(payloadHex))
+			.withId(idText)
+			.withOrder(1)
+			.build();
+
+		const der = built.toDer();
+		const mid = Math.floor(der.length / 2);
+
+		const stream = client.openStream();
+		await stream.push(der.subarray(0, mid));
+		await stream.push(der.subarray(mid));
+
+		const response = await stream.close();
+		if (response === undefined) {
+			throw new Error("streaming peer returned no response frame");
+		}
+
+		return toResult(response);
+	} finally {
+		client.close();
+	}
+}
+
 window.tbMuxConcurrentRoundTrip = muxConcurrentRoundTrip;
 window.tbMuxCallbackRoundTrip = muxCallbackRoundTrip;
 window.tbMuxClearConcurrentRoundTrip = muxClearConcurrentRoundTrip;
 window.tbMuxLifecycleProbe = muxLifecycleProbe;
 window.tbMuxDrainReason = muxDrainReason;
+window.tbStreamingRoundTrip = streamingRoundTrip;
 window.tbMuxParkedCallbackRoundTrip = muxParkedCallbackRoundTrip;
 window.tbMuxRefusalRoundTrip = muxRefusalRoundTrip;
 

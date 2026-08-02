@@ -7,15 +7,20 @@
  * peer. Not safe to display to end users.
  */
 export class InternalError extends Error {
+	/**
+	 * Discriminant for the internal error family.
+	 */
 	readonly kind = "E_INTERNAL";
 
-	constructor(
-		readonly code: string,
-		message: string,
-		cause?: unknown,
-	) {
+	/**
+	 * Stable programmatic code for branching on this failure.
+	 */
+	readonly code: string;
+
+	constructor(code: string, message: string, cause?: unknown) {
 		super(message, { cause });
 		this.name = this.constructor.name;
+		this.code = code;
 	}
 }
 
@@ -52,11 +57,14 @@ export type TransitCode =
 export class StreamRefusal extends Error {
 	override readonly name: string = "StreamRefusal";
 
-	constructor(
-		readonly code: TransitCode,
-		message: string,
-	) {
+	/**
+	 * gRPC canonical status name answered to the peer for this refusal.
+	 */
+	readonly code: TransitCode;
+
+	constructor(code: TransitCode, message: string) {
 		super(message);
+		this.code = code;
 	}
 }
 
@@ -73,11 +81,14 @@ export const TRANSPORT_ERROR_NAME = "TightbeamTransportError";
 class ClientTransportError extends Error implements TransportError {
 	override readonly name: string = TRANSPORT_ERROR_NAME;
 
-	constructor(
-		readonly code: string,
-		message: string,
-	) {
+	/**
+	 * The tightbeam-rs error variant name used for programmatic branching.
+	 */
+	readonly code: string;
+
+	constructor(code: string, message: string) {
 		super(message);
+		this.code = code;
 	}
 }
 
@@ -116,7 +127,12 @@ export function connectionClosed(operation: string): TransportError {
  * - `DeadlineExceeded`, `Unauthenticated`, `PermissionDenied`: gate policy rejections.
  */
 export interface TransportError extends Error {
-	/** The tightbeam-rs error variant name. */
+	/**
+	 * The tightbeam-rs error variant name.
+	 *
+	 * Callers branch on this string. The set is stable across releases for
+	 * the codes listed on this interface.
+	 */
 	readonly code: string;
 }
 
