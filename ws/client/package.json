@@ -1,6 +1,6 @@
 {
 	"name": "@wahidgroup/tightbeam-ws-client",
-	"version": "0.1.0",
+	"version": "0.1.1",
 	"description": "Browser client for the tightbeam WebSocket transport: build tightbeam frames from a payload and ship them over a socket.",
 	"type": "module",
 	"main": "dist/index.js",
