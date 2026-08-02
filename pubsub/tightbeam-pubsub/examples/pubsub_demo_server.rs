@@ -306,7 +306,7 @@ async fn serve_ws_connection(
 	serve_handshake(&mut transport).await?;
 
 	let mux = assemble_mux(transport, MuxRole::Server)?;
-	serve_connection(mux, commands, move |context, frame| answer_stream(context, frame)).await?;
+	serve_connection(mux, commands, answer_stream).await?;
 
 	Ok(())
 }
