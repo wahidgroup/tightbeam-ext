@@ -26,10 +26,14 @@ The session profile (curve, AEAD, digests, certificate policy) is a compile-time
 
 A deployment on a different provider builds its own wasm crate against this one (it compiles as an `rlib`) and reuses the transport layer with its own `#[wasm_bindgen]` bindings:
 
-- `build_transport_with::<P>(socket, trust_store, credentials)` assembles the encrypted transport for any provider over an opened `gloo` WebSocket. The caller supplies a matching `Arc<dyn CertificateTrust>` (see `profile_trust_store` for the default-profile construction).
-- Mutual authentication is provider-generic too: `ClientCredentials::<P>::from_signer(cert_der, signer)` adapts an external JavaScript `TransportSigner` (WebAuthn, wallet, KMS bridge), so only OIDs and signature bytes cross the boundary. The signer's output must verify under `P`'s signature algorithm.
-- Drive the handshake on the returned transport (`perform_client_handshake`), where the concrete provider satisfies tightbeam's handshake bounds.
-- Single-flight traffic: call `emit` directly. Multiplexed traffic: offer mux before the handshake (`with_mux_config`), then `split_mux(transport)` yields the stream handle and responder with the driver tasks already running.
+1. `build_transport_with::<P>(socket, trust_store, credentials)` assembles the encrypted transport for any provider over an opened `gloo` WebSocket. The caller supplies a matching `Arc<dyn CertificateTrust>` (see `profile_trust_store` for the default-profile construction).
+2. Mutual authentication is provider-generic too: `ClientCredentials::<P>::from_signer(cert_der, signer)` adapts an external JavaScript `TransportSigner` (WebAuthn, wallet, KMS bridge), so only OIDs and signature bytes cross the boundary. The signer's output must verify under `P`'s signature algorithm.
+3. Drive the handshake on the returned transport (`perform_client_handshake`), where the concrete provider satisfies tightbeam's handshake bounds.
+4. Single-flight traffic: call `emit` directly. Multiplexed traffic: offer mux before the handshake (`with_mux_config`), then `split_mux(transport)` yields the stream handle and responder with the driver tasks already running.
+
+## Related
+
+The host transport lives in [tightbeam-ws](../tightbeam-ws). This crate ships inside the npm package `@wahidgroup/tightbeam-ws-client` ([client](../client)). See the [repository README](../../README.md) for development and release workflows.
 
 ## License
 

@@ -25,9 +25,10 @@ Two wasm bundles ship in the package, a `web` build and a `nodejs` build, select
 - [Install](#install)
 - [Cleartext round-trip](#cleartext-round-trip)
 - [Encrypted sessions (ECIES)](#encrypted-sessions-ecies)
-- [Session budgets (mutual auth only)](#session-budgets-mutual-auth-only)
+	- [Session budgets (mutual auth only)](#session-budgets-mutual-auth-only)
 - [Two-way streams](#two-way-streams)
-- [Progressive body streaming](#progressive-body-streaming)
+	- [Progressive body streaming](#progressive-body-streaming)
+	- [Routing server-initiated streams](#routing-server-initiated-streams)
 - [Cancellation and timeouts](#cancellation-and-timeouts)
 - [Connection lifecycle](#connection-lifecycle)
 - [Transport errors](#transport-errors)
@@ -39,6 +40,7 @@ Two wasm bundles ship in the package, a `web` build and a `nodejs` build, select
 - [Verification and decryption](#verification-and-decryption)
 - [Envelopes](#envelopes)
 - [Detached commitments](#detached-commitments)
+- [Related](#related)
 - [License](#license)
 
 ## Install
@@ -86,7 +88,7 @@ client.close();
 
 ## Encrypted sessions (ECIES)
 
-The server is authenticated by pinning its DER certificate. The ECIES handshake also negotiates stream multiplexing (HTTP/2-style, tightbeam's `transport-multiplex`): the `maxPeerStreams` option caps concurrent server-initiated streams (default 8), the server's advertisement caps this client's concurrent emits, and connecting to a server that does not offer multiplexing rejects.
+The server is authenticated by pinning its DER certificate. The ECIES handshake also negotiates stream multiplexing (HTTP/2-style, tightbeam's `transport-multiplex`). The `maxPeerStreams` option caps concurrent server-initiated streams (default 8), and the server's advertisement caps this client's concurrent emits. Connecting to a server that does not offer multiplexing rejects.
 
 ```ts
 import { TightbeamWsClient } from "@wahidgroup/tightbeam-ws-client";
@@ -103,7 +105,9 @@ const mutual = await TightbeamWsClient.connectMutual(
 );
 ```
 
-When the certificate key lives in an external key store (WebAuthn, a wallet, a KMS bridge), pass a `TransportSigner` instead of the raw scalar. The handshake hands it the transcript prehash to sign, so the private key never crosses into wasm. The contract is algorithm-agnostic: the signer signs the prehash directly (no rehash) and returns whatever signature encoding the session profile verifies. Under the default-profile build that is a secp256k1 signature as 64-byte `r || s`. A custom-profile build expects its own profile's encoding (see the [`tightbeam-ws-wasm` README](../tightbeam-ws-wasm/README.md)).
+When the certificate key lives in an external key store (WebAuthn, a wallet, a KMS bridge), pass a `TransportSigner` instead of the raw scalar. The handshake hands it the transcript prehash to sign, so the private key never crosses into wasm. The contract is algorithm-agnostic: the signer signs the prehash directly (no rehash) and returns whatever signature encoding the session profile verifies.
+
+Under the default-profile build that is a secp256k1 signature as 64-byte `r || s`. A custom-profile build expects its own profile's encoding (see the [`tightbeam-ws-wasm` README](../tightbeam-ws-wasm/README.md)).
 
 ```ts
 import type { TransportSigner } from "@wahidgroup/tightbeam-ws-client";
@@ -346,7 +350,7 @@ Local conditions carry their variant name: `ConnectionClosed`, `Draining`, and `
 - `Unknown`: unclassified peer handler failure
 - `DeadlineExceeded`, `Unauthenticated`, `PermissionDenied`: gate policy rejections
 
-Instead of retrying `StreamsExhausted` blind, wait for admission. `waitForStreamSlot()` resolves once a new stream would be admitted, rejects with `Draining` once no stream ever will be again, and takes the same `{ signal }` option as `emit` for callers that give up first. It is advisory like `hasStreamHeadroom`: a concurrent emit can take the slot between wake and use, so the rejection handling stays.
+Instead of retrying `StreamsExhausted` blind, wait for admission. `waitForStreamSlot()` resolves once a new stream would be admitted, and rejects with `Draining` once no stream ever will be again. It takes the same `{ signal }` option as `emit` for callers that give up first. Like `hasStreamHeadroom`, it is advisory: a concurrent emit can take the slot between wake and use, so the rejection handling stays.
 
 ```ts
 await mux.waitForStreamSlot({ signal: AbortSignal.timeout(5_000) });
@@ -628,6 +632,10 @@ const verified = await disclosed.verify(new Sha3_256(), commitment);
 ```
 
 `verify` resolves with `false` on an algorithm mismatch or a digest mismatch. An empty salt reproduces the plain body digest (binding, not hiding). Any `Hasher` works on both sides.
+
+## Related
+
+The host transport is [tightbeam-ws](../tightbeam-ws). Custom wasm transport profiles are documented in [tightbeam-ws-wasm](../tightbeam-ws-wasm). Topic subscriptions on top of this client live in [`@wahidgroup/tightbeam-pubsub-client`](../../pubsub/client). See the [repository README](../../README.md) for development and release workflows.
 
 ## License
 

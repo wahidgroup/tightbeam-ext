@@ -6,7 +6,7 @@ This repository is the supported home for everything beyond the tightbeam core: 
 
 ## Extensions
 
-Each extension lives in its own directory carrying everything it needs: crates, browser packages, and end-to-end tests. Each carries its own README with usage and design details.
+Each extension lives in its own directory carrying everything it needs: crates, browser packages, and end-to-end tests, plus a README with usage and design details.
 
 ### [ws/](ws) - WebSocket transport
 
@@ -24,7 +24,7 @@ Each extension lives in its own directory carrying everything it needs: crates, 
 make setup       # toolchains + npm workspaces + Playwright (idempotent)
 make lint        # rustfmt + clippy -D warnings + eslint/prettier + cspell
 make lint fix=1  # apply lint/format fixes
-make test        # cargo tests (all features) + dockerized e2e (TS app)
+make test        # cargo tests + TS units + dockerized e2e
 make build       # cargo build --release
 make audit       # cargo audit + npm audit
 make ci          # full CI pipeline
@@ -52,7 +52,9 @@ make release version=v0.1.0 dry-run=1  # preview without mutations
 make release yank=1                    # yank a published version
 ```
 
-Extensions are released independently: each top-level extension directory (e.g. `ws/`) versions its crates on its own. A release bumps that extension's versions, opens a release pull request, and on merge creates a signed `releases/<ext>/v<version>` tag. Pushing that tag publishes that extension's publishable crates to crates.io (Cargo multi-package, dependency order - not the whole workspace) and creates the GitHub release. The deploy guard `check-yanked.sh` refuses yanked versions (`yanked/<ext>/v<version>`).
+Extensions are released independently: each top-level extension directory (e.g. `ws/`) versions its crates on its own. A release bumps that extension's versions, opens a release pull request, and on merge creates a signed `releases/<ext>/v<version>` tag. Pushing that tag publishes that extension's publishable crates to crates.io (Cargo multi-package, dependency order - not the whole workspace) and creates the GitHub release.
+
+The deploy guard `check-yanked.sh` refuses yanked versions (`yanked/<ext>/v<version>`).
 
 ## License
 

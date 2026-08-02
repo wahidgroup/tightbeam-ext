@@ -18,7 +18,7 @@ This crate exposes WebSocket framing for tightbeam transports. Authentication an
 
 ## Limitations
 
-- The listener has no native TLS acceptor: it binds `ws://` only. This does not gate security or `wss://` deployments. Authentication and confidentiality come from tightbeam's ECIES handshake above the socket, and browsers on `https://` pages connect over `wss://` by terminating TLS in front (reverse proxy, load balancer) and forwarding `ws://` to this crate.
+- The listener has no native TLS acceptor: it binds `ws://` only. This does not gate security or `wss://` deployments. Authentication and confidentiality come from tightbeam's ECIES handshake above the socket. Browsers on `https://` pages connect over `wss://` by terminating TLS in front (reverse proxy, load balancer) and forwarding `ws://` to this crate.
 
 ## Sources
 
