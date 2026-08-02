@@ -2,7 +2,7 @@
 //!
 //! Wraps tightbeam [`RequestSink`] / [`StreamBody`] / [`ReplySink`] for
 //! JavaScript. Pushes reach the wire eagerly, so a duplex exchange may
-//! await a reply chunk between pushes; a known final chunk closes the
+//! await a reply chunk between pushes. A known final chunk closes the
 //! body in one record via `closeWith`.
 //!
 //! Every async method clones an `Rc` to shared state into the promise so
@@ -29,7 +29,7 @@ use tightbeam::utils::marker::MaybeSend;
 use tightbeam::utils::urn::Urn;
 use tightbeam::Frame;
 
-use crate::fault::{transport_to_js, validation};
+use crate::fault::{debug_coded, transport_to_js, validation};
 use crate::mux::status_from_code;
 use crate::promise::bytes_or_undefined;
 use crate::secure::response_der;
@@ -137,12 +137,16 @@ pub struct MuxDuplexStream {
 
 #[wasm_bindgen(js_class = MuxDuplexStream)]
 impl MuxDuplexStream {
+	/// Open an unrouted duplex stream on `handle`.
 	pub(crate) fn open(handle: &MuxHandle) -> Result<MuxDuplexStream, JsValue> {
 		let (sink, body) = handle.open_duplex().map_err(transport_to_js)?;
 		Ok(Self::from_parts(sink, body))
 	}
 
 	/// Open a duplex stream routed to a servlet URN (`urn:<nid>:<nss>`).
+	///
+	/// The Open carries the origin hop-budget sentinel so the first
+	/// gateway applies its `max_hops` clamp.
 	pub(crate) fn open_to(handle: &MuxHandle, target: &str) -> Result<MuxDuplexStream, JsValue> {
 		let urn = parse_stream_target(target)?;
 		let (sink, body) = handle.open_duplex_to(urn).map_err(transport_to_js)?;
@@ -330,7 +334,7 @@ async fn call_streaming_handler(
 	}
 
 	let response_der = Uint8Array::from(settled).to_vec();
-	let response = Frame::from_der(&response_der).map_err(|error| crate::fault::debug_coded(&error))?;
+	let response = Frame::from_der(&response_der).map_err(|error| debug_coded(&error))?;
 	Ok(ResponsePackage::new(TransitStatus::Ok, Some(response)))
 }
 

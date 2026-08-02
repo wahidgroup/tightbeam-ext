@@ -284,7 +284,7 @@ export interface ConnectOptions {
 	maxPeerStreams?: number;
 	/**
 	 * Per-direction session-budget credits to request. Mutual auth only
-	 * ({@link TightbeamWsClient.connectMutual}); rejected on other connectors.
+	 * ({@link TightbeamWsClient.connectMutual}). Rejected on other connectors.
 	 */
 	budgets?: { clientToServer: number; serverToClient: number };
 	/**
@@ -365,15 +365,20 @@ function assertNoSessionOffer(
 }
 
 /**
+ * Mutual-only session knobs packed for the wasm dial.
+ */
+interface SessionOfferJs {
+	budgets?: { clientToServer: number; serverToClient: number };
+	authorization?: Uint8Array;
+	approveReceipt?: ConnectOptions["approveReceipt"];
+}
+
+/**
  * Pack mutual-only session knobs for the wasm dial, or omit when unused.
  */
-function sessionOfferFrom(options: ConnectOptions | undefined):
-	| {
-			budgets?: { clientToServer: number; serverToClient: number };
-			authorization?: Uint8Array;
-			approveReceipt?: ConnectOptions["approveReceipt"];
-	  }
-	| undefined {
+function sessionOfferFrom(
+	options: ConnectOptions | undefined,
+): SessionOfferJs | undefined {
 	if (options === undefined) {
 		return undefined;
 	}
@@ -385,11 +390,12 @@ function sessionOfferFrom(options: ConnectOptions | undefined):
 		return undefined;
 	}
 
-	return {
+	const offer: SessionOfferJs = {
 		budgets: options.budgets,
 		authorization: options.authorization,
 		approveReceipt: options.approveReceipt,
 	};
+	return offer;
 }
 
 /**
@@ -490,7 +496,7 @@ export type MuxStreamHandler = (
 ) => Promise<Frame | undefined | null> | Frame | undefined | null;
 
 /**
- * Progressive body source: each yield is one wire chunk; the iterator
+ * Progressive body source. Each yield is one wire chunk. The iterator
  * ends after the peer's `last` chunk.
  */
 export type StreamBodySource = AsyncIterable<Uint8Array>;
@@ -637,30 +643,35 @@ function wrapRequestStream(stream: WasmRequestStream): RequestStream {
 			return undefined;
 		}
 
-		return Frame.fromDer(der);
+		const frame = Frame.fromDer(der);
+		return frame;
 	};
 
-	return {
+	const wrapped: RequestStream = {
 		push: (chunk: Uint8Array): Promise<void> => stream.push(chunk),
 		close: async (): Promise<Frame | undefined> => {
 			const der = await stream.close();
-			return decodeResponse(der);
+			const response = decodeResponse(der);
+			return response;
 		},
 		closeWith: async (chunk: Uint8Array): Promise<Frame | undefined> => {
 			const der = await stream.closeWith(chunk);
-			return decodeResponse(der);
+			const response = decodeResponse(der);
+			return response;
 		},
 	};
+	return wrapped;
 }
 
 function wrapDuplexStream(stream: WasmDuplexStream): DuplexStream {
-	return {
+	const wrapped: DuplexStream = {
 		push: (chunk: Uint8Array): Promise<void> => stream.push(chunk),
 		close: (): Promise<void> => stream.close(),
 		closeWith: (chunk: Uint8Array): Promise<void> =>
 			stream.closeWith(chunk),
 		body: bodyChunks(stream),
 	};
+	return wrapped;
 }
 
 /**
@@ -855,7 +866,7 @@ export class TightbeamWsClient extends SocketLifecycle<MuxWsClient> {
 			throw new InternalError(
 				"ServeDispatchClaimed",
 				"stream dispatch is exclusively claimed on this client " +
-					"(a SubscriptionManager?); route application streams " +
+					"(a SubscriptionManager?). Route application streams " +
 					"through the claimant instead of calling serve again",
 			);
 		}
@@ -905,19 +916,24 @@ export class TightbeamWsClient extends SocketLifecycle<MuxWsClient> {
 		this.requireLive("openStream");
 
 		const stream = this.socket.openStream();
-		return wrapRequestStream(stream);
+		const request = wrapRequestStream(stream);
+		return request;
 	}
 
 	/**
 	 * Progressive client request routed to a servlet URN
 	 * (`urn:<nid>:<nss>`). The Open carries the origin hop-budget
 	 * sentinel so the first gateway applies its `max_hops` clamp.
+	 *
+	 * @throws TightbeamTransportError with code `InvalidStreamRoute`
+	 * when `target` is not a URN.
 	 */
 	openStreamTo(target: string): RequestStream {
 		this.requireLive("openStreamTo");
 
 		const stream = this.socket.openStreamTo(target);
-		return wrapRequestStream(stream);
+		const request = wrapRequestStream(stream);
+		return request;
 	}
 
 	/**
@@ -932,22 +948,31 @@ export class TightbeamWsClient extends SocketLifecycle<MuxWsClient> {
 		this.requireLive("openDuplex");
 
 		const stream = this.socket.openDuplex();
-		return wrapDuplexStream(stream);
+		const duplex = wrapDuplexStream(stream);
+		return duplex;
 	}
 
 	/**
 	 * Duplex stream routed to a servlet URN (`urn:<nid>:<nss>`).
+	 *
+	 * As {@link openStreamTo}: the Open carries the origin hop-budget
+	 * sentinel so the first gateway applies its `max_hops` clamp.
+	 *
+	 * @throws TightbeamTransportError with code `InvalidStreamRoute`
+	 * when `target` is not a URN.
 	 */
 	openDuplexTo(target: string): DuplexStream {
 		this.requireLive("openDuplexTo");
 
 		const stream = this.socket.openDuplexTo(target);
-		return wrapDuplexStream(stream);
+		const duplex = wrapDuplexStream(stream);
+		return duplex;
 	}
 
 	/**
-	 * Serve peer streams as progressive bodies. Mutually exclusive with
-	 * {@link serve} / {@link serveDuplex}.
+	 * Serve peer streams as progressive bodies. The handler receives the
+	 * body chunks and the Open's {@link StreamRoute}. Mutually exclusive
+	 * with {@link serve} / {@link serveDuplex}.
 	 */
 	serveStreaming(
 		handler: StreamingBodyHandler,
@@ -963,7 +988,8 @@ export class TightbeamWsClient extends SocketLifecycle<MuxWsClient> {
 					return undefined;
 				}
 
-				return response.toDer();
+				const responseDer = response.toDer();
+				return responseDer;
 			},
 		);
 	}
@@ -1086,8 +1112,8 @@ export class TightbeamWsClient extends SocketLifecycle<MuxWsClient> {
 
 	/**
 	 * Usable outbound session-budget credits for this epoch, or
-	 * `undefined` when unmetered. Invoice sizing uses this figure;
-	 * there is no live remaining-balance getter.
+	 * `undefined` when unmetered. Invoice sizing uses this figure.
+	 * There is no live remaining-balance getter.
 	 */
 	get usableSendBudget(): number | undefined {
 		if (this.isReleased) {

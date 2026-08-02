@@ -79,7 +79,7 @@ export class ValidationError extends Error {
 	}
 
 	/**
-	 * Duck-type guard for `ValidationError` instances; survives multiple
+	 * Duck-type guard for `ValidationError` instances. Survives multiple
 	 * copies of this module in one graph where `instanceof` would not.
 	 */
 	static isInstance(err: unknown): err is ValidationError {

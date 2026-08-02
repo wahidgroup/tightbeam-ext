@@ -36,6 +36,7 @@ use crate::secure::{build_signer_transport, build_transport, response_der, Clien
 use crate::signer::TransportSigner;
 use crate::socket::{open_observed, SocketMonitor};
 use crate::stream::{GlooStream, WsTransport};
+use crate::streaming::{start_serve_duplex, start_serve_streaming, MuxDuplexStream, MuxRequestStream};
 
 /// Optional budget / settlement knobs for a mutual-auth dial.
 struct SessionOffer {
@@ -50,9 +51,9 @@ impl SessionOffer {
 			return Ok(Self { budgets: None, authorization: None, approver: None });
 		}
 
-		let budgets = budgets_from_js(&js_sys::Reflect::get(value, &JsValue::from_str("budgets"))?)?;
-		let authorization = authorization_from_js(&js_sys::Reflect::get(value, &JsValue::from_str("authorization"))?)?;
-		let approver = approver_from_js(&js_sys::Reflect::get(value, &JsValue::from_str("approveReceipt"))?)?;
+		let budgets = budgets_from_js(&Reflect::get(value, &JsValue::from_str("budgets"))?)?;
+		let authorization = authorization_from_js(&Reflect::get(value, &JsValue::from_str("authorization"))?)?;
+		let approver = approver_from_js(&Reflect::get(value, &JsValue::from_str("approveReceipt"))?)?;
 
 		Ok(Self { budgets, authorization, approver })
 	}
@@ -121,9 +122,13 @@ fn goaway_label(reason: GoAwayReason) -> String {
 
 /// A multiplexed tightbeam client over a single browser WebSocket session.
 ///
-/// Requests are concurrent: every [`request`](Self::request) follows its own
-/// stream, and a caller-supplied handler ([`serve`](Self::serve)) answers
-/// streams the server initiates.
+/// Concurrent unary [`request`](Self::request) calls share the connection.
+/// Progressive bodies use [`open_stream`](Self::open_stream) /
+/// [`open_stream_to`](Self::open_stream_to) and duplex
+/// [`open_duplex`](Self::open_duplex) / [`open_duplex_to`](Self::open_duplex_to).
+/// Peer-initiated work is answered by [`serve`](Self::serve),
+/// [`serve_streaming`](Self::serve_streaming), or
+/// [`serve_duplex`](Self::serve_duplex) (mutually exclusive on first claim).
 ///
 /// Async operations run on cloned handles instead of borrowing the wasm
 /// object: `free()` is safe with requests in flight, which then settle
@@ -301,9 +306,9 @@ impl MuxWsClient {
 	/// returns (or resolves with) the response frame DER, or `undefined`/`null`
 	/// for a bodiless acceptance. A rejection whose `code` names a gRPC
 	/// canonical status (the client's `StreamRefusal`) answers the stream with
-	/// that status; any other throwing or rejecting handler answers `Unknown`.
+	/// that status. Any other throwing or rejecting handler answers `Unknown`.
 	///
-	/// Callable repeatedly: the latest handler serves every stream dispatched
+	/// Callable repeatedly. The latest handler serves every stream dispatched
 	/// after the call, and streams already in flight finish on the handler they
 	/// started with. Handlers for distinct streams run concurrently.
 	///
@@ -328,8 +333,8 @@ impl MuxWsClient {
 
 	/// Progressive request body: push chunks, then close for a Frame reply.
 	#[wasm_bindgen(js_name = openStream)]
-	pub fn open_stream(&self) -> Result<crate::streaming::MuxRequestStream, JsValue> {
-		crate::streaming::MuxRequestStream::open(&self.handle)
+	pub fn open_stream(&self) -> Result<MuxRequestStream, JsValue> {
+		MuxRequestStream::open(&self.handle)
 	}
 
 	/// Progressive request routed to a servlet URN (`urn:<nid>:<nss>`).
@@ -337,8 +342,8 @@ impl MuxWsClient {
 	/// The Open carries the origin hop-budget sentinel so the first
 	/// gateway applies its `max_hops` clamp.
 	#[wasm_bindgen(js_name = openStreamTo)]
-	pub fn open_stream_to(&self, target: &str) -> Result<crate::streaming::MuxRequestStream, JsValue> {
-		crate::streaming::MuxRequestStream::open_to(&self.handle, target)
+	pub fn open_stream_to(&self, target: &str) -> Result<MuxRequestStream, JsValue> {
+		MuxRequestStream::open_to(&self.handle, target)
 	}
 
 	/// Full-duplex body streaming on one stream id.
@@ -346,14 +351,17 @@ impl MuxWsClient {
 	/// Pushes reach the wire eagerly, so awaiting a reply chunk
 	/// between pushes (a chunk-for-chunk conversation) is sound.
 	#[wasm_bindgen(js_name = openDuplex)]
-	pub fn open_duplex(&self) -> Result<crate::streaming::MuxDuplexStream, JsValue> {
-		crate::streaming::MuxDuplexStream::open(&self.handle)
+	pub fn open_duplex(&self) -> Result<MuxDuplexStream, JsValue> {
+		MuxDuplexStream::open(&self.handle)
 	}
 
 	/// Duplex stream routed to a servlet URN (`urn:<nid>:<nss>`).
+	///
+	/// As [`open_stream_to`](Self::open_stream_to): the Open carries the
+	/// origin hop-budget sentinel for the first gateway's `max_hops` clamp.
 	#[wasm_bindgen(js_name = openDuplexTo)]
-	pub fn open_duplex_to(&self, target: &str) -> Result<crate::streaming::MuxDuplexStream, JsValue> {
-		crate::streaming::MuxDuplexStream::open_to(&self.handle, target)
+	pub fn open_duplex_to(&self, target: &str) -> Result<MuxDuplexStream, JsValue> {
+		MuxDuplexStream::open_to(&self.handle, target)
 	}
 
 	/// Serve peer streams as progressive bodies. The handler receives a
@@ -365,7 +373,7 @@ impl MuxWsClient {
 		self.handler.replace(handler);
 
 		if let Some(responder) = self.responder.take() {
-			crate::streaming::start_serve_streaming(responder, Rc::clone(&self.handler));
+			start_serve_streaming(responder, Rc::clone(&self.handler));
 		}
 	}
 
@@ -379,7 +387,7 @@ impl MuxWsClient {
 		self.handler.replace(handler);
 
 		if let Some(responder) = self.responder.take() {
-			crate::streaming::start_serve_duplex(responder, Rc::clone(&self.handler));
+			start_serve_duplex(responder, Rc::clone(&self.handler));
 		}
 	}
 
@@ -479,7 +487,7 @@ impl MuxWsClient {
 	/// so the peer's reconnect policy can branch on it.
 	///
 	/// `reason` is a label or a numeric code. Codes outside the reserved
-	/// range are application-defined; the label `"Application"` alone
+	/// range are application-defined. The label `"Application"` alone
 	/// carries no code and is rejected.
 	#[wasm_bindgen(js_name = shutdownWith, unchecked_return_type = "Promise<void>")]
 	pub fn shutdown_with(
@@ -503,7 +511,7 @@ impl MuxWsClient {
 
 	/// Usable outbound session-budget credits for this epoch, or
 	/// `undefined` when the session is unmetered. Invoice sizing uses
-	/// this figure (grant minus drain reserve); there is no live
+	/// this figure (grant minus drain reserve). There is no live
 	/// remaining-balance getter.
 	#[wasm_bindgen(getter, js_name = usableSendBudget)]
 	pub fn usable_send_budget(&self) -> Option<f64> {

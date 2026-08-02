@@ -32,7 +32,7 @@ export interface CompressedBody {
 	 */
 	readonly parametersDer?: Uint8Array;
 	/**
-	 * Content-type OID of the uncompressed body; defaults to
+	 * Content-type OID of the uncompressed body. Defaults to
 	 * `id-ct-compressedData` when omitted.
 	 */
 	readonly contentOid?: string;
@@ -114,9 +114,9 @@ interface ZstdModule {
 let zstdLoading: Promise<ZstdModule> | undefined;
 
 /**
- * Load and initialize the bundled libzstd wasm module once; subsequent
- * calls await the same load. Lazy, so clients that never compress never
- * pay for it.
+ * Load and initialize the bundled libzstd wasm module once. Subsequent
+ * calls await the same load. The load is lazy, so clients that never
+ * compress never pay for it.
  */
 function zstdModule(): Promise<ZstdModule> {
 	if (zstdLoading === undefined) {
@@ -249,14 +249,12 @@ function serializeSeekTable(frames: SeekFrame[]): Uint8Array {
 
 /**
  * The tightbeam profile compression: zstd in the seekable format
- * (`PROFILE_OIDS.zstd`), wire-compatible with tightbeam-rs
- * `ZstdCompression` (zeekstd). Backed by a lazily loaded wasm build of
- * libzstd.
+ * (`PROFILE_OIDS.zstd`), wire-compatible with tightbeam-rs `ZstdCompression`
+ * (zeekstd). Backed by a lazily loaded wasm build of libzstd.
  *
- * Decompression is bounded. The seek table's declared output size is
- * checked against `maxOutput` (default 16 MiB, matching tightbeam-rs)
- * before any allocation, so a wire-supplied decompression bomb is rejected
- * up front.
+ * Decompression is bounded. The seek table's declared output size is checked
+ * against `maxOutput` (default 16 MiB, matching tightbeam-rs) before any
+ * allocation, so a wire-supplied decompression bomb is rejected up front.
  *
  * # Sources
  *

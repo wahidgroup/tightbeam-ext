@@ -20,7 +20,7 @@ $(PROJECTS):
 	@:
 
 # Flags forwarded to project Makefiles.
-PASSTHRU := features="$(features)" no-default="$(no-default)" fix="$(fix)"
+PASSTHRU := features="$(features)" no-default="$(no-default)" fix="$(fix)" wasm_opt="$(wasm_opt)"
 
 # Run one target in every scoped project.
 define EACH_PROJECT
@@ -105,6 +105,7 @@ help-body:
 	@printf '    yank            If set (e.g., yank=1), yank a published version\n'
 	@printf '    ui              If set (e.g., ui=1), run the e2e suite in Playwright UI mode\n'
 	@printf '    trace           If set (e.g., trace=1), force Playwright traces\n'
+	@printf '    wasm_opt        If set (e.g., wasm_opt=1), keep wasm-opt during make test (default: skip)\n'
 	@printf '    NPM_INSTALL_FLAGS  Extra flags for npm install/ci (e.g. --ignore-scripts)\n'
 	@printf '    CI              If set (CI=true), setup.sh uses npm ci\n\n'
 	@printf 'EXAMPLES:\n'
@@ -200,7 +201,7 @@ audit: setup
 ci:
 	$(MAKE) lint SCOPE="$(SCOPE)"
 	$(MAKE) build SCOPE="$(SCOPE)"
-	$(MAKE) test SCOPE="$(SCOPE)"
+	$(MAKE) test SCOPE="$(SCOPE)" wasm_opt=1
 	$(MAKE) wasm SCOPE="$(SCOPE)"
 	$(MAKE) client SCOPE="$(SCOPE)"
 	$(MAKE) smoke SCOPE="$(SCOPE)"

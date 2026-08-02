@@ -39,13 +39,17 @@ struct OpaqueBody {
 /// operations.
 #[derive(Default)]
 pub struct FrameConfig {
-	/// Protocol version; when `None` uses the floor for the structural
+	/// Protocol version. When `None`, uses the floor for the structural
 	/// fields. Callers configuring security afterwards MUST pin the version
 	/// themselves, since this config never sees those fields.
 	pub version: Option<Version>,
 	/// Opaque message identifier.
 	pub id: Vec<u8>,
-	/// Monotonic order (Unix seconds).
+	/// Frame order stamp.
+	///
+	/// The value is protocol-opaque. Any monotonic scheme works, such as a
+	/// Unix timestamp or a dense per-channel counter. When omitted, the
+	/// build defaults it to the current Unix time in seconds.
 	pub order: u64,
 	/// The frame body as DER: any `Message` encoding the peer expects.
 	/// Callers without an ASN.1 schema wrap raw payload bytes with
@@ -57,14 +61,15 @@ pub struct FrameConfig {
 	pub lifetime: Option<u64>,
 	/// Parent-frame link by content digest (V2+).
 	pub previous_hash: Option<DigestInfo>,
-	/// N×N control matrix (V2+).
+	/// N×N control matrix (V3+).
 	pub matrix: Option<MatrixDyn>,
 }
 
 impl FrameConfig {
-	/// Lowest frame version that admits the structural fields. The matrix is
-	/// a V3 feature; priority, lifetime, and previous-hash are V2 features; a
-	/// bare payload stays at V0.
+	/// Lowest frame version that admits the configured structural fields.
+	///
+	/// The matrix requires V3. Priority, lifetime, and previous-hash require
+	/// V2. A bare payload stays at V0.
 	fn effective_version(&self) -> Version {
 		if let Some(version) = self.version {
 			return version;
@@ -86,7 +91,7 @@ impl FrameConfig {
 	/// `message` is installed as the frame body. The builder never
 	/// re-encodes it, so any `Message` schema round-trips bit-exactly.
 	pub fn build(self) -> Result<Vec<u8>, TightBeamError> {
-		// The upstream builder requires a typed message; build with an
+		// The upstream builder requires a typed message. Build with an
 		// empty placeholder body, then install the caller's body DER.
 		let placeholder = OpaqueBody { body: OctetString::new([])? };
 
@@ -328,11 +333,15 @@ pub struct FrameSummary {
 	pub version: u8,
 	/// Opaque message identifier.
 	pub id: Vec<u8>,
-	/// Monotonic order (Unix seconds).
+	/// Frame order stamp.
+	///
+	/// The value is protocol-opaque. Any monotonic scheme works, such as a
+	/// Unix timestamp or a dense per-channel counter. When omitted at build
+	/// time, the profile defaults to the current Unix time in seconds.
 	pub order: u64,
-	/// The raw frame body: the caller's body DER when cleartext, the
+	/// The raw frame body: the caller's body DER when cleartext, or the
 	/// ciphertext when confidential. Decode a profile opaque body with
-	/// [`decode_body`]; typed bodies decode under the caller's schema.
+	/// [`decode_body`]. Typed bodies decode under the caller's schema.
 	pub body_der: Vec<u8>,
 	/// Message priority ordinal (`LowEffort` -> 0, ...), when present (V2+).
 	pub priority: Option<u8>,
@@ -473,7 +482,7 @@ pub fn profile_signer_id(public_key_sec1: impl AsRef<[u8]>) -> Result<Vec<u8>, T
 /// Verify a frame's non-repudiation signature against a SEC1-encoded
 /// secp256k1 public key under the profile scheme (ECDSA over SHA3-256).
 ///
-/// `Ok(())` means the signature is valid; a missing signature, an algorithm
+/// `Ok(())` means the signature is valid. A missing signature, an algorithm
 /// mismatch, or a bad signature are all errors. Frames signed under other
 /// schemes verify caller-side from [`tbs_bytes`] and the carried signature.
 pub fn verify_signature(frame_der: impl AsRef<[u8]>, public_key_sec1: impl AsRef<[u8]>) -> Result<(), TightBeamError> {
@@ -841,8 +850,8 @@ mod tests {
 		Ok(())
 	}
 
-	/// The structure path is algorithm-agnostic, so garbage bytes attach;
-	/// verification is where they must fail.
+	/// The structure path is algorithm-agnostic, so garbage bytes attach.
+	/// Verification is where they must fail.
 	#[test]
 	fn garbage_signature_attaches_but_fails_verification() -> TestResult {
 		let frame_der = seal_frame(b"junk", 1)?;

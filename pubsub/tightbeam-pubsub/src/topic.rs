@@ -11,9 +11,9 @@
 //!   <https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html>
 //!
 
+use core::error::Error;
 use core::fmt;
 use core::str::{from_utf8, FromStr, Utf8Error};
-use std::error::Error;
 use std::sync::Arc;
 
 /// Wire prefix a client subscribes with: `sub/<topic>`.

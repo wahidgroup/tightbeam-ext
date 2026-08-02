@@ -2,7 +2,7 @@
 //!
 //! Runs only as a backend process: browsers never reach it. The demo
 //! server's `RelayBackplane` dials it over a multiplexed encrypted
-//! tightbeam-ws connection and relays every publish through it; the
+//! tightbeam-ws connection and relays every publish through it. The
 //! servlet answers each request with the transformed inner frame,
 //! which is what the registry then sequences and fans out.
 //!
@@ -23,6 +23,7 @@
 //!   - `MUX_STREAMS`            client-initiated concurrency cap (default `8`)
 
 use std::env;
+use std::error::Error;
 use std::fs;
 use std::sync::Arc;
 
@@ -46,13 +47,13 @@ use tightbeam_ws::testing::{budget_ceiling, env_u32, paywall_enabled, serve_hand
 use tokio::net::TcpStream;
 use tokio_tungstenite::MaybeTlsStream;
 
-type BoxError = Box<dyn std::error::Error + Send + Sync>;
+type BoxError = Box<dyn Error + Send + Sync>;
 
 /// The transport an accepted WebSocket connection follows.
 type ServerTransport = WsTransport<MaybeTlsStream<TcpStream>>;
 
 /// The demo's pre-shared, deterministic AES-256-GCM key. Subscribers
-/// declare it in their envelope (`sealed(Aes256Gcm.fromKey(...))`); a
+/// declare it in their envelope (`sealed(Aes256Gcm.fromKey(...))`). A
 /// production servlet would provision per-topic keys instead.
 const PROCESSED_TOPIC_KEY: [u8; 32] = [0x07; 32];
 

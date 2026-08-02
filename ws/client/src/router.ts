@@ -36,7 +36,7 @@ export interface Route {
 
 /**
  * A server-initiated stream arrived with an id no route matches. Thrown
- * from the routed handler; its `Unimplemented` code answers the stream.
+ * from the routed handler. Its `Unimplemented` code answers the stream.
  */
 export class UnroutedTopicError extends StreamRefusal {
 	override readonly name: string = "UnroutedTopicError";

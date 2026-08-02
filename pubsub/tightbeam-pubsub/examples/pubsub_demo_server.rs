@@ -24,6 +24,9 @@
 //!   - `PUBSUB_PROCESSOR_CERT`      path to the processor certificate DER the
 //!     relay dial pins (required with the endpoint)
 //!   - `TBWS_CLIENT_CERT`           required when `TBWS_PAYWALL=1`
+//!   - `TBWS_CLIENT_KEY`            raw 32-byte client signing key. Required
+//!     for the processor relay dial under paywall (distinct from the
+//!     server identity this process presents to browsers)
 //!   - `TBWS_PAYWALL`               enable demo session-budget paywall
 
 use core::fmt;
@@ -61,7 +64,7 @@ use tokio::sync::mpsc::{channel, Sender};
 use tokio::time::timeout;
 use tokio_tungstenite::{connect_async, MaybeTlsStream};
 
-type BoxError = Box<dyn std::error::Error + Send + Sync>;
+type BoxError = Box<dyn Error + Send + Sync>;
 
 /// The transport an accepted WebSocket connection follows.
 type ServerTransport = WsTransport<MaybeTlsStream<TcpStream>>;
@@ -107,26 +110,30 @@ const RELAY_DEPTH: usize = 64;
 /// servlet's answer is what gets sequenced and fanned out. Composes the
 /// stock [`Local`] for sequencing and sink management.
 ///
-/// A publish acks once enqueued (the distributed-backplane contract, so
-/// relay delivery is at-most-once). The queue is bounded at [`RELAY_DEPTH`]
-/// a saturated relay answers `Unavailable` instead of growing without limit,
-/// and a processor failure closes the relay so every later publish answers
-/// `Unavailable` instead of silently dropping.
+/// This fabric documents **at-most-once** acks. [`Backplane::publish`]
+/// returns once the work is enqueued, not once [`Local`] has stamped and
+/// delivered. The queue is bounded at [`RELAY_DEPTH`]. A saturated relay
+/// answers `Unavailable` instead of growing without limit. A processor
+/// failure closes the relay so every later publish answers `Unavailable`
+/// instead of silently dropping.
 struct RelayBackplane {
 	local: Local,
 	requests: Sender<(Topic, Vec<u8>)>,
 }
 
 impl RelayBackplane {
-	/// Dial the processor over ECIES (pinning `cert_path`) and spawn the
-	/// relay worker. When `paywall` is set, the dial presents `identity`
-	/// as the client and pays demo invoices so renewals stay live.
+	/// Dial the processor over ECIES, pin `cert_path`, and spawn the relay
+	/// worker.
+	///
+	/// When `paywall` is set, the dial presents `client` (the stack client
+	/// fixture the processor pins) and pays demo invoices so renewals stay
+	/// live.
 	async fn connect(
 		endpoint: &str,
 		cert_path: &str,
 		cap: u32,
 		paywall: bool,
-		identity: &Identity,
+		client: &Identity,
 	) -> Result<Arc<Self>, BoxError> {
 		let trust = pinned_trust(&fs::read(cert_path)?)?;
 		let (websocket, _response) = connect_async(endpoint).await?;
@@ -139,7 +146,7 @@ impl RelayBackplane {
 
 		let mut transport = transport.with_trust_store(trust).with_mux_offer(Some(offer));
 		if paywall {
-			let (cert, keys) = identity.client_identity();
+			let (cert, keys) = client.client_identity();
 			transport = transport
 				.with_client_identity(cert, keys)
 				.with_receipt_approver(FixedWallet::shared(1024)?);
@@ -148,9 +155,20 @@ impl RelayBackplane {
 		transport.perform_client_handshake().await?;
 
 		let mux = assemble_mux(transport, MuxRole::Client)?;
-		let (handle, reader_driver, writer_driver, _responder) = mux.into_parts();
+		let (handle, reader_driver, writer_driver, responder) = mux.into_parts();
+
 		tokio::spawn(reader_driver.drive());
 		tokio::spawn(writer_driver.drive());
+		/*
+		 * Serve the responder so peer-initiated work such as paywall
+		 * renewals drains. Otherwise the inbound queue fills and emit
+		 * stalls.
+		 */
+		tokio::spawn(async move {
+			let _ = responder
+				.serve(|_| async { ResponsePackage::new(TransitStatus::Unimplemented, None) })
+				.await;
+		});
 
 		Ok(Self::spawned(handle))
 	}
@@ -195,8 +213,8 @@ impl RelayBackplane {
 
 /// How long one processor round-trip may take: an emit on a lost mux
 /// link can hang rather than error, so a timeout means the relay link
-/// is dead.
-const PROCESSOR_TIMEOUT: Duration = Duration::from_secs(2);
+/// is dead. Sized for a cold dockerized servlet under parallel e2e load.
+const PROCESSOR_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// One bounded round-trip to the processor: raw payload out, processed
 /// back.
@@ -222,6 +240,14 @@ impl Backplane for RelayBackplane {
 
 			BackplaneError::Unavailable(cause)
 		})
+	}
+
+	fn reserve_order(&self, topic: &Topic) -> u64 {
+		self.local.reserve_order(topic)
+	}
+
+	fn last_order(&self, topic: &Topic) -> u64 {
+		self.local.last_order(topic)
 	}
 }
 
@@ -269,6 +295,10 @@ async fn answer_poke(handle: &MuxHandle) -> ResponsePackage {
 
 /// Complete every topic, wait for the completion pushes to leave, then
 /// drain this connection with an orderly `Shutdown` GoAway.
+///
+/// This demo path is open to any connected peer. A production surface
+/// MUST authorize the caller before it exposes an equivalent command.
+/// Use [`serve_connection_as`] with a policy check when identity matters.
 async fn answer_quiesce(registry: &TopicRegistry, handle: &MuxHandle) -> ResponsePackage {
 	if let Err(error) = registry.quiesce() {
 		eprintln!("[pubsub-demo] quiesce failed: {error}");
@@ -321,6 +351,20 @@ fn client_validators(path: &str) -> Result<Vec<Arc<dyn CertificateValidation>>, 
 	Ok(vec![Arc::new(pinning)])
 }
 
+/// Load the client fixture from `TBWS_CLIENT_CERT` and `TBWS_CLIENT_KEY`.
+///
+/// The processor pins that certificate on mutual-auth dials.
+fn relay_client_identity() -> Result<Identity, BoxError> {
+	let certificate_der = fs::read(var("TBWS_CLIENT_CERT")?)?;
+	let key_bytes = fs::read(var("TBWS_CLIENT_KEY")?)?;
+	let key: [u8; 32] = key_bytes
+		.as_slice()
+		.try_into()
+		.map_err(|_| "TBWS_CLIENT_KEY must hold exactly 32 bytes")?;
+
+	Ok(Identity::from_der(&certificate_der, &key)?)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
 	let port = env_u32("PUBSUB_WS_PORT", 9110);
@@ -334,7 +378,12 @@ async fn main() -> Result<(), BoxError> {
 	let mut options = RegistryOptions { queue_capacity, ..RegistryOptions::default() };
 	if let Ok(endpoint) = var("PUBSUB_PROCESSOR_ENDPOINT") {
 		let cert_path = var("PUBSUB_PROCESSOR_CERT")?;
-		options.backplane = RelayBackplane::connect(&endpoint, &cert_path, cap, paywall, &identity).await?;
+		/*
+		 * The processor pins `TBWS_CLIENT_CERT`. Present that client
+		 * fixture on the relay dial, not this process's server identity.
+		 */
+		let client = relay_client_identity()?;
+		options.backplane = RelayBackplane::connect(&endpoint, &cert_path, cap, paywall, &client).await?;
 		println!("[pubsub-demo] publishing through the processor at {endpoint}");
 	}
 
@@ -397,7 +446,8 @@ mod tests {
 	/// the worker observes the processor failure asynchronously, no
 	/// sooner than [`PROCESSOR_TIMEOUT`] on a hung link.
 	async fn relay_refused(backplane: &RelayBackplane, topic: &Topic) -> bool {
-		for _ in 0..50 {
+		let deadline = tokio::time::Instant::now() + PROCESSOR_TIMEOUT + Duration::from_secs(2);
+		while tokio::time::Instant::now() < deadline {
 			let outcome = backplane.publish(topic, b"tick");
 			if matches!(outcome, Err(BackplaneError::Unavailable(_))) {
 				return true;
@@ -442,8 +492,10 @@ mod tests {
 	async fn a_processor_failure_closes_the_relay() {
 		let (client, server) = memory_mux_pair(4);
 		let (handle, reader_driver, writer_driver, _responder) = server.into_parts();
+
 		tokio::spawn(reader_driver.drive());
 		tokio::spawn(writer_driver.drive());
+
 		/*
 		 * A dropped peer closes the link: every processor request fails,
 		 * and the first failure the worker observes must close the

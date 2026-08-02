@@ -25,9 +25,11 @@ describe("Node mutual paywall", () => {
 	});
 
 	it("closes the session when settlement is unpaid", async () => {
-		// The client finishes dial before the server settles the
-		// countersigned receipt. An unpaid challenge still aborts the
-		// server side; the client observes that as `closed`.
+		/*
+		 * The client finishes dial before the server settles the
+		 * countersigned receipt. An unpaid challenge still aborts the
+		 * server side. The client observes that as `closed`.
+		 */
 		const client = await TightbeamWsClient.connectMutual(
 			muxMutualEndpoint,
 			certBytes("server.cert.der"),

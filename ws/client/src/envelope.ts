@@ -5,9 +5,9 @@
  *
  * The frame format fixes the layering, so an envelope takes declarations
  * rather than a free-form pipeline. `frame()` begins a builder with them
- * applied; `unwrap()` reverses them and ENFORCES them: a declared
- * signature or seal that a received frame lacks REJECTS instead of degrading,
- * so a peer cannot downgrade the conversation by omission.
+ * applied. `unwrap()` reverses them and ENFORCES them. A declared
+ * signature or seal that a received frame lacks REJECTS instead of
+ * degrading, so a peer cannot downgrade the conversation by omission.
  */
 
 import type { FrameCodec } from "./builder/codec.js";

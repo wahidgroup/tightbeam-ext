@@ -49,7 +49,7 @@ pub async fn unrouted(_context: ConnectionContext, _frame: Arc<Frame>) -> Respon
 
 /// Serve one anonymous multiplexed connection until it ends.
 ///
-/// Wire commands answer through `commands`; everything else goes to
+/// Wire commands answer through `commands`. Everything else goes to
 /// `app`. The connection registers on entry and drops (with all its
 /// subscriptions) on exit, whatever ended the serve loop.
 ///
@@ -73,9 +73,13 @@ where
 	serve(mux, commands, None, app).await
 }
 
-/// [`serve_connection`], registered under `identity` (a mutual-auth
-/// peer certificate DER is the expected source) so the policies can
+/// Serve one mux connection as [`serve_connection`], but register the
+/// peer under `identity` so [`SubscribePolicy`] / [`PublishPolicy`] can
 /// authorize by caller.
+///
+/// Pass the mutual-auth peer certificate DER when the application uses
+/// identity-based topic ACL. [`serve_connection`] alone leaves identity
+/// as `None`.
 ///
 /// # Errors
 ///

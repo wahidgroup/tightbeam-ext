@@ -507,8 +507,8 @@ async function muxConcurrentRoundTrip(
 			const response = await emitFrame(client, built);
 			return response;
 		});
-		const echoed = await Promise.all(emits);
 
+		const echoed = await Promise.all(emits);
 		const result = {
 			echoedIds: echoed.map((response) => TEXT.decode(response.id)),
 			echoedBodiesHex: echoed.map((response) =>
@@ -589,12 +589,14 @@ async function muxLifecycleProbe(
 	return withMuxClient(url, serverCertB64, async (client) => {
 		await client.ping();
 		await client.waitForStreamSlot();
+
 		const headroom = client.hasStreamHeadroom;
 		const pendingIdle = !client.hasPendingStreams;
 		const liveReasonEmpty = client.goawayReason === undefined;
 
 		const abandoned = new AbortController();
 		abandoned.abort(new Error("ping abandoned"));
+
 		let abandonedPingRejection = "";
 		try {
 			await client.ping({ signal: abandoned.signal });
@@ -666,6 +668,7 @@ async function muxDrainReason(
 		}
 
 		controller.abort(new Error("drain observed"));
+
 		let emitRejection = "";
 		try {
 			await pending;
@@ -697,18 +700,25 @@ async function muxParkedCallbackRoundTrip(
 ): Promise<MuxCallbackResult> {
 	return withMuxClient(url, serverCertB64, async (client) => {
 		/*
-		 * Fire the call-back trigger with no handler registered and give
-		 * the server's stream time to arrive and park. No parked-count
-		 * surface exists to poll: a sleep too short degrades this into
-		 * the ordinary served path (still passing, weaker), never into
-		 * a flake.
+		 * Fire the call-back with no handler, then wait until the local
+		 * emit occupies a stream slot so serve registers only after the
+		 * request left the client.
 		 */
 		const callMe = await frame(hexToBytes(payloadHex))
 			.withId("call-me-parked-browser")
 			.withOrder(4)
 			.build();
 		const pending = emitFrame(client, callMe);
-		await new Promise((resolve) => setTimeout(resolve, 100));
+		const deadline = Date.now() + 10_000;
+		while (!client.hasPendingStreams) {
+			if (Date.now() > deadline) {
+				throw new Error("timed out waiting for pending call-back emit");
+			}
+
+			await new Promise<void>((resolve) => {
+				setTimeout(resolve, 0);
+			});
+		}
 
 		const servedIds: string[] = [];
 		client.serve(async (request) => {

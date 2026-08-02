@@ -15,6 +15,7 @@ services:
       TBWS_SERVER_CERT: /certs/server.cert.der
       TBWS_SERVER_KEY: /certs/server.key
       TBWS_CLIENT_CERT: /certs/client.cert.der
+      TBWS_CLIENT_KEY: /certs/client.key
       TBWS_PAYWALL: "1"
       TBWS_MUX_BUDGET_C2S: "4096"
       TBWS_MUX_BUDGET_S2C: "4096"
@@ -41,6 +42,7 @@ services:
       TBWS_SERVER_CERT: /certs/server.cert.der
       TBWS_SERVER_KEY: /certs/server.key
       TBWS_CLIENT_CERT: /certs/client.cert.der
+      TBWS_CLIENT_KEY: /certs/client.key
       TBWS_PAYWALL: "1"
       TBWS_MUX_BUDGET_C2S: "4096"
       TBWS_MUX_BUDGET_S2C: "4096"
@@ -68,6 +70,7 @@ services:
       TBWS_SERVER_CERT: /certs/server.cert.der
       TBWS_SERVER_KEY: /certs/server.key
       TBWS_CLIENT_CERT: /certs/client.cert.der
+      TBWS_CLIENT_KEY: /certs/client.key
       TBWS_PAYWALL: "1"
       TBWS_MUX_BUDGET_C2S: "4096"
       TBWS_MUX_BUDGET_S2C: "4096"

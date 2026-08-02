@@ -28,7 +28,7 @@ import { emitOrFail, withClient } from "./harness.js";
 /**
  * Open a cleartext multiplexed client against the echo server. The frame
  * features under test are transport-agnostic, so the cleartext lane keeps
- * these round-trips fast; the encrypted lanes are covered explicitly.
+ * these round-trips fast. The encrypted lanes are covered explicitly.
  */
 async function withEchoClient(
 	run: (client: TightbeamWsClient) => Promise<void>,

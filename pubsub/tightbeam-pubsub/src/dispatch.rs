@@ -71,7 +71,7 @@ impl<P: SubscribePolicy> PubsubCommands<P> {
 		&self.registry
 	}
 
-	/// Answer `frame` when it is a pub/sub command; `None` hands the
+	/// Answer `frame` when it is a pub/sub command. `None` hands the
 	/// frame to the application's own routes.
 	pub fn answer(&self, connection: ConnectionId, frame: &Frame) -> Option<ResponsePackage> {
 		let id = frame.metadata.id.as_slice();

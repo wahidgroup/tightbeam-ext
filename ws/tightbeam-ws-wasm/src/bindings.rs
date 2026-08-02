@@ -151,7 +151,11 @@ impl FrameComposer {
 		self.config.id = id;
 	}
 
-	/// Set the monotonic order (Unix seconds).
+	/// Set the frame order stamp.
+	///
+	/// The value is protocol-opaque. Any monotonic scheme works, such as a
+	/// Unix timestamp or a dense per-channel counter. When omitted, the
+	/// build defaults it to the current Unix time in seconds.
 	#[wasm_bindgen(js_name = withOrder)]
 	pub fn with_order(&mut self, order: u64) {
 		self.config.order = order;
@@ -237,8 +241,9 @@ pub fn set_message_integrity(frame_der: Vec<u8>, algorithm_oid: &str, digest: Ve
 
 /// Replace the frame body with `ciphertext` and record the confidentiality
 /// info (V1+ frames): the caller's encryption algorithm OID, its DER-encoded
-/// parameters (e.g. the nonce; pass `undefined` when the scheme has none),
-/// and the plaintext content-type OID (defaults to `id-data`).
+/// parameters (for example the nonce), and the plaintext content-type OID
+/// (defaults to `id-data`). Pass `undefined` for parameters when the scheme
+/// has none.
 #[wasm_bindgen(js_name = setConfidentiality)]
 pub fn set_confidentiality(
 	frame_der: Vec<u8>,
@@ -295,7 +300,7 @@ pub fn attach_witness(frame_der: Vec<u8>, algorithm_oid: &str, digest: Vec<u8>) 
 
 /// The to-be-signed bytes of a frame (everything but the signature field).
 /// Sign them with any scheme and install the result via `attachSignature`.
-/// Call after `attachWitness`; the signature covers the witness.
+/// Call after `attachWitness`. The signature covers the witness.
 #[wasm_bindgen(js_name = tbsBytes)]
 pub fn tbs_bytes(frame_der: Vec<u8>) -> Result<Vec<u8>, JsError> {
 	build::tbs_bytes(frame_der).map_err(|error| JsError::new(&error.to_string()))
@@ -356,7 +361,11 @@ impl FrameView {
 		self.summary.as_ref().map(|summary| summary.id.clone()).unwrap_or_default()
 	}
 
-	/// Monotonic order (Unix seconds).
+	/// Frame order stamp.
+	///
+	/// The value is protocol-opaque. Any monotonic scheme works, such as a
+	/// Unix timestamp or a dense per-channel counter. When omitted at build
+	/// time, the profile defaults to the current Unix time in seconds.
 	#[wasm_bindgen(getter)]
 	pub fn order(&self) -> u64 {
 		self.summary.as_ref().map(|summary| summary.order).unwrap_or(0)

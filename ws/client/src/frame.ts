@@ -40,8 +40,8 @@ export const INTEGRITY_VERDICTS = [
 ] as const;
 
 /**
- * An integrity-check outcome. Only `"verified"` means the check passed;
- * `"absent"` distinguishes a frame that carries nothing to check.
+ * An integrity-check outcome. Only `"verified"` means the check passed.
+ * The value `"absent"` distinguishes a frame that carries nothing to check.
  */
 export type IntegrityVerdict = (typeof INTEGRITY_VERDICTS)[number];
 
@@ -392,7 +392,11 @@ export class Frame {
 	}
 
 	/**
-	 * Monotonic order (Unix seconds).
+	 * Frame order stamp.
+	 *
+	 * The value is protocol-opaque. Any monotonic scheme works, such as a
+	 * Unix timestamp or a dense per-channel counter. When omitted at build
+	 * time, the profile defaults to the current Unix time in seconds.
 	 */
 	get order(): bigint {
 		const order = this.decoded().order;
@@ -400,9 +404,11 @@ export class Frame {
 	}
 
 	/**
-	 * The raw frame body DER. When {@link confidential} is true this is
-	 * ciphertext; open it with {@link decryptMessage}. Decode a cleartext
-	 * body into a typed message with {@link message}.
+	 * The raw frame body DER.
+	 *
+	 * When {@link confidential} is true, the octets are ciphertext. Open
+	 * them with {@link decryptMessage}. Decode a cleartext body into a
+	 * typed message with {@link message}.
 	 */
 	get bodyDer(): Uint8Array {
 		const bodyDer = this.decoded().bodyDer;
@@ -540,9 +546,10 @@ export class Frame {
 	}
 
 	/**
-	 * The message-commitment preimage under `salt` (the salt passed to
-	 * `withMessageHasher`; may be empty), computed over the carried body
-	 * DER.
+	 * The message-commitment preimage under `salt`, computed over the
+	 * carried body DER.
+	 *
+	 * Pass the same salt given to `withMessageHasher`. An empty salt is valid.
 	 */
 	commitmentInput(salt: Uint8Array): Uint8Array {
 		const commitmentInput = commitmentPreimage(salt, this.bodyDer);
@@ -606,7 +613,7 @@ export class Frame {
 				{
 					path: "frame",
 					message:
-						"The frame body is encrypted; decode it with decryptMessage",
+						"The frame body is encrypted. Decode it with decryptMessage",
 				},
 			]);
 		}
@@ -615,7 +622,7 @@ export class Frame {
 				{
 					path: "frame",
 					message:
-						"The frame body is compressed; decode it with inflateMessage",
+						"The frame body is compressed. Decode it with inflateMessage",
 				},
 			]);
 		}
@@ -643,7 +650,7 @@ export class Frame {
 				{
 					path: "frame",
 					message:
-						"The frame body is encrypted; decode it with decryptMessage",
+						"The frame body is encrypted. Decode it with decryptMessage",
 				},
 			]);
 		}
@@ -671,10 +678,11 @@ export class Frame {
 
 	/**
 	 * Decrypt the encrypted body with any {@link BodyDecryptor} and decode
-	 * the plaintext into a typed message under `codec`. The profile
-	 * decryptors are `Aes256Gcm` and `EciesDecryptor`; the profile codec
-	 * for raw bytes is `Opaque`. A compressed-then-sealed body additionally
-	 * needs `inflator` to decompress the decrypted bytes.
+	 * the plaintext into a typed message under `codec`.
+	 *
+	 * The profile decryptors are `Aes256Gcm` and `EciesDecryptor`. The
+	 * profile codec for raw bytes is `Opaque`. A compressed-then-sealed
+	 * body also needs `inflator` to decompress the decrypted bytes.
 	 *
 	 * @throws ValidationError when the frame is not encrypted, or is
 	 * compressed and no `inflator` is given.
@@ -703,7 +711,7 @@ export class Frame {
 				{
 					path: "frame",
 					message:
-						"The frame body is compressed; decryptMessage needs an inflator",
+						"The frame body is compressed. decryptMessage needs an inflator.",
 				},
 			]);
 		}
@@ -732,16 +740,18 @@ export class Frame {
  */
 export const Framed: MessageCodec<Frame> = wrapped({
 	encode(inner: Frame): Uint8Array {
-		return inner.toDer();
+		const der = inner.toDer();
+		return der;
 	},
 	decode(payload: Uint8Array): Frame {
-		return Frame.fromDer(payload);
+		const frame = Frame.fromDer(payload);
+		return frame;
 	},
 });
 
 /**
- * Decompress decrypted plaintext when the frame carries compactness info;
- * pass uncompressed plaintext through unchanged. The missing-inflator case
+ * Decompress decrypted plaintext when the frame carries compactness info.
+ * Pass uncompressed plaintext through unchanged. The missing-inflator case
  * is rejected before decryption runs.
  */
 async function inflate(

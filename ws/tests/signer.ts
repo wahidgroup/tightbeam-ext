@@ -14,7 +14,7 @@ const ECDSA_WITH_SHA3_256 = "2.16.840.1.101.3.4.3.10";
  * SEQUENCE { SEQUENCE { id-ecPublicKey, secp256k1 }, BIT STRING (65 bytes) }.
  *
  * MUST match the SPKI encoding in the client certificate. Receipt
- * countersign SID is `SHA3-256(publicKeyDer)[..20]`; the server expects
+ * countersign SID is `SHA3-256(publicKeyDer)[..20]`. The server expects
  * that SID to equal the cert's SPKI digest. Compressed vs uncompressed
  * DER hashes diverge even when the point is the same.
  */

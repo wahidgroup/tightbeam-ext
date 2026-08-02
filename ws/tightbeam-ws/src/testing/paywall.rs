@@ -41,7 +41,7 @@ pub fn paywall_enabled() -> bool {
 /// Must clear the mux drain reserve
 /// (`2 * (local_cap + peer_cap) + 1` records × `ceil(chunk / credit_unit)`
 /// credits). With the default 8/8 caps, 16 KiB chunks, and 1 KiB credit
-/// unit that reserve is 528 credits; 64 leaves zero usable budget.
+/// unit that reserve is 528 credits. A grant of 64 leaves zero usable budget.
 pub const DEMO_BUDGET_CREDITS: u64 = 4096;
 
 /// Per-direction budget ceiling from `TBWS_MUX_BUDGET_C2S` /

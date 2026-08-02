@@ -153,17 +153,18 @@ describe.each(LANES)(
 		it("parks server-initiated streams until a handler registers", async () => {
 			await withClient(connect, async (client) => {
 				/*
-				 * Fire the call-back trigger with no handler registered and
-				 * give the server's stream time to arrive. No parked-count
-				 * surface exists to poll: a sleep too short degrades this
-				 * into the ordinary served path, never into a flake.
+				 * Fire the call-back with no handler, then wait until the
+				 * local emit occupies a stream slot. That proves the
+				 * request left the client before serve starts. The peer
+				 * Open parks in the responder queue until the handler
+				 * registers.
 				 */
 				const built = await frame(new Uint8Array([0xb0, 0x0f]))
 					.withId("call-me-early")
 					.withOrder(1)
 					.build();
 				const pending = client.emit(built);
-				await new Promise((resolve) => setTimeout(resolve, 100));
+				await expect.poll(() => client.hasPendingStreams).toBe(true);
 
 				const served: string[] = [];
 				client.serve(async (request) => {

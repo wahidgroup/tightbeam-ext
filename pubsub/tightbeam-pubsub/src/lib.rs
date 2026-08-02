@@ -5,13 +5,13 @@
 //! command frames, and updates are server-initiated streams whose frame
 //! id is the topic.
 //!
-//! - [`Topic`]: validated names; the command prefixes are reserved.
+//! - [`Topic`]: validated names. The command prefixes are reserved.
 //! - [`TopicRegistry`]: membership, publish fan-out with dense per-topic
 //!   `metadata.order` stamps, and one bounded queue per subscriber so a
 //!   slow client never stalls the rest.
 //! - [`Backplane`]: sequencing and cross-node distribution behind the
-//!   registry. [`Local`] (in-process, the default) covers one node;
-//!   implement the trait over Redis/Postgres/NATS to span nodes without
+//!   registry. [`Local`] (in-process, the default) covers one node.
+//!   Implement the trait over Redis/Postgres/NATS to span nodes without
 //!   touching the wire format.
 //! - [`PubsubCommands`]: answers the wire commands inside an existing
 //!   serve handler, consulting a [`SubscribePolicy`] (and, once

@@ -157,7 +157,7 @@ fn open_promise(raw: &web_sys::WebSocket) -> Promise {
 }
 
 /// Drain the watch and detach both listeners. The caller settles the
-/// promise and drops the watch; the closure currently executing is freed
+/// promise and drops the watch. The closure currently executing is freed
 /// once its call returns (the shim defers deallocation while invoked).
 fn take_watch(slot: &OpenWatchSlot, target: &web_sys::WebSocket) -> Option<OpenWatch> {
 	let watch = slot.borrow_mut().take()?;

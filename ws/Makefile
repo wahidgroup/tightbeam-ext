@@ -21,6 +21,14 @@ else
 LINT_MODE := check
 endif
 
+# Local `make test` skips wasm-opt (~1m per target). `make ci` passes
+# wasm_opt=1 so the suite still builds release-sized wasm.
+ifneq ($(filter 1,$(wasm_opt)),)
+TEST_WASM_PACK_FLAGS :=
+else
+TEST_WASM_PACK_FLAGS := --no-opt
+endif
+
 setup:
 	@$(REPO)/scripts/setup.sh ws
 
@@ -32,7 +40,8 @@ build:
 	@echo "Building ws crates..."
 	cargo build --release $(CRATES) $(CARGO_FLAGS)
 
-test: client
+test: setup
+	@$(MAKE) client WASM_PACK_FLAGS="$(TEST_WASM_PACK_FLAGS)"
 	@echo "Running ws cargo tests..."
 ifeq ($(strip $(features)$(no-default)),)
 	cargo test $(CRATES) --all-features
@@ -61,7 +70,7 @@ wasm: setup
 
 client: setup
 	@echo "Building the ws TS/wasm client package..."
-	npm run build
+	WASM_PACK_FLAGS="$(WASM_PACK_FLAGS)" npm run build
 
 sbom: setup
 	@echo "Generating the ws client SBOM..."

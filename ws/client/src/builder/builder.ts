@@ -277,7 +277,11 @@ export class FrameBuilder {
 	}
 
 	/**
-	 * Set the monotonic order (Unix seconds).
+	 * Set the frame order stamp.
+	 *
+	 * The value is protocol-opaque. Any monotonic scheme works, such as a
+	 * Unix timestamp or a dense per-channel counter. When omitted, the
+	 * build defaults it to the current Unix time in seconds.
 	 */
 	withOrder(order: bigint | number): FrameBuilder {
 		const next = this.with({ order: toBigInt(order) });
@@ -357,7 +361,7 @@ export class FrameBuilder {
 
 	/**
 	 * Commit to the message body under any `Hasher` (V2+). The profile
-	 * hasher is `Sha3_256`; bring your own for other digests.
+	 * hasher is `Sha3_256`. Bring your own hasher for other digests.
 	 */
 	withMessageHasher(hasher: Hasher, salt?: Uint8Array): FrameBuilder {
 		if (salt === undefined) {
@@ -391,10 +395,12 @@ export class FrameBuilder {
 	}
 
 	/**
-	 * Encrypt the message body with any `BodyEncryptor` (V1+). The profile
-	 * encryptors are `Aes256Gcm` (shared key) and `EciesEncryptor` (to a
-	 * recipient public key); bring your own for other schemes. Open the
-	 * received body with `Frame.decryptMessage(decryptor, codec)`.
+	 * Encrypt the message body with any `BodyEncryptor` (V1+).
+	 *
+	 * The profile encryptors are `Aes256Gcm` (shared key) and
+	 * `EciesEncryptor` (to a recipient public key). Bring your own
+	 * encryptor for other schemes. Open the received body with
+	 * `Frame.decryptMessage(decryptor, codec)`.
 	 */
 	withEncryptor(encryptor: BodyEncryptor): FrameBuilder {
 		const next = this.with({ encryptor });

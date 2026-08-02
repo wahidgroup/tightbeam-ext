@@ -308,10 +308,12 @@ async fn quiescing_one_node_leaves_the_backplane_live() {
 
 	let end = on_a.next_update().await;
 	assert_eq!(end.metadata.id, b"end/prices", "the quiesced node should complete its topics");
+	assert_eq!(end.metadata.order, 2, "quiesce claims the next dense stamp for end/");
 
 	published(&node_b, "prices", b"tock");
+
 	let update = on_b.next_update().await;
-	assert_eq!(update.metadata.order, 2, "the live node should continue the dense sequence");
+	assert_eq!(update.metadata.order, 3, "the live node should continue after the end/ stamp");
 }
 
 #[tokio::test]
