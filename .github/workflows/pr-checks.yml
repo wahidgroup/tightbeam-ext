@@ -46,7 +46,7 @@ jobs:
 
   body:
     name: Body
-    if: ${{ !startsWith(github.head_ref, 'process/v') }}
+    if: ${{ !startsWith(github.head_ref, 'process/') }}
     runs-on: ubuntu-latest
     steps:
       - name: Validate required sections
