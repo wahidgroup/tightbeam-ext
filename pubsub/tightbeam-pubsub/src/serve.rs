@@ -74,8 +74,8 @@ where
 }
 
 /// Serve one mux connection as [`serve_connection`], but register the
-/// peer under `identity` so [`SubscribePolicy`] / [`PublishPolicy`] can
-/// authorize by caller.
+/// peer under `identity` so [`crate::SubscribePolicy`] /
+/// [`crate::PublishPolicy`] can authorize by caller.
 ///
 /// Pass the mutual-auth peer certificate DER when the application uses
 /// identity-based topic ACL. [`serve_connection`] alone leaves identity
