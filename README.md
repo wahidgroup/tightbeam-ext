@@ -18,6 +18,11 @@ Each extension lives in its own directory carrying everything it needs: crates, 
 - **[pubsub/tightbeam-pubsub](pubsub/tightbeam-pubsub)** - server-side topic registry over the core mux: publish fan-out with dense per-topic ordering, bounded per-subscriber queues with delivery policies, subscribe authorization, and orderly quiesce. Carrier-agnostic, no new wire protocol.
 - **[pubsub/client](pubsub/client)** - `@wahidgroup/tightbeam-pubsub-client`, typed subscribe/unsubscribe lifecycle over the ws client: exact-match dispatch, per-topic ordering gates with gap detection, completion callbacks, and reconnect replay.
 
+### [mpc/](mpc) - HoneyBadgerMPC over tightbeam
+
+- **[mpc/tightbeam-mpc](mpc/tightbeam-mpc)** - HoneyBadgerMPC network adapter: full-mesh party transport and consumer dial-in over mutually authenticated tightbeam links, with engine and control lanes, optional session round helpers, and injected tracing for live verification.
+- **[mpc/tightbeam-vm](mpc/tightbeam-vm)** - bytecode VM for secret arithmetic and fixed-point programs: consumers build and submit DER programs, parties validate and agree on the digest, then execute against HoneyBadgerMPC and return reconstructed outputs.
+
 ## Development
 
 ```sh

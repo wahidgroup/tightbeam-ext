@@ -1,0 +1,62 @@
+[package]
+name = "tightbeam-mpc"
+description = "HoneyBadgerMPC network adapter over the tightbeam messaging protocol"
+authors.workspace = true
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/tightbeam-mpc"
+readme = "README.md"
+keywords = ["mpc", "honeybadger", "messaging", "protocol", "tightbeam"]
+categories.workspace = true
+
+[lib]
+name = "tightbeam_mpc"
+
+[features]
+testing = []
+session = ["dep:stoffelcrypto", "dep:ark-std"]
+testing-csp = ["tightbeam-rs/testing-csp"]
+testing-fdr = ["testing-csp", "tightbeam-rs/testing-fdr"]
+testing-fault = ["testing-fdr", "tightbeam-rs/testing-fault"]
+testing-fmea = ["testing-fault", "tightbeam-rs/testing-fmea"]
+testing-timing = ["testing-csp", "tightbeam-rs/testing-timing"]
+instrument = ["tightbeam-rs/instrument"]
+tokio = ["tightbeam-rs/tokio"]
+
+[dependencies]
+tightbeam-rs = { workspace = true, features = [
+	"std",
+	"tcp",
+	"tokio",
+	"transport-ecies",
+	"transport-multiplex",
+	"derive",
+] }
+stoffelnet = { workspace = true }
+async-trait = { workspace = true }
+ark-ff = { workspace = true }
+ark-std = { workspace = true, optional = true }
+stoffelcrypto = { workspace = true, optional = true }
+der = { workspace = true, features = ["alloc", "derive", "oid"] }
+tokio = { workspace = true, features = ["rt", "sync", "macros", "net", "time"] }
+futures-util = { workspace = true, features = ["alloc"] }
+
+[dev-dependencies]
+# Self dev-dependency: turns testing + session + the verification
+# framework on for every test build.
+tightbeam-mpc = { path = ".", features = ["testing", "session", "testing-fmea", "tokio", "instrument"] }
+husky-rs = { workspace = true }
+stoffelcrypto = { workspace = true }
+ark-bls12-381 = { workspace = true }
+ark-std = { workspace = true }
+tokio = { workspace = true, features = [
+	"rt-multi-thread",
+	"macros",
+	"sync",
+	"time",
+] }
+futures-util = { workspace = true, features = ["std"] }

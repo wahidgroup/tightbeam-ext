@@ -1,0 +1,62 @@
+[package]
+name = "tightbeam-vm"
+description = "Bytecode VM for HoneyBadgerMPC programs over the tightbeam messaging protocol"
+version = "0.1.0"
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/tightbeam-vm"
+readme = "README.md"
+keywords = ["mpc", "honeybadger", "bytecode", "vm", "tightbeam"]
+categories = ["network-programming", "asynchronous"]
+
+[lib]
+name = "tightbeam_vm"
+path = "src/lib.rs"
+
+[[bin]]
+name = "fuzz_program_decode"
+path = "fuzz/program_decode.rs"
+required-features = ["fuzz"]
+
+[features]
+# AFL fuzz harness for the untrusted program decoder. Build the binary
+# with cargo-afl (RUSTFLAGS sets cfg(fuzzing)); outside AFL it is a stub.
+fuzz = ["dep:afl", "testing-csp", "tightbeam-rs/testing-fuzz"]
+# The tb_* macros expand cfg(feature = "testing-*") into the calling
+# crate, so the names must exist here and forward to the real gates.
+testing-csp = ["tightbeam-rs/testing-csp"]
+testing-fdr = ["testing-csp", "tightbeam-rs/testing-fdr"]
+testing-fault = ["testing-fdr", "tightbeam-rs/testing-fault"]
+testing-fmea = ["testing-fault", "tightbeam-rs/testing-fmea"]
+testing-timing = ["testing-csp", "tightbeam-rs/testing-timing"]
+instrument = ["tightbeam-mpc/instrument", "tightbeam-rs/instrument"]
+# tb_scenario!'s async environments gate their generated #[tokio::test]
+# functions behind cfg(feature = "tokio") in the calling crate.
+tokio = ["tightbeam-rs/tokio"]
+
+[dependencies]
+# Program digest hashing rides tightbeam's crypto surface (FIPS 202
+# SHA3-256), the same family the rest of the stack authenticates with.
+tightbeam-rs = { workspace = true, features = ["std", "sha3"] }
+afl = { workspace = true, optional = true }
+tightbeam-mpc = { path = "../tightbeam-mpc", version = "0.1.0", features = ["session"] }
+stoffelnet = { workspace = true }
+stoffelcrypto = { workspace = true }
+ark-ff = { workspace = true }
+ark-std = { workspace = true }
+ark-serialize = { workspace = true }
+der = { workspace = true, features = ["alloc", "derive"] }
+tokio = { workspace = true, features = ["rt", "sync", "macros", "time"] }
+
+[dev-dependencies]
+# Self dev-dependency keeps test builds identical to consumer builds
+# and turns the verification framework on for every test target.
+tightbeam-vm = { path = ".", features = ["testing-fmea", "tokio", "instrument"] }
+tightbeam-mpc = { path = "../tightbeam-mpc", features = ["testing", "session"] }
+ark-bls12-381 = { workspace = true }
+futures-util = { workspace = true, features = ["alloc"] }
+husky-rs = { workspace = true }
