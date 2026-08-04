@@ -38,7 +38,7 @@ install_toolchain() {
 
 	if ! command -v cargo-audit >/dev/null 2>&1; then
 		echo "Installing cargo-audit..."
-		cargo install cargo-audit
+		cargo install cargo-audit --locked
 	fi
 }
 

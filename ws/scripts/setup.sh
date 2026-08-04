@@ -34,7 +34,7 @@ install_wasm_tooling() {
 
 	if ! command -v wasm-pack >/dev/null 2>&1; then
 		echo "Installing wasm-pack..."
-		cargo install wasm-pack
+		cargo install wasm-pack --locked
 	fi
 }
 
