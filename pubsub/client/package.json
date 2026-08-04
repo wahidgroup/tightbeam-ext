@@ -1,6 +1,6 @@
 {
 	"name": "@wahidgroup/tightbeam-pubsub-client",
-	"version": "0.2.0",
+	"version": "0.2.1",
 	"description": "Topic subscriptions for the tightbeam WebSocket client: typed subscribe/unsubscribe lifecycle with per-topic ordering and reconnect replay.",
 	"type": "module",
 	"main": "dist/index.js",
