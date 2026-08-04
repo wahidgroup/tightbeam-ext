@@ -41,8 +41,6 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-
       - uses: actions/setup-node@v4
         with:
           node-version-file: .nvmrc
@@ -56,6 +54,9 @@ jobs:
         run: make setup NPM_INSTALL_FLAGS=--ignore-scripts
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # After toolchain install: cache key uses active rustc / cargo metadata.
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
       - name: Security Audit
         run: make audit
