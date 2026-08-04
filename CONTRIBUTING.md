@@ -4,7 +4,12 @@ The key words "MUST", "MUST NOT", "SHOULD", "SHOULD NOT", and "MAY" in this docu
 
 ## Getting Started
 
-Contributors MUST have the Rust toolchain (via [rustup](https://rustup.rs)), Node.js (>=24, for the hybrid TS/wasm client), Docker (for the e2e stack), Git, and Make.
+Contributors MUST have [rustup](https://rustup.rs), Node.js, Docker (for the e2e stack), Git, and Make. Pin files are the source of truth:
+
+- Rust: [`rust-toolchain.toml`](rust-toolchain.toml) (channel, components, `wasm32-unknown-unknown`)
+- Node: [`.nvmrc`](.nvmrc)
+
+`make setup` installs that Rust pin via `rustup toolchain install`, then each extension's tooling.
 
 ```bash
 make setup

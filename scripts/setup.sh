@@ -32,12 +32,13 @@ toolchain_required() {
 }
 
 install_toolchain() {
-	echo "Installing Rust toolchain components..."
+	echo "Installing pinned toolchain, components, and targets (rust-toolchain.toml)..."
+	rustup toolchain install
 	rustup component add rustfmt clippy
 
 	if ! command -v cargo-audit >/dev/null 2>&1; then
 		echo "Installing cargo-audit..."
-		cargo install cargo-audit
+		cargo install cargo-audit --locked
 	fi
 }
 
