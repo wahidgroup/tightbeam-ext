@@ -16,7 +16,7 @@
 		"lint:fix": "eslint . --fix && prettier --write ."
 	},
 	"dependencies": {
-		"@wahidgroup/tightbeam-ws-client": "^0.1.0"
+		"@wahidgroup/tightbeam-ws-client": "*"
 	},
 	"devDependencies": {
 		"@noble/curves": "2.2.0",
