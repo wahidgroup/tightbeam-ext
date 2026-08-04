@@ -9,6 +9,7 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "**/Cargo.toml"
+      - "rust-toolchain.toml"
       - "ws/package.json"
       - "ws/package-lock.json"
       - "ws/*/package.json"
@@ -18,6 +19,7 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "**/Cargo.toml"
+      - "rust-toolchain.toml"
       - "ws/package.json"
       - "ws/package-lock.json"
       - "ws/*/package.json"
@@ -39,10 +41,6 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
-        with:
-          toolchain: stable
-
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
       - uses: actions/setup-node@v4
@@ -53,6 +51,7 @@ jobs:
           registry-url: https://npm.pkg.github.com
           scope: "@wahidgroup"
 
+      # Rust SoT: rust-toolchain.toml via scripts/setup.sh (rustup toolchain install).
       - name: Setup
         run: make setup NPM_INSTALL_FLAGS=--ignore-scripts
         env:

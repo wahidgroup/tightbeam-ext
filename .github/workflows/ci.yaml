@@ -33,12 +33,6 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
-        with:
-          toolchain: stable
-          components: rustfmt, clippy
-          targets: wasm32-unknown-unknown
-
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
       - uses: actions/setup-node@v4
@@ -49,6 +43,7 @@ jobs:
           registry-url: https://npm.pkg.github.com
           scope: "@wahidgroup"
 
+      # Rust SoT: rust-toolchain.toml via scripts/setup.sh (rustup toolchain install).
       - name: Setup
         run: make setup
         env:
