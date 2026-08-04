@@ -16,7 +16,7 @@
 		"lint:fix": "eslint . --fix && prettier --write ."
 	},
 	"dependencies": {
-		"@wahidgroup/tightbeam-pubsub-client": "^0.1.0",
+		"@wahidgroup/tightbeam-pubsub-client": "*",
 		"@wahidgroup/tightbeam-ws-client": "file:../../ws/client"
 	},
 	"devDependencies": {
