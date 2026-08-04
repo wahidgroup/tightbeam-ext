@@ -131,6 +131,40 @@ words:
   - cfgs
   - unmetered
   - subarray
+  - Sbox
+  - sbox
+  - SBOX
+  - MUXES
+  - muxes
+  - Peralta
+  - peralta
+  - Damgård
+  - Damgard
+  - IACR
+  - rcon
+  - RCON
+  - xtime
+  - nbytes
+  - xors
+  - xored
+  - subtractor
+  - Subtractor
+  - microbench
+  - Stoffel
+  - AVSS
+  - Paillier
+  - rustdoc
+  - POSIWID
+  - STIG
+  - bitness
+  - SSOT
+  - nocapture
+  - ACNS
+  - decomps
+  - subrange
+  - downcasting
+  - strided
+  - addc
 ignorePaths:
   - node_modules/**
   - "**/sbom.json"
@@ -146,3 +180,4 @@ ignorePaths:
   - .git/**
   - .github/**
   - "**/*.toml"
+  - graphs/state/**

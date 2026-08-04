@@ -403,10 +403,7 @@ mod tests {
 			(Instruction::Pack { dest: zero, src: zero, width: 1 }, Opcode::Pack),
 			(Instruction::BitDec { dest: zero, src: zero, width: 1 }, Opcode::BitDec),
 			(
-				Instruction::Sbox {
-					dest: SecretRange { base: 0, len: 8 },
-					src: SecretRange { base: 0, len: 8 },
-				},
+				Instruction::Sbox { dest: SecretRange { base: 0, len: 8 }, src: SecretRange { base: 0, len: 8 } },
 				Opcode::Sbox,
 			),
 			(Instruction::ByteXor { dest: zero, a: zero, b: zero }, Opcode::ByteXor),

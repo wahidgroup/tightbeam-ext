@@ -197,7 +197,9 @@ fn tops(program: &Program) -> (u32, u32) {
 			Instruction::Mux { dest, cond, t, f } => {
 				secret_top = secret_top.max(dest.end()).max(cond.end()).max(t.end()).max(f.end());
 			}
-			Instruction::Pack { dest, src, .. } | Instruction::BitDec { dest, src, .. } | Instruction::Sbox { dest, src } => {
+			Instruction::Pack { dest, src, .. }
+			| Instruction::BitDec { dest, src, .. }
+			| Instruction::Sbox { dest, src } => {
 				secret_top = secret_top.max(dest.end()).max(src.end());
 			}
 			Instruction::ByteXor { dest, a, b } => {

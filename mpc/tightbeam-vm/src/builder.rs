@@ -53,9 +53,7 @@ impl Secret {
 	/// registers when the program is built.
 	#[must_use]
 	pub fn slice(&self, start: u32, len: u32) -> Self {
-		Self {
-			range: SecretRange { base: self.range.base.saturating_add(start), len },
-		}
+		Self { range: SecretRange { base: self.range.base.saturating_add(start), len } }
 	}
 }
 
@@ -130,10 +128,7 @@ impl Bits {
 	pub fn get(&self, element: u32) -> Self {
 		let width = u32::from(self.width);
 		Self {
-			range: SecretRange {
-				base: self.range.base.saturating_add(element.saturating_mul(width)),
-				len: width,
-			},
+			range: SecretRange { base: self.range.base.saturating_add(element.saturating_mul(width)), len: width },
 			width: self.width,
 		}
 	}
@@ -382,8 +377,7 @@ impl ProgramBuilder {
 	/// Element-wise XOR on byte-valued secrets.
 	pub fn byte_xor(&mut self, a: Secret, b: Secret) -> Secret {
 		let dest = self.alloc_secret(a.range.len);
-		self.instructions
-			.push(Instruction::ByteXor { dest, a: a.range, b: b.range });
+		self.instructions.push(Instruction::ByteXor { dest, a: a.range, b: b.range });
 		Secret { range: dest }
 	}
 

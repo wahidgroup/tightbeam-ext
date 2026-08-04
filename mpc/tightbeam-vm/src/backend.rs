@@ -614,11 +614,7 @@ where
 	/// `V[k] = S(δ ⊕ k)`, driven by the secret mask bits. The first
 	/// level is local against public leaves. Remaining levels cost
 	/// [`crate::validate::SBOX_ONLINE_MUXES`] Beaver muls per byte.
-	async fn select_sbox_bytes(
-		&mut self,
-		mask_bits: &[RobustShare<F>],
-		opened: &[F],
-	) -> Result<Vec<RobustShare<F>>> {
+	async fn select_sbox_bytes(&mut self, mask_bits: &[RobustShare<F>], opened: &[F]) -> Result<Vec<RobustShare<F>>> {
 		let count = opened.len();
 		let mut level: Vec<RobustShare<F>> = Vec::with_capacity(count * 128);
 		for (element, delta) in opened.iter().enumerate() {

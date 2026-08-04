@@ -558,10 +558,7 @@ mod tests {
 					src: SecretRange { base: 11, len: 2 },
 					width: 2,
 				},
-				Instruction::Sbox {
-					dest: SecretRange { base: 24, len: 8 },
-					src: SecretRange { base: 16, len: 8 },
-				},
+				Instruction::Sbox { dest: SecretRange { base: 24, len: 8 }, src: SecretRange { base: 16, len: 8 } },
 				Instruction::ByteXor {
 					dest: SecretRange { base: 32, len: 1 },
 					a: SecretRange { base: 11, len: 1 },

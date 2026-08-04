@@ -378,9 +378,7 @@ mod tests {
 		backend: &mut PlainBackend,
 		trace: &TraceHandle,
 	) -> Output<Fr> {
-		execute(valid, inputs, backend, trace)
-			.await
-			.expect("execution should complete")
+		execute(valid, inputs, backend, trace).await.expect("execution should complete")
 	}
 
 	/// Read a small plain value back out of the field.
@@ -906,18 +904,16 @@ mod tests {
 
 	#[tokio::test]
 	async fn aes128_encrypt_block_matches_clear_reference() {
+		use crate::circuits::aes128::{encrypt_block, BLOCK_LEN};
 		use aes::Aes128;
 		use cipher::{BlockEncrypt, KeyInit};
-		use crate::circuits::aes128::{encrypt_block, BLOCK_LEN};
 
 		// FIPS 197 Appendix C.1.
 		const KEY: [u8; 16] = [
-			0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
-			0x0f,
+			0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
 		];
 		const PLAIN: [u8; 16] = [
-			0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
-			0xff,
+			0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
 		];
 
 		let mut builder = ProgramBuilder::default();
@@ -936,8 +932,7 @@ mod tests {
 		values.extend(PLAIN.iter().map(|byte| u64::from(*byte)));
 
 		let mut backend = PlainBackend::default();
-		let output = match execute(&valid, plain_inputs(&values), &mut backend, &TraceHandle::default()).await
-		{
+		let output = match execute(&valid, plain_inputs(&values), &mut backend, &TraceHandle::default()).await {
 			Ok(output) => output,
 			Err(error) => panic!("AES execution should complete: {error}"),
 		};
