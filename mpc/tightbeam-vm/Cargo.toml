@@ -60,3 +60,6 @@ tightbeam-mpc = { path = "../tightbeam-mpc", features = ["testing", "session"] }
 ark-bls12-381 = { workspace = true }
 futures-util = { workspace = true, features = ["alloc"] }
 husky-rs = { workspace = true }
+# Clear AES-128 reference for the circuits::aes128 exit-gate tests.
+aes = "0.8.4"
+cipher = "0.4.4"

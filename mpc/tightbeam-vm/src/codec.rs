@@ -96,6 +96,11 @@ fn clear_range(args: &[u64], at: usize, opcode: Opcode) -> Result<ClearRange, Co
 	Ok(ClearRange { base: secret.base, len: secret.len })
 }
 
+/// Narrow a wire argument into a bit width octet (`Pack`'s width).
+fn width_component(value: u64, opcode: Opcode) -> Result<u8, CodecError> {
+	u8::try_from(value).map_err(|_| CodecError::MalformedArguments { opcode })
+}
+
 impl From<&Instruction> for WireInstruction {
 	fn from(instruction: &Instruction) -> Self {
 		let opcode = u8::from(instruction.opcode());
@@ -111,7 +116,7 @@ impl From<&Instruction> for WireInstruction {
 			Instruction::AddC { dest, a, c } | Instruction::SubC { dest, a, c } | Instruction::MulC { dest, a, c } => {
 				vec![u64::from(dest.base), u64::from(a.base), u64::from(c.base), u64::from(dest.len)]
 			}
-			Instruction::MulS { pairs } => {
+			Instruction::MulS { pairs } | Instruction::AndS { pairs } | Instruction::XorS { pairs } => {
 				let mut args = Vec::with_capacity(pairs.len() * 4);
 				for pair in pairs {
 					args.push(u64::from(pair.dest.base));
@@ -121,6 +126,35 @@ impl From<&Instruction> for WireInstruction {
 				}
 
 				args
+			}
+			Instruction::NotS { dest, a } => {
+				vec![u64::from(dest.base), u64::from(a.base), u64::from(dest.len)]
+			}
+			Instruction::Mux { dest, cond, t, f } => {
+				vec![
+					u64::from(dest.base),
+					u64::from(cond.base),
+					u64::from(t.base),
+					u64::from(f.base),
+					u64::from(dest.len),
+				]
+			}
+			Instruction::Pack { dest, src, width } => {
+				vec![
+					u64::from(dest.base),
+					u64::from(src.base),
+					u64::from(dest.len),
+					u64::from(*width),
+				]
+			}
+			Instruction::BitDec { dest, src, width } => {
+				vec![u64::from(dest.base), u64::from(src.base), u64::from(src.len), u64::from(*width)]
+			}
+			Instruction::Sbox { dest, src } => {
+				vec![u64::from(dest.base), u64::from(src.base), u64::from(dest.len / 8)]
+			}
+			Instruction::ByteXor { dest, a, b } => {
+				vec![u64::from(dest.base), u64::from(a.base), u64::from(b.base), u64::from(dest.len)]
 			}
 			Instruction::FpMulS { dest, a, b, precision } => {
 				vec![
@@ -165,7 +199,15 @@ impl TryFrom<&WireInstruction> for Instruction {
 			Opcode::LdC => decode_ldc(args),
 			Opcode::AddS | Opcode::SubS => decode_binary_secret(opcode, args),
 			Opcode::AddC | Opcode::SubC | Opcode::MulC => decode_clear_operand(opcode, args),
-			Opcode::MulS => decode_muls(args),
+			Opcode::MulS => Ok(Instruction::MulS { pairs: decode_pairs(opcode, args)? }),
+			Opcode::AndS => Ok(Instruction::AndS { pairs: decode_pairs(opcode, args)? }),
+			Opcode::XorS => Ok(Instruction::XorS { pairs: decode_pairs(opcode, args)? }),
+			Opcode::NotS => decode_not(args),
+			Opcode::Mux => decode_mux(args),
+			Opcode::Pack => decode_pack(args),
+			Opcode::BitDec => decode_bit_dec(args),
+			Opcode::Sbox => decode_sbox(args),
+			Opcode::ByteXor => decode_byte_xor(args),
 			Opcode::FpMulS => decode_fp_mul(args),
 			Opcode::FpDivC => decode_fp_div(args),
 			Opcode::Reveal => decode_reveal(args),
@@ -259,8 +301,10 @@ fn decode_clear_operand(opcode: Opcode, args: &[u64]) -> Result<Instruction, Cod
 	}
 }
 
-fn decode_muls(args: &[u64]) -> Result<Instruction, CodecError> {
-	let opcode = Opcode::MulS;
+/// Decode a batched-pairs argument list shared by `MulS`, `AndS`, and
+/// `XorS`: `[dest, a, b, len]` repeated once per element-wise operand
+/// pair.
+fn decode_pairs(opcode: Opcode, args: &[u64]) -> Result<Vec<MulTriple>, CodecError> {
 	if args.is_empty() || args.len() % 4 != 0 {
 		return Err(CodecError::MalformedArguments { opcode });
 	}
@@ -274,7 +318,96 @@ fn decode_muls(args: &[u64]) -> Result<Instruction, CodecError> {
 		pairs.push(MulTriple { dest, a, b });
 	}
 
-	Ok(Instruction::MulS { pairs })
+	Ok(pairs)
+}
+
+fn decode_not(args: &[u64]) -> Result<Instruction, CodecError> {
+	let opcode = Opcode::NotS;
+	if args.len() != 3 {
+		return Err(CodecError::MalformedArguments { opcode });
+	}
+
+	let len = register(args[2])?;
+	let dest = SecretRange { base: register(args[0])?, len };
+	let a = SecretRange { base: register(args[1])?, len };
+
+	Ok(Instruction::NotS { dest, a })
+}
+
+fn decode_mux(args: &[u64]) -> Result<Instruction, CodecError> {
+	let opcode = Opcode::Mux;
+	if args.len() != 5 {
+		return Err(CodecError::MalformedArguments { opcode });
+	}
+
+	let len = register(args[4])?;
+	let dest = SecretRange { base: register(args[0])?, len };
+	let cond = SecretRange { base: register(args[1])?, len: 1 };
+	let t = SecretRange { base: register(args[2])?, len };
+	let f = SecretRange { base: register(args[3])?, len };
+
+	Ok(Instruction::Mux { dest, cond, t, f })
+}
+
+fn decode_pack(args: &[u64]) -> Result<Instruction, CodecError> {
+	let opcode = Opcode::Pack;
+	if args.len() != 4 {
+		return Err(CodecError::MalformedArguments { opcode });
+	}
+
+	let width = width_component(args[3], opcode)?;
+	let dest_len = register(args[2])?;
+	let dest = SecretRange { base: register(args[0])?, len: dest_len };
+	let src_len = u64::from(dest_len) * u64::from(width);
+	let src = SecretRange { base: register(args[1])?, len: register(src_len)? };
+
+	Ok(Instruction::Pack { dest, src, width })
+}
+
+/// `BitDec` carries the source element count on the wire (the given
+/// quantity a builder call already knows) and derives the destination
+/// bit count as `src.len * width`, the inverse of `Pack`'s derivation.
+fn decode_bit_dec(args: &[u64]) -> Result<Instruction, CodecError> {
+	let opcode = Opcode::BitDec;
+	if args.len() != 4 {
+		return Err(CodecError::MalformedArguments { opcode });
+	}
+
+	let width = width_component(args[3], opcode)?;
+	let src_len = register(args[2])?;
+	let src = SecretRange { base: register(args[1])?, len: src_len };
+	let dest_len = u64::from(src_len) * u64::from(width);
+	let dest = SecretRange { base: register(args[0])?, len: register(dest_len)? };
+
+	Ok(Instruction::BitDec { dest, src, width })
+}
+
+fn decode_sbox(args: &[u64]) -> Result<Instruction, CodecError> {
+	let opcode = Opcode::Sbox;
+	if args.len() != 3 {
+		return Err(CodecError::MalformedArguments { opcode });
+	}
+
+	let nbytes = register(args[2])?;
+	let bit_len = register(u64::from(nbytes) * 8)?;
+	let dest = SecretRange { base: register(args[0])?, len: bit_len };
+	let src = SecretRange { base: register(args[1])?, len: bit_len };
+
+	Ok(Instruction::Sbox { dest, src })
+}
+
+fn decode_byte_xor(args: &[u64]) -> Result<Instruction, CodecError> {
+	let opcode = Opcode::ByteXor;
+	if args.len() != 4 {
+		return Err(CodecError::MalformedArguments { opcode });
+	}
+
+	let len = register(args[3])?;
+	let dest = SecretRange { base: register(args[0])?, len };
+	let a = SecretRange { base: register(args[1])?, len };
+	let b = SecretRange { base: register(args[2])?, len };
+
+	Ok(Instruction::ByteXor { dest, a, b })
 }
 
 fn decode_reveal(args: &[u64]) -> Result<Instruction, CodecError> {
@@ -351,6 +484,18 @@ pub fn digest(bytes: &[u8]) -> ProgramDigest {
 mod tests {
 	use super::*;
 
+	fn must_encode(program: &Program) -> Vec<u8> {
+		encode(program).expect("the program encodes")
+	}
+
+	fn must_decode(bytes: &[u8]) -> Program {
+		decode(bytes).expect("the bytes decode")
+	}
+
+	fn must_instruction(wire: &WireInstruction) -> Instruction {
+		Instruction::try_from(wire).expect("the instruction decodes")
+	}
+
 	fn sample_program() -> Program {
 		Program {
 			version: VERSION,
@@ -382,6 +527,46 @@ mod tests {
 					precision: FixedPrecision { k: 16, f: 4 },
 				},
 				Instruction::Reveal { dest: ClearRange { base: 2, len: 1 }, src: SecretRange { base: 4, len: 1 } },
+				Instruction::AndS {
+					pairs: vec![MulTriple {
+						dest: SecretRange { base: 7, len: 1 },
+						a: SecretRange { base: 2, len: 1 },
+						b: SecretRange { base: 3, len: 1 },
+					}],
+				},
+				Instruction::XorS {
+					pairs: vec![MulTriple {
+						dest: SecretRange { base: 8, len: 1 },
+						a: SecretRange { base: 2, len: 1 },
+						b: SecretRange { base: 3, len: 1 },
+					}],
+				},
+				Instruction::NotS { dest: SecretRange { base: 9, len: 1 }, a: SecretRange { base: 7, len: 1 } },
+				Instruction::Mux {
+					dest: SecretRange { base: 10, len: 1 },
+					cond: SecretRange { base: 9, len: 1 },
+					t: SecretRange { base: 7, len: 1 },
+					f: SecretRange { base: 8, len: 1 },
+				},
+				Instruction::Pack {
+					dest: SecretRange { base: 11, len: 1 },
+					src: SecretRange { base: 7, len: 3 },
+					width: 3,
+				},
+				Instruction::BitDec {
+					dest: SecretRange { base: 12, len: 4 },
+					src: SecretRange { base: 11, len: 2 },
+					width: 2,
+				},
+				Instruction::Sbox {
+					dest: SecretRange { base: 24, len: 8 },
+					src: SecretRange { base: 16, len: 8 },
+				},
+				Instruction::ByteXor {
+					dest: SecretRange { base: 32, len: 1 },
+					a: SecretRange { base: 11, len: 1 },
+					b: SecretRange { base: 11, len: 1 },
+				},
 				Instruction::Out { client: 100, src: SecretRange { base: 4, len: 1 } },
 			],
 		}
@@ -390,15 +575,15 @@ mod tests {
 	#[test]
 	fn programs_round_trip_through_der() {
 		let program = sample_program();
-		let bytes = encode(&program).expect("the program encodes");
-		let recovered = decode(&bytes).expect("the bytes decode");
+		let bytes = must_encode(&program);
+		let recovered = must_decode(&bytes);
 		assert_eq!(recovered, program);
 	}
 
 	#[test]
 	fn digests_are_stable_and_content_addressed() {
 		let program = sample_program();
-		let bytes = encode(&program).expect("the program encodes");
+		let bytes = must_encode(&program);
 		let first = digest(&bytes);
 		let second = digest(&bytes);
 		assert_eq!(first, second);
@@ -406,7 +591,7 @@ mod tests {
 		let mut altered = program;
 		altered.instructions.pop();
 
-		let altered_bytes = encode(&altered).expect("the altered program encodes");
+		let altered_bytes = must_encode(&altered);
 		assert_ne!(digest(&altered_bytes), first);
 	}
 
@@ -427,7 +612,7 @@ mod tests {
 	#[test]
 	fn foreign_versions_are_refused() {
 		let program = Program { version: 99, inputs: Vec::new(), instructions: Vec::new() };
-		let bytes = encode(&program).expect("even a foreign version encodes");
+		let bytes = must_encode(&program);
 		let outcome = decode(&bytes);
 		assert!(matches!(outcome, Err(CodecError::UnsupportedVersion { found: 99 })));
 	}
@@ -435,7 +620,7 @@ mod tests {
 	#[test]
 	fn truncated_bytes_are_refused() {
 		let program = sample_program();
-		let bytes = encode(&program).expect("the program encodes");
+		let bytes = must_encode(&program);
 		let outcome = decode(&bytes[..bytes.len() - 3]);
 		assert!(matches!(outcome, Err(CodecError::Der(_))));
 	}
@@ -452,6 +637,111 @@ mod tests {
 		let wire = WireInstruction { opcode: u8::from(Opcode::MulS), args: vec![0, 1, 2] };
 		let outcome = Instruction::try_from(&wire);
 		assert!(matches!(outcome, Err(CodecError::MalformedArguments { opcode: Opcode::MulS })));
+	}
+
+	#[test]
+	fn ands_argument_lists_must_be_whole_triples() {
+		let wire = WireInstruction { opcode: u8::from(Opcode::AndS), args: vec![0, 1, 2] };
+		let outcome = Instruction::try_from(&wire);
+		assert!(matches!(outcome, Err(CodecError::MalformedArguments { opcode: Opcode::AndS })));
+	}
+
+	#[test]
+	fn xors_argument_lists_must_be_whole_triples() {
+		let wire = WireInstruction { opcode: u8::from(Opcode::XorS), args: vec![0, 1, 2] };
+		let outcome = Instruction::try_from(&wire);
+		assert!(matches!(outcome, Err(CodecError::MalformedArguments { opcode: Opcode::XorS })));
+	}
+
+	#[test]
+	fn nots_argument_lists_must_have_three_entries() {
+		let wire = WireInstruction { opcode: u8::from(Opcode::NotS), args: vec![0, 1] };
+		let outcome = Instruction::try_from(&wire);
+		assert!(matches!(outcome, Err(CodecError::MalformedArguments { opcode: Opcode::NotS })));
+	}
+
+	#[test]
+	fn mux_argument_lists_must_have_five_entries() {
+		let wire = WireInstruction { opcode: u8::from(Opcode::Mux), args: vec![0, 1, 2, 3] };
+		let outcome = Instruction::try_from(&wire);
+		assert!(matches!(outcome, Err(CodecError::MalformedArguments { opcode: Opcode::Mux })));
+	}
+
+	#[test]
+	fn pack_argument_lists_must_have_four_entries() {
+		let wire = WireInstruction { opcode: u8::from(Opcode::Pack), args: vec![0, 1, 2] };
+		let outcome = Instruction::try_from(&wire);
+		assert!(matches!(outcome, Err(CodecError::MalformedArguments { opcode: Opcode::Pack })));
+	}
+
+	#[test]
+	fn pack_width_must_fit_one_octet() {
+		let wire = WireInstruction { opcode: u8::from(Opcode::Pack), args: vec![0, 1, 1, 300] };
+		let outcome = Instruction::try_from(&wire);
+		assert!(matches!(outcome, Err(CodecError::MalformedArguments { opcode: Opcode::Pack })));
+	}
+
+	#[test]
+	fn pack_derives_its_source_range_from_dest_len_times_width() {
+		let wire = WireInstruction { opcode: u8::from(Opcode::Pack), args: vec![10, 0, 2, 3] };
+		let instruction = must_instruction(&wire);
+		assert!(matches!(
+			instruction,
+			Instruction::Pack {
+				dest: SecretRange { base: 10, len: 2 },
+				src: SecretRange { base: 0, len: 6 },
+				width: 3
+			}
+		));
+	}
+
+	#[test]
+	fn bit_dec_argument_lists_must_have_four_entries() {
+		let wire = WireInstruction { opcode: u8::from(Opcode::BitDec), args: vec![0, 1, 2] };
+		let outcome = Instruction::try_from(&wire);
+		assert!(matches!(
+			outcome,
+			Err(CodecError::MalformedArguments { opcode: Opcode::BitDec })
+		));
+	}
+
+	#[test]
+	fn bit_dec_width_must_fit_one_octet() {
+		let wire = WireInstruction { opcode: u8::from(Opcode::BitDec), args: vec![0, 1, 1, 300] };
+		let outcome = Instruction::try_from(&wire);
+		assert!(matches!(
+			outcome,
+			Err(CodecError::MalformedArguments { opcode: Opcode::BitDec })
+		));
+	}
+
+	#[test]
+	fn bit_dec_derives_its_dest_range_from_src_len_times_width() {
+		let wire = WireInstruction { opcode: u8::from(Opcode::BitDec), args: vec![10, 0, 2, 3] };
+		let instruction = must_instruction(&wire);
+		assert!(matches!(
+			instruction,
+			Instruction::BitDec {
+				dest: SecretRange { base: 10, len: 6 },
+				src: SecretRange { base: 0, len: 2 },
+				width: 3
+			}
+		));
+	}
+
+	#[test]
+	fn mux_fixes_cond_width_at_one() {
+		let wire = WireInstruction { opcode: u8::from(Opcode::Mux), args: vec![5, 2, 0, 1, 2] };
+		let instruction = must_instruction(&wire);
+		assert!(matches!(
+			instruction,
+			Instruction::Mux {
+				dest: SecretRange { base: 5, len: 2 },
+				cond: SecretRange { base: 2, len: 1 },
+				t: SecretRange { base: 0, len: 2 },
+				f: SecretRange { base: 1, len: 2 },
+			}
+		));
 	}
 
 	#[test]

@@ -11,15 +11,29 @@ use crate::error::{Bank, Result, ValidationError};
 use crate::isa::{ClearRange, FixedPrecision, InputDecl, Instruction, MulTriple, Program, SecretRange};
 
 /// Instruction ceiling: bounds worst-case execution work per program.
-pub const MAX_INSTRUCTIONS: usize = 4096;
+/// An unrolled AES-128 bit circuit needs about 8800 instructions, so
+/// this constant sits above that measured size.
+pub const MAX_INSTRUCTIONS: usize = 65536;
 
 /// Registers per bank: bounds executor memory (one field element each).
+/// An AES-128 bit circuit peaks near 44k secret registers, so
+/// `1 << 16` still fits with headroom.
 pub const BANK_SIZE: u64 = 1 << 16;
 
 /// Widest fixed-point format a program may name. Keeps the engine's
 /// statistical-security headroom (`kappa + 2k - f` bits) far inside
 /// the field's bit width.
 pub const MAX_PRECISION_BITS: u8 = 32;
+
+/// Widest bit width `Pack` or `BitDec` may name. Keeps every
+/// `1 << position` local weight inside `u64` (`position < 64`) and
+/// keeps the mask-and-reveal cleartext well inside the scalar field's
+/// bit width for byte- and word-sized elements.
+pub const MAX_BIT_WIDTH: u8 = 64;
+
+/// Beaver muls in one depth-8 mux tree over a public 256-entry S-box
+/// row after the free first level against public leaves (`64+…+1`).
+pub const SBOX_ONLINE_MUXES: usize = 127;
 
 /// Preprocessing material one program consumes.
 ///
@@ -39,6 +53,8 @@ pub struct Budget {
 	pub prandbits: usize,
 	/// Shared random integers: one per fixed-point truncation.
 	pub prandints: usize,
+	/// TinyTable masked AES S-box lookups the program will consume.
+	pub sbox_tables: usize,
 }
 
 /// A program that passed every static check, plus its identity and
@@ -169,6 +185,23 @@ fn tops(program: &Program) -> (u32, u32) {
 			}
 			Instruction::Out { src, .. } => {
 				secret_top = secret_top.max(src.end());
+			}
+			Instruction::AndS { pairs } | Instruction::XorS { pairs } => {
+				for pair in pairs {
+					secret_top = secret_top.max(pair.dest.end()).max(pair.a.end()).max(pair.b.end());
+				}
+			}
+			Instruction::NotS { dest, a } => {
+				secret_top = secret_top.max(dest.end()).max(a.end());
+			}
+			Instruction::Mux { dest, cond, t, f } => {
+				secret_top = secret_top.max(dest.end()).max(cond.end()).max(t.end()).max(f.end());
+			}
+			Instruction::Pack { dest, src, .. } | Instruction::BitDec { dest, src, .. } | Instruction::Sbox { dest, src } => {
+				secret_top = secret_top.max(dest.end()).max(src.end());
+			}
+			Instruction::ByteXor { dest, a, b } => {
+				secret_top = secret_top.max(dest.end()).max(a.end()).max(b.end());
 			}
 		}
 	}
@@ -394,6 +427,159 @@ impl Checker {
 		Ok(())
 	}
 
+	/// `AndS` / `XorS`: every batched pair checked like a binary secret
+	/// op, each element priced at one Beaver triple (XOR needs the
+	/// intermediate product `a * b` to form `a + b - 2ab`).
+	fn check_bit_gate(&mut self, index: usize, pairs: &[MulTriple]) -> Result<()> {
+		if pairs.is_empty() {
+			return Err(ValidationError::EmptyRange { index }.into());
+		}
+
+		for pair in pairs {
+			self.check_binary_secret(index, &pair.dest, &pair.a, &pair.b)?;
+			self.budget.triples += pair.dest.len as usize;
+		}
+
+		Ok(())
+	}
+
+	/// `NotS`: a written secret run negated locally, no protocol cost.
+	fn check_not(&mut self, index: usize, dest: &SecretRange, a: &SecretRange) -> Result<()> {
+		check_secret_bounds(index, dest)?;
+		check_secret_bounds(index, a)?;
+		Self::require_lengths(index, dest.len, &[a.len])?;
+
+		self.secret.require(index, a.base, a.len)?;
+		self.secret.mark(dest.base, dest.len);
+		Ok(())
+	}
+
+	/// `Mux`: a single selector bit broadcast across two written runs
+	/// of matching length, priced at one Beaver triple per element.
+	/// `cond` is deliberately not checked against `dest.len`: its
+	/// width-1 broadcast is the documented contract, not a relaxed
+	/// [`Self::require_lengths`] case.
+	fn check_mux(
+		&mut self,
+		index: usize,
+		dest: &SecretRange,
+		cond: &SecretRange,
+		t: &SecretRange,
+		f: &SecretRange,
+	) -> Result<()> {
+		check_secret_bounds(index, dest)?;
+		check_secret_bounds(index, cond)?;
+		check_secret_bounds(index, t)?;
+		check_secret_bounds(index, f)?;
+		if cond.len != 1 {
+			return Err(ValidationError::LengthMismatch { index }.into());
+		}
+		Self::require_lengths(index, dest.len, &[t.len, f.len])?;
+
+		self.secret.require(index, cond.base, cond.len)?;
+		self.secret.require(index, t.base, t.len)?;
+		self.secret.require(index, f.base, f.len)?;
+		self.secret.mark(dest.base, dest.len);
+		self.budget.triples += dest.len as usize;
+		Ok(())
+	}
+
+	/// Refuse a `Pack` or `BitDec` bit width outside the range local
+	/// weight arithmetic and the mask-and-reveal cleartext bound can
+	/// serve safely.
+	fn check_width(index: usize, width: u8) -> Result<()> {
+		if width == 0 || width > MAX_BIT_WIDTH {
+			return Err(ValidationError::UnsafeWidth { index, width, max: MAX_BIT_WIDTH }.into());
+		}
+
+		Ok(())
+	}
+
+	/// `Pack`: a written run of bits folded locally into its packed
+	/// elements, no protocol cost. The source width is derived from
+	/// `dest.len * width` before any element is read, so a disagreeing
+	/// wire shape is refused before the bank check runs.
+	fn check_pack(&mut self, index: usize, dest: &SecretRange, src: &SecretRange, width: u8) -> Result<()> {
+		Self::check_width(index, width)?;
+		check_secret_bounds(index, dest)?;
+		check_secret_bounds(index, src)?;
+
+		let expected = u64::from(dest.len) * u64::from(width);
+		if u64::from(src.len) != expected {
+			return Err(ValidationError::LengthMismatch { index }.into());
+		}
+
+		self.secret.require(index, src.base, src.len)?;
+		self.secret.mark(dest.base, dest.len);
+		Ok(())
+	}
+
+	/// `BitDec`: a written secret run decomposed interactively into
+	/// `width` bits per element, LSB-first. Priced from the
+	/// mask-and-reveal ripple-borrow-subtractor the executor runs.
+	/// Each element costs `width` prandbits and two Beaver triples per
+	/// bit position (one for the difference bit, one for the borrow
+	/// into the next position). The last position's unused borrow is
+	/// priced too, trading a little preprocessing for a uniform,
+	/// easier-to-audit round structure.
+	fn check_bit_dec(&mut self, index: usize, dest: &SecretRange, src: &SecretRange, width: u8) -> Result<()> {
+		Self::check_width(index, width)?;
+		check_secret_bounds(index, dest)?;
+		check_secret_bounds(index, src)?;
+
+		let expected = u64::from(src.len) * u64::from(width);
+		if u64::from(dest.len) != expected {
+			return Err(ValidationError::LengthMismatch { index }.into());
+		}
+
+		self.secret.require(index, src.base, src.len)?;
+		self.secret.mark(dest.base, dest.len);
+
+		let elements = src.len as usize;
+		let width = width as usize;
+		self.budget.prandbits += elements * width;
+		self.budget.triples += elements * width * 2;
+		Ok(())
+	}
+
+	/// `Sbox`: TinyTable v1 online lookup over bit groups. Each byte
+	/// prices one random mask (8 prandbits), 8 bit XORs for `δ = x ⊕ r`,
+	/// one depth-8 byte mux tree, then a width-8 `bit_dec` so the
+	/// result stays on bit planes.
+	fn check_sbox(&mut self, index: usize, dest: &SecretRange, src: &SecretRange) -> Result<()> {
+		check_secret_bounds(index, dest)?;
+		check_secret_bounds(index, src)?;
+		if dest.len != src.len || src.len % 8 != 0 {
+			return Err(ValidationError::LengthMismatch { index }.into());
+		}
+
+		self.secret.require(index, src.base, src.len)?;
+		self.secret.mark(dest.base, dest.len);
+
+		let elements = (src.len / 8) as usize;
+		self.budget.sbox_tables += elements;
+		// Mask bits for δ = x ⊕ r.
+		self.budget.prandbits += elements * 8;
+		self.budget.triples += elements * 8;
+		self.budget.triples += elements * SBOX_ONLINE_MUXES;
+		// Follow-up bit_dec of the selected byte (width 8).
+		self.budget.prandbits += elements * 8;
+		self.budget.triples += elements * 8 * 2;
+		Ok(())
+	}
+
+	/// `ByteXor`: element-wise XOR of byte-valued secrets via two
+	/// width-8 decompositions, 8 bit XORs per element, and a pack.
+	fn check_byte_xor(&mut self, index: usize, dest: &SecretRange, a: &SecretRange, b: &SecretRange) -> Result<()> {
+		self.check_binary_secret(index, dest, a, b)?;
+
+		let elements = dest.len as usize;
+		self.budget.prandbits += elements * 8 * 2;
+		self.budget.triples += elements * 8 * 2 * 2;
+		self.budget.triples += elements * 8;
+		Ok(())
+	}
+
 	/// `Reveal`: a written secret run opened into clear registers.
 	fn check_reveal(&mut self, index: usize, dest: &ClearRange, src: &SecretRange) -> Result<()> {
 		check_clear_bounds(index, dest)?;
@@ -479,6 +665,13 @@ fn check(program: &Program) -> Result<(Budget, Option<FixedPrecision>)> {
 			}
 			Instruction::Reveal { dest, src } => checker.check_reveal(index, dest, src)?,
 			Instruction::Out { src, .. } => checker.check_out(index, last, src)?,
+			Instruction::AndS { pairs } | Instruction::XorS { pairs } => checker.check_bit_gate(index, pairs)?,
+			Instruction::NotS { dest, a } => checker.check_not(index, dest, a)?,
+			Instruction::Mux { dest, cond, t, f } => checker.check_mux(index, dest, cond, t, f)?,
+			Instruction::Pack { dest, src, width } => checker.check_pack(index, dest, src, *width)?,
+			Instruction::BitDec { dest, src, width } => checker.check_bit_dec(index, dest, src, *width)?,
+			Instruction::Sbox { dest, src } => checker.check_sbox(index, dest, src)?,
+			Instruction::ByteXor { dest, a, b } => checker.check_byte_xor(index, dest, a, b)?,
 		}
 	}
 
@@ -495,6 +688,14 @@ mod tests {
 	use super::*;
 	use crate::error::VmError;
 	use crate::isa::VERSION;
+
+	fn must_validate(program: Program) -> ValidProgram {
+		ValidProgram::try_from(program).expect("the program should validate")
+	}
+
+	fn must_from_der(bytes: &[u8]) -> ValidProgram {
+		ValidProgram::from_der(bytes).expect("the bytes should re-validate")
+	}
 
 	fn program(inputs: Vec<InputDecl>, instructions: Vec<Instruction>) -> Program {
 		Program { version: VERSION, inputs, instructions }
@@ -518,14 +719,14 @@ mod tests {
 
 	#[test]
 	fn a_sound_program_is_priced() {
-		let valid = ValidProgram::try_from(two_input_product()).expect("the program should validate");
+		let valid = must_validate(two_input_product());
 		assert_eq!(valid.budget(), Budget { triples: 1, random_shares: 2, ..Budget::default() });
 	}
 
 	#[test]
 	fn digests_match_the_wire_bytes() {
-		let valid = ValidProgram::try_from(two_input_product()).expect("the program should validate");
-		let reparsed = ValidProgram::from_der(valid.bytes()).expect("the bytes should re-validate");
+		let valid = must_validate(two_input_product());
+		let reparsed = must_from_der(valid.bytes());
 		assert_eq!(reparsed.digest(), valid.digest());
 	}
 
@@ -705,7 +906,7 @@ mod tests {
 			],
 		);
 
-		let valid = ValidProgram::try_from(batched).expect("the program should validate");
+		let valid = must_validate(batched);
 		assert_eq!(valid.budget(), Budget { triples: 3, random_shares: 4, ..Budget::default() });
 	}
 
@@ -733,14 +934,13 @@ mod tests {
 	#[test]
 	fn fixed_point_truncation_is_priced() {
 		let precision = FixedPrecision { k: 16, f: 4 };
-		let valid = ValidProgram::try_from(fixed_point_pipeline(precision, precision, 32))
-			.expect("the program should validate");
+		let valid = must_validate(fixed_point_pipeline(precision, precision, 32));
 
-		// FpMulS: 1 mul triple + 4 bit triples; FpDivC: 4 bit triples.
+		// FpMulS: 1 mul triple + 4 bit triples. FpDivC: 4 bit triples.
 		// Random shares: 2 inputs + 4 + 4 bits. One prandint each.
 		assert_eq!(
 			valid.budget(),
-			Budget { triples: 9, random_shares: 10, prandbits: 8, prandints: 2 }
+			Budget { triples: 9, random_shares: 10, prandbits: 8, prandints: 2, ..Budget::default() }
 		);
 		assert_eq!(valid.precision(), Some(precision));
 	}
@@ -773,6 +973,257 @@ mod tests {
 		assert!(matches!(
 			outcome,
 			Err(VmError::Validation(ValidationError::ZeroDivisor { index: 1 }))
+		));
+	}
+
+	fn bit_input() -> Program {
+		program(
+			vec![InputDecl { client: 100, dest: SecretRange { base: 0, len: 2 } }],
+			Vec::new(),
+		)
+	}
+
+	fn with_bit_gate(gate: Instruction) -> Program {
+		let mut built = bit_input();
+		built.instructions.push(gate);
+		built
+			.instructions
+			.push(Instruction::Out { client: 100, src: SecretRange { base: 2, len: 1 } });
+		built
+	}
+
+	#[test]
+	fn ands_price_one_triple_per_element_like_muls() {
+		let gate = Instruction::AndS {
+			pairs: vec![MulTriple {
+				dest: SecretRange { base: 2, len: 1 },
+				a: SecretRange { base: 0, len: 1 },
+				b: SecretRange { base: 1, len: 1 },
+			}],
+		};
+
+		let valid = must_validate(with_bit_gate(gate));
+		assert_eq!(valid.budget(), Budget { triples: 1, random_shares: 2, ..Budget::default() });
+	}
+
+	#[test]
+	fn xors_price_one_triple_per_element() {
+		let gate = Instruction::XorS {
+			pairs: vec![MulTriple {
+				dest: SecretRange { base: 2, len: 1 },
+				a: SecretRange { base: 0, len: 1 },
+				b: SecretRange { base: 1, len: 1 },
+			}],
+		};
+
+		let valid = must_validate(with_bit_gate(gate));
+		assert_eq!(valid.budget(), Budget { triples: 1, random_shares: 2, ..Budget::default() });
+	}
+
+	#[test]
+	fn nots_price_no_triples_like_addc() {
+		let gate = Instruction::NotS { dest: SecretRange { base: 2, len: 1 }, a: SecretRange { base: 0, len: 1 } };
+
+		let valid = must_validate(with_bit_gate(gate));
+		assert_eq!(valid.budget(), Budget { triples: 0, random_shares: 2, ..Budget::default() });
+	}
+
+	#[test]
+	fn mux_prices_one_triple_per_element() {
+		let gate = Instruction::Mux {
+			dest: SecretRange { base: 2, len: 1 },
+			cond: SecretRange { base: 0, len: 1 },
+			t: SecretRange { base: 0, len: 1 },
+			f: SecretRange { base: 1, len: 1 },
+		};
+
+		let valid = must_validate(with_bit_gate(gate));
+		assert_eq!(valid.budget(), Budget { triples: 1, random_shares: 2, ..Budget::default() });
+	}
+
+	#[test]
+	fn mux_refuses_a_cond_wider_than_one() {
+		let unsound = with_bit_gate(Instruction::Mux {
+			dest: SecretRange { base: 2, len: 1 },
+			cond: SecretRange { base: 0, len: 2 },
+			t: SecretRange { base: 0, len: 1 },
+			f: SecretRange { base: 1, len: 1 },
+		});
+
+		let outcome = ValidProgram::try_from(unsound);
+		assert!(matches!(
+			outcome,
+			Err(VmError::Validation(ValidationError::LengthMismatch { index: 0 }))
+		));
+	}
+
+	#[test]
+	fn pack_prices_no_triples_and_folds_a_derived_source_range() {
+		let program = program(
+			vec![InputDecl { client: 100, dest: SecretRange { base: 0, len: 2 } }],
+			vec![
+				Instruction::Pack {
+					dest: SecretRange { base: 2, len: 1 },
+					src: SecretRange { base: 0, len: 2 },
+					width: 2,
+				},
+				Instruction::Out { client: 100, src: SecretRange { base: 2, len: 1 } },
+			],
+		);
+
+		let valid = must_validate(program);
+		assert_eq!(valid.budget(), Budget { triples: 0, random_shares: 2, ..Budget::default() });
+	}
+
+	#[test]
+	fn pack_refuses_a_source_range_disagreeing_with_dest_times_width() {
+		let unsound = program(
+			vec![InputDecl { client: 100, dest: SecretRange { base: 0, len: 2 } }],
+			vec![
+				Instruction::Pack {
+					dest: SecretRange { base: 2, len: 1 },
+					src: SecretRange { base: 0, len: 2 },
+					width: 3,
+				},
+				Instruction::Out { client: 100, src: SecretRange { base: 2, len: 1 } },
+			],
+		);
+
+		let outcome = ValidProgram::try_from(unsound);
+		assert!(matches!(
+			outcome,
+			Err(VmError::Validation(ValidationError::LengthMismatch { index: 0 }))
+		));
+	}
+
+	#[test]
+	fn bit_gates_refuse_bank_overruns_like_muls() {
+		let unsound = with_bit_gate(Instruction::AndS {
+			pairs: vec![MulTriple {
+				dest: SecretRange { base: 2, len: 1 },
+				a: SecretRange { base: u32::MAX - 1, len: 2 },
+				b: SecretRange { base: 1, len: 1 },
+			}],
+		});
+
+		let outcome = ValidProgram::try_from(unsound);
+		assert!(matches!(
+			outcome,
+			Err(VmError::Validation(ValidationError::BankExceeded { bank: Bank::Secret, .. }))
+		));
+	}
+
+	#[test]
+	fn bit_dec_prices_prandbits_and_two_triples_per_bit() {
+		let program = program(
+			vec![InputDecl { client: 100, dest: SecretRange { base: 0, len: 1 } }],
+			vec![
+				Instruction::BitDec {
+					dest: SecretRange { base: 1, len: 8 },
+					src: SecretRange { base: 0, len: 1 },
+					width: 8,
+				},
+				Instruction::Out { client: 100, src: SecretRange { base: 1, len: 8 } },
+			],
+		);
+
+		let valid = must_validate(program);
+		assert_eq!(
+			valid.budget(),
+			Budget { triples: 16, random_shares: 1, prandbits: 8, prandints: 0, ..Budget::default() }
+		);
+	}
+
+	#[test]
+	fn bit_dec_refuses_a_dest_range_disagreeing_with_src_times_width() {
+		let unsound = program(
+			vec![InputDecl { client: 100, dest: SecretRange { base: 0, len: 1 } }],
+			vec![
+				Instruction::BitDec {
+					dest: SecretRange { base: 1, len: 7 },
+					src: SecretRange { base: 0, len: 1 },
+					width: 8,
+				},
+				Instruction::Out { client: 100, src: SecretRange { base: 1, len: 7 } },
+			],
+		);
+
+		let outcome = ValidProgram::try_from(unsound);
+		assert!(matches!(
+			outcome,
+			Err(VmError::Validation(ValidationError::LengthMismatch { index: 0 }))
+		));
+	}
+
+	#[test]
+	fn bit_dec_refuses_a_width_beyond_the_safe_ceiling() {
+		let unsound = program(
+			vec![InputDecl { client: 100, dest: SecretRange { base: 0, len: 1 } }],
+			vec![
+				Instruction::BitDec {
+					dest: SecretRange { base: 1, len: 65 },
+					src: SecretRange { base: 0, len: 1 },
+					width: 65,
+				},
+				Instruction::Out { client: 100, src: SecretRange { base: 1, len: 65 } },
+			],
+		);
+
+		let outcome = ValidProgram::try_from(unsound);
+		assert!(matches!(
+			outcome,
+			Err(VmError::Validation(ValidationError::UnsafeWidth {
+				index: 0,
+				width: 65,
+				max: MAX_BIT_WIDTH
+			}))
+		));
+	}
+
+	#[test]
+	fn pack_refuses_a_zero_width() {
+		let unsound = program(
+			vec![InputDecl { client: 100, dest: SecretRange { base: 0, len: 1 } }],
+			vec![
+				Instruction::Pack {
+					dest: SecretRange { base: 1, len: 1 },
+					src: SecretRange { base: 0, len: 0 },
+					width: 0,
+				},
+				Instruction::Out { client: 100, src: SecretRange { base: 1, len: 1 } },
+			],
+		);
+
+		let outcome = ValidProgram::try_from(unsound);
+		assert!(matches!(
+			outcome,
+			Err(VmError::Validation(ValidationError::UnsafeWidth { index: 0, width: 0, .. }))
+		));
+	}
+
+	#[test]
+	fn bit_gates_refuse_uninitialized_reads_like_muls() {
+		let unsound = program(
+			Vec::new(),
+			vec![
+				Instruction::AndS {
+					pairs: vec![MulTriple {
+						dest: SecretRange { base: 0, len: 1 },
+						a: SecretRange { base: 1, len: 1 },
+						b: SecretRange { base: 2, len: 1 },
+					}],
+				},
+				Instruction::Out { client: 100, src: SecretRange { base: 0, len: 1 } },
+			],
+		);
+
+		let outcome = ValidProgram::try_from(unsound);
+		assert!(matches!(
+			outcome,
+			Err(VmError::Validation(ValidationError::UninitializedRead {
+				bank: Bank::Secret,
+				..
+			}))
 		));
 	}
 }

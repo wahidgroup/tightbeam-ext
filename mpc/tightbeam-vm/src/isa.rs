@@ -71,13 +71,13 @@ pub struct InputDecl {
 	pub dest: SecretRange,
 }
 
-/// One VM instruction. Linear operations run locally; `MulS`, `Reveal`,
+/// One VM instruction. Linear operations run locally. `MulS`, `Reveal`,
 /// and `Out` are interactive.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Instruction {
 	/// Load public immediates into clear registers.
 	LdC {
-		/// Where the immediates land; `dest.len == values.len()`.
+		/// Where the immediates land. `dest.len` equals `values.len()`.
 		dest: ClearRange,
 		/// The immediates, lifted into the field at execution.
 		values: Vec<u64>,
@@ -171,6 +171,75 @@ pub enum Instruction {
 		/// The shares to send.
 		src: SecretRange,
 	},
+	/// Batched secret AND on bits in `{0,1}`: `dest = a * b`, one Beaver
+	/// triple per element.
+	AndS {
+		/// The element-wise conjunctions to run together.
+		pairs: Vec<MulTriple>,
+	},
+	/// Batched secret XOR on bits in `{0,1}`: `dest = a + b - 2ab`, one
+	/// Beaver triple per element.
+	XorS {
+		/// The element-wise exclusive-ors to run together.
+		pairs: Vec<MulTriple>,
+	},
+	/// Local secret NOT on bits in `{0,1}`: `dest = 1 - a`.
+	NotS {
+		/// Where the negations land.
+		dest: SecretRange,
+		/// The bits to negate.
+		a: SecretRange,
+	},
+	/// Bit-selected choice: `dest = f + cond * (t - f)`. `cond` is a
+	/// single bit broadcast across every element of `t`/`f`.
+	Mux {
+		/// Where the selections land.
+		dest: SecretRange,
+		/// The single selector bit.
+		cond: SecretRange,
+		/// Values chosen when `cond` is `1`.
+		t: SecretRange,
+		/// Values chosen when `cond` is `0`.
+		f: SecretRange,
+	},
+	/// Local little-endian bit packing: `dest[j] = sum_i 2^i * src[j*width + i]`.
+	Pack {
+		/// Where the packed elements land.
+		dest: SecretRange,
+		/// The LSB-first bits, `dest.len * width` of them.
+		src: SecretRange,
+		/// Bits per packed element.
+		width: u8,
+	},
+	/// Interactive mask-and-reveal bit decomposition: `dest[j*width + i]`
+	/// is bit `i` of `src[j] mod 2^width`, LSB-first.
+	BitDec {
+		/// Where the decomposed bits land, `src.len * width` of them.
+		dest: SecretRange,
+		/// The elements to decompose.
+		src: SecretRange,
+		/// Bits per decomposed element.
+		width: u8,
+	},
+	/// Batched AES S-box on LSB-first byte bit groups. `src` and `dest`
+	/// are both `nbytes * 8` bit registers. Online: open `δ = x ⊕ r`,
+	/// mux-select the substituted byte, then bit-decompose it so the
+	/// result stays on bit planes.
+	Sbox {
+		/// Where the substituted bits land.
+		dest: SecretRange,
+		/// The input bits (`dest.len` registers, LSB-first per byte).
+		src: SecretRange,
+	},
+	/// Element-wise XOR on byte-valued secrets (`0..=255`).
+	ByteXor {
+		/// Where the XORs land.
+		dest: SecretRange,
+		/// Left bytes.
+		a: SecretRange,
+		/// Right bytes.
+		b: SecretRange,
+	},
 }
 
 /// Wire discriminants for [`Instruction`]. Values are stable: they are
@@ -200,6 +269,22 @@ pub enum Opcode {
 	FpMulS = 10,
 	/// [`Instruction::FpDivC`].
 	FpDivC = 11,
+	/// [`Instruction::BitDec`].
+	BitDec = 12,
+	/// [`Instruction::XorS`].
+	XorS = 13,
+	/// [`Instruction::AndS`].
+	AndS = 14,
+	/// [`Instruction::NotS`].
+	NotS = 15,
+	/// [`Instruction::Mux`].
+	Mux = 16,
+	/// [`Instruction::Pack`].
+	Pack = 17,
+	/// [`Instruction::Sbox`].
+	Sbox = 18,
+	/// [`Instruction::ByteXor`].
+	ByteXor = 19,
 }
 
 impl From<Opcode> for u8 {
@@ -224,6 +309,14 @@ impl TryFrom<u8> for Opcode {
 			9 => Ok(Self::Out),
 			10 => Ok(Self::FpMulS),
 			11 => Ok(Self::FpDivC),
+			12 => Ok(Self::BitDec),
+			13 => Ok(Self::XorS),
+			14 => Ok(Self::AndS),
+			15 => Ok(Self::NotS),
+			16 => Ok(Self::Mux),
+			17 => Ok(Self::Pack),
+			18 => Ok(Self::Sbox),
+			19 => Ok(Self::ByteXor),
 			_ => Err(CodecError::UnknownOpcode { opcode: value }),
 		}
 	}
@@ -244,6 +337,14 @@ impl Instruction {
 			Self::FpDivC { .. } => Opcode::FpDivC,
 			Self::Reveal { .. } => Opcode::Reveal,
 			Self::Out { .. } => Opcode::Out,
+			Self::AndS { .. } => Opcode::AndS,
+			Self::XorS { .. } => Opcode::XorS,
+			Self::NotS { .. } => Opcode::NotS,
+			Self::Mux { .. } => Opcode::Mux,
+			Self::Pack { .. } => Opcode::Pack,
+			Self::BitDec { .. } => Opcode::BitDec,
+			Self::Sbox { .. } => Opcode::Sbox,
+			Self::ByteXor { .. } => Opcode::ByteXor,
 		}
 	}
 }
@@ -289,5 +390,30 @@ mod tests {
 	fn range_ends_do_not_overflow() {
 		let range = SecretRange { base: u32::MAX, len: u32::MAX };
 		assert_eq!(range.end(), u64::from(u32::MAX) * 2);
+	}
+
+	#[test]
+	fn gate_and_pack_instructions_name_their_opcode() {
+		let zero = SecretRange { base: 0, len: 1 };
+		let cases = [
+			(Instruction::AndS { pairs: Vec::new() }, Opcode::AndS),
+			(Instruction::XorS { pairs: Vec::new() }, Opcode::XorS),
+			(Instruction::NotS { dest: zero, a: zero }, Opcode::NotS),
+			(Instruction::Mux { dest: zero, cond: zero, t: zero, f: zero }, Opcode::Mux),
+			(Instruction::Pack { dest: zero, src: zero, width: 1 }, Opcode::Pack),
+			(Instruction::BitDec { dest: zero, src: zero, width: 1 }, Opcode::BitDec),
+			(
+				Instruction::Sbox {
+					dest: SecretRange { base: 0, len: 8 },
+					src: SecretRange { base: 0, len: 8 },
+				},
+				Opcode::Sbox,
+			),
+			(Instruction::ByteXor { dest: zero, a: zero, b: zero }, Opcode::ByteXor),
+		];
+
+		for (instruction, opcode) in cases {
+			assert_eq!(instruction.opcode(), opcode);
+		}
 	}
 }

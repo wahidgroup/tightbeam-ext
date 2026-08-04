@@ -3157,11 +3157,13 @@ dependencies = [
 name = "tightbeam-vm"
 version = "0.1.0"
 dependencies = [
+ "aes",
  "afl",
  "ark-bls12-381",
  "ark-ff",
  "ark-serialize",
  "ark-std",
+ "cipher",
  "der",
  "futures-util",
  "husky-rs",

@@ -26,6 +26,7 @@
 
 pub mod backend;
 pub mod builder;
+pub mod circuits;
 pub mod codec;
 pub mod consumer;
 pub mod control;
@@ -37,7 +38,7 @@ pub mod party;
 pub mod validate;
 
 pub use backend::{HoneyBadgerBackend, SecretOps};
-pub use builder::{Clear, ProgramBuilder, Secret};
+pub use builder::{Bits, Clear, ProgramBuilder, Secret};
 pub use codec::ProgramDigest;
 pub use consumer::VmConsumer;
 pub use control::ControlMessage;

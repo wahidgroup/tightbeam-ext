@@ -188,11 +188,22 @@ pub enum ValidationError {
 		/// The offending instruction's index.
 		index: usize,
 	},
-	/// Two fixed-point instructions name different precisions; the
+	/// Two fixed-point instructions name different precisions. The
 	/// engine pins one format per program.
 	MixedPrecision {
 		/// The offending instruction's index.
 		index: usize,
+	},
+	/// A `Pack` or `BitDec` bit width is zero or exceeds the range
+	/// local `1 << position` arithmetic and the mask-and-reveal
+	/// cleartext bound can serve safely.
+	UnsafeWidth {
+		/// The offending instruction's index.
+		index: usize,
+		/// The requested width.
+		width: u8,
+		/// The ceiling.
+		max: u8,
 	},
 }
 
@@ -236,6 +247,9 @@ impl fmt::Display for ValidationError {
 			}
 			Self::MixedPrecision { index } => {
 				write!(f, "instruction {index} names a second fixed-point precision")
+			}
+			Self::UnsafeWidth { index, width, max } => {
+				write!(f, "instruction {index} names bit width {width}, the safe ceiling is {max}")
 			}
 		}
 	}

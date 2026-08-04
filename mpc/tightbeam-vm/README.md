@@ -23,6 +23,12 @@ Register-based, version-tagged, straight line (no jumps, no recursion). Register
 - `AddS` / `SubS` - secret plus/minus secret (local share arithmetic, zero rounds).
 - `AddC` / `SubC` / `MulC` - secret against clear constant (local, zero rounds).
 - `MulS` - vectorized secret multiplication: one Beaver round for the whole range.
+- `AndS` / `XorS` / `NotS` - bit gates on `{0,1}` secret registers (`XorS` is `a + b - 2ab`). `AndS` and `XorS` batch like `MulS`.
+- `Mux` - bit-selected choice: one condition bit broadcasts across a secret vector.
+- `BitDec` - interactive mask-and-reveal bit decomposition into LSB-first `{0,1}` bits.
+- `Pack` - local little-endian fold of bit groups back into secret field elements.
+- `Sbox` - batched AES S-box on width-8 bit groups via TinyTable online (reveal masked index, mux-select, bit-decompose).
+- `ByteXor` - element-wise XOR on byte-valued secrets.
 - `FpMulS` / `FpDivC` - fixed-point multiplication (secret by secret) and division by a public constant, with probabilistic truncation by `2^f`. Register values are raw fixed-point integers (`real * 2^f`); every fixed-point instruction in one program must name the same `(k, f)` precision, because the engine pins one format per run.
 - `Reveal` - open secret registers into clear registers over the control lane.
 - `Out` - final instruction; names the secret range delivered to the consumer.
@@ -31,14 +37,16 @@ Static validation enforces instruction and bank limits, def-before-use, single t
 
 ## Surface
 
-- `ProgramBuilder` / `Secret` / `Clear` - fluent, infallible program construction with typed register handles.
+- `ProgramBuilder` / `Secret` / `Clear` / `Bits` - fluent, infallible program construction with typed register handles. Bit ops mint `Bits`. `input_bytes` documents byte-valued secrets before `bit_dec(..., 8)`.
+- `circuits::aes128::encrypt_block` - default AES-128 one-block encrypt on the TinyTable LUT path (`Sbox` + bit-plane linear layers).
+- `circuits::aes128::encrypt_block_boolean` - Boyar-Peralta boolean oracle for PlainBackend cross-checks only.
 - `Program` / `ValidProgram` - the raw instruction list and its validated, budgeted form (parse, don't validate).
 - `ProgramDigest` - SHA3-256 identity of the DER bytes; doubles as the MPC instance id.
 - `VmParty` / `VmPartyConfig` - party-side host: receive, validate, echo verdict, preprocess, collect inputs, execute, deliver.
 - `VmConsumer` - consumer-side host: submit the program, verify every party echoes the same digest, provide inputs, reconstruct outputs.
 - `SecretOps` / `HoneyBadgerBackend` - the execution backend trait; the interpreter is generic over it, so unit tests run against a plaintext backend.
 - `execute` / `Output` - the interpreter entry point and its result.
-- `TraceHandle` (re-exported from tightbeam-mpc) - program bytes carry no tracing of their own; hosts record lifecycle events through injected handles instead. `VmPartyConfig::trace` observes the submission verdict (`admit` / `refuse` / `submit_timeout`), the session's round transitions, and the interpreter's execution events (`program_start`, `reveal`, `program_end`); `VmConsumer::with_trace` observes the submission flow (`submit`, `echo_ok`, `echo_lost`, `digest_mismatch`) and output reconstruction.
+- `TraceHandle` (re-exported from tightbeam-mpc) - program bytes carry no tracing of their own. Hosts record lifecycle events through injected handles instead. `VmPartyConfig::trace` observes the submission verdict (`admit` / `refuse` / `submit_timeout`), the session's round transitions, and the interpreter's execution events (`program_start`, `reveal`, `program_end`). `VmConsumer::with_trace` observes the submission flow (`submit`, `echo_ok`, `echo_lost`, `digest_mismatch`) and output reconstruction.
 
 ## Usage
 
@@ -68,9 +76,32 @@ let mut party: VmParty<Fr, Avid<SessionId>> = VmParty::receive(network, config).
 party.run(&mut rng).await?; // preprocess, collect inputs, execute, deliver
 ```
 
+### AES-128 (LUT default)
+
+Declare sixteen key bytes and sixteen plaintext bytes, expand the encrypt circuit, then size preprocessing from the priced budget:
+
+```rust
+use tightbeam_vm::circuits::aes128::{encrypt_block, BLOCK_LEN};
+
+let mut builder = ProgramBuilder::default();
+let inputs = builder.input_bytes(client_id, BLOCK_LEN * 2);
+let key = inputs.slice(0, BLOCK_LEN);
+let block = inputs.slice(BLOCK_LEN, BLOCK_LEN);
+let ciphertext = encrypt_block(&mut builder, key, block);
+builder.output(client_id, ciphertext);
+let program = builder.build()?;
+// size party preprocessing from program.budget()
+```
+
+`encrypt_block` is the LUT path: TinyTable `Sbox` for SubBytes, with ShiftRows / MixColumns / AddRoundKey on bit planes. `encrypt_block_boolean` keeps the Boyar-Peralta circuit as a PlainBackend oracle only. The HoneyBadger mesh e2e (`an_aes128_block_encrypts_end_to_end`) targets preprocess plus online within 10 minutes on 5-party localhost. A reveal microbench on the same topology measured about 0.65 s for a 16-open batch and about 0.77 s for a 160-open batch in release.
+
+## Roadmap
+
+secp256k1 threshold ECDSA is a follow-on track on the [tightbeam-mpc](../tightbeam-mpc) `Network`, not more AES/LUT opcodes on HoneyBadger. Stoffel splits backends: HoneyBadger for field-arithmetic apps, and AVSS plus curve workflows (including `secp256k1`) for verifiable scalars and curve-oriented protocols ([Stoffel MPC architecture](https://docs.stoffelmpc.com/architecture/mpc)). A future signing product would host AVSS / threshold-ECDSA rounds as a sibling session type on the same mesh. Non-goals for the AES LUT wave: MtA, Paillier, secp256k1 scalar-mul opcodes, and AVSS integration.
+
 ## Related
 
-The integration tests run submitted programs end-to-end over localhost TCP with five parties and a consumer, as `tb_scenario!` scenarios whose assertion specs count the live lifecycle events - including a fixed-point pipeline and malformed-submission rejection: [tests/vm_e2e.rs](tests/vm_e2e.rs). Shared fixture code lives in [tests/common](tests/common/mod.rs) over `tightbeam_mpc::testing::TestTopology`. Transport, roster, and session mechanics live in [tightbeam-mpc](../tightbeam-mpc).
+The integration tests run submitted programs end-to-end over localhost TCP with five parties and a consumer, as `tb_scenario!` scenarios whose assertion specs count the live lifecycle events - including a fixed-point pipeline, bit-decomposed comparison, reveal-batch cost measurement, LUT AES mesh encrypt, and malformed-submission rejection: [tests/vm_e2e.rs](tests/vm_e2e.rs). AES-128 circuit correctness against the clear `aes` crate is also covered by a PlainBackend unit test. Shared fixture code lives in [tests/common](tests/common/mod.rs) over `tightbeam_mpc::testing::TestTopology`. Transport, roster, and session mechanics live in [tightbeam-mpc](../tightbeam-mpc).
 
 Three suites use tightbeam's verification framework:
 

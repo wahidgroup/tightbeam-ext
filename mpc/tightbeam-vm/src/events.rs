@@ -25,6 +25,12 @@ pub const DIGEST_MISMATCH: TraceEvent = TraceEvent::new("digest_mismatch", "vm:e
 pub const PROGRAM_START: TraceEvent = TraceEvent::new("program_start", "vm:event/program-start");
 /// The interpreter ran an interactive reveal.
 pub const REVEAL: TraceEvent = TraceEvent::new("reveal", "vm:event/reveal");
+/// The interpreter ran an interactive mask-and-reveal bit
+/// decomposition (`BitDec`'s own reveal round, distinct from an
+/// explicit `Reveal` instruction).
+pub const BIT_DEC: TraceEvent = TraceEvent::new("bit_dec", "vm:event/bit-dec");
+/// The interpreter ran a TinyTable AES S-box batch.
+pub const SBOX: TraceEvent = TraceEvent::new("sbox", "vm:event/sbox");
 /// The interpreter finished the program.
 pub const PROGRAM_END: TraceEvent = TraceEvent::new("program_end", "vm:event/program-end");
 
@@ -43,5 +49,7 @@ pub mod kind {
 	pub const DIGEST_MISMATCH: Urn<'static> = super::DIGEST_MISMATCH.urn();
 	pub const PROGRAM_START: Urn<'static> = super::PROGRAM_START.urn();
 	pub const REVEAL: Urn<'static> = super::REVEAL.urn();
+	pub const BIT_DEC: Urn<'static> = super::BIT_DEC.urn();
+	pub const SBOX: Urn<'static> = super::SBOX.urn();
 	pub const PROGRAM_END: Urn<'static> = super::PROGRAM_END.urn();
 }
