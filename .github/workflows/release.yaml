@@ -31,13 +31,11 @@ jobs:
           registry-url: https://npm.pkg.github.com
           scope: "@wahidgroup"
 
-      # Rust SoT: rust-toolchain.toml via scripts/setup.sh (rustup toolchain install).
       - name: Setup
         run: make setup
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # After toolchain install: cache key uses active rustc / cargo metadata.
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
       - name: CI
