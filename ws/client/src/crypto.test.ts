@@ -126,6 +126,23 @@ describe("profile algorithm identifiers", () => {
 	});
 });
 
+describe("Secp256k1SigningKey.toSpkiDer", () => {
+	// EncodePublicKey SPKI for scalar 0x01…01 (uncompressed SEC1).
+	const SPKI_HEX =
+		"3056301006072a8648ce3d020106052b8104000a034200041b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f70beaf8f588b541507fed6a642c5ab42dfdf8120a7f639de5122d47a69a8e8d1";
+
+	it("emits uncompressed SPKI matching EncodePublicKey", () => {
+		const key = Secp256k1SigningKey.fromBytes(new Uint8Array(32).fill(1));
+		const spki = key.toSpkiDer();
+
+		expect(spki.length).toBe(88);
+		expect(spki[0]).toBe(0x30);
+		expect(spki[1]).toBe(0x56);
+		expect(spki[23]).toBe(0x04);
+		expect(bytesToHex(spki)).toBe(SPKI_HEX);
+	});
+});
+
 describe("profile Hasher", () => {
 	it("computes the SHA3-256 test vector for 'abc'", async () => {
 		const digest = await new Sha3_256().digest(

@@ -1,6 +1,6 @@
 //! Encrypted round-trip driven by DER identity fixtures.
 //!
-//! Proves the fixtures are loadable and drive a real ECIES handshake: mint a
+//! Proves the fixtures are loadable and drive a real ECIES handshake: issue a
 //! server identity, serialize it to a DER certificate + raw key, reload it the
 //! way the echo server and browser client do, then complete an encrypted frame
 //! round-trip over the WebSocket transport using only the public surface.
@@ -21,11 +21,11 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn encrypted_round_trip_over_der_fixtures() -> Result<(), BoxError> {
-	// 1. Mint a server identity, then round-trip it through the DER certificate
+	// 1. Issue a server identity, then round-trip it through the DER certificate
 	//    and raw key bytes exactly as the generator writes and peers reload.
-	let minted = Identity::mint_root("CN=fixture echo,O=tightbeam-ws,C=US", 1, Duration::from_secs(3600))?;
-	let cert_der = minted.certificate_der()?;
-	let key_bytes = minted.signing_key_bytes();
+	let issued = Identity::mint_root("CN=fixture echo,O=tightbeam-ws,C=US", 1, Duration::from_secs(3600))?;
+	let cert_der = issued.certificate_der()?;
+	let key_bytes = issued.signing_key_bytes();
 	let identity = Identity::from_der(&cert_der, &key_bytes)?;
 
 	// 2. Bind an encrypted server presenting the reloaded identity.

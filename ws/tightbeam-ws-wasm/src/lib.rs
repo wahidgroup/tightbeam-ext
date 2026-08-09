@@ -5,6 +5,7 @@
 //! bidirectional streams.
 
 pub mod build;
+pub mod work;
 
 #[cfg(target_arch = "wasm32")]
 mod approver;
@@ -14,6 +15,8 @@ mod bindings;
 mod fault;
 #[cfg(target_arch = "wasm32")]
 mod mux;
+#[cfg(target_arch = "wasm32")]
+mod profile;
 #[cfg(target_arch = "wasm32")]
 mod promise;
 #[cfg(target_arch = "wasm32")]
@@ -37,3 +40,4 @@ pub use signer::{JsSigningKeyProvider, TransportSigner};
 pub use stream::{GlooStream, WsTransport};
 #[cfg(target_arch = "wasm32")]
 pub use streaming::{MuxDuplexStream, MuxReplySink, MuxRequestStream, MuxStreamBody};
+pub use work::{WorkReply, WorkRequestEnvelope};

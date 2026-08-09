@@ -3,14 +3,12 @@
  */
 
 import {
-	derivePublicKey,
-	openAes256Gcm,
-	openEciesSecp256k1,
-	profileSignerId,
-	sealAes256Gcm,
-	sealEciesSecp256k1,
-	sha3_256 as wasmSha3_256,
-	signTbs,
+	Aes256Gcm as WasmAes256Gcm,
+	EciesSecp256k1Decryptor as WasmEciesDecryptor,
+	EciesSecp256k1Encryptor as WasmEciesEncryptor,
+	Secp256k1SigningKey as WasmSecp256k1SigningKey,
+	Secp256k1VerifyingKey as WasmSecp256k1VerifyingKey,
+	Sha3_256 as WasmSha3_256,
 } from "#wasm";
 
 import { ValidationError } from "./builder/errors.js";
@@ -122,6 +120,44 @@ export interface BodyDecryptor {
 }
 
 /**
+ * Minimum frame surface a {@link FrameVerifier} needs. Kept structural so
+ * crypto does not import {@link Frame} (avoids a crypto↔frame cycle).
+ */
+export interface VerifiableFrame {
+	/**
+	 * Frame DER octets.
+	 */
+	toDer(): Uint8Array;
+
+	/**
+	 * To-be-signed octets for external verifiers.
+	 */
+	tbs(): Uint8Array;
+
+	/**
+	 * Carried signature metadata, when present.
+	 */
+	readonly signatureInfo?: {
+		readonly algorithmOid: string;
+		readonly signature: Uint8Array;
+	};
+}
+
+/**
+ * Unwrap/verify half of authenticity. Algorithm lives in the
+ * implementation (profile secp256k1, BYO ed25519, …).
+ */
+export interface FrameVerifier {
+	/**
+	 * Verify this frame's non-repudiation signature.
+	 *
+	 * @throws when the frame is unsigned, the algorithm differs, or the
+	 * signature does not verify.
+	 */
+	verifyFrame(frame: VerifiableFrame): void;
+}
+
+/**
  * A frame signer. Anything that can produce a signature over the to-be-signed
  * bytes qualifies - a local {@link Secp256k1SigningKey}, wallets, passkeys,
  * HSMs, remote KMS backends. An external signer's private key never enters
@@ -137,6 +173,13 @@ export interface Signatory {
 	 * The dotted OID of the digest the signature is computed over.
 	 */
 	readonly digestAlgorithmOid: string;
+
+	/**
+	 * Present when this signer can derive its verify half (local keys).
+	 * Envelope `signed(signatory)` uses it for `unwrap()` without a
+	 * separate `verified()` declaration.
+	 */
+	readonly verifier?: FrameVerifier;
 
 	/**
 	 * The subject-key-identifier octets naming this signer in the frame.
@@ -183,6 +226,27 @@ function requireAlgorithm(sealed: EncryptedBody, expectedOid: string): void {
 }
 
 /**
+ * Read {@link EncryptedBody} fields from a wasm `SealedBody`, then free it.
+ */
+function takeSealedBody(sealed: {
+	algorithmOid: string;
+	parametersDer?: Uint8Array;
+	ciphertext: Uint8Array;
+	free(): void;
+}): EncryptedBody {
+	try {
+		const encryptedBody = {
+			algorithmOid: sealed.algorithmOid,
+			parametersDer: sealed.parametersDer,
+			ciphertext: sealed.ciphertext,
+		};
+		return encryptedBody;
+	} finally {
+		sealed.free();
+	}
+}
+
+/**
  * The profile {@link Hasher}: SHA3-256 computed in the wasm module.
  */
 export class Sha3_256 implements Hasher {
@@ -195,7 +259,7 @@ export class Sha3_256 implements Hasher {
 	 * Digest `data` with SHA3-256.
 	 */
 	digest(data: Uint8Array): Promise<Uint8Array> {
-		const digest = wasmSha3_256(data);
+		const digest = WasmSha3_256.digest(data);
 		const result = Promise.resolve(digest);
 		return result;
 	}
@@ -204,8 +268,8 @@ export class Sha3_256 implements Hasher {
 /**
  * A secp256k1 ECDSA verifying (public) key, for `Frame.verify`.
  */
-export class Secp256k1VerifyingKey {
-	private constructor(private readonly sec1: Uint8Array) {}
+export class Secp256k1VerifyingKey implements FrameVerifier {
+	private constructor(private readonly inner: WasmSecp256k1VerifyingKey) {}
 
 	/**
 	 * Wrap a SEC1-encoded point (33-byte compressed or 65-byte uncompressed).
@@ -215,7 +279,9 @@ export class Secp256k1VerifyingKey {
 	static fromSec1Bytes(sec1: Uint8Array): Secp256k1VerifyingKey {
 		requireLength(sec1, [33, 65], "sec1");
 
-		const key = new Secp256k1VerifyingKey(sec1);
+		const key = new Secp256k1VerifyingKey(
+			WasmSecp256k1VerifyingKey.fromSec1Bytes(sec1),
+		);
 		return key;
 	}
 
@@ -223,13 +289,27 @@ export class Secp256k1VerifyingKey {
 	 * The SEC1-encoded point.
 	 */
 	toSec1Bytes(): Uint8Array {
-		return this.sec1;
+		return this.inner.toSec1Bytes();
+	}
+
+	/**
+	 * Subject-key-identifier octets naming this verifying key.
+	 */
+	signerId(): Uint8Array {
+		return this.inner.signerId();
+	}
+
+	/**
+	 * Verify a frame under this key (profile ECDSA over SHA3-256).
+	 */
+	verifyFrame(frame: VerifiableFrame): void {
+		this.inner.verifyFrame(frame.toDer());
 	}
 }
 
 /**
  * The profile {@link Signatory}: a local secp256k1 ECDSA signing key (raw
- * 32-byte scalar) signing SHA3-256 digests in the wasm module.
+ * 32-byte scalar) owned by the wasm module.
  */
 export class Secp256k1SigningKey implements Signatory {
 	/**
@@ -242,7 +322,7 @@ export class Secp256k1SigningKey implements Signatory {
 	 */
 	readonly digestAlgorithmOid = PROFILE_OIDS.sha3_256;
 
-	private constructor(private readonly scalar: Uint8Array) {}
+	private constructor(private readonly inner: WasmSecp256k1SigningKey) {}
 
 	/**
 	 * Wrap a raw 32-byte secp256k1 scalar.
@@ -252,7 +332,9 @@ export class Secp256k1SigningKey implements Signatory {
 	static fromBytes(bytes: Uint8Array): Secp256k1SigningKey {
 		requireLength(bytes, [32], "bytes");
 
-		const key = new Secp256k1SigningKey(bytes);
+		const key = new Secp256k1SigningKey(
+			WasmSecp256k1SigningKey.fromBytes(bytes),
+		);
 		return key;
 	}
 
@@ -262,18 +344,34 @@ export class Secp256k1SigningKey implements Signatory {
 	 */
 	verifyingKey(): Secp256k1VerifyingKey {
 		const key = Secp256k1VerifyingKey.fromSec1Bytes(
-			derivePublicKey(this.scalar),
+			this.inner.derivePublicKey(),
 		);
 		return key;
+	}
+
+	/**
+	 * Verify half for envelope `signed(this)` / `Frame.verify`.
+	 */
+	get verifier(): FrameVerifier {
+		return this.verifyingKey();
+	}
+
+	/**
+	 * DER SubjectPublicKeyInfo for this key (uncompressed SEC1).
+	 *
+	 * Matches Rust profile `EncodePublicKey` / leaf-cert SPKI, so the
+	 * octets are safe for CSR enrollment and `TransportSigner.publicKeyDer`.
+	 * The wasm module MUST be initialized (`initClient`).
+	 */
+	toSpkiDer(): Uint8Array {
+		return this.inner.toSpkiDer();
 	}
 
 	/**
 	 * The subject-key-identifier octets naming this signer in the frame.
 	 */
 	signerId(): Uint8Array {
-		const publicKey = derivePublicKey(this.scalar);
-		const id = profileSignerId(publicKey);
-		return id;
+		return this.inner.signerId();
 	}
 
 	/**
@@ -281,7 +379,7 @@ export class Secp256k1SigningKey implements Signatory {
 	 * the raw 64-byte `r || s` signature.
 	 */
 	sign(tbs: Uint8Array): Promise<Uint8Array> {
-		const signature = signTbs(this.scalar, tbs);
+		const signature = this.inner.signTbs(tbs);
 		const result = Promise.resolve(signature);
 		return result;
 	}
@@ -293,7 +391,7 @@ export class Secp256k1SigningKey implements Signatory {
  * opens.
  */
 export class Aes256Gcm implements BodyEncryptor, BodyDecryptor {
-	private constructor(private readonly keyBytes: Uint8Array) {}
+	private constructor(private readonly inner: WasmAes256Gcm) {}
 
 	/**
 	 * Wrap a raw 32-byte key.
@@ -303,7 +401,7 @@ export class Aes256Gcm implements BodyEncryptor, BodyDecryptor {
 	static fromKey(key: Uint8Array): Aes256Gcm {
 		requireLength(key, [32], "key");
 
-		const aes256Gcm = new Aes256Gcm(key);
+		const aes256Gcm = new Aes256Gcm(WasmAes256Gcm.fromKey(key));
 		return aes256Gcm;
 	}
 
@@ -311,19 +409,9 @@ export class Aes256Gcm implements BodyEncryptor, BodyDecryptor {
 	 * Seal `bodyDer` under a fresh nonce.
 	 */
 	encrypt(bodyDer: Uint8Array): Promise<EncryptedBody> {
-		const sealed = sealAes256Gcm(this.keyBytes, bodyDer);
-		try {
-			const encryptedBody = {
-				algorithmOid: sealed.algorithmOid,
-				parametersDer: sealed.parametersDer,
-				ciphertext: sealed.ciphertext,
-			};
-
-			const result = Promise.resolve(encryptedBody);
-			return result;
-		} finally {
-			sealed.free();
-		}
+		const encryptedBody = takeSealedBody(this.inner.seal(bodyDer));
+		const result = Promise.resolve(encryptedBody);
+		return result;
 	}
 
 	/**
@@ -334,8 +422,7 @@ export class Aes256Gcm implements BodyEncryptor, BodyDecryptor {
 	async decrypt(sealed: EncryptedBody): Promise<Uint8Array> {
 		requireAlgorithm(sealed, PROFILE_OIDS.aes256Gcm);
 
-		const plaintext = openAes256Gcm(
-			this.keyBytes,
+		const plaintext = this.inner.open(
 			sealed.parametersDer,
 			sealed.ciphertext,
 		);
@@ -349,7 +436,7 @@ export class Aes256Gcm implements BodyEncryptor, BodyDecryptor {
  * the matching secret key can open the body.
  */
 export class EciesEncryptor implements BodyEncryptor {
-	private constructor(private readonly recipient: Uint8Array) {}
+	private constructor(private readonly inner: WasmEciesEncryptor) {}
 
 	/**
 	 * Wrap the recipient's SEC1-encoded public key (33-byte compressed or
@@ -360,7 +447,9 @@ export class EciesEncryptor implements BodyEncryptor {
 	static fromBytes(recipientPublicKey: Uint8Array): EciesEncryptor {
 		requireLength(recipientPublicKey, [33, 65], "recipientPublicKey");
 
-		const encryptor = new EciesEncryptor(recipientPublicKey);
+		const encryptor = new EciesEncryptor(
+			WasmEciesEncryptor.fromBytes(recipientPublicKey),
+		);
 		return encryptor;
 	}
 
@@ -368,19 +457,9 @@ export class EciesEncryptor implements BodyEncryptor {
 	 * Seal `bodyDer` to the recipient under a fresh ephemeral key.
 	 */
 	encrypt(bodyDer: Uint8Array): Promise<EncryptedBody> {
-		const sealed = sealEciesSecp256k1(this.recipient, bodyDer);
-		try {
-			const encryptedBody = {
-				algorithmOid: sealed.algorithmOid,
-				parametersDer: sealed.parametersDer,
-				ciphertext: sealed.ciphertext,
-			};
-
-			const result = Promise.resolve(encryptedBody);
-			return result;
-		} finally {
-			sealed.free();
-		}
+		const encryptedBody = takeSealedBody(this.inner.seal(bodyDer));
+		const result = Promise.resolve(encryptedBody);
+		return result;
 	}
 }
 
@@ -389,7 +468,7 @@ export class EciesEncryptor implements BodyEncryptor {
  * holds the raw 32-byte recipient secret key.
  */
 export class EciesDecryptor implements BodyDecryptor {
-	private constructor(private readonly secret: Uint8Array) {}
+	private constructor(private readonly inner: WasmEciesDecryptor) {}
 
 	/**
 	 * Wrap the raw 32-byte recipient secret key.
@@ -399,7 +478,9 @@ export class EciesDecryptor implements BodyDecryptor {
 	static fromBytes(secretKey: Uint8Array): EciesDecryptor {
 		requireLength(secretKey, [32], "secretKey");
 
-		const decryptor = new EciesDecryptor(secretKey);
+		const decryptor = new EciesDecryptor(
+			WasmEciesDecryptor.fromBytes(secretKey),
+		);
 		return decryptor;
 	}
 
@@ -411,8 +492,7 @@ export class EciesDecryptor implements BodyDecryptor {
 	async decrypt(sealed: EncryptedBody): Promise<Uint8Array> {
 		requireAlgorithm(sealed, PROFILE_OIDS.eciesSecp256k1);
 
-		const plaintext = openEciesSecp256k1(
-			this.secret,
+		const plaintext = this.inner.open(
 			sealed.parametersDer,
 			sealed.ciphertext,
 		);

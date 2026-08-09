@@ -381,8 +381,9 @@ fn stream_closed() -> JsValue {
 	validation("StreamClosed", "the streaming handle is closed")
 }
 
-/// Parse a servlet target URN for routed stream opens.
-fn parse_stream_target(target: &str) -> Result<Urn<'static>, JsValue> {
+/// Parse a servlet target URN for routed stream opens and unary work
+/// submissions.
+pub(crate) fn parse_stream_target(target: &str) -> Result<Urn<'static>, JsValue> {
 	Urn::from_str(target).map_err(|error| {
 		validation(
 			"InvalidStreamRoute",

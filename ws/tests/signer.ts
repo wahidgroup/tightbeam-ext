@@ -5,23 +5,10 @@
 import { secp256k1 } from "@noble/curves/secp256k1.js";
 
 import type { TransportSigner } from "@wahidgroup/tightbeam-ws-client";
+import { Secp256k1SigningKey } from "@wahidgroup/tightbeam-ws-client";
 
 /** ecdsa-with-SHA3-256 (NIST / TB profile). */
 const ECDSA_WITH_SHA3_256 = "2.16.840.1.101.3.4.3.10";
-
-/**
- * DER SubjectPublicKeyInfo prefix for an uncompressed secp256k1 point:
- * SEQUENCE { SEQUENCE { id-ecPublicKey, secp256k1 }, BIT STRING (65 bytes) }.
- *
- * MUST match the SPKI encoding in the client certificate. Receipt
- * countersign SID is `SHA3-256(publicKeyDer)[..20]`. The server expects
- * that SID to equal the cert's SPKI digest. Compressed vs uncompressed
- * DER hashes diverge even when the point is the same.
- */
-const SPKI_UNCOMPRESSED_PREFIX = new Uint8Array([
-	0x30, 0x56, 0x30, 0x10, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02,
-	0x01, 0x06, 0x05, 0x2b, 0x81, 0x04, 0x00, 0x0a, 0x03, 0x42, 0x00,
-]);
 
 /**
  * Copy `view` by index into a realm-local `Uint8Array`.
@@ -50,26 +37,32 @@ export class NobleTransportSigner implements TransportSigner {
 	readonly algorithmOid = ECDSA_WITH_SHA3_256;
 
 	/**
-	 * DER SubjectPublicKeyInfo for the signing key, derived from the
-	 * secret at construction.
-	 */
-	readonly publicKeyDer: Uint8Array;
-
-	/**
 	 * How many prehashes the handshake asked this signer to sign.
 	 */
 	signatures = 0;
 
 	private readonly secret: Uint8Array;
+	private cachedPublicKeyDer: Uint8Array | undefined;
 
 	constructor(secret: Uint8Array) {
 		this.secret = copyBytes(secret);
+	}
 
-		const point = secp256k1.getPublicKey(this.secret, false);
-		this.publicKeyDer = new Uint8Array([
-			...SPKI_UNCOMPRESSED_PREFIX,
-			...point,
-		]);
+	/**
+	 * DER SubjectPublicKeyInfo for the signing key.
+	 *
+	 * Lazy so `connectMutual` can `initClient` before shape checks read
+	 * this field. Encoding comes from {@link Secp256k1SigningKey.toSpkiDer}
+	 * (profile EncodePublicKey / uncompressed SEC1).
+	 */
+	get publicKeyDer(): Uint8Array {
+		if (this.cachedPublicKeyDer === undefined) {
+			this.cachedPublicKeyDer = Secp256k1SigningKey.fromBytes(
+				this.secret,
+			).toSpkiDer();
+		}
+
+		return this.cachedPublicKeyDer;
 	}
 
 	signPrehash(prehash: Uint8Array): Promise<Uint8Array> {

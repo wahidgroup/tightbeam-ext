@@ -12,9 +12,19 @@ This crate exposes WebSocket framing for tightbeam transports. Authentication an
 - `io::WsStream` and `io::WsTransport` implement `AsyncProtocolStream` over `tokio-tungstenite`.
 - Cleartext and ECIES-encrypted round-trips reuse tightbeam's transport-agnostic handshake unchanged.
 
+## Cluster work plane
+
+tightbeam's `colony` feature routes signed work frames through a cluster gateway to hive-registered servlets. The upstream `SubmitWork` blanket implementation already covers `GenericClient<WsListener>`, so no code in this crate changes for it. `tests/work_plane.rs` proves the round trip and a typed `WorkRefused` refusal over a real gateway, hive, and servlet topology on the ws transport:
+
+```rust
+let served = client.submit_work_to(servlet_urn, &signed_work_frame).await?;
+```
+
+The gateway forwards the caller's signed frame to the servlet byte-for-byte, and the servlet's complete signed response frame returns the same way. Enable `colony` on `tightbeam-rs` in your own manifest to use it.
+
 ## Features
 
-- `testing` - test-support module with X.509 identity fixtures and the shared multiplexed echo behavior for encrypted end-to-end tests and examples (`gen_certs`, `echo_server_mux`, `echo_server_mux_clear`).
+- `testing` - test-support module with X.509 identity fixtures and the shared multiplexed echo behavior for encrypted end-to-end tests and examples (`gen_certs`, `echo_server_mux`, `echo_server_mux_clear`, `work_gateway_server`).
 
 ## Limitations
 

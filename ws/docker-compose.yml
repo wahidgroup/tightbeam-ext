@@ -48,3 +48,19 @@ services:
       TBWS_ECHO_BODY: duplex
     ports:
       - "${ECHO_WS_MUX_DUPLEX_HOST_PORT:-9103}:9103"
+
+  # Cluster work-plane gateway: a real gateway, hive, and work-probe servlet
+  # in one process. The browser pins the server certificate for transport
+  # encryption and shares the client key as the end-to-end work signing key.
+  work-gateway:
+    image: ${ECHO_IMAGE:-tightbeam-ws-echo:dev}
+    command: ["work-gateway-server"]
+    environment:
+      ECHO_WS_PORT: "9104"
+      TBWS_SERVER_CERT: /certs/server.cert.der
+      TBWS_SERVER_KEY: /certs/server.key
+      TBWS_WORK_KEY: /certs/client.key
+    volumes:
+      - ${CERT_DIR:?}:/certs:ro
+    ports:
+      - "${WORK_GATEWAY_WS_HOST_PORT:-9104}:9104"

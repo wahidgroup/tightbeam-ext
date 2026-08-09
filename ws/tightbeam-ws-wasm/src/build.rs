@@ -453,42 +453,24 @@ pub fn sha3_256_digest(data: impl AsRef<[u8]>) -> Vec<u8> {
 	Sha3_256::digest(data.as_ref()).to_vec()
 }
 
-/// Derive the SEC1 compressed public key for a raw 32-byte secp256k1 signing
-/// key, for verifying frames signed with that key.
-pub fn derive_public_key(key_bytes: [u8; 32]) -> Result<Vec<u8>, TightBeamError> {
-	let key = Secp256k1SigningKey::from_bytes(&key_bytes.into())?;
-	Ok(key.verifying_key().to_sec1_bytes().into_vec())
-}
-
-/// Sign the SHA3-256 digest of `tbs` with a raw 32-byte secp256k1 signing
-/// key, returning the raw 64-byte `r || s` signature accepted by
-/// [`attach_signature`] - the profile signer.
-pub fn sign_tbs(key_bytes: [u8; 32], tbs: impl AsRef<[u8]>) -> Result<Vec<u8>, TightBeamError> {
-	let key = Secp256k1SigningKey::from_bytes(&key_bytes.into())?;
-	let signature: Secp256k1Signature = sign_canonical::<Sha3_256, _>(&key, tbs.as_ref())?;
+/// Sign the SHA3-256 digest of `tbs` with a profile secp256k1 signing key.
+pub fn sign_tbs(key: &Secp256k1SigningKey, tbs: impl AsRef<[u8]>) -> Result<Vec<u8>, TightBeamError> {
+	let signature: Secp256k1Signature = sign_canonical::<Sha3_256, _>(key, tbs.as_ref())?;
 	Ok(signature.to_bytes().to_vec())
 }
 
-/// The subject-key-identifier octets naming a secp256k1 signer (the SHA3-256
-/// digest of its SPKI encoding, truncated to 20 octets).
-pub fn profile_signer_id(public_key_sec1: impl AsRef<[u8]>) -> Result<Vec<u8>, TightBeamError> {
-	let key = Secp256k1VerifyingKey::from_sec1_bytes(public_key_sec1.as_ref())?;
-	match secp256k1_signer_identifier(&key)? {
+/// Subject-key-identifier octets for a profile secp256k1 verifying key.
+pub fn signer_id(key: &Secp256k1VerifyingKey) -> Result<Vec<u8>, TightBeamError> {
+	match secp256k1_signer_identifier(key)? {
 		SignerIdentifier::SubjectKeyIdentifier(skid) => Ok(skid.0.as_bytes().to_vec()),
 		SignerIdentifier::IssuerAndSerialNumber(_) => Err(TightBeamError::SignatureEncodingError),
 	}
 }
 
-/// Verify a frame's non-repudiation signature against a SEC1-encoded
-/// secp256k1 public key under the profile scheme (ECDSA over SHA3-256).
-///
-/// `Ok(())` means the signature is valid. A missing signature, an algorithm
-/// mismatch, or a bad signature are all errors. Frames signed under other
-/// schemes verify caller-side from [`tbs_bytes`] and the carried signature.
-pub fn verify_signature(frame_der: impl AsRef<[u8]>, public_key_sec1: impl AsRef<[u8]>) -> Result<(), TightBeamError> {
+/// Verify a frame's non-repudiation signature under the profile scheme.
+pub fn verify_signature(key: &Secp256k1VerifyingKey, frame_der: impl AsRef<[u8]>) -> Result<(), TightBeamError> {
 	let frame = Frame::from_der(frame_der.as_ref())?;
-	let key = Secp256k1VerifyingKey::from_sec1_bytes(public_key_sec1.as_ref())?;
-	frame.verify::<Secp256k1Signature, Sha3_256>(&key)
+	frame.verify::<Secp256k1Signature, Sha3_256>(key)
 }
 
 /// A sealed body produced by a profile encryptor: the pieces
@@ -533,49 +515,78 @@ fn encrypted_info(
 	})
 }
 
-/// Seal `plaintext` (a [`body_preimage`]) under AES-256-GCM with a 32-byte
-/// key - the profile symmetric encryptor.
-pub fn seal_aes_256_gcm(key: impl AsRef<[u8]>, plaintext: impl AsRef<[u8]>) -> Result<SealedBody, TightBeamError> {
-	let cipher = Aes256Gcm::new_from_slice(key.as_ref())?;
-	let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
-	let info = Encryptor::<Aes256GcmOid>::encrypt_content(&cipher, plaintext.as_ref(), nonce, None)?;
-	sealed_body(info)
+/// Profile AES-256-GCM under a 32-byte shared key.
+pub struct Aes256GcmKey {
+	key: [u8; 32],
 }
 
-/// Open an AES-256-GCM sealed body with the shared 32-byte key, returning
-/// the plaintext body DER (decode it with [`decode_body`]).
-pub fn open_aes_256_gcm(
-	key: impl AsRef<[u8]>,
-	parameters_der: Option<Vec<u8>>,
-	ciphertext: Vec<u8>,
-) -> Result<Vec<u8>, TightBeamError> {
-	let cipher = Aes256Gcm::new_from_slice(key.as_ref())?;
-	let info = encrypted_info(tightbeam::oids::AES_256_GCM, parameters_der, ciphertext)?;
-	Ok(cipher.decrypt_content(&info)?.to_insecure()?.to_vec())
+impl Aes256GcmKey {
+	/// Construct from a raw 32-byte key.
+	pub fn new(key: impl AsRef<[u8]>) -> Result<Self, TightBeamError> {
+		let slice = key.as_ref();
+		let _ = Aes256Gcm::new_from_slice(slice)?;
+		let mut owned = [0u8; 32];
+		owned.copy_from_slice(slice);
+		Ok(Self { key: owned })
+	}
+
+	/// Seal `plaintext` (a [`body_preimage`]) under a fresh nonce.
+	pub fn seal(&self, plaintext: impl AsRef<[u8]>) -> Result<SealedBody, TightBeamError> {
+		let cipher = Aes256Gcm::new_from_slice(&self.key)?;
+		let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+		let info = Encryptor::<Aes256GcmOid>::encrypt_content(&cipher, plaintext.as_ref(), nonce, None)?;
+		sealed_body(info)
+	}
+
+	/// Open a sealed body, returning the plaintext body DER.
+	pub fn open(&self, parameters_der: Option<Vec<u8>>, ciphertext: Vec<u8>) -> Result<Vec<u8>, TightBeamError> {
+		let cipher = Aes256Gcm::new_from_slice(&self.key)?;
+		let info = encrypted_info(tightbeam::oids::AES_256_GCM, parameters_der, ciphertext)?;
+		Ok(cipher.decrypt_content(&info)?.to_insecure()?.to_vec())
+	}
 }
 
-/// Seal `plaintext` (a [`body_preimage`]) to the holder of the secp256k1 key
-/// behind this SEC1 public key - the profile asymmetric encryptor (ECIES:
-/// secp256k1 + HKDF-SHA3-256 + AES-256-GCM).
-pub fn seal_ecies_secp256k1(
-	recipient_public_key: impl AsRef<[u8]>,
-	plaintext: impl AsRef<[u8]>,
-) -> Result<SealedBody, TightBeamError> {
-	let encryptor = EciesEncryptor::from_bytes(recipient_public_key.as_ref())?;
-	let info = encryptor.encrypt_content(plaintext.as_ref(), [], None)?;
-	sealed_body(info)
+/// Profile ECIES encryptor (secp256k1 + HKDF-SHA3-256 + AES-256-GCM).
+pub struct EciesSecp256k1Encryptor {
+	recipient_public_key: Vec<u8>,
 }
 
-/// Open an ECIES sealed body with the raw 32-byte recipient secret key,
-/// returning the plaintext body DER (decode it with [`decode_body`]).
-pub fn open_ecies_secp256k1(
-	secret_key: impl AsRef<[u8]>,
-	parameters_der: Option<Vec<u8>>,
-	ciphertext: Vec<u8>,
-) -> Result<Vec<u8>, TightBeamError> {
-	let decryptor = EciesDecryptor::new(SecretKey::from_slice(secret_key.as_ref())?);
-	let info = encrypted_info(EciesSecp256k1Oid::OID, parameters_der, ciphertext)?;
-	Ok(decryptor.decrypt_content(&info)?.to_insecure()?.to_vec())
+impl EciesSecp256k1Encryptor {
+	/// Construct from the recipient's SEC1 public key.
+	pub fn from_sec1(recipient_public_key: impl AsRef<[u8]>) -> Result<Self, TightBeamError> {
+		let _ = EciesEncryptor::from_bytes(recipient_public_key.as_ref())?;
+		Ok(Self { recipient_public_key: recipient_public_key.as_ref().to_vec() })
+	}
+
+	/// Seal `plaintext` to the recipient under a fresh ephemeral key.
+	pub fn seal(&self, plaintext: impl AsRef<[u8]>) -> Result<SealedBody, TightBeamError> {
+		let encryptor = EciesEncryptor::from_bytes(&self.recipient_public_key)?;
+		let info = encryptor.encrypt_content(plaintext.as_ref(), [], None)?;
+		sealed_body(info)
+	}
+}
+
+/// Profile ECIES decryptor holding the recipient secp256k1 secret.
+pub struct EciesSecp256k1Decryptor {
+	secret: [u8; 32],
+}
+
+impl EciesSecp256k1Decryptor {
+	/// Construct from a raw 32-byte recipient secret key.
+	pub fn new(secret_key: impl AsRef<[u8]>) -> Result<Self, TightBeamError> {
+		let slice = secret_key.as_ref();
+		let _ = SecretKey::from_slice(slice)?;
+		let mut secret = [0u8; 32];
+		secret.copy_from_slice(slice);
+		Ok(Self { secret })
+	}
+
+	/// Open a sealed body, returning the plaintext body DER.
+	pub fn open(&self, parameters_der: Option<Vec<u8>>, ciphertext: Vec<u8>) -> Result<Vec<u8>, TightBeamError> {
+		let decryptor = EciesDecryptor::new(SecretKey::from_slice(&self.secret)?);
+		let info = encrypted_info(EciesSecp256k1Oid::OID, parameters_der, ciphertext)?;
+		Ok(decryptor.decrypt_content(&info)?.to_insecure()?.to_vec())
+	}
 }
 
 #[cfg(test)]
@@ -597,11 +608,13 @@ mod tests {
 
 	use tightbeam::compress::{Compressor, Inflator, ZstdCompression};
 
+	use tightbeam::spki::EncodePublicKey;
+
 	use super::{
-		attach_signature, attach_witness, body_preimage, commitment_preimage, decode_body, derive_public_key,
-		inspect_frame, open_aes_256_gcm, open_ecies_secp256k1, profile_signer_id, seal_aes_256_gcm,
-		seal_ecies_secp256k1, set_compactness, set_confidentiality, set_message_integrity, sha3_256_digest, sign_tbs,
-		tbs_bytes, verify_signature, witness_input, FrameConfig, OpaqueBody,
+		attach_signature, attach_witness, body_preimage, commitment_preimage, decode_body, inspect_frame,
+		set_compactness, set_confidentiality, set_message_integrity, sha3_256_digest, sign_tbs, signer_id, tbs_bytes,
+		verify_signature, witness_input, Aes256GcmKey, EciesSecp256k1Decryptor, EciesSecp256k1Encryptor, FrameConfig,
+		OpaqueBody,
 	};
 
 	type TestResult = core::result::Result<(), Box<dyn core::error::Error>>;
@@ -639,7 +652,7 @@ mod tests {
 
 	/// Drive the full caller-side pipeline with the profile primitives, the
 	/// way the TS builder does: commit, witness, then sign detached.
-	fn signed_frame(id: &[u8], order: u64, key_bytes: [u8; 32]) -> AnyResult<Vec<u8>> {
+	fn signed_frame(id: &[u8], order: u64, key: &Secp256k1SigningKey) -> AnyResult<Vec<u8>> {
 		let config = FrameConfig { version: Some(Version::V2), ..base_config(id, order)? };
 		let der = config.build()?;
 
@@ -649,16 +662,15 @@ mod tests {
 		let witness = sha3_256_digest(witness_input(&der)?);
 		let der = attach_witness(&der, HASH_SHA3_256, witness)?;
 
-		let signature = sign_tbs(key_bytes, tbs_bytes(&der)?)?;
-		let public_key = derive_public_key(key_bytes)?;
-		let signer_id = profile_signer_id(&public_key)?;
+		let signature = sign_tbs(key, tbs_bytes(&der)?)?;
+		let sid = signer_id(key.verifying_key())?;
 
 		Ok(attach_signature(
 			&der,
 			signature,
 			SIGNER_ECDSA_WITH_SHA3_256,
 			HASH_SHA3_256,
-			signer_id,
+			sid,
 		)?)
 	}
 
@@ -781,7 +793,7 @@ mod tests {
 
 	#[test]
 	fn signed_frame_carries_security_infos() -> TestResult {
-		let summary = inspect_frame(signed_frame(b"signed-1", 5, [1u8; 32])?)?;
+		let summary = inspect_frame(signed_frame(b"signed-1", 5, &signing_key()?)?)?;
 		assert_eq!(summary.signature_algorithm_oid.as_deref(), Some("2.16.840.1.101.3.4.3.10"));
 		assert_eq!(
 			summary.signature_digest_algorithm_oid.as_deref(),
@@ -798,7 +810,7 @@ mod tests {
 
 	#[test]
 	fn signed_frame_body_opens() -> TestResult {
-		let frame_der = signed_frame(b"signed-2", 5, [1u8; 32])?;
+		let frame_der = signed_frame(b"signed-2", 5, &signing_key()?)?;
 		assert_eq!(open_frame(&frame_der)?, sample_message());
 		Ok(())
 	}
@@ -807,7 +819,7 @@ mod tests {
 	fn signed_frame_verifies_with_tightbeam() -> TestResult {
 		let key = signing_key()?;
 		let verifying_key = *key.verifying_key();
-		let frame = Frame::from_der(&signed_frame(b"signed-3", 5, [1u8; 32])?)?;
+		let frame = Frame::from_der(&signed_frame(b"signed-3", 5, &key)?)?;
 
 		frame.verify::<Secp256k1Signature, Sha3_256>(&verifying_key)?;
 		Ok(())
@@ -815,38 +827,36 @@ mod tests {
 
 	#[test]
 	fn verify_signature_accepts_signer_key() -> TestResult {
-		let public_key = signing_key()?.verifying_key().to_sec1_bytes();
-		let frame_der = signed_frame(b"sig-ok", 1, [1u8; 32])?;
+		let key = signing_key()?;
+		let frame_der = signed_frame(b"sig-ok", 1, &key)?;
 
-		verify_signature(&frame_der, &public_key)?;
+		verify_signature(key.verifying_key(), &frame_der)?;
 		Ok(())
 	}
 
 	#[test]
-	fn derived_public_key_verifies_signature() -> TestResult {
-		let secret = [1u8; 32];
-		let public_key = derive_public_key(secret)?;
-		let frame_der = signed_frame(b"sig-derived", 1, secret)?;
+	fn signing_key_spki_matches_encode_public_key() -> TestResult {
+		let key = signing_key()?;
+		let spki = key.verifying_key().to_public_key_der()?.into_vec();
 
-		verify_signature(&frame_der, &public_key)?;
+		assert_eq!(spki.len(), 88);
+		assert_eq!(spki[23], 0x04);
 		Ok(())
 	}
 
 	#[test]
 	fn verify_signature_rejects_wrong_key() -> TestResult {
-		let frame_der = signed_frame(b"sig-bad", 1, [1u8; 32])?;
+		let frame_der = signed_frame(b"sig-bad", 1, &signing_key()?)?;
 		let other = Secp256k1SigningKey::from_bytes(&[2u8; 32].into())?;
-		let public_key = other.verifying_key().to_sec1_bytes();
 
-		assert!(verify_signature(&frame_der, &public_key).is_err());
+		assert!(verify_signature(other.verifying_key(), &frame_der).is_err());
 		Ok(())
 	}
 
 	#[test]
 	fn verify_signature_rejects_unsigned_frame() -> TestResult {
 		let frame_der = seal_frame(b"unsigned", 1)?;
-		let public_key = signing_key()?.verifying_key().to_sec1_bytes();
-		assert!(verify_signature(&frame_der, &public_key).is_err());
+		assert!(verify_signature(signing_key()?.verifying_key(), &frame_der).is_err());
 		Ok(())
 	}
 
@@ -854,12 +864,12 @@ mod tests {
 	/// Verification is where they must fail.
 	#[test]
 	fn garbage_signature_attaches_but_fails_verification() -> TestResult {
+		let key = signing_key()?;
 		let frame_der = seal_frame(b"junk", 1)?;
-		let public_key = signing_key()?.verifying_key().to_sec1_bytes();
-		let signer_id = profile_signer_id(&public_key)?;
+		let sid = signer_id(key.verifying_key())?;
 
-		let signed = attach_signature(&frame_der, [0u8; 64], SIGNER_ECDSA_WITH_SHA3_256, HASH_SHA3_256, signer_id)?;
-		assert!(verify_signature(&signed, &public_key).is_err());
+		let signed = attach_signature(&frame_der, [0u8; 64], SIGNER_ECDSA_WITH_SHA3_256, HASH_SHA3_256, sid)?;
+		assert!(verify_signature(key.verifying_key(), &signed).is_err());
 		Ok(())
 	}
 
@@ -920,7 +930,8 @@ mod tests {
 		let key = [0x42u8; 32];
 		let der = FrameConfig { version: Some(Version::V1), ..base_config(b"sealed", 8)? }.build()?;
 
-		let sealed = seal_aes_256_gcm(key, body_preimage(sample_message())?)?;
+		let aes = Aes256GcmKey::new(key)?;
+		let sealed = aes.seal(body_preimage(sample_message())?)?;
 		assert_eq!(sealed.algorithm_oid, AES_256_GCM.to_string());
 
 		let der = set_confidentiality(
@@ -944,19 +955,20 @@ mod tests {
 
 	#[test]
 	fn aead_seal_open_round_trips() -> TestResult {
-		let key = [0x42u8; 32];
+		let aes = Aes256GcmKey::new([0x42u8; 32])?;
 		let preimage = body_preimage(sample_message())?;
 
-		let sealed = seal_aes_256_gcm(key, &preimage)?;
-		let opened = open_aes_256_gcm(key, sealed.parameters_der, sealed.ciphertext)?;
+		let sealed = aes.seal(&preimage)?;
+		let opened = aes.open(sealed.parameters_der, sealed.ciphertext)?;
 		assert_eq!(opened, preimage);
 		Ok(())
 	}
 
 	#[test]
 	fn aead_open_rejects_wrong_key() -> TestResult {
-		let sealed = seal_aes_256_gcm([0x42u8; 32], body_preimage(sample_message())?)?;
-		assert!(open_aes_256_gcm([0x43u8; 32], sealed.parameters_der, sealed.ciphertext).is_err());
+		let sealed = Aes256GcmKey::new([0x42u8; 32])?.seal(body_preimage(sample_message())?)?;
+		let other = Aes256GcmKey::new([0x43u8; 32])?;
+		assert!(other.open(sealed.parameters_der, sealed.ciphertext).is_err());
 		Ok(())
 	}
 
@@ -965,10 +977,10 @@ mod tests {
 		let recipient_public = signing_key()?.verifying_key().to_sec1_bytes().to_vec();
 		let preimage = body_preimage(sample_message())?;
 
-		let sealed = seal_ecies_secp256k1(&recipient_public, &preimage)?;
+		let sealed = EciesSecp256k1Encryptor::from_sec1(&recipient_public)?.seal(&preimage)?;
 		assert_eq!(sealed.algorithm_oid, "1.3.132.1.12.0");
 
-		let opened = open_ecies_secp256k1([1u8; 32], sealed.parameters_der, sealed.ciphertext)?;
+		let opened = EciesSecp256k1Decryptor::new([1u8; 32])?.open(sealed.parameters_der, sealed.ciphertext)?;
 		assert_eq!(opened, preimage);
 		Ok(())
 	}
@@ -976,8 +988,10 @@ mod tests {
 	#[test]
 	fn ecies_open_rejects_wrong_secret() -> TestResult {
 		let recipient_public = signing_key()?.verifying_key().to_sec1_bytes().to_vec();
-		let sealed = seal_ecies_secp256k1(&recipient_public, body_preimage(sample_message())?)?;
-		assert!(open_ecies_secp256k1([2u8; 32], sealed.parameters_der, sealed.ciphertext).is_err());
+		let sealed = EciesSecp256k1Encryptor::from_sec1(&recipient_public)?.seal(body_preimage(sample_message())?)?;
+		assert!(EciesSecp256k1Decryptor::new([2u8; 32])?
+			.open(sealed.parameters_der, sealed.ciphertext)
+			.is_err());
 		Ok(())
 	}
 
@@ -1097,7 +1111,7 @@ mod tests {
 		let (compressed, info) = compressor.compress(&sample_body()?, None)?;
 		let der = set_compactness(&der, None, info.compression_alg.oid, None, compressed.clone())?;
 
-		let sealed = seal_aes_256_gcm(key, &compressed)?;
+		let sealed = Aes256GcmKey::new(key)?.seal(&compressed)?;
 		let der = set_confidentiality(
 			&der,
 			None,

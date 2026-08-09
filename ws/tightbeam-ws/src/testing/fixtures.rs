@@ -1,8 +1,8 @@
 //! X.509 identity fixtures for the encrypted WebSocket end-to-end tests.
 //!
-//! The browser cannot mint certificates (it has no clock), so identities
+//! The browser cannot issue certificates (it has no clock), so identities
 //! are generated natively here and provisioned as DER certificate + raw signing
-//! key bytes. A single code path mints, serializes, and reloads them, keeping
+//! key bytes. A single code path issues, serializes, and reloads them, keeping
 //! the generator binary, the encrypted echo server, and the integration tests
 //! on one source of truth.
 
@@ -43,7 +43,7 @@ pub struct Identity {
 }
 
 impl Identity {
-	/// Mint a fresh self-signed root identity valid for `validity` from now.
+	/// Issue a fresh self-signed root identity valid for `validity` from now.
 	pub fn mint_root(subject: &str, serial: u32, validity: Duration) -> Result<Self> {
 		Ok(mint_root(subject, serial, validity)?)
 	}

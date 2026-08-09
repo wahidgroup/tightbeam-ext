@@ -13,14 +13,13 @@ import {
 	commitmentPreimage,
 	inspectFrameFields,
 	tbsBytes,
-	verifySignature as wasmVerifySignature,
 	witnessInput as wasmWitnessInput,
 } from "#wasm";
 
 import type { MessagePriority } from "./builder/priority.js";
 import type { Version } from "./builder/version.js";
 import type { BodyInflator } from "./compress.js";
-import type { BodyDecryptor, Hasher, Secp256k1VerifyingKey } from "./crypto.js";
+import type { BodyDecryptor, FrameVerifier, Hasher } from "./crypto.js";
 import type { MessageCodec } from "./message.js";
 import { ValidationError } from "./builder/errors.js";
 import { priorityFromOrdinal } from "./builder/priority.js";
@@ -557,16 +556,16 @@ export class Frame {
 	}
 
 	/**
-	 * Verify the frame's non-repudiation signature under the tightbeam
-	 * profile scheme (secp256k1 ECDSA over SHA3-256). Frames signed under
-	 * other schemes verify from {@link tbs} and {@link signatureInfo} with
-	 * your own library.
+	 * Verify the frame's non-repudiation signature through `verifier`.
+	 * Profile secp256k1 uses {@link Secp256k1VerifyingKey}; other schemes
+	 * supply their own {@link FrameVerifier} (or use {@link tbs} /
+	 * {@link signatureInfo} directly).
 	 *
 	 * @throws when the frame is unsigned, the algorithm differs, or the
 	 * signature does not verify.
 	 */
-	verify(verifyingKey: Secp256k1VerifyingKey): void {
-		wasmVerifySignature(this.der, verifyingKey.toSec1Bytes());
+	verify(verifier: FrameVerifier): void {
+		verifier.verifyFrame(this);
 	}
 
 	/**

@@ -29,6 +29,7 @@ Two wasm bundles ship in the package, a `web` build and a `nodejs` build, select
 - [Two-way streams](#two-way-streams)
     - [Progressive body streaming](#progressive-body-streaming)
     - [Routing server-initiated streams](#routing-server-initiated-streams)
+- [Cluster work submission](#cluster-work-submission)
 - [Cancellation and timeouts](#cancellation-and-timeouts)
 - [Connection lifecycle](#connection-lifecycle)
 - [Transport errors](#transport-errors)
@@ -241,6 +242,33 @@ mux.serve(
 ```
 
 The server matches on the frame id prefix before decoding in its own stream handler. The router only routes: subscription semantics, ordering, and replay stay with the application.
+
+## Cluster work submission
+
+`submitWork` routes a signed work frame through a tightbeam cluster gateway to the servlet type named by a URN, and resolves with the servlet's complete response frame. The caller's frame crosses the gateway byte-for-byte in both directions, so end-to-end signatures stay verifiable on each side.
+
+```ts
+const work = await frame(payload)
+	.withId("job-42")
+	.withOrder(1)
+	.withSigner(signingKey)
+	.build();
+
+const served = await mux.submitWork("urn:tightbeam::servlet:work-probe", work);
+served.verify(signingKey.verifyingKey());
+```
+
+A gateway refusal rejects with `code === "WorkRefused"` and the refusal's transit status name on a `status` property (the gRPC canonical registry, e.g. `"Unavailable"` for an unserved servlet type). An `AbortSignal` in the options cancels the submission the same way as `emit`:
+
+```ts
+try {
+	await mux.submitWork(target, work, { signal });
+} catch (error) {
+	if (isTransportError(error) && error.code === "WorkRefused") {
+		handleRefusal(error);
+	}
+}
+```
 
 ## Cancellation and timeouts
 

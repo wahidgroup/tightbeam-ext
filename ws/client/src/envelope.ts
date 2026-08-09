@@ -5,24 +5,23 @@
  *
  * The frame format fixes the layering, so an envelope takes declarations
  * rather than a free-form pipeline. `frame()` begins a builder with them
- * applied. `unwrap()` reverses them and ENFORCES them. A declared
- * signature or seal that a received frame lacks REJECTS instead of
- * degrading, so a peer cannot downgrade the conversation by omission.
+ * applied. `unwrap()` reverses them and ENFORCES them. A declared signature
+ * or seal that a received frame lacks REJECTS instead of degrading, so a
+ * peer cannot downgrade the conversation by omission.
  */
 
-import type { FrameCodec } from "./builder/codec.js";
-import type { BodyCompressor, BodyInflator } from "./compress.js";
 import type {
 	BodyDecryptor,
 	BodyEncryptor,
-	Secp256k1VerifyingKey,
+	FrameVerifier,
 	Signatory,
 } from "./crypto.js";
+import type { FrameCodec } from "./builder/codec.js";
+import type { BodyCompressor, BodyInflator } from "./compress.js";
 import type { Frame } from "./frame.js";
 import type { MessageCodec } from "./message.js";
 import { FrameBuilder } from "./builder/builder.js";
 import { ValidationError } from "./builder/errors.js";
-import { Secp256k1SigningKey } from "./crypto.js";
 
 /**
  * The declared layers. Each direction is optional so one-sided parties
@@ -32,7 +31,7 @@ import { Secp256k1SigningKey } from "./crypto.js";
  */
 interface Layers {
 	readonly signer?: Signatory;
-	readonly verifier?: Secp256k1VerifyingKey;
+	readonly verifier?: FrameVerifier;
 	readonly sealer?: BodyEncryptor;
 	readonly opener?: BodyDecryptor;
 	readonly compressor?: BodyCompressor;
@@ -92,10 +91,10 @@ export class Envelope<T> {
 	 * Declare authenticity with the wrap-side capability: `frame()` signs
 	 * with `signatory`, and `unwrap()` REQUIRES a valid signature.
 	 *
-	 * A profile `Secp256k1SigningKey` derives its own verifying key, so
-	 * one call declares both directions. Any other {@link Signatory}
-	 * (wallet, passkey, HSM) needs {@link verified} alongside it before
-	 * `unwrap()` can check the signature.
+	 * A signatory with {@link Signatory.verifier} (profile
+	 * `Secp256k1SigningKey`) declares both directions. Any other
+	 * {@link Signatory} needs {@link verified} alongside it, or must
+	 * expose its own `verifier`, before `unwrap()` can check the signature.
 	 */
 	signed(signatory: Signatory): Envelope<T> {
 		const next = this.with({ signer: signatory });
@@ -104,12 +103,11 @@ export class Envelope<T> {
 
 	/**
 	 * Declare authenticity with the unwrap-side capability: `unwrap()`
-	 * REQUIRES a signature verifying under `key` (the profile scheme).
-	 * The read-only half of {@link signed}, for parties without the
-	 * signing key.
+	 * REQUIRES a signature verifying under `verifier`. The read-only half
+	 * of {@link signed}, for parties without the signing key.
 	 */
-	verified(key: Secp256k1VerifyingKey): Envelope<T> {
-		const next = this.with({ verifier: key });
+	verified(verifier: FrameVerifier): Envelope<T> {
+		const next = this.with({ verifier });
 		return next;
 	}
 
@@ -291,38 +289,33 @@ export class Envelope<T> {
 	}
 
 	/**
-	 * The verifying key for `unwrap()`: the explicit declaration, or the
-	 * one a profile signing key derives. Derived lazily so envelopes can
+	 * The verifier for `unwrap()`: the explicit declaration, or the
+	 * signatory's own verify half. Resolved lazily so envelopes can
 	 * compose before the wasm module initializes.
 	 */
-	private verifierKey(): Secp256k1VerifyingKey | undefined {
+	private resolveVerifier(): FrameVerifier | undefined {
 		if (this.layers.verifier !== undefined) {
 			return this.layers.verifier;
 		}
 
-		const signer = this.layers.signer;
-		if (signer instanceof Secp256k1SigningKey) {
-			return signer.verifyingKey();
-		}
-
-		return undefined;
+		return this.layers.signer?.verifier;
 	}
 
 	/**
 	 * Enforce declared authenticity: the frame MUST carry a signature
-	 * verifying under the declared (or derived) key.
+	 * verifying under the declared (or derived) verifier.
 	 */
 	private checkAuthenticity(received: Frame): void {
 		if (!this.authenticityDeclared()) {
 			return;
 		}
 
-		const verifier = this.verifierKey();
+		const verifier = this.resolveVerifier();
 		if (verifier === undefined) {
 			throw envelopeError(
 				"ENVELOPE_VERIFIER",
 				"The envelope declares authenticity but its signatory " +
-					"derives no verifying key: declare verified(key) to " +
+					"exposes no verifier: declare verified(verifier) to " +
 					"unwrap frames",
 			);
 		}
