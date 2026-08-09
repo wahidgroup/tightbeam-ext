@@ -1,6 +1,6 @@
 {
 	"name": "@wahidgroup/tightbeam-pubsub-client",
-	"version": "0.2.1",
+	"version": "0.3.0",
 	"description": "Topic subscriptions for the tightbeam WebSocket client: typed subscribe/unsubscribe lifecycle with per-topic ordering and reconnect replay.",
 	"type": "module",
 	"main": "dist/index.js",
@@ -32,12 +32,13 @@
 		"pack:check": "node --experimental-strip-types ../../ws/client/scripts/check-pack.ts",
 		"clean": "rm -rf dist coverage"
 	},
-	"dependencies": {
-		"@wahidgroup/tightbeam-ws-client": "file:../../ws/client"
+	"peerDependencies": {
+		"@wahidgroup/tightbeam-ws-client": "^0.3.0"
 	},
 	"devDependencies": {
 		"@types/node": "24.0.4",
 		"@wahidgroup/lint-rules": "0.1.2",
+		"@wahidgroup/tightbeam-ws-client": "file:../../ws/client",
 		"typescript": "5.9.3",
 		"vitest": "4.1.10"
 	},
