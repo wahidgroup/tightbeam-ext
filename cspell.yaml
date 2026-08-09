@@ -5,6 +5,7 @@ import:
 words:
   - tightbeam
   - acking
+  - cfgs
   - errorizable
   - websocket
   - websockets

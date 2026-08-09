@@ -59,8 +59,10 @@ export type {
 	BodyDecryptor,
 	BodyEncryptor,
 	EncryptedBody,
+	FrameVerifier,
 	Hasher,
 	Signatory,
+	VerifiableFrame,
 } from "./crypto.js";
 export { Envelope } from "./envelope.js";
 export { Opaque, wrapped } from "./message.js";
@@ -810,12 +812,14 @@ export class TightbeamWsClient extends SocketLifecycle<MuxWsClient> {
 		options?: ConnectOptions,
 	): Promise<TightbeamWsClient> {
 		assertOptionsShape(options);
-		assertClientKeyShape(clientKey);
 
 		const maxPeerStreams = options?.maxPeerStreams ?? DEFAULT_STREAM_CAP;
 		assertStreamCap("maxPeerStreams", maxPeerStreams);
 
+		// Init before shape checks so TransportSigner getters may call
+		// profile crypto (e.g. Secp256k1SigningKey.toSpkiDer).
 		await initClient();
+		assertClientKeyShape(clientKey);
 
 		const session = sessionOfferFrom(options);
 		let socket: MuxWsClient;
@@ -862,6 +866,45 @@ export class TightbeamWsClient extends SocketLifecycle<MuxWsClient> {
 
 		const result = await emitFrame(this.socket, frame, options);
 		return result;
+	}
+
+	/**
+	 * Submit a signed end-to-end work frame to the servlet type addressed
+	 * by `target` (`urn:<nid>:<nss>`) through a cluster gateway, and
+	 * resolve with the servlet's complete response frame.
+	 *
+	 * The work frame's DER passes through byte-for-byte in both
+	 * directions: its signature stays verifiable at the servlet, and the
+	 * returned frame is the servlet's envelope with the same fidelity, so
+	 * verify it before trusting the message body. A served work always
+	 * carries a frame.
+	 *
+	 * A gateway refusal rejects with a `TightbeamTransportError` whose
+	 * `code` is `WorkRefused` and whose `status` property names the
+	 * refusal's gRPC canonical status. An {@link EmitOptions.signal}
+	 * abort cancels the stream and rejects with the signal's abort
+	 * reason.
+	 */
+	async submitWork(
+		target: string,
+		work: Frame,
+		options?: EmitOptions,
+	): Promise<Frame> {
+		this.requireLive("submitWork");
+
+		let responseDer: Uint8Array;
+		if (options?.signal === undefined) {
+			responseDer = await this.socket.submitWork(target, work.toDer());
+		} else {
+			responseDer = await this.socket.submitWorkWithSignal(
+				target,
+				work.toDer(),
+				options.signal,
+			);
+		}
+
+		const response = Frame.fromDer(responseDer);
+		return response;
 	}
 
 	/**

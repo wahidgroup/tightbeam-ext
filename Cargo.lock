@@ -1243,9 +1243,9 @@ dependencies = [
 
 [[package]]
 name = "tightbeam-rs"
-version = "0.12.0"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "903daa896615dbfcfda468fb6fc0ccaa5b0d6804974a9a3fdbeb52f8bb9c2b7d"
+checksum = "4052aec1c12600b9b5881f9a270e66e6374306426141b8b34b9409e3cac3b3c8"
 dependencies = [
  "aead",
  "aes",
@@ -1281,6 +1281,7 @@ dependencies = [
 name = "tightbeam-ws"
 version = "0.2.1"
 dependencies = [
+ "der",
  "futures-util",
  "husky-rs",
  "tightbeam-rs",

@@ -31,6 +31,10 @@ required-features = ["testing"]
 name = "echo_server_mux_clear"
 required-features = ["testing"]
 
+[[example]]
+name = "work_gateway_server"
+required-features = ["testing"]
+
 [dependencies]
 tightbeam-rs = { workspace = true, features = [
     "tcp",
@@ -44,8 +48,11 @@ tokio-tungstenite = { workspace = true, features = ["connect", "handshake"] }
 futures-util = { workspace = true, features = ["std", "sink"] }
 
 [dev-dependencies]
+# The der crate backs the Sequence derive in the work-gateway example,
+# whose expansion references the crate by its absolute path.
+der = { workspace = true, features = ["alloc", "derive", "oid"] }
 husky-rs = { workspace = true }
-tightbeam-rs = { workspace = true, features = ["testing"] }
+tightbeam-rs = { workspace = true, features = ["testing", "colony"] }
 tokio = { workspace = true, features = [
     "rt-multi-thread",
     "macros",

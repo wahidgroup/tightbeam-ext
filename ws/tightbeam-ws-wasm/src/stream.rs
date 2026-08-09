@@ -43,7 +43,7 @@ impl From<WebSocket> for GlooStream {
 
 /// tightbeam's transport-agnostic transport instantiated over a browser
 /// WebSocket. Parameterised by the crypto provider `P` so encrypted clients
-/// can utilize their own provider.
+/// can use their own provider.
 pub type WsTransport<P = DefaultCryptoProvider> = TcpTransport<GlooStream, P>;
 
 /// Map a `gloo` WebSocket error onto the transport-agnostic [`TransportError`].

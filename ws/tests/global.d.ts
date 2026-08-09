@@ -12,6 +12,9 @@ import type {
 	SignedRoundTripResult,
 	SignerRoundTripResult,
 	TypedRoundTripResult,
+	WorkRefusalResult,
+	WorkRoundTripOptions,
+	WorkRoundTripResult,
 } from "./app/main.js";
 
 export {};
@@ -124,5 +127,15 @@ declare global {
 			serverCertB64: string,
 			payloadHex: string,
 		) => Promise<MuxRefusalResult>;
+		tbWorkRoundTrip: (
+			options: WorkRoundTripOptions,
+		) => Promise<WorkRoundTripResult>;
+		tbWorkRefusal: (
+			url: string,
+			serverCertB64: string,
+			target: string,
+			payloadHex: string,
+			workKeyB64: string,
+		) => Promise<WorkRefusalResult>;
 	}
 }

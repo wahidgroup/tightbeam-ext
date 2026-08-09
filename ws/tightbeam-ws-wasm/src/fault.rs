@@ -13,6 +13,7 @@ use js_sys::{Error as JsError, Reflect};
 use wasm_bindgen::JsValue;
 
 use tightbeam::transport::TransportError;
+use tightbeam::TightBeamError;
 
 /// The `name` carried by every structured transport error.
 pub const TRANSPORT_ERROR_NAME: &str = "TightbeamTransportError";
@@ -45,6 +46,26 @@ pub(crate) fn transport_to_js(error: TransportError) -> JsValue {
 		TransportError::MessageNotSent(_, failure) => coded(&format!("{failure:?}"), &error),
 		other => debug_coded(other),
 	}
+}
+
+/// Surface a work-plane error as a structured JavaScript error.
+///
+/// A refusal additionally carries the gateway's transit status name on a
+/// `status` property, matching the gRPC canonical registry the serve path
+/// already uses, so JavaScript callers branch on the status without
+/// parsing the message.
+pub(crate) fn work_error_to_js(error: &TightBeamError) -> JsValue {
+	let js_error = debug_coded(error);
+	if let TightBeamError::WorkRefused(status) = error {
+		// `Reflect::set` on a freshly built `Error` object cannot fail.
+		let _ = Reflect::set(
+			&js_error,
+			&JsValue::from_str("status"),
+			&JsValue::from_str(&format!("{status:?}")),
+		);
+	}
+
+	js_error
 }
 
 /// Surface an error as a structured JavaScript error whose `code` is the

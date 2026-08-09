@@ -48,3 +48,6 @@ web-sys = { workspace = true, features = [
 [dev-dependencies]
 tightbeam-rs = { workspace = true, features = ["testing", "zstd"] }
 wasm-bindgen-test = "0.3"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+tightbeam-rs = { workspace = true, features = ["colony"] }

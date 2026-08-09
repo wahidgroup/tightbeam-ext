@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { Envelope } from "./envelope.js";
+import type { FrameVerifier, Signatory } from "./crypto.js";
 import type { MessageCodec } from "./message.js";
 import { Aes256Gcm, Secp256k1SigningKey } from "./crypto.js";
 import { ZstdCompression } from "./compress.js";
@@ -12,6 +13,7 @@ import {
 	initClient,
 	wrapped,
 } from "./index.js";
+import { NobleSignatory } from "./testing/noble_signatory.js";
 
 /**
  * The envelope's contract: every declared layer applies on `frame()` and
@@ -50,6 +52,27 @@ const Notes: MessageCodec<Note> = wrapped({
 });
 
 const NOTE: Note = { text: "hello" };
+
+/**
+ * A Signatory that signs with the profile key but is not an instanceof
+ * Secp256k1SigningKey. Optionally exposes a verify half via `verifier`.
+ */
+function profileBackedSignatory(options: {
+	readonly verifier?: FrameVerifier;
+}): Signatory {
+	const base = {
+		signatureAlgorithmOid: SIGNING_KEY.signatureAlgorithmOid,
+		digestAlgorithmOid: SIGNING_KEY.digestAlgorithmOid,
+		signerId: (): Uint8Array => SIGNING_KEY.signerId(),
+		sign: (tbs: Uint8Array): Promise<Uint8Array> => SIGNING_KEY.sign(tbs),
+	};
+
+	if (options.verifier === undefined) {
+		return base;
+	}
+
+	return { ...base, verifier: options.verifier };
+}
 
 await initClient();
 
@@ -133,13 +156,25 @@ describe("Envelope round-trips", () => {
 });
 
 describe("Envelope one-sided parties", () => {
-	it("verified-only unwraps a peer's signed frame", async () => {
-		const publisher = envelope(Notes).signed(SIGNING_KEY);
-		const subscriber = envelope(Notes).verified(SIGNING_KEY.verifyingKey());
+	it.for([
+		{
+			name: "verifyingKey()",
+			verifier: (): FrameVerifier => SIGNING_KEY.verifyingKey(),
+		},
+		{
+			name: "signer.verifier",
+			verifier: (): FrameVerifier => SIGNING_KEY.verifier,
+		},
+	])(
+		"verified-only ($name) unwraps a peer's signed frame",
+		async ({ verifier }) => {
+			const publisher = envelope(Notes).signed(SIGNING_KEY);
+			const subscriber = envelope(Notes).verified(verifier());
 
-		const built = await publisher.frame(NOTE).build();
-		await expect(subscriber.unwrap(built)).resolves.toEqual(NOTE);
-	});
+			const built = await publisher.frame(NOTE).build();
+			await expect(subscriber.unwrap(built)).resolves.toEqual(NOTE);
+		},
+	);
 
 	it("ECIES halves compose one side each", async () => {
 		const recipientSecret = new Uint8Array(32).fill(3);
@@ -153,6 +188,34 @@ describe("Envelope one-sided parties", () => {
 		const subscriber = envelope(Notes).sealed(
 			EciesDecryptor.fromBytes(recipientSecret),
 		);
+
+		const built = await publisher.frame(NOTE).build();
+		await expect(subscriber.unwrap(built)).resolves.toEqual(NOTE);
+	});
+});
+
+describe("Envelope Signatory.verifier", () => {
+	it("unwraps when an external signatory exposes a verifier", async () => {
+		const external = envelope(Notes).signed(
+			profileBackedSignatory({ verifier: SIGNING_KEY.verifier }),
+		);
+
+		const built = await external.frame(NOTE).build();
+		await expect(external.unwrap(built)).resolves.toEqual(NOTE);
+	});
+
+	it("unwraps when a BYO signatory carries its own FrameVerifier", async () => {
+		const byo = new NobleSignatory(new Uint8Array(32).fill(5));
+		const notes = envelope(Notes).signed(byo);
+
+		const built = await notes.frame(NOTE).build();
+		await expect(notes.unwrap(built)).resolves.toEqual(NOTE);
+	});
+
+	it("verified(BYO FrameVerifier) unwraps a BYO-signed frame", async () => {
+		const byo = new NobleSignatory(new Uint8Array(32).fill(5));
+		const publisher = envelope(Notes).signed(byo);
+		const subscriber = envelope(Notes).verified(byo.verifier);
 
 		const built = await publisher.frame(NOTE).build();
 		await expect(subscriber.unwrap(built)).resolves.toEqual(NOTE);
@@ -244,13 +307,8 @@ describe("Envelope wrap-side strictness", () => {
 		);
 	});
 
-	it("an external signatory without a verifying key refuses to unwrap", async () => {
-		const external = envelope(Notes).signed({
-			signatureAlgorithmOid: SIGNING_KEY.signatureAlgorithmOid,
-			digestAlgorithmOid: SIGNING_KEY.digestAlgorithmOid,
-			signerId: () => SIGNING_KEY.signerId(),
-			sign: (tbs) => SIGNING_KEY.sign(tbs),
-		});
+	it("an external signatory without a verifier refuses to unwrap", async () => {
+		const external = envelope(Notes).signed(profileBackedSignatory({}));
 
 		const built = await external.frame(NOTE).build();
 		await expect(external.unwrap(built)).rejects.toMatchObject({

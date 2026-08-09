@@ -12,6 +12,7 @@ COPY . .
 WORKDIR /src/tightbeam-ext
 RUN cargo build --example echo_server_mux -p tightbeam-ws --features testing \
 	&& cargo build --example echo_server_mux_clear -p tightbeam-ws --features testing \
+	&& cargo build --example work_gateway_server -p tightbeam-ws --features testing \
 	&& cargo build --example pubsub_demo_server -p tightbeam-pubsub --features testing \
 	&& cargo build --example pubsub_processor_server -p tightbeam-pubsub --features testing
 
@@ -24,6 +25,7 @@ RUN apt-get update \
 
 COPY --from=build /src/tightbeam-ext/target/debug/examples/echo_server_mux /usr/local/bin/echo-server-mux
 COPY --from=build /src/tightbeam-ext/target/debug/examples/echo_server_mux_clear /usr/local/bin/echo-server-mux-clear
+COPY --from=build /src/tightbeam-ext/target/debug/examples/work_gateway_server /usr/local/bin/work-gateway-server
 COPY --from=build /src/tightbeam-ext/target/debug/examples/pubsub_demo_server /usr/local/bin/pubsub-demo-server
 COPY --from=build /src/tightbeam-ext/target/debug/examples/pubsub_processor_server /usr/local/bin/pubsub-processor-server
 

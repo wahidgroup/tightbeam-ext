@@ -27,16 +27,19 @@ use tightbeam::transport::handshake::negotiation::{MuxBudgets, MuxSettings, Tran
 use tightbeam::transport::handshake::receipt::ReceiptApprover;
 use tightbeam::transport::multiplex::{MultiplexedProtocol, MuxHandle, MuxResponder, MuxRole, MuxTransport};
 use tightbeam::transport::{EncryptedMessageIO, EnvelopeSink, EnvelopeSource, ResponsePackage, X509ClientConfig};
-use tightbeam::Frame;
+use tightbeam::{Frame, TightBeamError};
 
 use crate::approver::{approver_from_js, authorization_from_js, budgets_from_js};
-use crate::fault::{to_js, transport_to_js, validation};
+use crate::fault::{to_js, transport_to_js, validation, work_error_to_js};
 use crate::promise::{bytes_or_undefined, race_abort, race_optional_abort};
 use crate::secure::{build_signer_transport, build_transport, response_der, ClientIdentity};
 use crate::signer::TransportSigner;
 use crate::socket::{open_observed, SocketMonitor};
 use crate::stream::{GlooStream, WsTransport};
-use crate::streaming::{start_serve_duplex, start_serve_streaming, MuxDuplexStream, MuxRequestStream};
+use crate::streaming::{
+	parse_stream_target, start_serve_duplex, start_serve_streaming, MuxDuplexStream, MuxRequestStream,
+};
+use crate::work::{WorkReply, WorkRequestEnvelope};
 
 /// Peer-serve dispatch shape claimed by the first `serve*` call.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -308,6 +311,38 @@ impl MuxWsClient {
 		// Dropping the emit future is the cancellation: tightbeam frees
 		// the stream and notifies the peer from the drop guard.
 		future_to_promise(async move { race_abort(&signal, run_stream_emit(handle, frame_der)).await })
+	}
+
+	/// Submit a signed end-to-end work frame to the servlet type addressed
+	/// by `target` (`urn:<nid>:<nss>`) through a cluster gateway, and
+	/// resolve with the DER of the servlet's complete response frame.
+	///
+	/// The work frame's DER bytes nest in the routing envelope untouched,
+	/// so its signature stays verifiable at the servlet, and the returned
+	/// bytes are the servlet's envelope with the same fidelity. A served
+	/// work always carries a frame, so the promise always resolves with
+	/// bytes. A gateway refusal rejects with code `WorkRefused` and the
+	/// refusal's transit status name on `status`.
+	#[wasm_bindgen(js_name = submitWork, unchecked_return_type = "Promise<Uint8Array>")]
+	pub fn submit_work(&self, target: &str, work_frame_der: Vec<u8>) -> Promise {
+		let handle = self.handle.clone();
+		let target = target.to_owned();
+		future_to_promise(async move { run_submit_work(handle, &target, work_frame_der).await })
+	}
+
+	/// As [`submitWork`](Self::submit_work), racing the submission against
+	/// `signal`.
+	///
+	/// An abort cancels the stream and rejects with the signal's abort reason.
+	/// Timeouts compose as `AbortSignal.timeout(ms)`.
+	#[wasm_bindgen(js_name = submitWorkWithSignal, unchecked_return_type = "Promise<Uint8Array>")]
+	pub fn submit_work_with_signal(&self, target: &str, work_frame_der: Vec<u8>, signal: AbortSignal) -> Promise {
+		let handle = self.handle.clone();
+		let target = target.to_owned();
+
+		// Dropping the submission future is the cancellation: tightbeam
+		// frees the stream and notifies the peer from the drop guard.
+		future_to_promise(async move { race_abort(&signal, run_submit_work(handle, &target, work_frame_der)).await })
 	}
 
 	/// Serve server-initiated streams with `handler`.
@@ -704,6 +739,29 @@ async fn run_stream_emit(handle: MuxHandle, frame_der: Vec<u8>) -> Result<JsValu
 	let der = response_der(response)?;
 
 	Ok(bytes_or_undefined(der))
+}
+
+/// Submit `work_frame_der` to `target` through the gateway on a fresh
+/// stream and resolve with the servlet frame's DER.
+///
+/// The decoded frame only validates the bytes and supplies the wrapper's
+/// correlation id. The envelope nests the caller's original DER, so the
+/// end-to-end frame crosses the boundary untouched in both directions.
+async fn run_submit_work(handle: MuxHandle, target: &str, work_frame_der: Vec<u8>) -> Result<JsValue, JsValue> {
+	let servlet_type = parse_stream_target(target)?;
+	let work = Frame::from_der(&work_frame_der).map_err(to_js)?;
+
+	let envelope = WorkRequestEnvelope::from_encoded(servlet_type, work_frame_der, &work);
+	let transport = envelope.into_transport_frame().map_err(|error| work_error_to_js(&error))?;
+
+	let reply = handle.emit_on_stream(&transport).await.map_err(transport_to_js)?;
+	let reply = reply.ok_or_else(|| work_error_to_js(&TightBeamError::MissingResponse))?;
+
+	let served = WorkReply::try_from(&reply)
+		.and_then(WorkReply::served_der)
+		.map_err(|error| work_error_to_js(&error))?;
+
+	Ok(Uint8Array::from(served.as_slice()).into())
 }
 
 /// Split a handshaken, mux-negotiated transport into a stream handle and

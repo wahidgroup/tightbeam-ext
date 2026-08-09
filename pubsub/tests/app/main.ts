@@ -1,11 +1,10 @@
 /**
  * Live board example app for the pubsub extension.
  *
- * Connects over mutual-auth ECIES to the demo server named in the
- * `endpoint` query parameter (pinning `cert`, presenting `clientCert` /
- * `clientKey`, paying the demo session-budget invoice), subscribes to
- * the `topic` query parameter, and renders every update into the DOM as
- * it arrives.
+ * Connects over mutual-auth ECIES to the demo server named in the `endpoint`
+ * query parameter (pinning `cert`, presenting `clientCert` / `clientKey`,
+ * paying the demo session-budget invoice), subscribes to the `topic` query
+ * parameter, and renders every update into the DOM as it arrives.
  *
  * Every message travels as a full tightbeam frame under a typed
  * {@link Envelope}: the envelope declares the layers once (signed by
@@ -27,6 +26,7 @@ import {
 	Secp256k1SigningKey,
 	TightbeamWsClient,
 	envelope,
+	initClient,
 	wrapped,
 } from "@wahidgroup/tightbeam-ws-client";
 import { SubscriptionManager } from "@wahidgroup/tightbeam-pubsub-client";
@@ -34,12 +34,6 @@ import { SubscriptionManager } from "@wahidgroup/tightbeam-pubsub-client";
 const ENCODER = new TextEncoder();
 
 const DECODER = new TextDecoder();
-
-/**
- * The publisher's signing identity. A fixed demo scalar: the subscriber
- * page derives the same verifying key to check authenticity end to end.
- */
-const PUBLISHER_KEY = Secp256k1SigningKey.fromBytes(new Uint8Array(32).fill(1));
 
 /**
  * The pre-shared AES-256-GCM key: the topic seal on sealed boards
@@ -125,8 +119,11 @@ const DEMO_PAYMENT = new TextEncoder().encode("tbws-demo-payment-v1");
  * The envelope this page publishes under: always signed, sealed when
  * the board runs sealed.
  */
-function publishEnvelope(seal: boolean): Envelope<Note> {
-	const signed = envelope(Notes).signed(PUBLISHER_KEY);
+function publishEnvelope(
+	seal: boolean,
+	publisherKey: Secp256k1SigningKey,
+): Envelope<Note> {
+	const signed = envelope(Notes).signed(publisherKey);
 	if (seal) {
 		return signed.sealed(Aes256Gcm.fromKey(TOPIC_KEY));
 	}
@@ -139,12 +136,16 @@ function publishEnvelope(seal: boolean): Envelope<Note> {
  * own publishes back untouched. The processed board expects the
  * servlet's rebuild: sealed under the pre-shared key and unsigned.
  */
-function receiveEnvelope(seal: boolean, processed: boolean): Envelope<Note> {
+function receiveEnvelope(
+	seal: boolean,
+	processed: boolean,
+	publisherKey: Secp256k1SigningKey,
+): Envelope<Note> {
 	if (processed) {
 		return envelope(Notes).sealed(Aes256Gcm.fromKey(TOPIC_KEY));
 	}
 
-	return publishEnvelope(seal);
+	return publishEnvelope(seal, publisherKey);
 }
 
 /**
@@ -203,8 +204,15 @@ async function main(): Promise<void> {
 
 	const seal = params.get("seal") === "1";
 	const processed = params.get("processed") === "1";
-	const publishing = publishEnvelope(seal);
-	const receiving = receiveEnvelope(seal, processed);
+
+	// Key construction needs the wasm module
+	await initClient();
+
+	const publisherKey = Secp256k1SigningKey.fromBytes(
+		new Uint8Array(32).fill(1),
+	);
+	const publishing = publishEnvelope(seal, publisherKey);
+	const receiving = receiveEnvelope(seal, processed, publisherKey);
 
 	const client = await TightbeamWsClient.connectMutual(
 		endpoint,

@@ -2,7 +2,7 @@ import { secp256k1 } from "@noble/curves/secp256k1.js";
 import { sha3_256, sha3_512 } from "@noble/hashes/sha3.js";
 import { describe, expect, it } from "vitest";
 
-import { bodyPreimage, profileSignerId } from "#wasm";
+import { bodyPreimage } from "#wasm";
 
 import type {
 	BodyCompressor,
@@ -14,7 +14,6 @@ import type {
 	BodyEncryptor,
 	EncryptedBody,
 	Hasher,
-	Signatory,
 } from "./crypto.js";
 import type { Frame, FrameBuilder, MessageCodec } from "./index.js";
 import { MessagePriority } from "./builder/priority.js";
@@ -36,6 +35,10 @@ import {
 	initClient,
 	wrapped,
 } from "./index.js";
+import {
+	NobleFrameVerifier,
+	NobleSignatory,
+} from "./testing/noble_signatory.js";
 
 /**
  * Wasm-backed round-trips through the real codec: what the builder writes,
@@ -378,43 +381,10 @@ describe("Frame.messageCommitmentVerdict", () => {
 });
 
 describe("external Signatory across the wasm boundary", () => {
-	/**
-	 * A {@link Signatory} backed by an independent JavaScript secp256k1
-	 * implementation (noble), standing in for a wallet or HSM: the wasm
-	 * module never sees the secret key, yet must verify the signature it
-	 * produces. Records each TBS that crosses the boundary.
-	 */
-	class NobleSignatory implements Signatory {
-		readonly signatureAlgorithmOid = PROFILE_OIDS.ecdsaWithSha3_256;
-		readonly digestAlgorithmOid = PROFILE_OIDS.sha3_256;
-		readonly seen: Uint8Array[] = [];
-
-		constructor(private readonly secret: Uint8Array) {}
-
-		publicKey(): Uint8Array {
-			const publicKey = secp256k1.getPublicKey(this.secret, true);
-			return publicKey;
-		}
-
-		signerId(): Uint8Array {
-			const id = profileSignerId(this.publicKey());
-			return id;
-		}
-
-		sign(tbs: Uint8Array): Promise<Uint8Array> {
-			this.seen.push(tbs);
-			const digest = sha3_256(tbs);
-			const signature = secp256k1.sign(digest, this.secret, {
-				prehash: false,
-			});
-
-			const result = Promise.resolve(signature);
-			return result;
-		}
-	}
+	const EXTERNAL_SECRET = new Uint8Array(32).fill(5);
 
 	it("attaches a noble-produced signature that wasm verification accepts", async () => {
-		const signatory = new NobleSignatory(new Uint8Array(32).fill(5));
+		const signatory = new NobleSignatory(EXTERNAL_SECRET);
 		const built = await frame(BODY)
 			.withId("external")
 			.withOrder(11)
@@ -428,18 +398,41 @@ describe("external Signatory across the wasm boundary", () => {
 		expect(() => built.verify(verifyingKey)).not.toThrow();
 	});
 
+	it("verifies through the signatory's BYO FrameVerifier", async () => {
+		const signatory = new NobleSignatory(EXTERNAL_SECRET);
+		const built = await frame(BODY).withSigner(signatory).build();
+		expect(() => built.verify(signatory.verifier)).not.toThrow();
+	});
+
+	it("rejects a BYO FrameVerifier under the wrong public key", async () => {
+		const signatory = new NobleSignatory(EXTERNAL_SECRET);
+		const built = await frame(BODY).withSigner(signatory).build();
+		const wrong = new NobleFrameVerifier(
+			secp256k1.getPublicKey(new Uint8Array(32).fill(9), true),
+		);
+
+		expect(() => built.verify(wrong)).toThrow();
+	});
+
 	it("rejects verification of the external signature under another key", async () => {
-		const signatory = new NobleSignatory(new Uint8Array(32).fill(5));
+		const signatory = new NobleSignatory(EXTERNAL_SECRET);
 		const built = await frame(BODY).withSigner(signatory).build();
 		expect(() => built.verify(SIGNING_KEY.verifyingKey())).toThrow();
 	});
 
 	it("validates the spec before anything crosses to the signatory", async () => {
-		const signatory = new NobleSignatory(new Uint8Array(32).fill(5));
+		const signatory = new NobleSignatory(EXTERNAL_SECRET);
 		const attempt = frame().withSigner(signatory).build();
 
 		await expect(attempt).rejects.toThrow(ValidationError);
 		expect(signatory.seen).toEqual([]);
+	});
+});
+
+describe("FrameVerifier capability", () => {
+	it("accepts the profile signing key's verifier getter", async () => {
+		const built = await frame(BODY).withSigner(SIGNING_KEY).build();
+		expect(() => built.verify(SIGNING_KEY.verifier)).not.toThrow();
 	});
 });
 

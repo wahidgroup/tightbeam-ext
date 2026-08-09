@@ -16,6 +16,7 @@ import {
 	TightbeamWsClient,
 	ZstdCompression,
 	frame,
+	initClient,
 	isTransportError,
 	wrapped,
 } from "@wahidgroup/tightbeam-ws-client";
@@ -250,6 +251,8 @@ async function signedRoundTrip(
 	signingKeyHex: string,
 	saltHex: string,
 ): Promise<SignedRoundTripResult> {
+	await initClient();
+
 	const signingKey = Secp256k1SigningKey.fromBytes(hexToBytes(signingKeyHex));
 	const salt = hexToBytes(saltHex);
 
@@ -301,6 +304,8 @@ async function sealedRoundTrip(
 	order: number,
 	keyHex: string,
 ): Promise<SealedRoundTripResult> {
+	await initClient();
+
 	const payload = hexToBytes(payloadHex);
 	const cipher = Aes256Gcm.fromKey(hexToBytes(keyHex));
 
@@ -365,6 +370,8 @@ async function compressedSealedRoundTrip(
 	order: number,
 	keyHex: string,
 ): Promise<CompressedRoundTripResult> {
+	await initClient();
+
 	const zstd = new ZstdCompression();
 	const cipher = Aes256Gcm.fromKey(hexToBytes(keyHex));
 
@@ -782,6 +789,158 @@ async function muxRefusalRoundTrip(
 	});
 }
 
+/**
+ * The outcome of a work submission through the cluster gateway: the
+ * servlet's typed echo plus the response-signature verdict recomputed
+ * in the browser.
+ */
+export interface WorkRoundTripResult {
+	readonly bodyText: string;
+	readonly idText: string;
+	readonly signatureValid: boolean;
+}
+
+/**
+ * How the caller observed a gateway work refusal: the structured
+ * rejection's name, its `code`, and the transit status it carried.
+ */
+export interface WorkRefusalResult {
+	readonly rejectionName: string;
+	readonly rejectionCode: string;
+	readonly rejectionStatus: string;
+}
+
+/**
+ * The `status` property a work refusal carries, when present.
+ */
+function refusalStatus(error: unknown): string {
+	if (typeof error === "object" && error !== null && "status" in error) {
+		const status: unknown = Reflect.get(error, "status");
+		if (typeof status === "string") {
+			return status;
+		}
+	}
+
+	return "";
+}
+
+/**
+ * Build and sign the end-to-end work frame the gateway must forward to
+ * the servlet byte-for-byte.
+ */
+async function signedWorkFrame(
+	payloadHex: string,
+	idText: string,
+	order: number,
+	workKey: Secp256k1SigningKey,
+): Promise<Frame> {
+	const built = await frame(hexToBytes(payloadHex))
+		.withId(idText)
+		.withOrder(order)
+		.withSigner(workKey)
+		.build();
+	return built;
+}
+
+/**
+ * Inputs for a work submission through the cluster gateway: the endpoint
+ * and pinned certificate, the servlet target, the signed-frame fields,
+ * and the base64 end-to-end work signing key.
+ */
+export interface WorkRoundTripOptions {
+	readonly url: string;
+	readonly serverCertB64: string;
+	readonly target: string;
+	readonly payloadHex: string;
+	readonly idText: string;
+	readonly order: number;
+	readonly workKeyB64: string;
+}
+
+async function workRoundTrip(
+	options: WorkRoundTripOptions,
+): Promise<WorkRoundTripResult> {
+	await initClient();
+
+	const workKey = Secp256k1SigningKey.fromBytes(
+		base64ToBytes(options.workKeyB64),
+	);
+	const client = await TightbeamWsClient.connect(
+		options.url,
+		base64ToBytes(options.serverCertB64),
+	);
+
+	try {
+		const built = await signedWorkFrame(
+			options.payloadHex,
+			options.idText,
+			options.order,
+			workKey,
+		);
+		const response = await client.submitWork(options.target, built);
+
+		let signatureValid = false;
+		try {
+			response.verify(workKey.verifyingKey());
+			signatureValid = true;
+		} catch {
+			signatureValid = false;
+		}
+
+		return {
+			bodyText: TEXT.decode(response.message(Opaque)),
+			idText: TEXT.decode(response.id),
+			signatureValid,
+		};
+	} finally {
+		client.close();
+	}
+}
+
+async function workRefusal(
+	url: string,
+	serverCertB64: string,
+	target: string,
+	payloadHex: string,
+	workKeyB64: string,
+): Promise<WorkRefusalResult> {
+	await initClient();
+
+	const workKey = Secp256k1SigningKey.fromBytes(base64ToBytes(workKeyB64));
+	const client = await TightbeamWsClient.connect(
+		url,
+		base64ToBytes(serverCertB64),
+	);
+
+	try {
+		const built = await signedWorkFrame(
+			payloadHex,
+			"e2e-work-refused",
+			1,
+			workKey,
+		);
+		await client.submitWork(target, built);
+	} catch (error) {
+		if (isTransportError(error)) {
+			return {
+				rejectionName: error.name,
+				rejectionCode: error.code,
+				rejectionStatus: refusalStatus(error),
+			};
+		}
+
+		return {
+			rejectionName: String(error),
+			rejectionCode: "",
+			rejectionStatus: "",
+		};
+	} finally {
+		client.close();
+	}
+
+	return { rejectionName: "", rejectionCode: "", rejectionStatus: "" };
+}
+
 window.tbRoundTrip = roundTrip;
 window.tbSecureRoundTrip = secureRoundTrip;
 window.tbMutualRoundTrip = mutualRoundTrip;
@@ -848,6 +1007,8 @@ window.tbMuxDrainReason = muxDrainReason;
 window.tbStreamingRoundTrip = streamingRoundTrip;
 window.tbMuxParkedCallbackRoundTrip = muxParkedCallbackRoundTrip;
 window.tbMuxRefusalRoundTrip = muxRefusalRoundTrip;
+window.tbWorkRoundTrip = workRoundTrip;
+window.tbWorkRefusal = workRefusal;
 
 const status = document.querySelector("#status");
 if (status) {

@@ -51,6 +51,12 @@ export const muxMutualEndpoint = requireEnv("E2E_ECHO_WS_MUX_MUTUAL_ENDPOINT");
 export const muxDuplexEndpoint = requireEnv("E2E_ECHO_WS_MUX_DUPLEX_ENDPOINT");
 
 /**
+ * The cluster work-plane gateway: a real gateway, hive, and `work-probe`
+ * servlet in one container, admitting browser work submissions.
+ */
+export const workGatewayEndpoint = requireEnv("E2E_WORK_GATEWAY_WS_ENDPOINT");
+
+/**
  * Demo settlement payment bytes matching `tightbeam_ws::testing::DEMO_PAYMENT`.
  */
 export const DEMO_PAYMENT = new TextEncoder().encode("tbws-demo-payment-v1");
