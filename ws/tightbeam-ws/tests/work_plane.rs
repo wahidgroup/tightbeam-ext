@@ -1,11 +1,14 @@
-//! Cluster work-plane round trips over the WebSocket transport.
+//! Cluster work-plane round trips through the WebSocket edge plane.
 //!
-//! Proves the upstream `SubmitWork` blanket impl reaches
-//! `GenericClient<WsListener>` with zero library changes in this crate.
-//! A signed end-to-end work frame travels through a real cluster gateway
-//! to a hive-registered servlet, and the servlet's complete signed
-//! response frame returns to the client with its signature verifiable.
-//! An unserved servlet type resolves to a typed `WorkRefused` refusal.
+//! The colony (gateway, hive, servlet) runs its internal traffic over
+//! TCP. The gateway additionally binds a WebSocket edge accept plane for
+//! external clients. Proves the upstream `SubmitWork` blanket impl
+//! reaches `GenericClient<WsListener>` with zero library changes in this
+//! crate. A signed end-to-end work frame travels from the WebSocket edge
+//! through the TCP colony to a hive-registered servlet, and the
+//! servlet's complete signed response frame returns to the client with
+//! its signature verifiable. An unserved servlet type resolves to a
+//! typed `WorkRefused` refusal.
 //!
 //! [`SubmitWork`]: tightbeam::colony::SubmitWork
 
@@ -30,9 +33,11 @@ use tightbeam::crypto::profiles::DefaultCryptoProvider;
 use tightbeam::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey};
 use tightbeam::crypto::x509::CertificateSpec;
 use tightbeam::policy::TransitStatus;
+use tightbeam::prelude::TightBeamSocketAddr;
 use tightbeam::testing::{create_test_signing_key, TestMessage};
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::handshake::negotiation::TransportOffer;
+use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::transport::{ClientBuilder, ConnectionBuilder};
 use tightbeam::utils::compose as frame_compose;
 use tightbeam::utils::urn::Urn;
@@ -48,7 +53,7 @@ servlet! {
 	/// the bytes the servlet received, proving byte-for-byte forwarding
 	/// through the gateway.
 	pub WorkProbeServlet<TestMessage, EnvConfig = ()>,
-	protocol: WsListener,
+	protocol: TokioListener,
 	handle: |req, frame, _ctx| async move {
 		let signature_valid = frame
 			.verify::<Secp256k1Signature, Sha3_256>(probe_signing_key().verifying_key())
@@ -66,12 +71,15 @@ servlet! {
 
 hive! {
 	pub WorkProbeHive,
-	protocol: WsListener
+	protocol: TokioListener
 }
 
 cluster! {
+	/// TCP colony gateway with a WebSocket edge accept plane. Hives
+	/// register over TCP; external clients submit work over WebSocket.
 	pub WorkPlaneGateway,
-	protocol: WsListener
+	protocol: TokioListener,
+	edge: WsListener
 }
 
 /// Deterministic end-to-end signing key shared by the client and the
@@ -129,6 +137,7 @@ fn cluster_conf(identity: &Identity) -> Result<ClusterConfig, BoxError> {
 
 	let mut conf = ClusterConfig::new(tls);
 	conf.pool_config.mux_offer = Some(Arc::new(TransportOffer::mux(8)));
+	conf.edge_bind_addr = Some("127.0.0.1:0".into());
 	Ok(conf)
 }
 
@@ -150,12 +159,12 @@ fn hive_conf(identity: &Identity) -> Result<HiveConfig, BoxError> {
 	Ok(conf)
 }
 
-/// Servlet config: encrypted ws listener under the shared identity with a
-/// mux offer matching the hive pool.
+/// Servlet config: encrypted TCP listener under the shared identity with
+/// a mux offer matching the hive pool.
 fn servlet_conf(
 	identity: &Identity,
-) -> Result<ServletConfig<WsListener, TestMessage, DefaultCryptoProvider>, BoxError> {
-	Ok(ServletConfig::<WsListener, TestMessage, DefaultCryptoProvider>::builder()
+) -> Result<ServletConfig<TokioListener, TestMessage, DefaultCryptoProvider>, BoxError> {
+	Ok(ServletConfig::<TokioListener, TestMessage, DefaultCryptoProvider>::builder()
 		.with_certificate(certificate_spec(identity), key_provider(identity)?, vec![])?
 		.with_mux_offer(Some(TransportOffer::mux(8)))
 		.with_config(Arc::new(()))
@@ -175,8 +184,9 @@ async fn signed_work_frame(id: &[u8]) -> Result<Frame, TightBeamError> {
 	unsigned.sign_with_provider::<Sha3_256, _>(&provider).await
 }
 
-/// Start gateway, servlet, and hive over the ws transport and register
-/// the servlet under `type_name`.
+/// Start gateway, servlet, and hive over the TCP colony transport and
+/// register the servlet under `type_name`. The gateway also binds its
+/// WebSocket edge plane for the external client.
 async fn start_stack(
 	trace: &TraceCollector,
 	identity: &Identity,
@@ -193,10 +203,15 @@ async fn start_stack(
 	assert_eq!(
 		registered.status,
 		TransitStatus::Ok,
-		"hive registration must succeed over the ws transport"
+		"hive registration must succeed over the TCP colony plane"
 	);
 
 	Ok((gateway, hive))
+}
+
+/// The gateway's WebSocket edge address for external client dials.
+fn edge_addr(gateway: &WorkPlaneGateway) -> Result<TightBeamSocketAddr, BoxError> {
+	Ok(gateway.edge_addr().ok_or("edge plane did not bind")?.clone())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -208,12 +223,11 @@ async fn submit_work_round_trips_through_ws_gateway() -> Result<(), BoxError> {
 	let mut client = ClientBuilder::<WsListener>::builder()
 		.with_trust_store(identity.trust_anchor()?)
 		.build()
-		.connect(gateway.addr())
+		.connect(&edge_addr(&gateway)?)
 		.await?;
 
 	let work = signed_work_frame(b"ws-work-1").await?;
 	let served = client.submit_work_to(servlet_urn("work-probe"), &work).await?;
-
 	assert!(
 		served
 			.verify::<Secp256k1Signature, Sha3_256>(probe_signing_key().verifying_key())
@@ -245,12 +259,11 @@ async fn unserved_type_resolves_to_typed_work_refusal() -> Result<(), BoxError> 
 	let mut client = ClientBuilder::<WsListener>::builder()
 		.with_trust_store(identity.trust_anchor()?)
 		.build()
-		.connect(gateway.addr())
+		.connect(&edge_addr(&gateway)?)
 		.await?;
 
 	let work = signed_work_frame(b"ws-work-refused").await?;
 	let refused = client.submit_work_to(servlet_urn("unserved"), &work).await;
-
 	assert!(
 		matches!(refused, Err(TightBeamError::WorkRefused(_))),
 		"an unserved servlet type must resolve to a typed WorkRefused refusal, got {refused:?}"

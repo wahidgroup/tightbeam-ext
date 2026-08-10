@@ -1,9 +1,10 @@
 //! Cluster work-plane gateway for the e2e stack.
 //!
-//! Assembles a real cluster gateway, a hive, and a `work-probe` servlet in
-//! one process over the encrypted WebSocket transport, so the browser suite
-//! exercises the genuine admission, routing, and refusal logic rather than
-//! an emulation.
+//! Assembles a real cluster gateway, a hive, and a `work-probe` servlet
+//! in one process. The colony (gateway, hive, servlet) speaks encrypted
+//! TCP internally. The gateway exposes an encrypted WebSocket edge
+//! accept plane on the public port, so the browser suite exercises the
+//! genuine admission, routing, and refusal logic rather than an emulation.
 //!
 //! The servlet answers the opaque work payload with a signed
 //! `pong:<payload-hex>:<signature-valid>` echo. The verdict witnesses
@@ -41,9 +42,9 @@ use tightbeam::crypto::profiles::DefaultCryptoProvider;
 use tightbeam::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey};
 use tightbeam::crypto::x509::CertificateSpec;
 use tightbeam::policy::TransitStatus;
-use tightbeam::prelude::TightBeamSocketAddr;
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::handshake::negotiation::TransportOffer;
+use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::utils::urn::Urn;
 use tightbeam::{cluster, compose, hive, servlet, Beamable, TightBeamError};
 use tightbeam_ws::protocol::WsListener;
@@ -68,7 +69,7 @@ servlet! {
 	/// whether the client's end-to-end signature verified on the bytes
 	/// the servlet received.
 	pub WorkProbeServlet<WorkBody, EnvConfig = ()>,
-	protocol: WsListener,
+	protocol: TokioListener,
 	handle: |req, frame, _ctx| async move {
 		// Main installs the key before the topology starts, so an empty
 		// slot is unreachable here. The early return keeps the handler
@@ -97,12 +98,15 @@ servlet! {
 
 hive! {
 	pub WorkProbeHive,
-	protocol: WsListener
+	protocol: TokioListener
 }
 
 cluster! {
+	/// TCP colony gateway with a WebSocket edge accept plane. Hives
+	/// register over TCP; the browser submits work over WebSocket.
 	pub WorkPlaneGateway,
-	protocol: WsListener
+	protocol: TokioListener,
+	edge: WsListener
 }
 
 /// Lowercase hex rendering of `bytes` for the echo payload.
@@ -138,8 +142,9 @@ fn certificate_spec(identity: &Identity) -> CertificateSpec {
 }
 
 /// Gateway config: the provisioned identity for TLS, the same identity as
-/// the hive-plane trust anchor, a fixed bind port, and an eight-stream mux
-/// offer shared with every accepted connection (including the browser).
+/// the hive-plane trust anchor, a loopback TCP colony bind, the public
+/// WebSocket edge on the fixed port, and an eight-stream mux offer shared
+/// with every accepted connection (including the browser).
 fn cluster_conf(identity: &Identity, port: u32) -> Result<ClusterConfig, BoxError> {
 	let tls = ClusterTlsConfig {
 		certificate: certificate_spec(identity),
@@ -151,7 +156,8 @@ fn cluster_conf(identity: &Identity, port: u32) -> Result<ClusterConfig, BoxErro
 	};
 
 	let mut conf = ClusterConfig::new(tls);
-	conf.bind_addr = Some(format!("0.0.0.0:{port}"));
+	conf.bind_addr = Some("127.0.0.1:0".into());
+	conf.edge_bind_addr = Some(format!("0.0.0.0:{port}"));
 	conf.pool_config.mux_offer = Some(Arc::new(TransportOffer::mux(8)));
 	Ok(conf)
 }
@@ -174,10 +180,12 @@ fn hive_conf(identity: &Identity) -> Result<HiveConfig, BoxError> {
 	Ok(conf)
 }
 
-/// Servlet config: encrypted ws listener under the provisioned identity
+/// Servlet config: encrypted TCP listener under the provisioned identity
 /// with a mux offer matching the hive pool.
-fn servlet_conf(identity: &Identity) -> Result<ServletConfig<WsListener, WorkBody, DefaultCryptoProvider>, BoxError> {
-	Ok(ServletConfig::<WsListener, WorkBody, DefaultCryptoProvider>::builder()
+fn servlet_conf(
+	identity: &Identity,
+) -> Result<ServletConfig<TokioListener, WorkBody, DefaultCryptoProvider>, BoxError> {
+	Ok(ServletConfig::<TokioListener, WorkBody, DefaultCryptoProvider>::builder()
 		.with_certificate(certificate_spec(identity), key_provider(identity)?, vec![])?
 		.with_mux_offer(Some(TransportOffer::mux(8)))
 		.with_config(Arc::new(()))
@@ -215,17 +223,18 @@ async fn main() -> Result<(), BoxError> {
 	hive.register(servlet_urn("work-probe")?, servlet, |t| WorkProbeServlet::start(t, None))?;
 	hive.establish(Arc::new(trace.share())).await?;
 
-	// The gateway binds 0.0.0.0. Registration dials loopback explicitly so
-	// the hive reaches the same process without a wildcard-address dial.
-	let gateway_addr = TightBeamSocketAddr(format!("127.0.0.1:{port}").parse()?);
-	let registered = hive.register_with_cluster(&gateway_addr).await?;
+	// The colony plane binds loopback with an ephemeral port, so the hive
+	// dials the bound address directly.
+	let registered = hive.register_with_cluster(gateway.addr()).await?;
 	if registered.status != TransitStatus::Ok {
 		return Err(format!("hive registration failed with status {:?}", registered.status).into());
 	}
 
+	let edge = gateway.edge_addr().ok_or("edge plane did not bind")?;
 	println!(
-		"[work-gateway] cluster work-plane gateway listening on ws://{} (servlet: work-probe)",
-		gateway.addr().0
+		"[work-gateway] cluster work-plane gateway: colony tcp://{} edge ws://{} (servlet: work-probe)",
+		gateway.addr().0,
+		edge.0
 	);
 
 	// The topology serves from background tasks. Main only keeps the

@@ -94,7 +94,7 @@ assemble_context() {
 }
 
 generate_certs() {
-	# Mint the X.509 identity fixtures the encrypted echo servers present and
+	# Issue the X.509 identity fixtures the encrypted echo servers present and
 	# the browser suite pins. Idempotent per instance: reuse existing certs so
 	# restarts keep the same trust anchors.
 	if [ -f "$CERT_DIR/server.cert.der" ] && [ -f "$CERT_DIR/client.cert.der" ]; then
