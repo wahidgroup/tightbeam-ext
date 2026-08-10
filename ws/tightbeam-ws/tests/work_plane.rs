@@ -211,7 +211,7 @@ async fn start_stack(
 
 /// The gateway's WebSocket edge address for external client dials.
 fn edge_addr(gateway: &WorkPlaneGateway) -> Result<TightBeamSocketAddr, BoxError> {
-	Ok(gateway.edge_addr().ok_or("edge plane did not bind")?.clone())
+	Ok(*gateway.edge_addr().ok_or("edge plane did not bind")?)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
