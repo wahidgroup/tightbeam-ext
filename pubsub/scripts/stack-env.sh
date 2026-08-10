@@ -19,7 +19,7 @@ STACK_PORT_SPECS+=(
 	"PUBSUB_PROCESSED_WS_HOST_PORT:PREFERRED_PUBSUB_PROCESSED_WS_PORT"
 )
 
-# Passed through to the compose environment and the env file verbatim.
+# Passed through to the compose environment and the env file unchanged.
 STACK_ENV_VARS+=("PUBSUB_QUEUE_CAPACITY")
 
 STACK_COMPOSE_FILES+=("$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/docker-compose.yml")

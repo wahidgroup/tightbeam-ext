@@ -14,7 +14,9 @@ This crate exposes WebSocket framing for tightbeam transports. Authentication an
 
 ## Cluster work plane
 
-tightbeam's `colony` feature routes signed work frames through a cluster gateway to hive-registered servlets. The upstream `SubmitWork` blanket implementation already covers `GenericClient<WsListener>`, so no code in this crate changes for it. `tests/work_plane.rs` proves the round trip and a typed `WorkRefused` refusal over a real gateway, hive, and servlet topology on the ws transport:
+tightbeam's `colony` feature routes signed work frames through a cluster gateway to hive-registered servlets. The WebSocket transport is the browser edge, not the colony interior: declare the gateway with `cluster! { ..., protocol: TokioListener, edge: WsListener }` and set `ClusterConfig::edge_bind_addr`. The colony (gateway, hives, servlets) keeps its TCP protocol, and the gateway binds a second WebSocket accept plane that admits `Work` frames only; control frames (registration, ads, gossip) are refused at the edge.
+
+The upstream `SubmitWork` blanket implementation already covers `GenericClient<WsListener>`, so no code in this crate changes for it. `tests/work_plane.rs` proves the round trip and a typed `WorkRefused` refusal from a WebSocket edge client through a real TCP gateway, hive, and servlet topology:
 
 ```rust
 let served = client.submit_work_to(servlet_urn, &signed_work_frame).await?;

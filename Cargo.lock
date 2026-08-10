@@ -1243,9 +1243,9 @@ dependencies = [
 
 [[package]]
 name = "tightbeam-rs"
-version = "0.13.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4052aec1c12600b9b5881f9a270e66e6374306426141b8b34b9409e3cac3b3c8"
+checksum = "d2b03e3afdc3bb40095fa9ab2eff2555c6781d6e34afacb147ac0b623b848f60"
 dependencies = [
  "aead",
  "aes",
