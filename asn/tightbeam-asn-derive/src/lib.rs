@@ -797,6 +797,7 @@ impl FieldKind {
 							let nested = #to_item;
 							array.push(&nested);
 						}
+
 						::tightbeam_asn::js::set_array(&object, #field_key, &array)?;
 					}
 				}
@@ -811,6 +812,7 @@ impl FieldKind {
 							let nested = #to_item;
 							array.push(&nested);
 						}
+
 						::tightbeam_asn::js::set_array(&object, #field_key, &array)?;
 					}
 				}
@@ -825,6 +827,7 @@ impl FieldKind {
 							let nested = #to_item;
 							array.push(&nested);
 						}
+
 						::tightbeam_asn::js::set_array(&object, #field_key, &array)?;
 					}
 				}
@@ -857,6 +860,7 @@ fn quote_vec_from_array(inner: &FieldKind, array: &Ident) -> proc_macro2::TokenS
 				items.push(#from_entry);
 				index += 1;
 			}
+
 			items
 		}
 	}
@@ -881,6 +885,7 @@ fn quote_sequence_of_from_array(inner: &FieldKind, len: &Expr, array: &Ident) ->
 			if (#array.length() as ::core::primitive::usize) != (#len as ::core::primitive::usize) {
 				return ::core::result::Result::Err(::der::Error::from(::der::ErrorKind::Failed));
 			}
+
 			let mut seq = ::der::asn1::SequenceOf::<_, #len>::new();
 			let mut index = 0_u32;
 			while index < #array.length() {
@@ -888,6 +893,7 @@ fn quote_sequence_of_from_array(inner: &FieldKind, len: &Expr, array: &Ident) ->
 				seq.add(#from_entry)?;
 				index += 1;
 			}
+
 			seq
 		}
 	}
@@ -912,6 +918,7 @@ fn quote_set_of_from_array(inner: &FieldKind, len: &Expr, array: &Ident) -> proc
 			if (#array.length() as ::core::primitive::usize) != (#len as ::core::primitive::usize) {
 				return ::core::result::Result::Err(::der::Error::from(::der::ErrorKind::Failed));
 			}
+
 			let mut set = ::der::asn1::SetOf::<_, #len>::new();
 			let mut index = 0_u32;
 			while index < #array.length() {
@@ -919,6 +926,7 @@ fn quote_set_of_from_array(inner: &FieldKind, len: &Expr, array: &Ident) -> proc
 				set.insert(#from_entry)?;
 				index += 1;
 			}
+
 			set
 		}
 	}
@@ -960,8 +968,8 @@ fn field_kind(ty: &Type) -> Result<FieldKind> {
 	let Type::Path(type_path) = ty else {
 		return Err(Error::new(ty.span(), FIELD_KIND_HELP));
 	};
-	let path = &type_path.path;
 
+	let path = &type_path.path;
 	if let Some(inner_ty) = single_type_arg(path, "Option") {
 		return Ok(FieldKind::Option(Box::new(field_kind(inner_ty)?)));
 	}
@@ -1063,12 +1071,14 @@ fn single_type_arg<'a>(path: &'a Path, name: &str) -> Option<&'a Type> {
 	if segment.ident != name {
 		return None;
 	}
+
 	let PathArguments::AngleBracketed(args) = &segment.arguments else {
 		return None;
 	};
 	if args.args.len() != 1 {
 		return None;
 	}
+
 	match &args.args[0] {
 		GenericArgument::Type(ty) => Some(ty),
 		_ => None,
@@ -1080,15 +1090,18 @@ fn type_and_const_args<'a>(path: &'a Path, name: &str) -> Option<(&'a Type, Expr
 	if segment.ident != name {
 		return None;
 	}
+
 	let PathArguments::AngleBracketed(args) = &segment.arguments else {
 		return None;
 	};
 	if args.args.len() != 2 {
 		return None;
 	}
+
 	let GenericArgument::Type(inner) = &args.args[0] else {
 		return None;
 	};
+
 	let len = const_generic_expr(&args.args[1])?;
 	Some((inner, len))
 }
@@ -1134,12 +1147,6 @@ fn is_enumerated(data: &DataEnum) -> Result<bool> {
 		if !matches!(variant.fields, Fields::Unit) {
 			return Ok(false);
 		}
-		if variant.discriminant.is_none() {
-			return Err(Error::new(
-				variant.span(),
-				"AsnCodec Enumerated variants require explicit discriminants",
-			));
-		}
 	}
 
 	Ok(true)
@@ -1167,6 +1174,7 @@ fn ensure_repr_u8(input: &DeriveInput) -> Result<()> {
 		}
 
 		let mut is_u8 = false;
+
 		attr.parse_nested_meta(|meta| {
 			if meta.path.is_ident("u8") {
 				is_u8 = true;
