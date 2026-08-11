@@ -1,0 +1,20 @@
+{
+	"name": "@wahidgroup/tightbeam-asn-workspace",
+	"version": "0.0.0",
+	"private": true,
+	"description": "npm workspace for tightbeam-asn emit integration tests.",
+	"type": "module",
+	"engines": {
+		"node": ">=24"
+	},
+	"workspaces": [
+		"tests"
+	],
+	"scripts": {
+		"test": "npm run test --workspace @wahidgroup/tightbeam-asn-tests",
+		"lint": "npm run lint --workspaces --if-present",
+		"lint:fix": "npm run lint:fix --workspaces --if-present",
+		"typecheck": "npm run typecheck --workspaces --if-present"
+	},
+	"license": "MIT OR Apache-2.0"
+}

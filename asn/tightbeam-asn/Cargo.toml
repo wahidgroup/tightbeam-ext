@@ -22,8 +22,8 @@ path = "src/bin/tightbeam-asn-emit.rs"
 required-features = ["emit"]
 
 [[test]]
-name = "emit_fixture"
-path = "tests/emit_fixture.rs"
+name = "emit"
+path = "tests/emit.rs"
 required-features = ["emit"]
 
 [features]

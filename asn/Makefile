@@ -33,6 +33,8 @@ ifeq ($(strip $(features)$(no-default)),)
 else
 	cargo test $(CRATES) $(CARGO_FLAGS)
 endif
+	@echo "Running asn vitest emit integration..."
+	npm run test
 	@echo "Running asn wasm32 JS round-trip tests..."
 	CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
 		cargo test -p tightbeam-asn --features wasm --target wasm32-unknown-unknown --test wasm_js_roundtrip
@@ -42,9 +44,11 @@ lint: setup
 ifeq ($(LINT_MODE),fix)
 	cargo fmt $(CRATES)
 	cargo clippy $(CRATES) --all-targets --all-features
+	npm run lint:fix
 else
 	cargo fmt $(CRATES) --check
 	cargo clippy $(CRATES) --all-targets --all-features -- -D warnings
+	npm run lint
 endif
 
 wasm:

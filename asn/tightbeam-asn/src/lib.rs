@@ -5,9 +5,9 @@
 //! convert plain JS values through RustCrypto `der` encode and decode.
 //!
 //! Consumer MessageCodec façades come from the `tightbeam-asn-emit` binary
-//! in this package (`cargo run -p tightbeam-asn --features emit --bin
-//! tightbeam-asn-emit`, `.d.ts` pair scan). Per-type `ASN_CODEC_TS` fragments
-//! remain for engine fixtures only. Fallible work uses [`der::Error`].
+//! shipped with the `emit` feature. Set `TIGHTBEAM_ASN_EMIT` to a prebuilt
+//! path when preferred. Per-type `ASN_CODEC_TS` fragments remain for engine
+//! fixtures only. Fallible work uses [`der::Error`].
 //!
 //! # Coverage
 //!
