@@ -37,6 +37,8 @@ words:
   - startswith
   - secp
   - beamable
+  - bitstring
+  - façades
   - nonrepudiation
   - gloo
   - goaway
@@ -50,7 +52,9 @@ words:
   - hashers
   - preimage
   - preimages
+  - qself
   - recomputable
+  - repr
   - parameterless
   - hkdf
   - chacha
@@ -104,6 +108,7 @@ words:
   - baselined
   - unmetered
   - subarray
+  - teletex
 ignorePaths:
   - node_modules/**
   - "**/sbom.json"

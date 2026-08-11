@@ -1,0 +1,21 @@
+[package]
+name = "tightbeam-asn-derive"
+description = "Proc-macro derive for tightbeam-asn AsnCodec bindings"
+authors.workspace = true
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords.workspace = true
+categories.workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "3.0.3", features = ["full"] }

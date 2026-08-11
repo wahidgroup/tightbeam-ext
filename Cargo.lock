@@ -1217,6 +1217,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "tightbeam-asn"
+version = "0.1.0"
+dependencies = [
+ "der",
+ "js-sys",
+ "tightbeam-asn-derive",
+ "tightbeam-asn-fixtures",
+ "tightbeam-derive",
+ "wasm-bindgen",
+ "wasm-bindgen-test",
+]
+
+[[package]]
+name = "tightbeam-asn-derive"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.3",
+]
+
+[[package]]
+name = "tightbeam-asn-fixtures"
+version = "0.1.0"
+dependencies = [
+ "der",
+ "tightbeam-asn",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "tightbeam-derive"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
