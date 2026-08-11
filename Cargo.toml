@@ -4,6 +4,9 @@ members = [
 	"ws/tightbeam-ws",
 	"ws/tightbeam-ws-wasm",
 	"pubsub/tightbeam-pubsub",
+	"asn/tightbeam-asn",
+	"asn/tightbeam-asn-derive",
+	"asn/tightbeam-asn-fixtures",
 ]
 
 [workspace.package]

@@ -18,6 +18,10 @@ Each extension lives in its own directory carrying everything it needs: crates, 
 - **[pubsub/tightbeam-pubsub](pubsub/tightbeam-pubsub)** - server-side topic registry over the core mux: publish fan-out with dense per-topic ordering, bounded per-subscriber queues with delivery policies, subscribe authorization, and orderly quiesce. Carrier-agnostic, no new wire protocol.
 - **[pubsub/client](pubsub/client)** - `@wahidgroup/tightbeam-pubsub-client`, typed subscribe/unsubscribe lifecycle over the ws client: exact-match dispatch, per-topic ordering gates with gap detection, completion callbacks, and reconnect replay.
 
+### [asn/](asn) - DER ASN.1 TypeScript bridge
+
+- **[asn/tightbeam-asn](asn/tightbeam-asn)** - RustCrypto `der` codec bridge: `AsnCodec` marker and runtime helpers for TypeScript façades.
+
 ## Development
 
 ```sh
