@@ -236,7 +236,9 @@ export class ZstdCompression implements BodyCompressor, BodyInflator {
 		}
 
 		const zstd = await zstdModule();
-		const bodyDer = zstd.decompress(compressed.data, { defaultHeapSize: this.maxOutput });
+		const bodyDer = zstd.decompress(compressed.data, {
+			defaultHeapSize: this.maxOutput,
+		});
 		return bodyDer;
 	}
 }
