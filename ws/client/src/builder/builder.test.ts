@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { decodeBody } from "#wasm";
 
 import type { FrameBuilder } from "./builder.js";
-import { Aes256Gcm, EciesEncryptor, Sha3_256 } from "../crypto.js";
+import { Aes256Gcm, HpkeEncryptor, Sha3_256 } from "../crypto.js";
 import { Frame } from "../frame.js";
 import { frame, initClient } from "../index.js";
 import { ValidationError } from "./errors.js";
@@ -16,8 +16,11 @@ import { Version } from "./version.js";
  */
 
 const BODY = new Uint8Array([1, 2, 3]);
-const AEAD_256 = Aes256Gcm.fromKey(new Uint8Array(32).fill(1));
-const RECIPIENT = EciesEncryptor.fromBytes(new Uint8Array(33).fill(2));
+const AEAD_256 = Aes256Gcm.fromKey(
+	new Uint8Array(32).fill(1),
+	new TextEncoder().encode("tbws/test/kek/v1"),
+);
+const RECIPIENT = HpkeEncryptor.fromBytes(new Uint8Array(33).fill(2));
 
 await initClient();
 
@@ -63,7 +66,7 @@ describe("FrameBuilder accumulation", () => {
 	it("records every metadata field", () => {
 		const digest = new Uint8Array([9, 9]);
 		const matrix = new Uint8Array([0, 1, 1, 0]);
-		const salt = new Uint8Array([5]);
+		const salt = new Uint8Array(16).fill(5);
 		const messageHasher = new Sha3_256();
 		const witnessHasher = new Sha3_256();
 		const spec = frame(BODY)
@@ -95,7 +98,7 @@ describe("FrameBuilder accumulation", () => {
 
 	it.each([
 		{ name: "AEAD cipher", encryptor: AEAD_256 },
-		{ name: "ECIES encryptor", encryptor: RECIPIENT },
+		{ name: "HPKE encryptor", encryptor: RECIPIENT },
 	])("records the $name in the encryptor slot", ({ encryptor }) => {
 		const spec = frame(BODY).withEncryptor(encryptor).toSpec();
 		expect(spec.encryptor).toBe(encryptor);

@@ -1,14 +1,10 @@
 /**
  * Liveness proof against the real dockerized tightbeam node: one page
  * publishes, another page's DOM updates through the registry fan-out,
- * with no polling and no reload. Every hop is ECIES encrypted, and every
- * message is a full tightbeam frame (the `Framed` codec): a typed JSON
- * note, signed by the publisher, sealed under the topic's AES-256-GCM
- * key. The wrapper only stamps topic and sequence; the broker never
- * reads the note.
+ * with no polling and no reload.
  *
  *   browser (publisher page)
- *      | ECIES ws: pub/<topic> [inner frame: signed + sealed note]
+ *      | HPKE ws: pub/<topic> [inner frame: signed + sealed note]
  *      v
  *   pubsub-demo ............... TopicRegistry (default Local backplane)
  *      | server push (wrapper order 1, inner relayed byte-for-byte)

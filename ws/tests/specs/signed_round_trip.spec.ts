@@ -17,7 +17,7 @@ test("signs a frame, echoes it, and verifies the round-tripped signature", async
 				"e2e-signed",
 				13,
 				"0101010101010101010101010101010101010101010101010101010101010101",
-				"5a5a5a5a",
+				"5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
 			),
 		{ url: muxClearEndpoint },
 	);

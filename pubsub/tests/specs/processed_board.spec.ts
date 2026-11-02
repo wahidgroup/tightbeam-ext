@@ -2,18 +2,12 @@
  * Custom-backplane proof: this demo server's `RelayBackplane` detours
  * every publish through a backend-only servlet before fan-out, so the
  * boards render the transformed note instead of the published one.
- * Every hop is ECIES encrypted. The published note travels signed but
- * unsealed: the servlet must read and rewrite the body, so mid-stream
- * transformation and an end-to-end seal are mutually exclusive, and the
- * rebuilt frame arrives unverified by design. The servlet seals its
- * rebuild under the pre-shared topic key, so the transformed note
- * arrives encrypted and the subscriber's envelope opens it.
  *
  *   browser (publisher page)
- *      | ECIES ws: pub/<topic> [inner frame: signed note "hello"]
+ *      | HPKE ws: pub/<topic> [inner frame: signed note "hello"]
  *      v
  *   pubsub-demo-processed ........ TopicRegistry + RelayBackplane
- *      | ECIES tightbeam ws mux request [inner frame]
+ *      | HPKE tightbeam ws mux request [inner frame]
  *      v
  *   pubsub-processor ............. backend-only servlet: lifts the
  *      |                           note, uppercases its text, rebuilds

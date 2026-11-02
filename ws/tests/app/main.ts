@@ -26,6 +26,11 @@ import { NobleTransportSigner } from "../signer.js";
 const TEXT = new TextDecoder();
 
 /**
+ * The identifier that names the shared key of the sealed round trips.
+ */
+const E2E_KEY_ID = new TextEncoder().encode("tbws/e2e/kek/v1");
+
+/**
  * The decoded outcome of a single round-trip, in a structured-clone-safe shape
  * (no `bigint`) so it crosses the Playwright `page.evaluate` boundary.
  */
@@ -281,7 +286,7 @@ async function signedRoundTrip(
 		frameVerdict: await response.frameIntegrityVerdict(),
 		messageVerdict: await response.messageCommitmentVerdict(salt),
 		wrongSaltVerdict: await response.messageCommitmentVerdict(
-			hexToBytes("deadbeef"),
+			hexToBytes("deadbeef".repeat(4)),
 		),
 	};
 }
@@ -307,7 +312,7 @@ async function sealedRoundTrip(
 	await initClient();
 
 	const payload = hexToBytes(payloadHex);
-	const cipher = Aes256Gcm.fromKey(hexToBytes(keyHex));
+	const cipher = Aes256Gcm.fromKey(hexToBytes(keyHex), E2E_KEY_ID);
 
 	const response = await withEchoClient(url, async (client) => {
 		const built = await frame(payload)
@@ -373,7 +378,7 @@ async function compressedSealedRoundTrip(
 	await initClient();
 
 	const zstd = new ZstdCompression();
-	const cipher = Aes256Gcm.fromKey(hexToBytes(keyHex));
+	const cipher = Aes256Gcm.fromKey(hexToBytes(keyHex), E2E_KEY_ID);
 
 	const response = await withEchoClient(url, async (client) => {
 		const built = await frame(hexToBytes(payloadHex))
@@ -563,8 +568,8 @@ async function muxCallbackRoundTrip(
 			.withId("call-me-browser")
 			.withOrder(4)
 			.build();
-		const relayed = await emitFrame(client, callMe);
 
+		const relayed = await emitFrame(client, callMe);
 		const result = {
 			servedIds,
 			relayedIdText: TEXT.decode(relayed.id),
@@ -666,6 +671,7 @@ async function muxDrainReason(
 			.withId("drain-calm-browser")
 			.withOrder(1)
 			.build();
+
 		const controller = new AbortController();
 		const pending = client.emit(drain, { signal: controller.signal });
 
@@ -715,6 +721,7 @@ async function muxParkedCallbackRoundTrip(
 			.withId("call-me-parked-browser")
 			.withOrder(4)
 			.build();
+
 		const pending = emitFrame(client, callMe);
 		const deadline = Date.now() + 10_000;
 		while (!client.hasPendingStreams) {
@@ -783,8 +790,10 @@ async function muxRefusalRoundTrip(
 			if (isTransportError(error)) {
 				return { rejectionName: error.name, rejectionCode: error.code };
 			}
+
 			return { rejectionName: String(error), rejectionCode: "" };
 		}
+
 		return { rejectionName: "", rejectionCode: "" };
 	});
 }

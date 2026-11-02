@@ -5,7 +5,7 @@ use std::sync::Arc;
 use tightbeam::crypto::x509::store::CertificateTrust;
 use tightbeam::policy::TransitStatus;
 use tightbeam::prelude::TightBeamSocketAddr;
-use tightbeam::transport::{AsyncListenerTrait, MessageCollector, MessageEmitter, Protocol, X509ClientConfig};
+use tightbeam::transport::{AsyncListenerTrait, ClientBuilder, ConnectionBuilder, MessageCollector};
 use tightbeam::Frame;
 use tightbeam_ws::protocol::WsListener;
 
@@ -33,10 +33,10 @@ pub async fn echo_round_trip(
 		transport.send_response(status, message).await
 	});
 
-	let stream = <WsListener as Protocol>::connect(addr).await?;
-	let mut transport = <WsListener as Protocol>::create_transport(stream).with_trust_store(trust_store);
+	let builder = ClientBuilder::<WsListener>::builder().with_trust_store(trust_store);
+	let mut client = builder.build().connect(addr).await?;
 
-	let response = transport.emit(expected.clone(), None).await?;
+	let response = client.emit(expected.clone(), None).await?;
 	assert_eq!(
 		response,
 		Some(expected),

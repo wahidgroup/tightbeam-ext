@@ -5,9 +5,8 @@
 //! mutate a finished frame, so integrity and non-repudiation artifacts
 //! stay valid.
 //!
-//! The body is an ASN.1 SEQUENCE of one OCTET STRING. That matches the
-//! ws client's opaque profile so TypeScript subscribers reuse ordinary
-//! codecs.
+//! The body is an ASN.1 SEQUENCE of one OCTET STRING. That matches the ws
+//! client's opaque profile so TypeScript subscribers reuse ordinary codecs.
 
 use der::asn1::OctetString;
 use der::{Decode, Sequence};
@@ -55,7 +54,7 @@ pub(crate) fn build(id: &str, order: u64, payload: &[u8]) -> Result<Frame, Tight
 /// Returns [`TightBeamError`] when `frame.message` is not a well-formed
 /// opaque body SEQUENCE wrapping one OCTET STRING.
 pub fn opaque_payload(frame: &Frame) -> Result<Vec<u8>, TightBeamError> {
-	let body = OpaqueBody::from_der(&frame.message)?;
+	let body = OpaqueBody::from_der(frame.message())?;
 	Ok(body.body.into_bytes())
 }
 
@@ -82,16 +81,16 @@ mod tests {
 	#[test]
 	fn update_frame_carries_topic_order_and_payload() {
 		let frame = built_update(&topic("prices/spot"), 7, b"payload");
-		assert_eq!(frame.metadata.id, b"prices/spot");
-		assert_eq!(frame.metadata.order, 7);
+		assert_eq!(frame.metadata().id(), b"prices/spot");
+		assert_eq!(frame.metadata().order(), 7);
 		assert_eq!(payload_of(&frame), b"payload");
 	}
 
 	#[test]
 	fn end_frame_prefixes_the_topic_and_carries_no_payload() {
 		let frame = built_end(&topic("prices/spot"), 8);
-		assert_eq!(frame.metadata.id, b"end/prices/spot");
-		assert_eq!(frame.metadata.order, 8);
+		assert_eq!(frame.metadata().id(), b"end/prices/spot");
+		assert_eq!(frame.metadata().order(), 8);
 		assert_eq!(payload_of(&frame), b"");
 	}
 }

@@ -12,6 +12,8 @@ mod approver;
 #[cfg(target_arch = "wasm32")]
 mod bindings;
 #[cfg(target_arch = "wasm32")]
+pub mod clock;
+#[cfg(target_arch = "wasm32")]
 mod fault;
 #[cfg(target_arch = "wasm32")]
 mod mux;
@@ -19,6 +21,8 @@ mod mux;
 mod profile;
 #[cfg(target_arch = "wasm32")]
 mod promise;
+#[cfg(target_arch = "wasm32")]
+pub mod protocol;
 #[cfg(target_arch = "wasm32")]
 mod secure;
 #[cfg(target_arch = "wasm32")]
@@ -33,7 +37,7 @@ mod streaming;
 #[cfg(target_arch = "wasm32")]
 pub use mux::{split_mux, MuxWsClient};
 #[cfg(target_arch = "wasm32")]
-pub use secure::{build_transport_with, profile_trust_store, ClientCredentials};
+pub use secure::{build_transport_with, profile_trust_store};
 #[cfg(target_arch = "wasm32")]
 pub use signer::{JsSigningKeyProvider, TransportSigner};
 #[cfg(target_arch = "wasm32")]

@@ -1,8 +1,8 @@
 //! Fixture `der` messages for `AsnCodec` encode and decode exports.
 
 use der::asn1::{
-	Any, BitString, BmpString, GeneralizedTime, Ia5String, Null, ObjectIdentifier, OctetString,
-	PrintableString, SequenceOf, SetOf, SetOfVec, TeletexString, UtcTime,
+	Any, BitString, BmpString, GeneralizedTime, Ia5String, Null, ObjectIdentifier, OctetString, PrintableString,
+	SequenceOf, SetOf, SetOfVec, TeletexString, UtcTime,
 };
 use der::{Choice, DateTime, Enumerated, Sequence, Tag};
 use tightbeam_asn::AsnCodec;

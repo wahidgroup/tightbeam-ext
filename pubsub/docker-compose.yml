@@ -2,7 +2,7 @@
 # scripts/stack.sh. The demo server shares the echo image and the command
 # selects the pubsub binary. Every service presents the stack's shared
 # server identity (gen_certs, bind-mounted under /certs), so every hop is
-# ECIES encrypted: browser to demo server, and the processed demo server's
+# HPKE encrypted: browser to demo server, and the processed demo server's
 # relay dial to the processor.
 
 services:

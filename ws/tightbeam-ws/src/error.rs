@@ -23,15 +23,6 @@ pub enum Error {
 	#[error("transport error: {0}")]
 	#[from]
 	Transport(tightbeam::transport::error::TransportError),
-	/// The peer sent an encrypted container during the cleartext
-	/// handshake phase.
-	#[cfg(feature = "testing")]
-	#[error("handshake containers must be cleartext")]
-	HandshakeCiphertext,
-	/// The handshake did not complete within the message ceiling.
-	#[cfg(feature = "testing")]
-	#[error("the handshake did not complete within the message ceiling")]
-	HandshakeIncomplete,
 }
 
 impl From<tokio_tungstenite::tungstenite::Error> for Error {

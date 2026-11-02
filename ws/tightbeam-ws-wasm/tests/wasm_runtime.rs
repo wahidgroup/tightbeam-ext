@@ -8,9 +8,8 @@
 //! feature wiring; passing here proves that wiring at runtime.
 #![cfg(target_arch = "wasm32")]
 
-use tightbeam::crypto::aead::Encryptor;
-use tightbeam::crypto::ecies::EciesEncryptor;
 use tightbeam::time::OffsetDateTime;
+use tightbeam_ws_wasm::build::HpkeSecp256k1Encryptor;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
 wasm_bindgen_test_configure!(run_in_browser);
@@ -31,20 +30,19 @@ fn now_utc_resolves_browser_clock() {
 	);
 }
 
-/// Encrypt `content` for the generator point, expecting every step so
-/// the test body stays assertion-only.
+/// Seal `content` to the generator point, expecting every step so the test
+/// body stays assertion-only.
 fn generator_ciphertext(content: &[u8]) -> Vec<u8> {
-	let encryptor = EciesEncryptor::from_bytes(G_COMPRESSED).expect("the recipient public key should parse");
-	let info = encryptor
-		.encrypt_content(content, [0u8; 12], None)
-		.expect("ECIES encrypt should drive OsRng without panicking");
+	let encryptor = HpkeSecp256k1Encryptor::from_sec1(G_COMPRESSED).expect("the recipient public key should parse");
+	let sealed = encryptor
+		.seal(content, None)
+		.expect("HPKE seal should drive OsRng without panicking");
 
-	let ciphertext = info.encrypted_content.expect("the encrypted content should be present");
-	ciphertext.as_bytes().to_vec()
+	sealed.ciphertext
 }
 
 #[wasm_bindgen_test]
-fn ecies_encrypt_resolves_browser_rng() {
+fn hpke_seal_resolves_browser_rng() {
 	let ciphertext = generator_ciphertext(b"wasm-rng-proof");
-	assert!(!ciphertext.is_empty(), "ECIES ciphertext must be non-empty");
+	assert!(!ciphertext.is_empty(), "HPKE ciphertext must be non-empty");
 }

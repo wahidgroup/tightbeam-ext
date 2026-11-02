@@ -3,14 +3,13 @@
 use js_sys::{Object, Reflect, Uint8Array};
 use wasm_bindgen::prelude::*;
 
-use tightbeam::crypto::ecies::EciesSecp256k1Oid;
+use tightbeam::asn1::{AlgorithmIdentifierOwned, ObjectIdentifier};
 use tightbeam::der::asn1::OctetString;
-use tightbeam::der::oid::AssociatedOid;
 use tightbeam::matrix::MatrixDyn;
 use tightbeam::oids::{
-	AES_256_GCM, COMPRESSION_CONTENT, COMPRESSION_ZLIB, COMPRESSION_ZSTD, HASH_SHA3_256, SIGNER_ECDSA_WITH_SHA3_256,
+	AES_256_GCM, COMPRESSION_ZLIB, COMPRESSION_ZSTD, DATA, DHKEM_SECP256K1, HASH_SHA3_256, SIGNER_ECDSA_WITH_SHA3_256,
 };
-use tightbeam::{AlgorithmIdentifierOwned, DigestInfo, MessagePriority, ObjectIdentifier, Version};
+use tightbeam::{DigestInfo, MessagePriority, Version};
 
 use crate::build::{self, FrameConfig, FrameSummary};
 
@@ -68,7 +67,7 @@ fn summary_into_js(summary: FrameSummary) -> JsValue {
 	set_bytes(&object, "compactnessParametersDer", summary.compactness_parameters_der);
 	set_string(&object, "compactnessContentOid", summary.compactness_content_oid);
 	set_string(&object, "confidentialityAlgorithmOid", summary.confidentiality_algorithm_oid);
-	set_bytes(&object, "confidentialityParametersDer", summary.confidentiality_parameters_der);
+	set_bytes(&object, "confidentialityEnvelopeDer", summary.confidentiality_envelope_der);
 	set_string(&object, "signatureAlgorithmOid", summary.signature_algorithm_oid);
 	set_string(&object, "signatureDigestAlgorithmOid", summary.signature_digest_algorithm_oid);
 	set_bytes(&object, "signature", summary.signature);
@@ -222,10 +221,11 @@ pub fn decode_body(body_der: Vec<u8>) -> Result<Vec<u8>, JsError> {
 
 /// The message-commitment preimage over `body_der` under `salt` (tightbeam's
 /// commitment framing). Hash it with any digest and install the result via
-/// `setMessageIntegrity`. An empty salt returns `body_der` by move.
+/// `setMessageIntegrity`. An empty salt commits in plain-digest mode, and any
+/// other salt MUST carry at least 16 octets.
 #[wasm_bindgen(js_name = commitmentPreimage)]
-pub fn commitment_preimage(salt: Vec<u8>, body_der: Vec<u8>) -> Vec<u8> {
-	build::commitment_preimage(salt, body_der).into_owned()
+pub fn commitment_preimage(salt: Vec<u8>, body_der: Vec<u8>) -> Result<Vec<u8>, JsError> {
+	build::commitment_preimage(salt, body_der).map_err(|error| JsError::new(&error.to_string()))
 }
 
 /// Install a message-integrity commitment: the digest of
@@ -236,32 +236,17 @@ pub fn set_message_integrity(frame_der: Vec<u8>, algorithm_oid: &str, digest: Ve
 	build::set_message_integrity(frame_der, oid, digest).map_err(|error| JsError::new(&error.to_string()))
 }
 
-/// Replace the frame body with `ciphertext` and record the confidentiality
-/// info (V1+ frames): the caller's encryption algorithm OID, its DER-encoded
-/// parameters (for example the nonce), and the plaintext content-type OID
-/// (defaults to `id-data`). Pass `undefined` for parameters when the scheme
-/// has none.
+/// Replace the frame body with `ciphertext` and install `envelope_der`, the
+/// DER `AuthEnvelopedData` that seals it, its content detached (V1+ frames).
 #[wasm_bindgen(js_name = setConfidentiality)]
-pub fn set_confidentiality(
-	frame_der: Vec<u8>,
-	content_oid: Option<String>,
-	algorithm_oid: &str,
-	parameters_der: Option<Vec<u8>>,
-	ciphertext: Vec<u8>,
-) -> Result<Vec<u8>, JsError> {
-	let content_oid = match content_oid {
-		Some(dotted) => Some(oid_from(&dotted, "contentOid")?),
-		None => None,
-	};
-	let algorithm_oid = oid_from(algorithm_oid, "confidentiality.algorithmOid")?;
-
-	build::set_confidentiality(frame_der, content_oid, algorithm_oid, parameters_der, ciphertext)
-		.map_err(|error| JsError::new(&error.to_string()))
+pub fn set_confidentiality(frame_der: Vec<u8>, envelope_der: Vec<u8>, ciphertext: Vec<u8>) -> Result<Vec<u8>, JsError> {
+	build::set_confidentiality(frame_der, envelope_der, ciphertext).map_err(|error| JsError::new(&error.to_string()))
 }
 
 /// Replace the frame body with `compressed` and record the compactness info
 /// (any version): the caller's compression algorithm OID, its DER-encoded
-/// parameters, and the content-type OID of the uncompressed body .
+/// parameters, and the content-type OID of the uncompressed body (defaults
+/// to `id-data`).
 #[wasm_bindgen(js_name = setCompactness)]
 pub fn set_compactness(
 	frame_der: Vec<u8>,
@@ -296,29 +281,32 @@ pub fn attach_witness(frame_der: Vec<u8>, algorithm_oid: &str, digest: Vec<u8>) 
 }
 
 /// The to-be-signed bytes of a frame (everything but the signature field).
-/// Sign them with any scheme and install the result via `attachSignature`.
 /// Call after `attachWitness`. The signature covers the witness.
 #[wasm_bindgen(js_name = tbsBytes)]
 pub fn tbs_bytes(frame_der: Vec<u8>) -> Result<Vec<u8>, JsError> {
 	build::tbs_bytes(frame_der).map_err(|error| JsError::new(&error.to_string()))
 }
 
-/// Attach a detached signature over `tbsBytes` to an unsigned frame (V1+
-/// frames), identified by the caller's signature and digest algorithm OIDs
-/// plus a subject-key-identifier octet string naming the signer.
-#[wasm_bindgen(js_name = attachSignature)]
-pub fn attach_signature(
-	frame_der: Vec<u8>,
-	signature: Vec<u8>,
-	signature_algorithm_oid: &str,
-	digest_algorithm_oid: &str,
-	signer_key_id: Vec<u8>,
-) -> Result<Vec<u8>, JsError> {
-	let signature_oid = oid_from(signature_algorithm_oid, "signature.algorithmOid")?;
-	let digest_oid = oid_from(digest_algorithm_oid, "signature.digestAlgorithmOid")?;
+/// The digest the key named by `signer_key_id` signs for this frame: the
+/// digest of its CMS signed attributes, which bind `tbsBytes`. Sign it
+/// directly, with no rehash, and install the result via `attachSignature`.
+#[wasm_bindgen(js_name = signingPrehash)]
+pub fn signing_prehash(frame_der: Vec<u8>, signer_key_id: Vec<u8>) -> Result<Vec<u8>, JsError> {
+	build::signing_prehash(frame_der, signer_key_id).map_err(|error| JsError::new(&error.to_string()))
+}
 
-	build::attach_signature(frame_der, signature, signature_oid, digest_oid, signer_key_id)
-		.map_err(|error| JsError::new(&error.to_string()))
+/// The digest a verifier checks this signed frame's signature against.
+#[wasm_bindgen(js_name = signaturePrehash)]
+pub fn signature_prehash(frame_der: Vec<u8>) -> Result<Vec<u8>, JsError> {
+	build::signature_prehash(frame_der).map_err(|error| JsError::new(&error.to_string()))
+}
+
+/// Attach `signature`, a DER `ECDSA-Sig-Value` over `signingPrehash`, to an
+/// unsigned frame (V1+ frames). `signer_key_id` is the subject key identifier
+/// that names the signer's certificate.
+#[wasm_bindgen(js_name = attachSignature)]
+pub fn attach_signature(frame_der: Vec<u8>, signature: Vec<u8>, signer_key_id: Vec<u8>) -> Result<Vec<u8>, JsError> {
+	build::attach_signature(frame_der, signature, signer_key_id).map_err(|error| JsError::new(&error.to_string()))
 }
 
 /// Read-only view of a decoded frame: body, metadata, and the carried
@@ -472,7 +460,7 @@ impl FrameView {
 			.and_then(|summary| summary.compactness_content_oid.clone())
 	}
 
-	/// Body-encryption algorithm OID, when confidential.
+	/// Content-encryption algorithm OID, when confidential.
 	#[wasm_bindgen(getter, js_name = confidentialityAlgorithmOid)]
 	pub fn confidentiality_algorithm_oid(&self) -> Option<String> {
 		self.summary
@@ -480,13 +468,12 @@ impl FrameView {
 			.and_then(|summary| summary.confidentiality_algorithm_oid.clone())
 	}
 
-	/// Body-encryption algorithm parameters DER (e.g. the nonce), when
-	/// confidential and present.
-	#[wasm_bindgen(getter, js_name = confidentialityParametersDer)]
-	pub fn confidentiality_parameters_der(&self) -> Option<Vec<u8>> {
+	/// DER `AuthEnvelopedData` that seals the body, when confidential.
+	#[wasm_bindgen(getter, js_name = confidentialityEnvelopeDer)]
+	pub fn confidentiality_envelope_der(&self) -> Option<Vec<u8>> {
 		self.summary
 			.as_ref()
-			.and_then(|summary| summary.confidentiality_parameters_der.clone())
+			.and_then(|summary| summary.confidentiality_envelope_der.clone())
 	}
 
 	/// Signature algorithm OID, when signed.
@@ -505,7 +492,7 @@ impl FrameView {
 			.and_then(|summary| summary.signature_digest_algorithm_oid.clone())
 	}
 
-	/// Raw signature octets, when signed.
+	/// DER signature octets, when signed.
 	#[wasm_bindgen(getter)]
 	pub fn signature(&self) -> Option<Vec<u8>> {
 		self.summary.as_ref().and_then(|summary| summary.signature.clone())
@@ -541,7 +528,7 @@ export interface InspectedFrame {
 	compactnessParametersDer?: Uint8Array;
 	compactnessContentOid?: string;
 	confidentialityAlgorithmOid?: string;
-	confidentialityParametersDer?: Uint8Array;
+	confidentialityEnvelopeDer?: Uint8Array;
 	signatureAlgorithmOid?: string;
 	signatureDigestAlgorithmOid?: string;
 	signature?: Uint8Array;
@@ -558,7 +545,7 @@ pub fn inspect_frame_fields(frame_der: Vec<u8>) -> Result<JsValue, JsError> {
 }
 
 // ---------------------------------------------------------------------------
-// Tightbeam profile primitives (SHA3-256 / secp256k1 / AES-256-GCM / ECIES).
+// Tightbeam profile primitives (SHA3-256 / secp256k1 / AES-256-GCM / HPKE).
 // ---------------------------------------------------------------------------
 
 /// TypeScript shape of the [`profile_oids`] table.
@@ -573,6 +560,8 @@ const PROFILE_OIDS_TS: &'static str = r#"
  *   <https://datatracker.ietf.org/doc/html/rfc8878>
  * - RFC 3274, Compressed Data Content Type:
  *   <https://datatracker.ietf.org/doc/html/rfc3274>
+ * - RFC 9629, Using Key Encapsulation Mechanism (KEM) Algorithms in CMS:
+ *   <https://datatracker.ietf.org/doc/html/rfc9629>
  */
 export interface ProfileOids {
 	/**
@@ -588,9 +577,9 @@ export interface ProfileOids {
 	 */
 	readonly aes256Gcm: string;
 	/**
-	 * ECIES over secp256k1 (HKDF-SHA3-256 + AES-256-GCM).
+	 * DHKEM over secp256k1, the profile recipient KEM.
 	 */
-	readonly eciesSecp256k1: string;
+	readonly dhkemSecp256k1: string;
 	/**
 	 * Zstandard, the profile compression.
 	 */
@@ -600,10 +589,10 @@ export interface ProfileOids {
 	 */
 	readonly zlib: string;
 	/**
-	 * id-ct-compressedData: the content type recorded in the compactness
-	 * info when the compressor names none.
+	 * id-data: the content type recorded in the compactness info and in an
+	 * envelope when the caller names none.
 	 */
-	readonly compressedContent: string;
+	readonly data: string;
 }
 "#;
 
@@ -616,10 +605,10 @@ pub fn profile_oids() -> Result<JsValue, JsValue> {
 		("sha3_256", HASH_SHA3_256),
 		("ecdsaWithSha3_256", SIGNER_ECDSA_WITH_SHA3_256),
 		("aes256Gcm", AES_256_GCM),
-		("eciesSecp256k1", EciesSecp256k1Oid::OID),
+		("dhkemSecp256k1", DHKEM_SECP256K1),
 		("zstd", COMPRESSION_ZSTD),
 		("zlib", COMPRESSION_ZLIB),
-		("compressedContent", COMPRESSION_CONTENT),
+		("data", DATA),
 	];
 
 	let table = Object::new();

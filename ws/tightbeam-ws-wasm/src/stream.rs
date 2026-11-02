@@ -13,6 +13,7 @@ use gloo_net::websocket::{Message, WebSocketError};
 use tightbeam::crypto::profiles::DefaultCryptoProvider;
 use tightbeam::transport::{
 	AsyncProtocolStream, AsyncReadStream, AsyncWriteStream, SplittableStream, TcpTransport, TransportError,
+	TransportFailure,
 };
 
 /// A browser WebSocket carrying tightbeam frames, one DER envelope per message.
@@ -23,15 +24,14 @@ pub struct GlooStream {
 }
 
 impl GlooStream {
-	/// Drive tightbeam's transport-agnostic transport over this WebSocket.
-	pub fn into_transport(self) -> WsTransport {
-		TcpTransport::from(self)
-	}
-
-	fn mark_dead_on_closed(&mut self, error: &TransportError) {
-		if matches!(error, TransportError::ConnectionClosed) {
+	/// A stream that met end of stream or any error reads as dead, as
+	/// [`AsyncProtocolStream::is_alive`] requires.
+	fn settle<T>(&mut self, outcome: Result<T, TransportError>) -> Result<T, TransportError> {
+		if outcome.is_err() {
 			self.alive = false;
 		}
+
+		outcome
 	}
 }
 
@@ -56,7 +56,10 @@ fn map_ws_error(error: WebSocketError) -> TransportError {
 
 /// Await the next binary message, skipping interleaved text frames and
 /// enforcing the caller's envelope size ceiling.
-async fn read_binary_frame<S>(source: &mut S, max_len: Option<usize>) -> Result<Vec<u8>, TransportError>
+///
+/// The browser assembles a message before it reaches JavaScript, so the
+/// ceiling holds at delivery and bounds what the transport decodes.
+async fn read_binary_frame<S>(source: &mut S, cap: usize) -> Result<Vec<u8>, TransportError>
 where
 	S: Stream<Item = Result<Message, WebSocketError>> + Unpin,
 {
@@ -65,10 +68,8 @@ where
 			None => return Err(TransportError::ConnectionClosed),
 			Some(Err(error)) => return Err(map_ws_error(error)),
 			Some(Ok(Message::Bytes(payload))) => {
-				if let Some(max) = max_len {
-					if payload.len() > max {
-						return Err(TransportError::InvalidMessage);
-					}
+				if payload.len() > cap {
+					return Err(TransportError::OperationFailed(TransportFailure::SizeExceeded));
 				}
 
 				return Ok(payload);
@@ -91,24 +92,14 @@ where
 impl AsyncProtocolStream for GlooStream {
 	type Error = TransportError;
 
-	async fn read_frame(&mut self, max_len: Option<usize>) -> Result<Vec<u8>, Self::Error> {
-		match read_binary_frame(&mut self.inner, max_len).await {
-			Ok(frame) => Ok(frame),
-			Err(error) => {
-				self.mark_dead_on_closed(&error);
-				Err(error)
-			}
-		}
+	async fn read_frame(&mut self, cap: usize) -> Result<Vec<u8>, Self::Error> {
+		let outcome = read_binary_frame(&mut self.inner, cap).await;
+		self.settle(outcome)
 	}
 
 	async fn write_frame(&mut self, buffer: &[u8]) -> Result<(), Self::Error> {
-		match write_binary_frame(&mut self.inner, buffer).await {
-			Ok(()) => Ok(()),
-			Err(error) => {
-				self.mark_dead_on_closed(&error);
-				Err(error)
-			}
-		}
+		let outcome = write_binary_frame(&mut self.inner, buffer).await;
+		self.settle(outcome)
 	}
 
 	fn is_alive(&self) -> bool {
@@ -126,8 +117,8 @@ pub struct GlooReadHalf {
 impl AsyncReadStream for GlooReadHalf {
 	type Error = TransportError;
 
-	async fn read_frame(&mut self, max_len: Option<usize>) -> Result<Vec<u8>, Self::Error> {
-		read_binary_frame(&mut self.inner, max_len).await
+	async fn read_frame(&mut self, cap: usize) -> Result<Vec<u8>, Self::Error> {
+		read_binary_frame(&mut self.inner, cap).await
 	}
 }
 

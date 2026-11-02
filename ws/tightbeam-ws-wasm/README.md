@@ -26,10 +26,11 @@ The session profile (curve, AEAD, digests, certificate policy) is a compile-time
 
 A deployment on a different provider builds its own wasm crate against this one (it compiles as an `rlib`) and reuses the transport layer with its own `#[wasm_bindgen]` bindings:
 
-1. `build_transport_with::<P>(socket, trust_store, credentials)` assembles the encrypted transport for any provider over an opened `gloo` WebSocket. The caller supplies a matching `Arc<dyn CertificateTrust>` (see `profile_trust_store` for the default-profile construction).
-2. Mutual authentication is provider-generic too: `ClientCredentials::<P>::from_signer(cert_der, signer)` adapts an external JavaScript `TransportSigner` (WebAuthn, wallet, KMS bridge), so only OIDs and signature bytes cross the boundary. The signer's output must verify under `P`'s signature algorithm.
-3. Drive the handshake on the returned transport (`perform_client_handshake`), where the concrete provider satisfies tightbeam's handshake bounds.
-4. Single-flight traffic: call `emit` directly. Multiplexed traffic: offer mux before the handshake (`with_mux_config`), then `split_mux(transport)` yields the stream handle and responder with the driver tasks already running.
+1. For mutual authentication, adapt a JavaScript `TransportSigner` with `JsSigningKeyProvider::identity::<P>(signer, cert_der)`. Its signatures MUST verify under `P`.
+2. Call `build_transport_with::<P>(socket, trust_store, identity)` on an opened `gloo` WebSocket, with the identity from step 1 or `None`. The trust store MUST validate under `P`, as `profile_trust_store` does for the default profile.
+3. For multiplexed traffic, offer mux with `with_mux_offer`.
+4. Run `perform_client_handshake` on the transport.
+5. Call `emit` for single-flight traffic, or `split_mux(transport)` for multiplexed traffic. `split_mux` accepts the default provider only.
 
 ## Related
 

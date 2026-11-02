@@ -11,15 +11,17 @@ use std::env;
 use std::future::Future;
 use std::sync::Arc;
 
-use tightbeam::der::Encode;
+use tightbeam::builder::{FrameBuilder, TypeBuilder};
+use tightbeam::crypto::profiles::TightbeamProfile;
+use tightbeam::der::{Any, Decode, Encode, EncodeValue, Length, Reader, Tag, Tagged, Writer};
+use tightbeam::marker::MaybeSend;
 use tightbeam::policy::TransitStatus;
 use tightbeam::transport::envelopes::GoAwayReason;
 use tightbeam::transport::error::TransportError;
 use tightbeam::transport::multiplex::{MuxDispatch, MuxHandle, ReplySink, StreamBody, StreamRoute};
-use tightbeam::transport::ResponsePackage;
-use tightbeam::utils::marker::MaybeSend;
-use tightbeam::utils::urn::Urn;
-use tightbeam::Frame;
+use tightbeam::transport::{ResponsePackage, TransportResult};
+use tightbeam::urn::Urn;
+use tightbeam::{Frame, Message, TightBeamError};
 
 /// Frame-id prefix that asks the server to call the client back.
 pub const CALL_ME: &[u8] = b"call-me";
@@ -38,6 +40,37 @@ pub const DRAIN_CALM: &[u8] = b"drain-calm";
 /// Frame-id prefix that asks the server to accept without a response
 /// frame, exercising the empty-response path in clients.
 pub const SINK: &[u8] = b"sink";
+
+/// A frame body held as the DER it arrived as, so a rebuilt frame carries the
+/// same octets under any message schema.
+#[derive(Clone, Debug, PartialEq)]
+struct RawBody(Any);
+
+impl Tagged for RawBody {
+	fn tag(&self) -> Tag {
+		self.0.tag()
+	}
+}
+
+impl EncodeValue for RawBody {
+	fn value_len(&self) -> tightbeam::der::Result<Length> {
+		self.0.value_len()
+	}
+
+	fn encode_value(&self, writer: &mut impl Writer) -> tightbeam::der::Result<()> {
+		self.0.encode_value(writer)
+	}
+}
+
+impl<'a> Decode<'a> for RawBody {
+	fn decode<R: Reader<'a>>(reader: &mut R) -> tightbeam::der::Result<Self> {
+		Any::decode(reader).map(Self)
+	}
+}
+
+impl Message for RawBody {
+	type Profile = TightbeamProfile;
+}
 
 /// Read a `u32` environment variable, falling back to `default`.
 pub fn env_u32(name: &str, default: u32) -> u32 {
@@ -64,14 +97,18 @@ impl EchoFrames {
 }
 
 impl MuxDispatch for EchoFrames {
-	fn unary(&self, frame: Arc<Frame>) -> impl Future<Output = ResponsePackage> + MaybeSend {
+	fn unary(&self, frame: Arc<Frame>) -> impl Future<Output = TransportResult<ResponsePackage>> + MaybeSend {
 		let handle = self.handle.clone();
-		async move { echo_stream(handle, frame).await }
+		async move { Ok(echo_stream(handle, frame).await) }
 	}
 
-	fn streaming(&self, body: StreamBody, route: StreamRoute) -> impl Future<Output = ResponsePackage> + MaybeSend {
+	fn streaming(
+		&self,
+		body: StreamBody,
+		route: StreamRoute,
+	) -> impl Future<Output = TransportResult<ResponsePackage>> + MaybeSend {
 		let handle = self.handle.clone();
-		async move { echo_streaming(handle, body, route).await }
+		async move { Ok(echo_streaming(handle, body, route).await) }
 	}
 }
 
@@ -83,13 +120,27 @@ impl MuxDispatch for EchoFrames {
 /// `InvalidArgument`.
 pub async fn echo_streaming(handle: MuxHandle, body: StreamBody, route: StreamRoute) -> ResponsePackage {
 	match body.into_frame().await {
-		Ok(mut frame) => {
-			frame.metadata.id = route_stamp(&route);
-			echo_stream(handle, Arc::new(frame)).await
-		}
+		Ok(frame) => match route_stamped(&frame, &route) {
+			Ok(stamped) => echo_stream(handle, Arc::new(stamped)).await,
+			Err(_) => ResponsePackage::new(TransitStatus::InvalidArgument, None),
+		},
 		Err(TransportError::DerError(_)) => ResponsePackage::new(TransitStatus::InvalidArgument, None),
 		Err(_) => ResponsePackage::new(TransitStatus::Cancelled, None),
 	}
+}
+
+/// `frame` rebuilt under the id of its route.
+///
+/// A frame keeps its fields private, so the id cannot change in place. The
+/// echo carries the version, order, and body the client sent, which is all a
+/// progressive echo asserts.
+fn route_stamped(frame: &Frame, route: &StreamRoute) -> Result<Frame, TightBeamError> {
+	let body = RawBody(Any::from_der(frame.message())?);
+	let builder = FrameBuilder::<RawBody>::from(frame.version())
+		.with_id(route_stamp(route))
+		.with_order(frame.metadata().order());
+
+	builder.with_message(body).build()
 }
 
 /// Frame id carrying the Open route for e2e assertions.
@@ -121,17 +172,18 @@ pub async fn echo_duplex(mut body: StreamBody, mut reply: ReplySink) -> TransitS
 /// progressive body routed to that URN, `drain-calm` drains the session,
 /// `sink` accepts without a response frame.
 pub async fn echo_stream(handle: MuxHandle, frame: Arc<Frame>) -> ResponsePackage {
-	if frame.metadata.id.starts_with(DRAIN_CALM) {
+	let id = frame.metadata().id();
+	if id.starts_with(DRAIN_CALM) {
 		return drain_session(handle).await;
 	}
-	if frame.metadata.id.starts_with(SINK) {
+	if id.starts_with(SINK) {
 		return ResponsePackage::new(TransitStatus::Ok, None);
 	}
-	if frame.metadata.id.starts_with(CALL_ME_STREAM) {
-		let target = frame.metadata.id[CALL_ME_STREAM.len()..].to_vec();
+	if let Some(target) = id.strip_prefix(CALL_ME_STREAM) {
+		let target = target.to_vec();
 		return call_me_stream(handle, frame, &target).await;
 	}
-	if !frame.metadata.id.starts_with(CALL_ME) {
+	if !id.starts_with(CALL_ME) {
 		return ResponsePackage::new(TransitStatus::Ok, Some(Frame::clone(&frame)));
 	}
 

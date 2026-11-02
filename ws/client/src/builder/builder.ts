@@ -398,7 +398,7 @@ export class FrameBuilder {
 	 * Encrypt the message body with any `BodyEncryptor` (V1+).
 	 *
 	 * The profile encryptors are `Aes256Gcm` (shared key) and
-	 * `EciesEncryptor` (to a recipient public key). Bring your own
+	 * `HpkeEncryptor` (to a recipient public key). Bring your own
 	 * encryptor for other schemes. Open the received body with
 	 * `Frame.decryptMessage(decryptor, codec)`.
 	 */

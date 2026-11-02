@@ -9,14 +9,14 @@
 
 #![cfg(feature = "testing")]
 
+use core::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
 use tightbeam::prelude::TightBeamSocketAddr;
-use tightbeam::testing::create_v0_tightbeam;
+use tightbeam::testing::TestFrame;
 use tightbeam::transport::handshake::negotiation::TransportOffer;
-use tightbeam::transport::multiplex::{ReplySink, StreamBody};
-use tightbeam::transport::serve::{CallContext, MuxService};
+use tightbeam::transport::multiplex::{CallContext, MuxService, ReplySink, StreamBody};
 use tightbeam::transport::{ConnectionBuilder, ConnectionPool, EncryptedProtocol, PoolConfig};
 use tightbeam::{encode, server, Frame, TightBeamError};
 use tightbeam_ws::protocol::WsListener;
@@ -53,10 +53,10 @@ impl MuxService for PooledEchoService {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn one_pooled_ws_connection_serves_multiple_stream_kinds() -> Result<(), BoxError> {
-	let identity = Identity::mint_root("CN=pooled echo,O=tightbeam-ws,C=US", 1, Duration::from_secs(3600))?;
+	let identity = Identity::mint("CN=pooled echo,O=tightbeam-ws,C=US", 1, Duration::from_secs(3600))?;
 
 	let bind_addr = TightBeamSocketAddr("127.0.0.1:0".parse()?);
-	let (server, addr) = <WsListener as EncryptedProtocol>::bind_with(bind_addr, identity.server_config()).await?;
+	let (server, addr) = <WsListener as EncryptedProtocol>::bind_with(bind_addr, identity.server_config()?).await?;
 
 	let server_handle = server! {
 		protocol WsListener: server,
@@ -68,7 +68,7 @@ async fn one_pooled_ws_connection_serves_multiple_stream_kinds() -> Result<(), B
 		ConnectionPool::<WsListener>::builder()
 			.with_config(PoolConfig {
 				idle_timeout: None,
-				max_connections: 1,
+				max_connections: NonZeroUsize::MIN,
 				mux_offer: Some(Arc::new(TransportOffer::mux(8))),
 			})
 			.with_trust_store(identity.trust_anchor()?)
@@ -81,7 +81,8 @@ async fn one_pooled_ws_connection_serves_multiple_stream_kinds() -> Result<(), B
 		lease.peer_certificate().is_some(),
 		"pooled mux lease must expose handshake peer certificate"
 	);
-	let expected = create_v0_tightbeam(None, None);
+
+	let expected = TestFrame::v0(None, None);
 	let echoed = lease.emit(expected.clone(), None).await?;
 	assert_eq!(echoed, Some(expected.clone()), "pooled unary emit must echo over the WebSocket");
 

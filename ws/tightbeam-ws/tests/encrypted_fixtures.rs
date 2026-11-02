@@ -1,6 +1,6 @@
 //! Encrypted round-trip driven by DER identity fixtures.
 //!
-//! Proves the fixtures are loadable and drive a real ECIES handshake: issue a
+//! Proves the fixtures are loadable and drive a real HPKE handshake: issue a
 //! server identity, serialize it to a DER certificate + raw key, reload it the
 //! way the echo server and browser client do, then complete an encrypted frame
 //! round-trip over the WebSocket transport using only the public surface.
@@ -10,7 +10,7 @@
 use std::time::Duration;
 
 use tightbeam::prelude::TightBeamSocketAddr;
-use tightbeam::testing::create_v0_tightbeam;
+use tightbeam::testing::TestFrame;
 use tightbeam::transport::EncryptedProtocol;
 use tightbeam_ws::protocol::WsListener;
 use tightbeam_ws::testing::Identity;
@@ -23,18 +23,18 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 async fn encrypted_round_trip_over_der_fixtures() -> Result<(), BoxError> {
 	// 1. Issue a server identity, then round-trip it through the DER certificate
 	//    and raw key bytes exactly as the generator writes and peers reload.
-	let issued = Identity::mint_root("CN=fixture echo,O=tightbeam-ws,C=US", 1, Duration::from_secs(3600))?;
+	let issued = Identity::mint("CN=fixture echo,O=tightbeam-ws,C=US", 1, Duration::from_secs(3600))?;
 	let cert_der = issued.certificate_der()?;
 	let key_bytes = issued.signing_key_bytes();
 	let identity = Identity::from_der(&cert_der, &key_bytes)?;
 
 	// 2. Bind an encrypted server presenting the reloaded identity.
 	let bind_addr = TightBeamSocketAddr("127.0.0.1:0".parse()?);
-	let (server, addr) = <WsListener as EncryptedProtocol>::bind_with(bind_addr, identity.server_config()).await?;
+	let (server, addr) = <WsListener as EncryptedProtocol>::bind_with(bind_addr, identity.server_config()?).await?;
 
 	// 3. Client pins the reloaded server certificate and round-trips a frame.
 	let trust_store = identity.trust_anchor()?;
-	let expected = create_v0_tightbeam(None, None);
+	let expected = TestFrame::v0(None, None);
 
 	common::echo_round_trip(server, addr, trust_store, expected).await
 }

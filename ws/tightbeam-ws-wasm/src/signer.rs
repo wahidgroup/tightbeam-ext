@@ -11,10 +11,14 @@ use js_sys::{Promise, Reflect, Uint8Array};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 
-use tightbeam::crypto::key::{KeyError, SigningKeyProvider};
-use tightbeam::crypto::sign::Error as SignatureError;
-use tightbeam::utils::marker::MaybeSendFuture;
-use tightbeam::{AlgorithmIdentifierOwned, ObjectIdentifier};
+use tightbeam::asn1::{AlgorithmIdentifierOwned, ObjectIdentifier};
+use tightbeam::crypto::key::{KeyBackend, KeyError, SigningKeyProvider};
+use tightbeam::crypto::profiles::SigningProvider;
+use tightbeam::crypto::sign::{Error as SignatureError, SigningIdentity};
+use tightbeam::der::{Decode, Encode};
+use tightbeam::marker::MaybeSendFuture;
+use tightbeam::spki::DecodePublicKey;
+use tightbeam::x509::Certificate;
 
 use crate::fault::{to_js, validation};
 
@@ -23,13 +27,13 @@ const TRANSPORT_SIGNER_TS: &'static str = r#"
 /**
  * External transport signer for mutual authentication.
  *
- * Algorithm-agnostic: receives the handshake transcript prehash (already
- * digested under the session profile) and must sign it directly (no
- * rehash), returning whatever signature encoding the peer's profile
- * verifies. The shipped default-profile build expects a secp256k1
- * signature as 64-byte `r || s`. Custom-profile builds expect their own
- * profile's encoding. Backed by WebAuthn, wallets, KMS bridges, or any
- * custom key store. The private key never crosses into wasm.
+ * Algorithm-agnostic: receives the handshake prehash (already digested
+ * under the session profile) and must sign it directly (no rehash),
+ * returning the signature encoding the session profile names. The shipped
+ * default-profile build expects a DER `ECDSA-Sig-Value` over secp256k1.
+ * Custom-profile builds expect their own profile's encoding. Backed by
+ * WebAuthn, wallets, KMS bridges, or any custom key store. The private key
+ * never crosses into wasm.
  *
  * `publicKeyDer` MUST be the SubjectPublicKeyInfo DER encoding carried
  * in the client certificate. Receipt countersign SID is derived from
@@ -54,7 +58,7 @@ export interface TransportSigner {
 	 * Sign the handshake transcript prehash.
 	 *
 	 * Resolves with the profile signature encoding. The default profile
-	 * expects 64-byte compact `r || s`.
+	 * expects a DER `ECDSA-Sig-Value` (RFC 3279 § 2.2.3).
 	 */
 	signPrehash(prehash: Uint8Array): Promise<Uint8Array> | Uint8Array;
 }
@@ -161,9 +165,27 @@ impl JsSigningKeyProvider {
 		Ok(Self { signer, algorithm, public_key_der })
 	}
 
-	/// Erase to the trait object the handshake key manager consumes.
+	/// Erase to the trait object a signing identity consumes.
 	pub fn into_provider(self) -> Arc<dyn SigningKeyProvider> {
 		Arc::new(self)
+	}
+
+	/// Pair the certificate in `cert_der` with `signer` under the signature
+	/// algorithm of the compile-time provider `P`: the key stays in
+	/// JavaScript, and only OIDs and signature bytes cross the boundary.
+	///
+	/// The signer's output MUST verify under `P`'s signature algorithm.
+	/// Custom-profile builds pair this with `build_transport_with`.
+	pub fn identity<P>(signer: TransportSigner, cert_der: &[u8]) -> Result<SigningIdentity, JsValue>
+	where
+		P: SigningProvider + 'static,
+		P::VerifyingKey: DecodePublicKey + PartialEq,
+	{
+		let certificate = Certificate::from_der(cert_der).map_err(to_js)?;
+		let cert_spki = certificate.tbs_certificate.subject_public_key_info.to_der().map_err(to_js)?;
+		let provider = Self::new(signer, &cert_spki)?.into_provider();
+
+		SigningIdentity::with_provider::<P>(certificate, provider).map_err(to_js)
 	}
 }
 
@@ -175,16 +197,17 @@ impl core::fmt::Debug for JsSigningKeyProvider {
 	}
 }
 
-impl SigningKeyProvider for JsSigningKeyProvider {
+impl KeyBackend for JsSigningKeyProvider {
 	fn algorithm(&self) -> AlgorithmIdentifierOwned {
 		self.algorithm.clone()
 	}
 
-	fn to_public_key_bytes(&self) -> MaybeSendFuture<'_, Result<Vec<u8>, KeyError>> {
-		let public_key_der = self.public_key_der.clone();
-		Box::pin(async move { Ok(public_key_der) })
+	fn to_public_key_bytes(&self) -> Result<Vec<u8>, KeyError> {
+		Ok(self.public_key_der.clone())
 	}
+}
 
+impl SigningKeyProvider for JsSigningKeyProvider {
 	fn sign_prehash(&self, prehash: &[u8]) -> MaybeSendFuture<'_, Result<Vec<u8>, KeyError>> {
 		let argument = Uint8Array::from(prehash);
 		let invoked = self.signer.sign_prehash(argument);

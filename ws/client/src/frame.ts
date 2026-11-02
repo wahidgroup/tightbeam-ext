@@ -2,16 +2,17 @@
  * A decoded tightbeam frame with its metadata, carried security infos, and
  * verification methods.
  *
- * Verification is algorithm-agile: the verdict methods recompute digests
- * with any {@link Hasher}, and the preimage accessors ({@link Frame.tbs},
- * {@link Frame.witnessInput}, {@link Frame.commitmentInput}) expose the
- * exact bytes to check signatures and digests with any external library.
+ * The verdict methods recompute digests with any {@link Hasher}, and the
+ * preimage accessors ({@link Frame.signaturePrehash},
+ * {@link Frame.witnessInput}, {@link Frame.commitmentInput}) expose the exact
+ * bytes to check signatures and digests with any external library.
  */
 
 import type { InspectedFrame } from "#wasm";
 import {
 	commitmentPreimage,
 	inspectFrameFields,
+	signaturePrehash,
 	tbsBytes,
 	witnessInput as wasmWitnessInput,
 } from "#wasm";
@@ -65,19 +66,18 @@ export interface DigestInfo {
 export type PreviousFrame = DigestInfo;
 
 /**
- * The confidentiality info carried by an encrypted frame: how the body
- * ciphertext was produced.
+ * The confidentiality info carried by an encrypted frame: the CMS envelope
+ * that seals the body ciphertext.
  */
 export interface ConfidentialityInfo {
 	/**
-	 * Dotted OID of the body-encryption algorithm.
+	 * Dotted OID of the content-encryption algorithm.
 	 */
 	readonly algorithmOid: string;
 	/**
-	 * The DER-encoded algorithm parameters (e.g. the nonce), when the
-	 * scheme has any.
+	 * The DER `AuthEnvelopedData`, its content detached into the frame body.
 	 */
-	readonly parametersDer?: Uint8Array;
+	readonly envelopeDer: Uint8Array;
 }
 
 /**
@@ -112,9 +112,9 @@ export interface SignatureInfo {
 	 */
 	readonly digestAlgorithmOid: string;
 	/**
-	 * The raw signature octets. Verify them over {@link Frame.tbs} with the
-	 * library of your choice, or use {@link Frame.verify} for the profile
-	 * scheme.
+	 * The DER signature octets. Verify them over
+	 * {@link Frame.signaturePrehash} with the library of your choice, or use
+	 * {@link Frame.verify} for the profile scheme.
 	 */
 	readonly signature: Uint8Array;
 }
@@ -205,14 +205,12 @@ function confidentialityOf(
 	inspected: InspectedFrame,
 ): ConfidentialityInfo | undefined {
 	const algorithmOid = inspected.confidentialityAlgorithmOid;
-	if (algorithmOid === undefined) {
+	const envelopeDer = inspected.confidentialityEnvelopeDer;
+	if (algorithmOid === undefined || envelopeDer === undefined) {
 		return undefined;
 	}
 
-	const confidentiality = {
-		algorithmOid,
-		parametersDer: inspected.confidentialityParametersDer,
-	};
+	const confidentiality = { algorithmOid, envelopeDer };
 	return confidentiality;
 }
 
@@ -527,12 +525,24 @@ export class Frame {
 	}
 
 	/**
-	 * The to-be-signed bytes (everything but the signature field). Verify
-	 * {@link signatureInfo} over these bytes with any signature library.
+	 * The to-be-signed bytes (everything but the signature field). The CMS
+	 * signed attributes bind their digest, and {@link signatureInfo} verifies
+	 * over {@link signaturePrehash}.
 	 */
 	tbs(): Uint8Array {
 		const tbs = tbsBytes(this.der);
 		return tbs;
+	}
+
+	/**
+	 * The digest this frame's signature verifies over: the digest of its CMS
+	 * signed attributes, which bind {@link tbs} (RFC 5652 § 5.4).
+	 *
+	 * @throws when the frame is unsigned.
+	 */
+	signaturePrehash(): Uint8Array {
+		const prehash = signaturePrehash(this.der);
+		return prehash;
 	}
 
 	/**
@@ -548,7 +558,8 @@ export class Frame {
 	 * The message-commitment preimage under `salt`, computed over the
 	 * carried body DER.
 	 *
-	 * Pass the same salt given to `withMessageHasher`. An empty salt is valid.
+	 * Pass the same salt given to `withMessageHasher`. An empty salt selects
+	 * plain-digest mode, and any other salt carries at least 16 octets.
 	 */
 	commitmentInput(salt: Uint8Array): Uint8Array {
 		const commitmentInput = commitmentPreimage(salt, this.bodyDer);
@@ -558,8 +569,8 @@ export class Frame {
 	/**
 	 * Verify the frame's non-repudiation signature through `verifier`.
 	 * Profile secp256k1 uses {@link Secp256k1VerifyingKey}; other schemes
-	 * supply their own {@link FrameVerifier} (or use {@link tbs} /
-	 * {@link signatureInfo} directly).
+	 * supply their own {@link FrameVerifier} (or use
+	 * {@link signaturePrehash} / {@link signatureInfo} directly).
 	 *
 	 * @throws when the frame is unsigned, the algorithm differs, or the
 	 * signature does not verify.
@@ -679,7 +690,7 @@ export class Frame {
 	 * Decrypt the encrypted body with any {@link BodyDecryptor} and decode
 	 * the plaintext into a typed message under `codec`.
 	 *
-	 * The profile decryptors are `Aes256Gcm` and `EciesDecryptor`. The
+	 * The profile decryptors are `Aes256Gcm` and `HpkeDecryptor`. The
 	 * profile codec for raw bytes is `Opaque`. A compressed-then-sealed
 	 * body also needs `inflator` to decompress the decrypted bytes.
 	 *
@@ -717,7 +728,7 @@ export class Frame {
 
 		const plaintext = await decryptor.decrypt({
 			algorithmOid: confidentiality.algorithmOid,
-			parametersDer: confidentiality.parametersDer,
+			envelopeDer: confidentiality.envelopeDer,
 			ciphertext: this.decoded().bodyDer,
 		});
 

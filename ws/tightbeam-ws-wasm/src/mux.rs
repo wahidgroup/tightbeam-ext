@@ -5,10 +5,11 @@
 //! [`MuxTransport`] driver on the browser microtask executor. The resulting
 //! client emits concurrent requests and serves peer-initiated streams over one
 //! connection. Encrypted sessions negotiate HTTP/2-style stream multiplexing
-//! during the ECIES handshake. Cleartext sessions have no handshake, so both
+//! during the HPKE handshake. Cleartext sessions have no handshake, so both
 //! endpoints configure the same symmetric cap.
 
 use core::cell::RefCell;
+use core::time::Duration;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -19,6 +20,8 @@ use wasm_bindgen_futures::{future_to_promise, spawn_local, JsFuture};
 
 use web_sys::AbortSignal;
 
+use tightbeam::clock::Clock;
+use tightbeam::constants::DEFAULT_OPERATION_TIMEOUT;
 use tightbeam::der::asn1::OctetString;
 use tightbeam::der::{Decode, Encode};
 use tightbeam::policy::TransitStatus;
@@ -26,20 +29,25 @@ use tightbeam::transport::envelopes::GoAwayReason;
 use tightbeam::transport::handshake::negotiation::{MuxBudgets, MuxSettings, TransportOffer};
 use tightbeam::transport::handshake::receipt::ReceiptApprover;
 use tightbeam::transport::multiplex::{MultiplexedProtocol, MuxHandle, MuxResponder, MuxRole, MuxTransport};
-use tightbeam::transport::{EncryptedMessageIO, EnvelopeSink, EnvelopeSource, ResponsePackage, X509ClientConfig};
+use tightbeam::transport::{EncryptedMessageIO, EnvelopeSink, EnvelopeSource, ResponsePackage};
 use tightbeam::{Frame, TightBeamError};
 
 use crate::approver::{approver_from_js, authorization_from_js, budgets_from_js};
+use crate::clock::BrowserClock;
 use crate::fault::{to_js, transport_to_js, validation, work_error_to_js};
 use crate::promise::{bytes_or_undefined, race_abort, race_optional_abort};
-use crate::secure::{build_signer_transport, build_transport, response_der, ClientIdentity};
+use crate::secure::{build_signer_transport, build_transport, cleartext_transport, response_der, ClientIdentity};
 use crate::signer::TransportSigner;
 use crate::socket::{open_observed, SocketMonitor};
-use crate::stream::{GlooStream, WsTransport};
+use crate::stream::WsTransport;
 use crate::streaming::{
 	parse_stream_target, start_serve_duplex, start_serve_streaming, MuxDuplexStream, MuxRequestStream,
 };
 use crate::work::{WorkReply, WorkRequestEnvelope};
+
+/// How often a client pings its peer: a third of the default operation
+/// deadline, so one lost probe leaves the link inside the deadline.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(DEFAULT_OPERATION_TIMEOUT.as_secs() / 3);
 
 /// Peer-serve dispatch shape claimed by the first `serve*` call.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -194,11 +202,6 @@ impl MuxWsClient {
 	/// socket is open, so a failed dial rejects here (`ConnectionClosed`)
 	/// rather than on the first emit.
 	///
-	/// Cleartext multiplexing has no handshake negotiation: `streams` is a
-	/// symmetric concurrency cap and both endpoints MUST configure the
-	/// same value, or their enforcement diverges. The connection carries
-	/// NO confidentiality or integrity protection.
-	///
 	/// `signal` aborts the dial: the socket closes and the promise
 	/// rejects with the signal's abort reason.
 	#[wasm_bindgen(js_name = connectCleartext)]
@@ -214,8 +217,8 @@ impl MuxWsClient {
 		let observed = open_observed(url)?;
 		Self::await_open(&observed.monitor, signal).await?;
 
-		let transport = GlooStream::from(observed.socket).into_transport();
-		let (reader, writer) = transport.into_split_cleartext().map_err(transport_to_js)?;
+		let transport = cleartext_transport(observed.socket)?;
+		let (reader, writer) = transport.into_split().map_err(transport_to_js)?;
 		let mux = MuxTransport::new(reader, writer, MuxRole::Client, MuxSettings::symmetric(streams));
 		let (handle, responder) = spawn_mux(mux);
 
@@ -453,8 +456,8 @@ impl MuxWsClient {
 	/// analog): resolves when the peer's ack arrives.
 	///
 	/// No stream is allocated and the peer's application handler never
-	/// runs, so this doubles as an idle keepalive for links whose carrier
-	/// cannot ping itself (a browser WebSocket).
+	/// runs. A client already pings on its own to hold an idle session
+	/// open, so call this to measure the link.
 	///
 	/// `signal` composes deadlines: an abort rejects with the signal's
 	/// abort reason and a late ack is ignored.
@@ -494,8 +497,9 @@ impl MuxWsClient {
 	/// Replaces polling `hasStreamHeadroom` in a loop, with the same
 	/// advisory caveat.
 	///
-	/// Rejects with `Draining` once no stream will ever be admitted again,
-	/// or with the abort reason of `signal` when the caller gives up first.
+	/// Rejects with `Draining` or `ConnectionClosed` once no stream will ever
+	/// be admitted again, or with the abort reason of `signal` when the caller
+	/// gives up first.
 	#[wasm_bindgen(js_name = waitForStreamSlot, unchecked_return_type = "Promise<void>")]
 	pub fn wait_for_stream_slot(&self, signal: Option<AbortSignal>) -> Promise {
 		let handle = self.handle.clone();
@@ -769,14 +773,14 @@ async fn run_submit_work(handle: MuxHandle, target: &str, work_frame_der: Vec<u8
 ///
 /// Generic over the compile-time crypto provider: custom-profile builds
 /// call this after driving their own handshake on a transport that carried
-/// a mux offer (`with_mux_config`). Rejects when the peer did not
+/// a mux offer (`with_mux_offer`). Rejects when the peer did not
 /// negotiate multiplexing.
 pub fn split_mux(transport: WsTransport) -> Result<(MuxHandle, MuxResponder), JsValue> {
 	if transport.negotiated_mux().is_none() {
 		return Err(JsValue::from_str("the server did not negotiate multiplexing"));
 	}
-	let mux = transport.into_mux(MuxRole::Client).map_err(transport_to_js)?;
 
+	let mux = transport.into_mux(MuxRole::Client).map_err(transport_to_js)?;
 	Ok(spawn_mux(mux))
 }
 
@@ -797,8 +801,21 @@ where
 	spawn_local(async move {
 		let _ = writer_driver.drive().await;
 	});
+	spawn_local(keep_alive(handle.clone()));
 
 	(handle, responder)
+}
+
+/// Ping the peer until the connection ends, so an idle session outlives the
+/// read deadline of a native peer. A failed ping ends the loop, and the
+/// connection's own failure reaches callers on their pending streams.
+async fn keep_alive(handle: MuxHandle) {
+	loop {
+		BrowserClock.sleep(KEEPALIVE_INTERVAL).await;
+		if handle.ping().await.is_err() {
+			return;
+		}
+	}
 }
 
 /// Drive one server-initiated stream through the JavaScript handler.

@@ -1,31 +1,32 @@
 //! Frame assembly and structural security operations over opaque message bytes.
 
-use std::borrow::Cow;
+use std::sync::Arc;
 
-use der::asn1::OctetString;
-use der::{Decode, Sequence};
-
+use tightbeam::asn1::{AuthEnvelopedData, ObjectIdentifier, WireDer};
 use tightbeam::builder::{FrameBuilder, TypeBuilder};
 use tightbeam::cms::compressed_data::CompressedData;
 use tightbeam::cms::content_info::CmsVersion;
-use tightbeam::cms::enveloped_data::EncryptedContentInfo;
 use tightbeam::cms::signed_data::{EncapsulatedContentInfo, SignerIdentifier};
-use tightbeam::crypto::aead::{AeadCore, Aes256Gcm, Aes256GcmOid, Decryptor, Encryptor, KeyInit};
-use tightbeam::crypto::ecies::{EciesDecryptor, EciesEncryptor, EciesSecp256k1Oid};
+use tightbeam::crypto::aead::{Aes256GcmOid, DecryptContent, Encryptor};
+use tightbeam::crypto::cms::{BareKemKey, KemRecipient};
+use tightbeam::crypto::commitment::CommitmentSalt;
 use tightbeam::crypto::hash::{Digest as _, Sha3_256};
-use tightbeam::crypto::k256::SecretKey;
-use tightbeam::crypto::secret::ToInsecure;
+use tightbeam::crypto::hpke::{HpkeDecryptor, HpkeEncryptor};
+use tightbeam::crypto::k256::{PublicKey, Secp256k1};
+use tightbeam::crypto::key::{Aes256GcmKeyProvider, DiffieHellman, Secp256k1KeyProvider};
+use tightbeam::crypto::profiles::DefaultCryptoProvider;
 use tightbeam::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey, Secp256k1VerifyingKey};
-use tightbeam::crypto::sign::{secp256k1_signer_identifier, sign_canonical, SignerInfoExt};
-use tightbeam::der::oid::AssociatedOid;
-use tightbeam::der::{Any, Encode, EncodeValue, FixedTag, Length, Tag, Writer};
-use tightbeam::matrix::MatrixDyn;
-use tightbeam::oids::{COMPRESSION_CONTENT, DATA};
-use tightbeam::random::OsRng;
-use tightbeam::{
-	AlgorithmIdentifierOwned, Beamable, DigestInfo, Frame, MessagePriority, ObjectIdentifier, SignerInfo,
-	TightBeamError, Version,
+use tightbeam::crypto::sign::{CmsSigner, PrehashSigner, SignedContent, SignerInfoDraft};
+use tightbeam::crypto::x509::utils::Skid;
+use tightbeam::der::asn1::OctetString;
+use tightbeam::der::{
+	Any, Decode, DecodeValue, Encode, EncodeValue, FixedTag, Header, Length, Reader, Sequence, Tag, TagNumber, Tagged,
+	Writer,
 };
+use tightbeam::matrix::{MatrixDyn, MatrixLike};
+use tightbeam::oids::DATA;
+use tightbeam::spki::{AlgorithmIdentifierOwned, EncodePublicKey, SubjectPublicKeyInfoOwned};
+use tightbeam::{Beamable, DigestInfo, Frame, MessagePriority, TightBeamError, Version};
 
 /// Opaque payload wrapper carried as the frame body.
 #[derive(Beamable, Clone, Debug, PartialEq, Eq, Sequence)]
@@ -113,9 +114,10 @@ impl FrameConfig {
 			builder = builder.with_matrix_dyn(matrix);
 		}
 
-		let mut frame = builder.build()?;
-		frame.message = self.message;
-		Ok(frame.to_der()?)
+		let frame = builder.build()?;
+		let mut wire = WireFrame::parse(frame.to_der()?)?;
+		wire.set_message(self.message)?;
+		wire.finish()
 	}
 }
 
@@ -132,37 +134,174 @@ pub fn decode_body(body_der: impl AsRef<[u8]>) -> Result<Vec<u8>, TightBeamError
 	Ok(OpaqueBody::from_der(body_der.as_ref())?.body.into_bytes())
 }
 
-/// The message-commitment preimage over `body_der` under `salt`
-/// (`commit_digest`): the bare body DER for an empty salt, or
-/// `len(salt) as u64 BE || salt || body DER` otherwise (length framing keeps
-/// distinct `(salt, body)` pairs from colliding).
+/// Preimage prefix of a commitment that only binds its body.
+const PLAIN_COMMITMENT: u8 = 0x00;
+/// Preimage prefix of a commitment that hides its body behind a salt.
+const HIDING_COMMITMENT: u8 = 0x01;
+
+/// The message-commitment preimage over `body_der` under `salt`:
+/// `0x00 || body DER` for an empty salt, or
+/// `0x01 || len(salt) as u64 BE || salt || body DER` otherwise.
 ///
-/// An empty salt returns `body_der` without copying. Hash this with any
-/// digest and install the result via [`set_message_integrity`].
-pub fn commitment_preimage<'a>(salt: impl AsRef<[u8]>, body_der: impl Into<Cow<'a, [u8]>>) -> Cow<'a, [u8]> {
+/// The mode byte keeps a hiding commitment and a plain digest of one body
+/// apart, and the length frame keeps distinct `(salt, body)` pairs from
+/// colliding. Hash this with any digest and install the result via
+/// [`set_message_integrity`].
+///
+/// # Errors
+///
+/// - [`TightBeamError::InvalidSaltLength`] -- a non-empty `salt` is too short
+///   to hide the body.
+pub fn commitment_preimage(salt: impl AsRef<[u8]>, body_der: impl AsRef<[u8]>) -> Result<Vec<u8>, TightBeamError> {
 	let salt = salt.as_ref();
-	let body_der = body_der.into();
-	if salt.is_empty() {
-		return body_der;
+	let body = body_der.as_ref();
+	let parsed = CommitmentSalt::parse(salt)?;
+
+	let mut buffer = Vec::with_capacity(9 + salt.len() + body.len());
+	match parsed {
+		CommitmentSalt::Plain => buffer.push(PLAIN_COMMITMENT),
+		CommitmentSalt::Hiding(_) => {
+			buffer.push(HIDING_COMMITMENT);
+			buffer.extend_from_slice(&(salt.len() as u64).to_be_bytes());
+			buffer.extend_from_slice(salt);
+		}
 	}
 
-	let body = body_der.as_ref();
-	let mut buffer = Vec::with_capacity(8 + salt.len() + body.len());
-	buffer.extend_from_slice(&(salt.len() as u64).to_be_bytes());
-	buffer.extend_from_slice(salt);
 	buffer.extend_from_slice(body);
-
-	Cow::Owned(buffer)
+	Ok(buffer)
 }
 
-/// Decode a frame DER, apply `mutate`, and re-encode.
-fn rewrite_frame(
-	frame_der: impl AsRef<[u8]>,
-	mutate: impl FnOnce(&mut Frame) -> Result<(), TightBeamError>,
-) -> Result<Vec<u8>, TightBeamError> {
-	let mut frame = Frame::from_der(frame_der.as_ref())?;
-	mutate(&mut frame)?;
-	Ok(frame.to_der()?)
+/// A SEQUENCE held as its raw components.
+///
+/// A [`Frame`] keeps its fields private, so a caller-side digest, envelope,
+/// or body reaches a frame through its encoding. Each component stays the TLV
+/// it arrived as, so a splice leaves every other field byte-identical.
+struct RawSequence(Vec<Any>);
+
+impl FixedTag for RawSequence {
+	const TAG: Tag = Tag::Sequence;
+}
+
+impl<'a> DecodeValue<'a> for RawSequence {
+	fn decode_value<R: Reader<'a>>(reader: &mut R, header: Header) -> der::Result<Self> {
+		reader.read_nested(header.length, |reader| {
+			let mut components = Vec::new();
+			while !reader.is_finished() {
+				components.push(Any::decode(reader)?);
+			}
+
+			Ok(Self(components))
+		})
+	}
+}
+
+impl EncodeValue for RawSequence {
+	fn value_len(&self) -> der::Result<Length> {
+		self.0
+			.iter()
+			.try_fold(Length::ZERO, |total, component| total + component.encoded_len()?)
+	}
+
+	fn encode_value(&self, writer: &mut impl Writer) -> der::Result<()> {
+		self.0.iter().try_for_each(|component| component.encode(writer))
+	}
+}
+
+impl RawSequence {
+	/// Place the EXPLICIT `[number]` field around `value`, in tag order among
+	/// the context fields that close a tightbeam SEQUENCE, in place of the
+	/// field that holds the number.
+	fn set_tagged(&mut self, number: TagNumber, value: &impl Encode) -> Result<(), TightBeamError> {
+		let tag = Tag::ContextSpecific { constructed: true, number };
+		let field = Any::new(tag, value.to_der()?)?;
+
+		let at_or_past =
+			|component: &Any| matches!(component.tag(), Tag::ContextSpecific { number: held, .. } if held >= number);
+		let position = self.0.iter().position(at_or_past).unwrap_or(self.0.len());
+
+		match self.0.get_mut(position) {
+			Some(held) if held.tag() == tag => *held = field,
+			_ => self.0.insert(position, field),
+		}
+
+		Ok(())
+	}
+}
+
+/// Position of the body in a `Frame` SEQUENCE: `version`, `metadata`, `message`.
+const FRAME_MESSAGE: usize = 2;
+/// Position of the metadata in a `Frame` SEQUENCE.
+const FRAME_METADATA: usize = 1;
+/// Position of the optional compactness in a `Metadata` SEQUENCE: `id`, `order`, `compactness`.
+const METADATA_COMPACTNESS: usize = 2;
+
+/// The context tag of `integrity` in `Frame`, and of the commitment in `Metadata`.
+const INTEGRITY_FIELD: TagNumber = TagNumber::N0;
+/// The context tag of `confidentiality` in `Metadata`.
+const CONFIDENTIALITY_FIELD: TagNumber = TagNumber::N1;
+
+/// A frame encoding open for a splice, as its components and those of its
+/// metadata.
+struct WireFrame {
+	frame: RawSequence,
+	metadata: RawSequence,
+}
+
+impl WireFrame {
+	/// Split `frame_der`, refusing bytes that do not encode a [`Frame`].
+	fn parse(frame_der: impl AsRef<[u8]>) -> Result<Self, TightBeamError> {
+		let frame_der = frame_der.as_ref();
+		Frame::from_der(frame_der)?;
+
+		let frame = RawSequence::from_der(frame_der)?;
+		let metadata = frame.0.get(FRAME_METADATA).ok_or(TightBeamError::InvalidMetadata)?;
+		let metadata = RawSequence::from_der(&metadata.to_der()?)?;
+
+		Ok(Self { frame, metadata })
+	}
+
+	/// Replace the body octets.
+	fn set_message(&mut self, message: Vec<u8>) -> Result<(), TightBeamError> {
+		let message = Any::from_der(&OctetString::new(message)?.to_der()?)?;
+		let held = self.frame.0.get_mut(FRAME_MESSAGE).ok_or(TightBeamError::InvalidBody)?;
+		*held = message;
+
+		Ok(())
+	}
+
+	/// Place `compactness` after `order`, in place of the one the frame holds.
+	fn set_compactness(&mut self, compactness: &CompressedData) -> Result<(), TightBeamError> {
+		let field = Any::from_der(&compactness.to_der()?)?;
+		let components = &mut self.metadata.0;
+
+		match components.get_mut(METADATA_COMPACTNESS) {
+			Some(held) if held.tag() == Tag::Sequence => *held = field,
+			_ => components.insert(METADATA_COMPACTNESS, field),
+		}
+
+		Ok(())
+	}
+
+	/// The encoding of `SEQUENCE { version, metadata }`, the preimage of the
+	/// frame-integrity digest.
+	fn witness_input(&self) -> Result<Vec<u8>, TightBeamError> {
+		let version = self.frame.0.first().ok_or(TightBeamError::InvalidMetadata)?.clone();
+		let metadata = Any::from_der(&self.metadata.to_der()?)?;
+		Ok(RawSequence(vec![version, metadata]).to_der()?)
+	}
+
+	/// Reassemble the frame, and refuse a result [`Frame`] would refuse, such
+	/// as a field below its version.
+	fn finish(mut self) -> Result<Vec<u8>, TightBeamError> {
+		let metadata = Any::from_der(&self.metadata.to_der()?)?;
+		let held = self.frame.0.get_mut(FRAME_METADATA).ok_or(TightBeamError::InvalidMetadata)?;
+		*held = metadata;
+
+		let spliced = self.frame.to_der()?;
+		Frame::from_der(&spliced)?;
+
+		Ok(spliced)
+	}
 }
 
 /// Build a parameterless `AlgorithmIdentifier` from an OID.
@@ -171,50 +310,42 @@ fn algorithm(oid: ObjectIdentifier) -> AlgorithmIdentifierOwned {
 }
 
 /// Install a message-integrity commitment: the digest of
-/// [`commitment_preimage`] under the caller's algorithm (V2+ frames).
+/// [`commitment_preimage`] under the caller's algorithm (V1+ frames).
 pub fn set_message_integrity(
 	frame_der: impl AsRef<[u8]>,
 	algorithm_oid: ObjectIdentifier,
 	digest: impl AsRef<[u8]>,
 ) -> Result<Vec<u8>, TightBeamError> {
 	let digest = OctetString::new(digest.as_ref())?;
-	rewrite_frame(frame_der, |frame| {
-		frame.metadata.integrity = Some(DigestInfo { algorithm: algorithm(algorithm_oid), digest });
-		Ok(())
-	})
+	let commitment = DigestInfo { algorithm: algorithm(algorithm_oid), digest };
+
+	let mut wire = WireFrame::parse(frame_der)?;
+	wire.metadata.set_tagged(INTEGRITY_FIELD, &commitment)?;
+	wire.finish()
 }
 
-/// Replace the frame body with `ciphertext` and record the confidentiality
-/// info (V1+ frames): the caller's encryption algorithm OID, its DER-encoded
-/// parameters (e.g. the nonce), and the content type of the plaintext
-/// (defaults to `id-data`).
+/// Replace the frame body with `ciphertext` and install `envelope_der`, the
+/// `AuthEnvelopedData` that seals it (V1+ frames).
+///
+/// The ciphertext travels detached from the envelope (RFC 5652 §6.1). The
+/// envelope carries the content type, the recipient, and the tag.
 pub fn set_confidentiality(
 	frame_der: impl AsRef<[u8]>,
-	content_oid: Option<ObjectIdentifier>,
-	algorithm_oid: ObjectIdentifier,
-	parameters_der: Option<Vec<u8>>,
+	envelope_der: impl AsRef<[u8]>,
 	ciphertext: Vec<u8>,
 ) -> Result<Vec<u8>, TightBeamError> {
-	let parameters = match parameters_der {
-		Some(der) => Some(Any::from_der(&der)?),
-		None => None,
-	};
-
-	rewrite_frame(frame_der, move |frame| {
-		frame.metadata.confidentiality = Some(EncryptedContentInfo {
-			content_type: content_oid.unwrap_or(DATA),
-			content_enc_alg: AlgorithmIdentifierOwned { oid: algorithm_oid, parameters },
-			encrypted_content: None,
-		});
-		frame.message = ciphertext;
-		Ok(())
-	})
+	let envelope = WireDer::<AuthEnvelopedData>::try_from(envelope_der.as_ref())?;
+	let mut wire = WireFrame::parse(frame_der)?;
+	wire.metadata.set_tagged(CONFIDENTIALITY_FIELD, envelope.value())?;
+	wire.set_message(ciphertext)?;
+	wire.finish()
 }
 
 /// Replace the frame body with `compressed` and record the compactness info
 /// (any version): the caller's compression algorithm OID, its DER-encoded
 /// parameters when the scheme has any, and the content type of the
-/// uncompressed body (defaults to `id-ct-compressedData`).
+/// uncompressed body (defaults to `id-data`, the type of an opaque frame
+/// body, RFC 3274 §1.1).
 ///
 /// Call before [`set_confidentiality`]: peers encrypt the compressed bytes
 /// and decompress after decrypting.
@@ -230,41 +361,16 @@ pub fn set_compactness(
 		None => None,
 	};
 
-	rewrite_frame(frame_der, move |frame| {
-		frame.metadata.compactness = Some(CompressedData {
-			version: CmsVersion::V0,
-			compression_alg: AlgorithmIdentifierOwned { oid: algorithm_oid, parameters },
-			encap_content_info: EncapsulatedContentInfo {
-				econtent_type: content_oid.unwrap_or(COMPRESSION_CONTENT),
-				econtent: None,
-			},
-		});
-		frame.message = compressed;
-		Ok(())
-	})
-}
+	let compactness = CompressedData {
+		version: CmsVersion::V0,
+		compression_alg: AlgorithmIdentifierOwned { oid: algorithm_oid, parameters },
+		encap_content_info: EncapsulatedContentInfo { econtent_type: content_oid.unwrap_or(DATA), econtent: None },
+	};
 
-/// The frame-integrity preimage: the envelope (version + metadata, message
-/// excluded), encoded exactly as tightbeam's witness scaffold. Borrowing the
-/// frame's own derived encoders keeps the preimage from drifting.
-struct WitnessScaffold<'a> {
-	version: &'a Version,
-	metadata: &'a tightbeam::Metadata,
-}
-
-impl FixedTag for WitnessScaffold<'_> {
-	const TAG: Tag = Tag::Sequence;
-}
-
-impl EncodeValue for WitnessScaffold<'_> {
-	fn value_len(&self) -> tightbeam::der::Result<Length> {
-		self.version.encoded_len()? + self.metadata.encoded_len()?
-	}
-
-	fn encode_value(&self, writer: &mut impl Writer) -> tightbeam::der::Result<()> {
-		self.version.encode(writer)?;
-		self.metadata.encode(writer)
-	}
+	let mut wire = WireFrame::parse(frame_der)?;
+	wire.set_compactness(&compactness)?;
+	wire.set_message(compressed)?;
+	wire.finish()
 }
 
 /// The frame-integrity (witness) preimage bytes for a frame: hash them with
@@ -273,27 +379,25 @@ impl EncodeValue for WitnessScaffold<'_> {
 /// Call after all metadata mutations ([`set_message_integrity`],
 /// [`set_confidentiality`]): the witness covers the final envelope.
 pub fn witness_input(frame_der: impl AsRef<[u8]>) -> Result<Vec<u8>, TightBeamError> {
-	let frame = Frame::from_der(frame_der.as_ref())?;
-	let scaffold = WitnessScaffold { version: &frame.version, metadata: &frame.metadata };
-	Ok(scaffold.to_der()?)
+	WireFrame::parse(frame_der)?.witness_input()
 }
 
 /// Install a frame-integrity witness: the digest of [`witness_input`] under
-/// the caller's algorithm (V2+ frames).
+/// the caller's algorithm (V1+ frames).
 pub fn attach_witness(
 	frame_der: impl AsRef<[u8]>,
 	algorithm_oid: ObjectIdentifier,
 	digest: impl AsRef<[u8]>,
 ) -> Result<Vec<u8>, TightBeamError> {
 	let digest = OctetString::new(digest.as_ref())?;
-	rewrite_frame(frame_der, |frame| {
-		frame.integrity = Some(DigestInfo { algorithm: algorithm(algorithm_oid), digest });
-		Ok(())
-	})
+	let witness = DigestInfo { algorithm: algorithm(algorithm_oid), digest };
+
+	let mut wire = WireFrame::parse(frame_der)?;
+	wire.frame.set_tagged(INTEGRITY_FIELD, &witness)?;
+	wire.finish()
 }
 
 /// The to-be-signed bytes of a frame (everything but the signature field).
-/// Sign them with any scheme and install the result via [`attach_signature`].
 ///
 /// Call after [`attach_witness`]: the signature covers the witness.
 pub fn tbs_bytes(frame_der: impl AsRef<[u8]>) -> Result<Vec<u8>, TightBeamError> {
@@ -301,28 +405,61 @@ pub fn tbs_bytes(frame_der: impl AsRef<[u8]>) -> Result<Vec<u8>, TightBeamError>
 	frame.to_tbs()
 }
 
-/// Attach a detached signature over [`tbs_bytes`] to an unsigned frame (V1+
-/// frames), identified by the caller's signature and digest algorithm OIDs
-/// plus a subject-key-identifier octet string naming the signer.
+/// The `SignerIdentifier` of a subject key identifier (RFC 5652 §5.3).
+fn signer_identifier(signer_key_id: impl AsRef<[u8]>) -> Result<SignerIdentifier, TightBeamError> {
+	let key_id = OctetString::new(signer_key_id.as_ref())?;
+	Ok(SignerIdentifier::SubjectKeyIdentifier(key_id.into()))
+}
+
+/// The CMS `SignerInfo` a frame's signature completes, over the TBS of
+/// `frame` under the profile signature.
+fn signature_draft(frame: &Frame, sid: SignerIdentifier) -> Result<SignerInfoDraft, TightBeamError> {
+	let tbs = frame.to_tbs()?;
+	Ok(CmsSigner::draft::<Secp256k1Signature>(sid, SignedContent::data(&tbs))?)
+}
+
+/// The digest a signer's key signs for `frame_der`: the digest of the DER of
+/// the CMS signed attributes, which bind the content type, the digest of the
+/// TBS, and the algorithms (RFC 5652 §5.4, RFC 6211).
+///
+/// `signer_key_id` is the subject key identifier that names the signer. Sign
+/// the digest directly, with no rehash, and install the result via
+/// [`attach_signature`].
+pub fn signing_prehash(
+	frame_der: impl AsRef<[u8]>,
+	signer_key_id: impl AsRef<[u8]>,
+) -> Result<Vec<u8>, TightBeamError> {
+	let frame = Frame::from_der(frame_der.as_ref())?;
+	let draft = signature_draft(&frame, signer_identifier(signer_key_id)?)?;
+
+	Ok(draft.prehash().to_vec())
+}
+
+/// The digest a verifier checks a signed frame's signature against, drawn
+/// from the frame's own signer and TBS.
+///
+/// The digest binds the signed attributes the profile requires, so a
+/// signature that verifies over it covers this frame.
+pub fn signature_prehash(frame_der: impl AsRef<[u8]>) -> Result<Vec<u8>, TightBeamError> {
+	let frame = Frame::from_der(frame_der.as_ref())?;
+	let signer_info = frame.nonrepudiation().ok_or(TightBeamError::MissingSignature)?;
+	let draft = signature_draft(&frame, signer_info.sid.clone())?;
+
+	Ok(draft.prehash().to_vec())
+}
+
+/// Attach `signature`, the signer's DER `ECDSA-Sig-Value` over
+/// [`signing_prehash`], to an unsigned frame (V1+ frames).
 pub fn attach_signature(
 	frame_der: impl AsRef<[u8]>,
 	signature: impl AsRef<[u8]>,
-	signature_algorithm_oid: ObjectIdentifier,
-	digest_algorithm_oid: ObjectIdentifier,
 	signer_key_id: impl AsRef<[u8]>,
 ) -> Result<Vec<u8>, TightBeamError> {
-	let sid = SignerIdentifier::SubjectKeyIdentifier(OctetString::new(signer_key_id.as_ref())?.into());
-	let signer_info = SignerInfo::from_parts(
-		signature.as_ref(),
-		algorithm(signature_algorithm_oid),
-		algorithm(digest_algorithm_oid),
-		sid,
-	)?;
+	let mut frame = Frame::from_der(frame_der.as_ref())?;
+	let draft = signature_draft(&frame, signer_identifier(signer_key_id)?)?;
 
-	rewrite_frame(frame_der, |frame| {
-		frame.nonrepudiation = Some(signer_info);
-		Ok(())
-	})
+	frame.attach_signer_info(draft.complete(signature, None)?)?;
+	Ok(frame.to_der()?)
 }
 
 /// Decoded view of a frame: its body, metadata, and the carried security
@@ -369,83 +506,80 @@ pub struct FrameSummary {
 	pub frame_integrity_algorithm_oid: Option<String>,
 	/// Witness digest octets, when witnessed.
 	pub frame_integrity_digest: Option<Vec<u8>>,
-	/// Body-encryption algorithm OID, when confidential.
+	/// Content-encryption algorithm OID, when confidential.
 	pub confidentiality_algorithm_oid: Option<String>,
-	/// Body-encryption algorithm parameters DER (e.g. the nonce), when
-	/// confidential and present.
-	pub confidentiality_parameters_der: Option<Vec<u8>>,
+	/// DER `AuthEnvelopedData` that seals the body, when confidential. The
+	/// ciphertext travels in the body, detached from it.
+	pub confidentiality_envelope_der: Option<Vec<u8>>,
 	/// Signature algorithm OID, when signed.
 	pub signature_algorithm_oid: Option<String>,
 	/// Signature digest algorithm OID, when signed.
 	pub signature_digest_algorithm_oid: Option<String>,
-	/// Raw signature octets, when signed.
+	/// DER signature octets, when signed.
 	pub signature: Option<Vec<u8>>,
 }
 
+/// The dotted algorithm OID and the digest octets of an optional digest.
+fn digest_fields(info: Option<&DigestInfo>) -> (Option<String>, Option<Vec<u8>>) {
+	let algorithm_oid = info.map(|info| info.algorithm.oid.to_string());
+	let digest = info.map(|info| info.digest.as_bytes().to_vec());
+
+	(algorithm_oid, digest)
+}
+
 /// Decode a frame DER into a [`FrameSummary`].
-///
-/// Owned octets (`id`, body, digests, matrix, signature) are taken out of
-/// the decoded [`Frame`] (`ZeroizeOnDrop` forbids a full destructure).
 pub fn inspect_frame(frame_der: impl AsRef<[u8]>) -> Result<FrameSummary, TightBeamError> {
-	let mut frame = Frame::from_der(frame_der.as_ref())?;
+	let frame = Frame::from_der(frame_der.as_ref())?;
+	let metadata = frame.metadata();
 
-	let confidentiality_parameters_der = frame
-		.metadata
-		.confidentiality
-		.as_ref()
-		.and_then(|info| info.content_enc_alg.parameters.as_ref())
-		.map(Encode::to_der)
-		.transpose()?;
-
-	let compactness_parameters_der = frame
-		.metadata
-		.compactness
-		.as_ref()
+	let compactness = metadata.compactness();
+	let compactness_parameters_der = compactness
 		.and_then(|info| info.compression_alg.parameters.as_ref())
 		.map(Encode::to_der)
 		.transpose()?;
 
-	let previous_frame = frame.metadata.previous_frame.take();
-	let message_integrity = frame.metadata.integrity.take();
-	let integrity = frame.integrity.take();
-	let nonrepudiation = frame.nonrepudiation.take();
-	let compactness = frame.metadata.compactness.take();
-	let confidentiality = frame.metadata.confidentiality.take();
-	let mut matrix = frame.metadata.matrix.take();
-	let matrix_n = matrix.as_ref().map(|entry| entry.n);
-	let matrix_data = matrix.as_mut().map(|entry| core::mem::take(&mut entry.data));
+	let confidentiality = metadata.confidentiality();
+	let confidentiality_envelope_der = confidentiality.map(Encode::to_der).transpose()?;
+	let confidentiality_algorithm_oid =
+		confidentiality.map(|envelope| envelope.auth_encrypted_content_info.content_enc_alg.oid.to_string());
+
+	let (previous_hash_algorithm_oid, previous_hash_digest) = digest_fields(metadata.previous_frame());
+	let (message_integrity_algorithm_oid, message_integrity_digest) = digest_fields(metadata.integrity());
+	let (frame_integrity_algorithm_oid, frame_integrity_digest) = digest_fields(frame.integrity());
+
+	let matrix = metadata.matrix();
+	let signature = frame.nonrepudiation();
 
 	Ok(FrameSummary {
-		version: frame.version as u8,
-		id: core::mem::take(&mut frame.metadata.id),
-		order: frame.metadata.order,
-		body_der: core::mem::take(&mut frame.message),
-		priority: frame.metadata.priority.map(|priority| priority as u8),
-		lifetime: frame.metadata.lifetime,
-		previous_hash_algorithm_oid: previous_frame.as_ref().map(|digest| digest.algorithm.oid.to_string()),
-		previous_hash_digest: previous_frame.map(|digest| digest.digest.into_bytes()),
-		matrix_n,
-		matrix_data,
-		compactness_algorithm_oid: compactness.as_ref().map(|info| info.compression_alg.oid.to_string()),
+		version: frame.version() as u8,
+		id: metadata.id().to_vec(),
+		order: metadata.order(),
+		body_der: frame.message().to_vec(),
+		priority: metadata.priority().map(|priority| priority as u8),
+		lifetime: metadata.lifetime(),
+		previous_hash_algorithm_oid,
+		previous_hash_digest,
+		matrix_n: matrix.map(MatrixLike::n),
+		matrix_data: matrix.map(|entry| entry.as_bytes().to_vec()),
+		compactness_algorithm_oid: compactness.map(|info| info.compression_alg.oid.to_string()),
 		compactness_parameters_der,
-		compactness_content_oid: compactness
-			.as_ref()
-			.map(|info| info.encap_content_info.econtent_type.to_string()),
-		message_integrity_algorithm_oid: message_integrity.as_ref().map(|info| info.algorithm.oid.to_string()),
-		message_integrity_digest: message_integrity.map(|info| info.digest.into_bytes()),
-		frame_integrity_algorithm_oid: integrity.as_ref().map(|info| info.algorithm.oid.to_string()),
-		frame_integrity_digest: integrity.map(|info| info.digest.into_bytes()),
-		confidentiality_algorithm_oid: confidentiality.as_ref().map(|info| info.content_enc_alg.oid.to_string()),
-		confidentiality_parameters_der,
-		signature_algorithm_oid: nonrepudiation.as_ref().map(|info| info.signature_algorithm.oid.to_string()),
-		signature_digest_algorithm_oid: nonrepudiation.as_ref().map(|info| info.digest_alg.oid.to_string()),
-		signature: nonrepudiation.map(|info| info.signature.into_bytes()),
+		compactness_content_oid: compactness.map(|info| info.encap_content_info.econtent_type.to_string()),
+		message_integrity_algorithm_oid,
+		message_integrity_digest,
+		frame_integrity_algorithm_oid,
+		frame_integrity_digest,
+		confidentiality_algorithm_oid,
+		confidentiality_envelope_der,
+		signature_algorithm_oid: signature.map(|info| info.signature_algorithm.oid.to_string()),
+		signature_digest_algorithm_oid: signature.map(|info| info.digest_alg.oid.to_string()),
+		signature: signature.map(|info| info.signature.as_bytes().to_vec()),
 	})
 }
 
 // ---------------------------------------------------------------------------
-// Tightbeam profile primitives (SHA3-256 / secp256k1 / AES-256-GCM / ECIES).
-// Conveniences only: the structure path above accepts any algorithm.
+// Tightbeam profile primitives (SHA3-256 / secp256k1 / AES-256-GCM / HPKE).
+// Conveniences only: the structure path above accepts any digest and any
+// envelope.
 // ---------------------------------------------------------------------------
 
 /// SHA3-256 digest of `data` - the profile hasher.
@@ -453,158 +587,169 @@ pub fn sha3_256_digest(data: impl AsRef<[u8]>) -> Vec<u8> {
 	Sha3_256::digest(data.as_ref()).to_vec()
 }
 
-/// Sign the SHA3-256 digest of `tbs` with a profile secp256k1 signing key.
-pub fn sign_tbs(key: &Secp256k1SigningKey, tbs: impl AsRef<[u8]>) -> Result<Vec<u8>, TightBeamError> {
-	let signature: Secp256k1Signature = sign_canonical::<Sha3_256, _>(key, tbs.as_ref())?;
+/// Sign `prehash` with a profile secp256k1 signing key, with no rehash, as a
+/// DER `ECDSA-Sig-Value`.
+pub fn sign_prehash(key: &Secp256k1SigningKey, prehash: impl AsRef<[u8]>) -> Result<Vec<u8>, TightBeamError> {
+	let signature: Secp256k1Signature = key.sign_prehash(prehash.as_ref())?;
 	Ok(signature.to_bytes().to_vec())
 }
 
-/// Subject-key-identifier octets for a profile secp256k1 verifying key.
+/// Subject-key-identifier octets for a profile secp256k1 verifying key, by
+/// RFC 7093 §2 method 1.
+///
+/// `tightbeam::cert!` writes the same identifier into each certificate, so a
+/// signature under this identifier names the certificate of the key.
 pub fn signer_id(key: &Secp256k1VerifyingKey) -> Result<Vec<u8>, TightBeamError> {
-	match secp256k1_signer_identifier(key)? {
-		SignerIdentifier::SubjectKeyIdentifier(skid) => Ok(skid.0.as_bytes().to_vec()),
-		SignerIdentifier::IssuerAndSerialNumber(_) => Err(TightBeamError::SignatureEncodingError),
-	}
+	let spki = SubjectPublicKeyInfoOwned::from_key(*key)?;
+	Ok(Skid::of_public_key(&spki).as_bytes().to_vec())
 }
 
-/// Verify a frame's non-repudiation signature under the profile scheme.
+/// Verify a frame's non-repudiation signature under a pinned profile key.
+///
+/// The key is the trust decision, so the check reads no certificate. The
+/// signature verifies over the signed attributes, which bind the frame's TBS.
 pub fn verify_signature(key: &Secp256k1VerifyingKey, frame_der: impl AsRef<[u8]>) -> Result<(), TightBeamError> {
 	let frame = Frame::from_der(frame_der.as_ref())?;
-	frame.verify::<Secp256k1Signature, Sha3_256>(key)
+	let signer_info = frame.nonrepudiation().ok_or(TightBeamError::MissingSignature)?;
+	let tbs = frame.to_tbs()?;
+
+	CmsSigner::verify::<Secp256k1Signature, _>(signer_info, key, SignedContent::data(&tbs))?;
+	Ok(())
 }
 
 /// A sealed body produced by a profile encryptor: the pieces
 /// [`set_confidentiality`] installs.
 pub struct SealedBody {
-	/// The encryption algorithm OID (dotted form).
+	/// The content-encryption algorithm OID (dotted form).
 	pub algorithm_oid: String,
-	/// The algorithm parameters DER (e.g. the nonce), when the scheme has
-	/// any.
-	pub parameters_der: Option<Vec<u8>>,
+	/// The DER `AuthEnvelopedData`, its content detached.
+	pub envelope_der: Vec<u8>,
 	/// The ciphertext replacing the frame body.
 	pub ciphertext: Vec<u8>,
 }
 
-/// Split an [`EncryptedContentInfo`] into the [`SealedBody`] pieces.
-fn sealed_body(mut info: EncryptedContentInfo) -> Result<SealedBody, TightBeamError> {
-	let ciphertext = info
-		.encrypted_content
-		.take()
-		.ok_or(TightBeamError::MissingEncryptionInfo)?
-		.into_bytes();
-	let parameters_der = info.content_enc_alg.parameters.as_ref().map(Encode::to_der).transpose()?;
+/// Detach the encrypted content of `envelope` into the [`SealedBody`] pieces.
+fn sealed_body(mut envelope: AuthEnvelopedData) -> Result<SealedBody, TightBeamError> {
+	let ciphertext = envelope.take_content()?.to_vec();
+	let algorithm_oid = envelope.auth_encrypted_content_info.content_enc_alg.oid.to_string();
+	let envelope_der = envelope.to_der()?;
 
-	Ok(SealedBody { algorithm_oid: info.content_enc_alg.oid.to_string(), parameters_der, ciphertext })
+	Ok(SealedBody { algorithm_oid, envelope_der, ciphertext })
 }
 
-/// Rebuild the [`EncryptedContentInfo`] a profile decryptor opens.
-fn encrypted_info(
-	algorithm_oid: ObjectIdentifier,
-	parameters_der: Option<Vec<u8>>,
-	ciphertext: Vec<u8>,
-) -> Result<EncryptedContentInfo, TightBeamError> {
-	let parameters = match parameters_der {
-		Some(der) => Some(Any::from_der(&der)?),
-		None => None,
-	};
+/// Open `ciphertext` under `decryptor`, against the envelope that seals it.
+async fn opened(
+	decryptor: &impl DecryptContent,
+	envelope_der: impl AsRef<[u8]>,
+	mut ciphertext: Vec<u8>,
+) -> Result<Vec<u8>, TightBeamError> {
+	let sealed = WireDer::<AuthEnvelopedData>::try_from(envelope_der.as_ref())?;
+	decryptor.decrypt_content(&sealed, &mut ciphertext).await?;
 
-	Ok(EncryptedContentInfo {
-		content_type: DATA,
-		content_enc_alg: AlgorithmIdentifierOwned { oid: algorithm_oid, parameters },
-		encrypted_content: Some(OctetString::new(ciphertext)?),
-	})
+	Ok(ciphertext)
 }
 
-/// Profile AES-256-GCM under a 32-byte shared key.
+/// Profile key-encryption key: a 32-byte shared key that wraps a fresh
+/// AES-256-GCM content key per seal, in a `KEKRecipientInfo` named by
+/// `key_id` (RFC 5652 §6.2.3).
 pub struct Aes256GcmKey {
-	key: [u8; 32],
+	provider: Aes256GcmKeyProvider,
 }
 
 impl Aes256GcmKey {
-	/// Construct from a raw 32-byte key.
-	pub fn new(key: impl AsRef<[u8]>) -> Result<Self, TightBeamError> {
-		let slice = key.as_ref();
-		let _ = Aes256Gcm::new_from_slice(slice)?;
-		let mut owned = [0u8; 32];
-		owned.copy_from_slice(slice);
-		Ok(Self { key: owned })
+	/// Construct from a raw 32-byte key and the identifier that names it to
+	/// every holder.
+	pub fn new(key: impl AsRef<[u8]>, key_id: impl AsRef<[u8]>) -> Result<Self, TightBeamError> {
+		let key = key.as_ref().to_vec();
+		let provider = Aes256GcmKeyProvider::new(key, key_id.as_ref().to_vec())?;
+		Ok(Self { provider })
 	}
 
-	/// Seal `plaintext` (a [`body_preimage`]) under a fresh nonce.
-	pub fn seal(&self, plaintext: impl AsRef<[u8]>) -> Result<SealedBody, TightBeamError> {
-		let cipher = Aes256Gcm::new_from_slice(&self.key)?;
-		let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
-		let info = Encryptor::<Aes256GcmOid>::encrypt_content(&cipher, plaintext.as_ref(), nonce, None)?;
-		sealed_body(info)
+	/// Seal `plaintext` (a [`body_preimage`]) of type `content_oid`, or
+	/// `id-data` without one, under a fresh content key.
+	pub fn seal(
+		&self,
+		plaintext: impl AsRef<[u8]>,
+		content_oid: Option<ObjectIdentifier>,
+	) -> Result<SealedBody, TightBeamError> {
+		let sealed = Encryptor::<Aes256GcmOid>::encrypt_content(&self.provider, plaintext.as_ref(), content_oid, None);
+		sealed_body(sealed?)
 	}
 
 	/// Open a sealed body, returning the plaintext body DER.
-	pub fn open(&self, parameters_der: Option<Vec<u8>>, ciphertext: Vec<u8>) -> Result<Vec<u8>, TightBeamError> {
-		let cipher = Aes256Gcm::new_from_slice(&self.key)?;
-		let info = encrypted_info(tightbeam::oids::AES_256_GCM, parameters_der, ciphertext)?;
-		Ok(cipher.decrypt_content(&info)?.to_insecure()?.to_vec())
+	pub async fn open(&self, envelope_der: impl AsRef<[u8]>, ciphertext: Vec<u8>) -> Result<Vec<u8>, TightBeamError> {
+		opened(&self.provider, envelope_der, ciphertext).await
 	}
 }
 
-/// Profile ECIES encryptor (secp256k1 + HKDF-SHA3-256 + AES-256-GCM).
-pub struct EciesSecp256k1Encryptor {
-	recipient_public_key: Vec<u8>,
+/// Profile HPKE encryptor (DHKEM over secp256k1, an AES-256-GCM content key,
+/// and a `KEMRecipientInfo` per RFC 9629).
+pub struct HpkeSecp256k1Encryptor {
+	inner: HpkeEncryptor<DefaultCryptoProvider>,
 }
 
-impl EciesSecp256k1Encryptor {
+impl HpkeSecp256k1Encryptor {
 	/// Construct from the recipient's SEC1 public key.
 	pub fn from_sec1(recipient_public_key: impl AsRef<[u8]>) -> Result<Self, TightBeamError> {
-		let _ = EciesEncryptor::from_bytes(recipient_public_key.as_ref())?;
-		Ok(Self { recipient_public_key: recipient_public_key.as_ref().to_vec() })
+		let key = Secp256k1VerifyingKey::from_sec1_bytes(recipient_public_key.as_ref())?;
+		let spki = key.to_public_key_der()?;
+		let inner = HpkeEncryptor::new(KemRecipient::bare(spki.as_bytes())?);
+
+		Ok(Self { inner })
 	}
 
-	/// Seal `plaintext` to the recipient under a fresh ephemeral key.
-	pub fn seal(&self, plaintext: impl AsRef<[u8]>) -> Result<SealedBody, TightBeamError> {
-		let encryptor = EciesEncryptor::from_bytes(&self.recipient_public_key)?;
-		let info = encryptor.encrypt_content(plaintext.as_ref(), [], None)?;
-		sealed_body(info)
+	/// Seal `plaintext` of type `content_oid`, or `id-data` without one, to
+	/// the recipient under a fresh ephemeral key.
+	pub fn seal(
+		&self,
+		plaintext: impl AsRef<[u8]>,
+		content_oid: Option<ObjectIdentifier>,
+	) -> Result<SealedBody, TightBeamError> {
+		let sealed = Encryptor::<Aes256GcmOid>::encrypt_content(&self.inner, plaintext.as_ref(), content_oid, None);
+		sealed_body(sealed?)
 	}
 }
 
-/// Profile ECIES decryptor holding the recipient secp256k1 secret.
-pub struct EciesSecp256k1Decryptor {
-	secret: [u8; 32],
+/// Profile HPKE decryptor holding the recipient secp256k1 secret.
+pub struct HpkeSecp256k1Decryptor {
+	inner: HpkeDecryptor<DefaultCryptoProvider>,
 }
 
-impl EciesSecp256k1Decryptor {
+impl HpkeSecp256k1Decryptor {
 	/// Construct from a raw 32-byte recipient secret key.
 	pub fn new(secret_key: impl AsRef<[u8]>) -> Result<Self, TightBeamError> {
-		let slice = secret_key.as_ref();
-		let _ = SecretKey::from_slice(slice)?;
-		let mut secret = [0u8; 32];
-		secret.copy_from_slice(slice);
-		Ok(Self { secret })
+		let signing_key = Secp256k1SigningKey::from_slice(secret_key.as_ref())?;
+		let public = PublicKey::from(signing_key.verifying_key());
+
+		let backend: Arc<dyn DiffieHellman<Secp256k1>> = Arc::new(Secp256k1KeyProvider::from(signing_key));
+		let inner = HpkeDecryptor::new(BareKemKey::new(public, backend)?);
+
+		Ok(Self { inner })
 	}
 
 	/// Open a sealed body, returning the plaintext body DER.
-	pub fn open(&self, parameters_der: Option<Vec<u8>>, ciphertext: Vec<u8>) -> Result<Vec<u8>, TightBeamError> {
-		let decryptor = EciesDecryptor::new(SecretKey::from_slice(&self.secret)?);
-		let info = encrypted_info(EciesSecp256k1Oid::OID, parameters_der, ciphertext)?;
-		Ok(decryptor.decrypt_content(&info)?.to_insecure()?.to_vec())
+	pub async fn open(&self, envelope_der: impl AsRef<[u8]>, ciphertext: Vec<u8>) -> Result<Vec<u8>, TightBeamError> {
+		opened(&self.inner, envelope_der, ciphertext).await
 	}
 }
 
 #[cfg(test)]
 mod tests {
 	use der::asn1::OctetString;
-	use tightbeam::crypto::aead::{Aes256Gcm, KeyInit};
+	use tightbeam::asn1::AlgorithmIdentifierOwned;
+	use tightbeam::core::IntegrityVerdict;
 	use tightbeam::crypto::commitment::Opening;
 	use tightbeam::crypto::hash::Sha3_256;
+	use tightbeam::crypto::key::Aes256GcmKeyProvider;
+	use tightbeam::crypto::profiles::DefaultCryptoProvider;
 	use tightbeam::crypto::secret::ToInsecure;
-	use tightbeam::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey};
-	use tightbeam::der::oid::AssociatedOid;
+	use tightbeam::crypto::sign::ecdsa::Secp256k1SigningKey;
+	use tightbeam::crypto::x509::{KeyPurposes, PeerCertificate, Signing};
 	use tightbeam::der::{Decode, Encode, Sequence};
-	use tightbeam::matrix::MatrixDyn;
-	use tightbeam::oids::{AES_256_GCM, HASH_SHA3_256, SIGNER_ECDSA_WITH_SHA3_256};
-	use tightbeam::{
-		AlgorithmIdentifierOwned, Beamable, DigestInfo, Frame, IntegrityVerdict, MessagePriority, ObjectIdentifier,
-		Version,
-	};
+	use tightbeam::matrix::{MatrixDyn, MatrixLike};
+	use tightbeam::oids::{AES_256_GCM, DHKEM_SECP256K1, HASH_SHA3_256, SIGNER_ECDSA_WITH_SHA3_256};
+	use tightbeam::testing::TestCertificate;
+	use tightbeam::{Beamable, DigestInfo, Frame, MessagePriority, Version};
 
 	use tightbeam::compress::{Compressor, Inflator, ZstdCompression};
 
@@ -612,9 +757,9 @@ mod tests {
 
 	use super::{
 		attach_signature, attach_witness, body_preimage, commitment_preimage, decode_body, inspect_frame,
-		set_compactness, set_confidentiality, set_message_integrity, sha3_256_digest, sign_tbs, signer_id, tbs_bytes,
-		verify_signature, witness_input, Aes256GcmKey, EciesSecp256k1Decryptor, EciesSecp256k1Encryptor, FrameConfig,
-		OpaqueBody,
+		set_compactness, set_confidentiality, set_message_integrity, sha3_256_digest, sign_prehash, signature_prehash,
+		signer_id, signing_prehash, verify_signature, witness_input, Aes256GcmKey, FrameConfig, HpkeSecp256k1Decryptor,
+		HpkeSecp256k1Encryptor, OpaqueBody,
 	};
 
 	type TestResult = core::result::Result<(), Box<dyn core::error::Error>>;
@@ -643,8 +788,14 @@ mod tests {
 
 	fn open_frame(frame_der: impl AsRef<[u8]>) -> AnyResult<Vec<u8>> {
 		let frame = Frame::from_der(frame_der.as_ref())?;
-		Ok(decode_body(&frame.message)?)
+		Ok(decode_body(frame.message())?)
 	}
+
+	/// A salt long enough to hide a body.
+	const HIDING_SALT: &[u8] = b"tbws-commitment-salt";
+
+	/// The identifier that names the shared key of the AEAD fixtures.
+	const KEY_ID: &[u8] = b"tbws/test/kek/v1";
 
 	fn frame_from(config: FrameConfig) -> AnyResult<Frame> {
 		Ok(Frame::from_der(&config.build()?)?)
@@ -656,22 +807,16 @@ mod tests {
 		let config = FrameConfig { version: Some(Version::V2), ..base_config(id, order)? };
 		let der = config.build()?;
 
-		let commitment = sha3_256_digest(commitment_preimage([], sample_body()?));
+		let commitment = sha3_256_digest(commitment_preimage([], sample_body()?)?);
 		let der = set_message_integrity(&der, HASH_SHA3_256, commitment)?;
 
 		let witness = sha3_256_digest(witness_input(&der)?);
 		let der = attach_witness(&der, HASH_SHA3_256, witness)?;
 
-		let signature = sign_tbs(key, tbs_bytes(&der)?)?;
 		let sid = signer_id(key.verifying_key())?;
+		let signature = sign_prehash(key, signing_prehash(&der, &sid)?)?;
 
-		Ok(attach_signature(
-			&der,
-			signature,
-			SIGNER_ECDSA_WITH_SHA3_256,
-			HASH_SHA3_256,
-			sid,
-		)?)
+		Ok(attach_signature(&der, signature, sid)?)
 	}
 
 	#[test]
@@ -686,18 +831,18 @@ mod tests {
 	fn cleartext_frame_carries_metadata() -> TestResult {
 		let frame_der = seal_frame(b"id-9", 42)?;
 		let frame = Frame::from_der(&frame_der)?;
-		assert_eq!(frame.metadata.id, b"id-9");
-		assert_eq!(frame.metadata.order, 42);
-		assert!(frame.integrity.is_none());
-		assert!(frame.nonrepudiation.is_none());
+		assert_eq!(frame.metadata().id(), b"id-9");
+		assert_eq!(frame.metadata().order(), 42);
+		assert!(frame.integrity().is_none());
+		assert!(frame.nonrepudiation().is_none());
 		Ok(())
 	}
 
 	#[test]
 	fn config_defaults_to_v0_cleartext() -> TestResult {
 		let frame = frame_from(base_config(b"plain", 1)?)?;
-		assert_eq!(frame.version, Version::V0);
-		assert!(frame.nonrepudiation.is_none());
+		assert_eq!(frame.version(), Version::V0);
+		assert!(frame.nonrepudiation().is_none());
 		Ok(())
 	}
 
@@ -710,9 +855,9 @@ mod tests {
 		};
 
 		let frame = frame_from(config)?;
-		assert_eq!(frame.version, Version::V2);
-		assert_eq!(frame.metadata.priority, Some(MessagePriority::LowLatency));
-		assert_eq!(frame.metadata.lifetime, Some(60));
+		assert_eq!(frame.version(), Version::V2);
+		assert_eq!(frame.metadata().priority(), Some(MessagePriority::LowLatency));
+		assert_eq!(frame.metadata().lifetime(), Some(60));
 		Ok(())
 	}
 
@@ -722,10 +867,10 @@ mod tests {
 		let config = FrameConfig { matrix: Some(matrix), ..base_config(b"matrix", 1)? };
 
 		let frame = frame_from(config)?;
-		assert_eq!(frame.version, Version::V3);
+		assert_eq!(frame.version(), Version::V3);
 
-		let recovered_matrix = frame.metadata.matrix.as_ref().ok_or("matrix present")?;
-		assert_eq!(recovered_matrix.n, 2);
+		let recovered_matrix = frame.metadata().matrix().ok_or("matrix present")?;
+		assert_eq!(recovered_matrix.n(), 2);
 		Ok(())
 	}
 
@@ -733,7 +878,7 @@ mod tests {
 	fn config_pins_explicit_version() -> TestResult {
 		let config = FrameConfig { version: Some(Version::V2), ..base_config(b"pinned", 3)? };
 		let frame = frame_from(config)?;
-		assert_eq!(frame.version, Version::V2);
+		assert_eq!(frame.version(), Version::V2);
 		Ok(())
 	}
 
@@ -818,10 +963,26 @@ mod tests {
 	#[test]
 	fn signed_frame_verifies_with_tightbeam() -> TestResult {
 		let key = signing_key()?;
-		let verifying_key = *key.verifying_key();
 		let frame = Frame::from_der(&signed_frame(b"signed-3", 5, &key)?)?;
 
-		frame.verify::<Secp256k1Signature, Sha3_256>(&verifying_key)?;
+		// The signature names the certificate of the key, so tightbeam's own
+		// certificate path resolves and verifies it.
+		let certificate = TestCertificate::self_signed(&key);
+		let signer = PeerCertificate::<Signing<DefaultCryptoProvider>>::parse(certificate, KeyPurposes::HOUSE.signer)?;
+		frame.verify(&signer)?;
+		Ok(())
+	}
+
+	#[test]
+	fn the_verifier_prehash_is_the_signer_prehash() -> TestResult {
+		let key = signing_key()?;
+		let sid = signer_id(key.verifying_key())?;
+
+		let der = FrameConfig { version: Some(Version::V1), ..base_config(b"prehash", 1)? }.build()?;
+		let prehash = signing_prehash(&der, &sid)?;
+		let signed = attach_signature(&der, sign_prehash(&key, &prehash)?, &sid)?;
+
+		assert_eq!(signature_prehash(&signed)?, prehash);
 		Ok(())
 	}
 
@@ -838,7 +999,6 @@ mod tests {
 	fn signing_key_spki_matches_encode_public_key() -> TestResult {
 		let key = signing_key()?;
 		let spki = key.verifying_key().to_public_key_der()?.into_vec();
-
 		assert_eq!(spki.len(), 88);
 		assert_eq!(spki[23], 0x04);
 		Ok(())
@@ -848,7 +1008,6 @@ mod tests {
 	fn verify_signature_rejects_wrong_key() -> TestResult {
 		let frame_der = signed_frame(b"sig-bad", 1, &signing_key()?)?;
 		let other = Secp256k1SigningKey::from_bytes(&[2u8; 32].into())?;
-
 		assert!(verify_signature(other.verifying_key(), &frame_der).is_err());
 		Ok(())
 	}
@@ -860,16 +1019,41 @@ mod tests {
 		Ok(())
 	}
 
-	/// The structure path is algorithm-agnostic, so garbage bytes attach.
-	/// Verification is where they must fail.
+	/// A signature that is no DER `ECDSA-Sig-Value` never reaches the frame.
 	#[test]
-	fn garbage_signature_attaches_but_fails_verification() -> TestResult {
+	fn a_compact_signature_is_refused_at_attach() -> TestResult {
 		let key = signing_key()?;
-		let frame_der = seal_frame(b"junk", 1)?;
+		let frame_der = FrameConfig { version: Some(Version::V1), ..base_config(b"junk", 1)? }.build()?;
 		let sid = signer_id(key.verifying_key())?;
 
-		let signed = attach_signature(&frame_der, [0u8; 64], SIGNER_ECDSA_WITH_SHA3_256, HASH_SHA3_256, sid)?;
-		assert!(verify_signature(key.verifying_key(), &signed).is_err());
+		assert!(attach_signature(&frame_der, [0u8; 64], sid).is_err());
+		Ok(())
+	}
+
+	/// A frame below V1 carries no signature, so the attach refuses it.
+	#[test]
+	fn a_v0_frame_refuses_a_signature() -> TestResult {
+		let key = signing_key()?;
+		let frame_der = seal_frame(b"v0", 1)?;
+		let sid = signer_id(key.verifying_key())?;
+		let signature = sign_prehash(&key, signing_prehash(&frame_der, &sid)?)?;
+
+		assert!(attach_signature(&frame_der, signature, sid).is_err());
+		Ok(())
+	}
+
+	/// A signature over one frame fails on another.
+	#[test]
+	fn a_signature_does_not_transfer_between_frames() -> TestResult {
+		let key = signing_key()?;
+		let sid = signer_id(key.verifying_key())?;
+
+		let first = FrameConfig { version: Some(Version::V1), ..base_config(b"first", 1)? }.build()?;
+		let second = FrameConfig { version: Some(Version::V1), ..base_config(b"second", 1)? }.build()?;
+		let signature = sign_prehash(&key, signing_prehash(&first, &sid)?)?;
+
+		let moved = attach_signature(&second, signature, sid)?;
+		assert!(verify_signature(key.verifying_key(), &moved).is_err());
 		Ok(())
 	}
 
@@ -877,14 +1061,14 @@ mod tests {
 	/// tightbeam's own commitment verdict: pins the preimage framing.
 	#[test]
 	fn caller_side_commitment_verifies_with_tightbeam() -> TestResult {
-		let salt = b"pepper";
+		let salt = HIDING_SALT;
 		let der = FrameConfig { version: Some(Version::V2), ..base_config(b"mi", 1)? }.build()?;
 
-		let commitment = sha3_256_digest(commitment_preimage(salt, body_preimage(sample_message())?));
+		let commitment = sha3_256_digest(commitment_preimage(salt, body_preimage(sample_message())?)?);
 		let der = set_message_integrity(&der, HASH_SHA3_256, commitment)?;
 
 		let frame = Frame::from_der(&der)?;
-		let body = OpaqueBody::from_der(&frame.message)?;
+		let body = OpaqueBody::from_der(frame.message())?;
 		let (_, opening) = Opening::prove::<Sha3_256, _>(&body, salt)?;
 		assert!(matches!(
 			frame.message_commitment_verdict::<Sha3_256>(&opening)?,
@@ -923,75 +1107,123 @@ mod tests {
 		Ok(())
 	}
 
-	/// A caller-sealed AES-256-GCM body must open with tightbeam's own
-	/// decryptor: pins the EncryptedContentInfo layout.
-	#[test]
-	fn caller_side_aead_seal_opens_with_tightbeam() -> TestResult {
+	/// A caller-sealed body must open with tightbeam's own decryptor: pins
+	/// the detached envelope layout.
+	#[tokio::test]
+	async fn caller_side_aead_seal_opens_with_tightbeam() -> TestResult {
 		let key = [0x42u8; 32];
 		let der = FrameConfig { version: Some(Version::V1), ..base_config(b"sealed", 8)? }.build()?;
 
-		let aes = Aes256GcmKey::new(key)?;
-		let sealed = aes.seal(body_preimage(sample_message())?)?;
+		let aes = Aes256GcmKey::new(key, KEY_ID)?;
+		let sealed = aes.seal(body_preimage(sample_message())?, None)?;
 		assert_eq!(sealed.algorithm_oid, AES_256_GCM.to_string());
 
-		let der = set_confidentiality(
-			&der,
-			None,
-			sealed.algorithm_oid.parse::<ObjectIdentifier>()?,
-			sealed.parameters_der,
-			sealed.ciphertext,
-		)?;
+		let der = set_confidentiality(&der, &sealed.envelope_der, sealed.ciphertext)?;
 
 		let summary = inspect_frame(&der)?;
 		assert_eq!(summary.confidentiality_algorithm_oid, Some(AES_256_GCM.to_string()));
+		assert_eq!(summary.confidentiality_envelope_der, Some(sealed.envelope_der));
 		assert_ne!(summary.body_der, sample_body()?);
 
-		let cipher = Aes256Gcm::new_from_slice(&key)?;
+		let holder = Aes256GcmKeyProvider::new(key.to_vec(), KEY_ID.to_vec())?;
 		let frame = Frame::from_der(&der)?;
-		let plaintext = frame.decrypt_bytes(&cipher)?.to_insecure()?;
+		let plaintext = frame.decrypt_bytes(&holder).await?.to_insecure();
 		assert_eq!(decode_body(&plaintext)?, sample_message());
 		Ok(())
 	}
 
-	#[test]
-	fn aead_seal_open_round_trips() -> TestResult {
-		let aes = Aes256GcmKey::new([0x42u8; 32])?;
+	/// A frame tightbeam seals must open under the caller-side key.
+	#[tokio::test]
+	async fn tightbeam_seal_opens_on_the_caller_side() -> TestResult {
+		let key = [0x42u8; 32];
+		let holder = Aes256GcmKeyProvider::new(key.to_vec(), KEY_ID.to_vec())?;
+
+		let body = OpaqueBody { body: OctetString::new(sample_message())? };
+		let frame = tightbeam::compose! {
+			V1: id: "native-sealed",
+				order: 2u64,
+				message: body,
+				confidentiality: holder
+		}?;
+
+		let summary = inspect_frame(frame.to_der()?)?;
+		let envelope = summary.confidentiality_envelope_der.ok_or("the frame is sealed")?;
+		let opened = Aes256GcmKey::new(key, KEY_ID)?.open(envelope, summary.body_der).await?;
+		assert_eq!(decode_body(opened)?, sample_message());
+		Ok(())
+	}
+
+	#[tokio::test]
+	async fn aead_seal_open_round_trips() -> TestResult {
+		let aes = Aes256GcmKey::new([0x42u8; 32], KEY_ID)?;
 		let preimage = body_preimage(sample_message())?;
 
-		let sealed = aes.seal(&preimage)?;
-		let opened = aes.open(sealed.parameters_der, sealed.ciphertext)?;
+		let sealed = aes.seal(&preimage, None)?;
+		let opened = aes.open(sealed.envelope_der, sealed.ciphertext).await?;
 		assert_eq!(opened, preimage);
 		Ok(())
 	}
 
-	#[test]
-	fn aead_open_rejects_wrong_key() -> TestResult {
-		let sealed = Aes256GcmKey::new([0x42u8; 32])?.seal(body_preimage(sample_message())?)?;
-		let other = Aes256GcmKey::new([0x43u8; 32])?;
-		assert!(other.open(sealed.parameters_der, sealed.ciphertext).is_err());
+	#[tokio::test]
+	async fn aead_open_rejects_wrong_key() -> TestResult {
+		let sealed = Aes256GcmKey::new([0x42u8; 32], KEY_ID)?.seal(body_preimage(sample_message())?, None)?;
+		let other = Aes256GcmKey::new([0x43u8; 32], KEY_ID)?;
+		assert!(other.open(sealed.envelope_der, sealed.ciphertext).await.is_err());
 		Ok(())
 	}
 
-	#[test]
-	fn ecies_seal_open_round_trips() -> TestResult {
+	#[tokio::test]
+	async fn aead_open_rejects_a_tampered_body() -> TestResult {
+		let aes = Aes256GcmKey::new([0x42u8; 32], KEY_ID)?;
+		let sealed = aes.seal(body_preimage(sample_message())?, None)?;
+
+		let mut tampered = sealed.ciphertext;
+		*tampered.first_mut().ok_or("the seal holds ciphertext")? ^= 0x01;
+		assert!(aes.open(sealed.envelope_der, tampered).await.is_err());
+		Ok(())
+	}
+
+	#[tokio::test]
+	async fn hpke_seal_open_round_trips() -> TestResult {
 		let recipient_public = signing_key()?.verifying_key().to_sec1_bytes().to_vec();
 		let preimage = body_preimage(sample_message())?;
 
-		let sealed = EciesSecp256k1Encryptor::from_sec1(&recipient_public)?.seal(&preimage)?;
-		assert_eq!(sealed.algorithm_oid, "1.3.132.1.12.0");
+		let sealed = HpkeSecp256k1Encryptor::from_sec1(&recipient_public)?.seal(&preimage, None)?;
+		assert_eq!(sealed.algorithm_oid, AES_256_GCM.to_string());
 
-		let opened = EciesSecp256k1Decryptor::new([1u8; 32])?.open(sealed.parameters_der, sealed.ciphertext)?;
+		let opened = HpkeSecp256k1Decryptor::new([1u8; 32])?
+			.open(sealed.envelope_der, sealed.ciphertext)
+			.await?;
 		assert_eq!(opened, preimage);
 		Ok(())
 	}
 
-	#[test]
-	fn ecies_open_rejects_wrong_secret() -> TestResult {
+	#[tokio::test]
+	async fn hpke_open_rejects_wrong_secret() -> TestResult {
 		let recipient_public = signing_key()?.verifying_key().to_sec1_bytes().to_vec();
-		let sealed = EciesSecp256k1Encryptor::from_sec1(&recipient_public)?.seal(body_preimage(sample_message())?)?;
-		assert!(EciesSecp256k1Decryptor::new([2u8; 32])?
-			.open(sealed.parameters_der, sealed.ciphertext)
-			.is_err());
+		let encryptor = HpkeSecp256k1Encryptor::from_sec1(&recipient_public)?;
+		let sealed = encryptor.seal(body_preimage(sample_message())?, None)?;
+
+		let stranger = HpkeSecp256k1Decryptor::new([2u8; 32])?;
+		assert!(stranger.open(sealed.envelope_der, sealed.ciphertext).await.is_err());
+		Ok(())
+	}
+
+	/// A splice of a sealed body keeps the frame gate: V0 forbids confidentiality.
+	#[test]
+	fn a_v0_frame_refuses_an_envelope() -> TestResult {
+		let der = seal_frame(b"v0-sealed", 1)?;
+		let sealed = Aes256GcmKey::new([0x42u8; 32], KEY_ID)?.seal(sample_body()?, None)?;
+
+		assert!(set_confidentiality(&der, sealed.envelope_der, sealed.ciphertext).is_err());
+		Ok(())
+	}
+
+	/// Bytes that are no envelope never reach a frame.
+	#[test]
+	fn a_malformed_envelope_is_refused() -> TestResult {
+		let der = FrameConfig { version: Some(Version::V1), ..base_config(b"bad-seal", 1)? }.build()?;
+		assert!(set_confidentiality(&der, [0x30, 0x00], vec![1, 2, 3]).is_err());
 		Ok(())
 	}
 
@@ -1000,18 +1232,29 @@ mod tests {
 		assert_eq!(HASH_SHA3_256.to_string(), "2.16.840.1.101.3.4.2.8");
 		assert_eq!(SIGNER_ECDSA_WITH_SHA3_256.to_string(), "2.16.840.1.101.3.4.3.10");
 		assert_eq!(AES_256_GCM.to_string(), "2.16.840.1.101.3.4.1.46");
-		assert_eq!(super::EciesSecp256k1Oid::OID.to_string(), "1.3.132.1.12.0");
+		assert_eq!(DHKEM_SECP256K1.to_string(), "1.3.6.1.4.1.64586.2.3");
 	}
 
 	#[test]
-	fn commitment_preimage_frames_nonempty_salt() {
+	fn commitment_preimage_marks_its_mode() -> TestResult {
 		let body = vec![0xBBu8; 4];
-		assert_eq!(commitment_preimage([], &body), body);
 
-		let framed = commitment_preimage(b"salt", &body);
-		assert_eq!(&framed[..8], &4u64.to_be_bytes());
-		assert_eq!(&framed[8..12], b"salt");
-		assert_eq!(&framed[12..], body.as_slice());
+		let plain = commitment_preimage([], &body)?;
+		assert_eq!(plain.first(), Some(&0x00));
+		assert_eq!(&plain[1..], body.as_slice());
+
+		let salt = [0xAAu8; 16];
+		let framed = commitment_preimage(salt, &body)?;
+		assert_eq!(framed.first(), Some(&0x01));
+		assert_eq!(&framed[1..9], &16u64.to_be_bytes());
+		assert_eq!(&framed[9..25], &salt);
+		assert_eq!(&framed[25..], body.as_slice());
+		Ok(())
+	}
+
+	#[test]
+	fn commitment_preimage_refuses_a_salt_too_short_to_hide() {
+		assert!(commitment_preimage([0xAAu8; 15], [0xBBu8; 4]).is_err());
 	}
 
 	#[test]
@@ -1033,24 +1276,23 @@ mod tests {
 		let der = set_compactness(&der, None, info.compression_alg.oid, None, compressed)?;
 
 		let mut frame = Frame::from_der(&der)?;
-		assert_eq!(frame.metadata.compactness.as_ref(), Some(&info));
+		assert_eq!(frame.metadata().compactness(), Some(&info));
 
-		frame.inflate_in_place(&compressor)?;
-		assert_eq!(decode_body(&frame.message)?, sample_message());
+		let _opened = frame.inflate_in_place(&compressor)?;
+		assert_eq!(decode_body(frame.message())?, sample_message());
 		Ok(())
 	}
 
 	/// A body compressed by the TypeScript profile `ZstdCompression` must
-	/// inflate with tightbeam's zeekstd-backed inflator: pins the
-	/// cross-layer zstd wire format.
+	/// inflate with tightbeam's inflator: pins the cross-layer zstd wire
+	/// format, one zstd frame with nothing after it.
 	///
 	/// Fixture: `new ZstdCompression().compress(payload)` from
 	/// `ws/client/src/compress.ts` over [`interop_payload`].
 	#[test]
 	fn typescript_zstd_stream_inflates_with_tightbeam() -> TestResult {
 		const FIXTURE_HEX: &str = "28b52ffd6020006d0100440274696768746265616d207a73746420696e746572\
-			6f70206669787475726520626f6479200100cc1f4a3d015e2a4d18110000003700\
-			0000200100000100000000b1ea928f";
+			6f70206669787475726520626f6479200100cc1f4a3d01";
 
 		let compressed = bytes_from_hex(FIXTURE_HEX)?;
 		let inflated = ZstdCompression::default().decompress(&compressed)?;
@@ -1067,7 +1309,7 @@ mod tests {
 	/// shared opening fixture: pins the detached-commitment digest the TS.
 	#[test]
 	fn opening_commitment_matches_typescript_fixture() -> TestResult {
-		const FIXTURE_HEX: &str = "60b6ac6b45c68572acafa88fa74257e84fc9dc71397a1a99265ecb454bf5e639";
+		const FIXTURE_HEX: &str = "678bec1605c349a2af6ceaa627569d31d57759ee2fbeffd2ac33026df930e04e";
 
 		let body = OpaqueBody { body: OctetString::new(opening_payload())? };
 		let (commitment, opening) = Opening::prove::<Sha3_256, _>(&body, opening_salt())?;
@@ -1102,8 +1344,8 @@ mod tests {
 
 	/// A compressed-then-sealed body must open through tightbeam's own
 	/// decrypt-and-inflate pipeline: pins the compress-before-encrypt order.
-	#[test]
-	fn compressed_then_sealed_body_decrypts_with_tightbeam() -> TestResult {
+	#[tokio::test]
+	async fn compressed_then_sealed_body_decrypts_with_tightbeam() -> TestResult {
 		let key = [0x42u8; 32];
 		let der = FrameConfig { version: Some(Version::V1), ..base_config(b"packed-sealed", 6)? }.build()?;
 
@@ -1111,19 +1353,13 @@ mod tests {
 		let (compressed, info) = compressor.compress(&sample_body()?, None)?;
 		let der = set_compactness(&der, None, info.compression_alg.oid, None, compressed.clone())?;
 
-		let sealed = Aes256GcmKey::new(key)?.seal(&compressed)?;
-		let der = set_confidentiality(
-			&der,
-			None,
-			sealed.algorithm_oid.parse::<ObjectIdentifier>()?,
-			sealed.parameters_der,
-			sealed.ciphertext,
-		)?;
+		let sealed = Aes256GcmKey::new(key, KEY_ID)?.seal(&compressed, None)?;
+		let der = set_confidentiality(&der, sealed.envelope_der, sealed.ciphertext)?;
 
-		let cipher = Aes256Gcm::new_from_slice(&key)?;
+		let holder = Aes256GcmKeyProvider::new(key.to_vec(), KEY_ID.to_vec())?;
 		let mut frame = Frame::from_der(&der)?;
-		frame.decrypt_in_place(&cipher, Some(&compressor))?;
-		assert_eq!(decode_body(&frame.message)?, sample_message());
+		let _opened = frame.decrypt_in_place(&holder, Some(&compressor)).await?;
+		assert_eq!(decode_body(frame.message())?, sample_message());
 		Ok(())
 	}
 
@@ -1137,7 +1373,7 @@ mod tests {
 
 		let summary = inspect_frame(&der)?;
 		assert_eq!(summary.compactness_algorithm_oid.as_deref(), Some("1.3.6.1.4.1.64586.2.1"));
-		assert_eq!(summary.compactness_content_oid.as_deref(), Some("1.2.840.113549.1.9.16.1.9"));
+		assert_eq!(summary.compactness_content_oid.as_deref(), Some("1.2.840.113549.1.7.1"));
 		assert_eq!(summary.compactness_parameters_der, None);
 		assert_eq!(summary.body_der, compressed);
 		Ok(())
@@ -1160,8 +1396,8 @@ mod tests {
 
 		let config = FrameConfig { message: body_der.clone(), ..base_config(b"typed", 1)? };
 		let frame = Frame::from_der(&config.build()?)?;
-		assert_eq!(frame.message, body_der);
-		assert_eq!(Doc::from_der(&frame.message)?, doc);
+		assert_eq!(frame.message(), body_der);
+		assert_eq!(Doc::from_der(frame.message())?, doc);
 		Ok(())
 	}
 
@@ -1169,7 +1405,7 @@ mod tests {
 	/// verdict computed from the typed message itself.
 	#[test]
 	fn typed_body_commitment_verifies_with_tightbeam() -> TestResult {
-		let salt = b"pepper";
+		let salt = HIDING_SALT;
 		let doc = Doc { title: "committed".into() };
 		let body_der = doc.to_der()?;
 
@@ -1180,7 +1416,7 @@ mod tests {
 		};
 
 		let der = config.build()?;
-		let commitment = sha3_256_digest(commitment_preimage(salt, &body_der));
+		let commitment = sha3_256_digest(commitment_preimage(salt, &body_der)?);
 		let der = set_message_integrity(&der, HASH_SHA3_256, commitment)?;
 
 		let frame = Frame::from_der(&der)?;

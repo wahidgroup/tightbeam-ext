@@ -6,10 +6,11 @@
  * digest. A commitment salts the body with a secret blinding value so the
  * digest reveals nothing until the opening `(salt, body)` is disclosed.
  *
- * The commitment value is computed over the same length-framed preimage the
+ * The commitment value is computed over the same mode-prefixed preimage the
  * in-frame message commitment uses (`commitmentPreimage`), so a detached
  * commitment and a frame-carried one are interchangeable. An empty salt
- * reproduces the plain body digest.
+ * commits in plain-digest mode, and any other salt carries at least 16
+ * octets.
  */
 
 import { commitmentPreimage } from "#wasm";
@@ -69,8 +70,10 @@ export class Opening {
 	 *
 	 * The returned commitment is the public value to publish. The opening
 	 * is the secret proof to disclose during verification. A high-entropy
-	 * `salt` makes the commitment hiding. An empty salt yields the plain
-	 * body digest (binding only).
+	 * `salt` of at least 16 octets makes the commitment hiding. An empty salt
+	 * commits in plain-digest mode (binding only).
+	 *
+	 * @throws when a non-empty `salt` is too short to hide the body.
 	 */
 	static async prove(
 		hasher: Hasher,

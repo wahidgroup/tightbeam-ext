@@ -100,7 +100,7 @@ refactor(client)!: rename exported type
 - `fix(ws): close the socket on handshake failure`
 - `chore(deps): bump tightbeam-rs`
 - `refactor(client)!: rename exported type`
-- `docs: document the ECIES session flow`
+- `docs: document the HPKE session flow`
 - `revert: undo accidental export rename`
 
 ### Body

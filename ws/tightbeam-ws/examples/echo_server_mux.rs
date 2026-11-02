@@ -1,14 +1,9 @@
 //! Multiplexed encrypted echo server for the tightbeam WebSocket transport.
 //!
-//! Negotiates HTTP/2-style stream multiplexing during the ECIES handshake,
-//! splits each connection into exclusive halves, and serves concurrent
-//! client streams with an echo handler.
-//!
-//! Two-way behavior: a request whose frame id starts with `call-me` makes
-//! the server initiate its own stream back to the client carrying the same
-//! frame. The client's answer becomes the response on the original stream.
-//! A `sink` id accepts without a response frame, a `drain-calm` id drains
-//! the session. Everything else echoes.
+//! The server offers multiplexing in the HPKE handshake and serves each client
+//! stream with the handler that `TBWS_ECHO_BODY` selects. In the `streaming`
+//! and `unary` modes, a frame id can select a command in place of the echo,
+//! as [`echo_stream`] lists.
 //!
 //! When `TBWS_CLIENT_CERT` is set, the server additionally requires mutual
 //! authentication, pinning that certificate as the only accepted client.
@@ -111,7 +106,7 @@ async fn main() -> Result<(), BoxError> {
 	let paywall = paywall_enabled();
 
 	let identity = Identity::from_env()?;
-	let mut config = identity.server_config();
+	let mut config = identity.server_config()?;
 
 	let mut mode = "server-auth";
 	let client_cert = env::var("TBWS_CLIENT_CERT");

@@ -21,7 +21,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 tightbeam-rs = { workspace = true, features = [
 	"std",
-	"transport-ecies",
+	"transport-hpke",
 	"transport-multiplex",
 	"async-transport",
 	"wasm",
@@ -51,3 +51,4 @@ wasm-bindgen-test = "0.3"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 tightbeam-rs = { workspace = true, features = ["colony"] }
+tokio = { workspace = true, features = ["macros", "rt"] }

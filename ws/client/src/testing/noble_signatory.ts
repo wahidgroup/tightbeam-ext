@@ -5,14 +5,13 @@
  */
 
 import { secp256k1 } from "@noble/curves/secp256k1.js";
-import { sha3_256 } from "@noble/hashes/sha3.js";
 
 import type { FrameVerifier, Signatory, VerifiableFrame } from "../crypto.js";
 import { PROFILE_OIDS, Secp256k1VerifyingKey } from "../crypto.js";
 
 /**
- * Verify a frame from `tbs` + carried signature bytes with noble secp256k1.
- * Stands in for any non-wasm verifier (wallet SDK, ed25519, …).
+ * Verify a frame from its signature prehash + carried signature bytes with
+ * noble secp256k1. Stands in for any non-wasm verifier (wallet SDK, …).
  */
 export class NobleFrameVerifier implements FrameVerifier {
 	constructor(private readonly publicKey: Uint8Array) {}
@@ -27,10 +26,12 @@ export class NobleFrameVerifier implements FrameVerifier {
 			throw new Error("unexpected signature algorithm");
 		}
 
-		const digest = sha3_256(frame.tbs());
-		const ok = secp256k1.verify(info.signature, digest, this.publicKey, {
-			prehash: false,
-		});
+		const ok = secp256k1.verify(
+			info.signature,
+			frame.signaturePrehash(),
+			this.publicKey,
+			{ format: "der", prehash: false },
+		);
 		if (!ok) {
 			throw new Error("signature verification failed");
 		}
@@ -38,8 +39,8 @@ export class NobleFrameVerifier implements FrameVerifier {
 }
 
 /**
- * A {@link Signatory} whose secret never enters wasm. Optional TBS capture
- * for boundary-order assertions.
+ * A {@link Signatory} whose secret never enters wasm. Optional prehash
+ * capture for boundary-order assertions.
  */
 export class NobleSignatory implements Signatory {
 	readonly signatureAlgorithmOid = PROFILE_OIDS.ecdsaWithSha3_256;
@@ -68,12 +69,14 @@ export class NobleSignatory implements Signatory {
 		return id;
 	}
 
-	sign(tbs: Uint8Array): Promise<Uint8Array> {
-		this.seen.push(tbs);
-		const digest = sha3_256(tbs);
-		const signature = secp256k1.sign(digest, this.secret, {
+	signPrehash(prehash: Uint8Array): Promise<Uint8Array> {
+		this.seen.push(prehash);
+
+		const signature = secp256k1.sign(prehash, this.secret, {
+			format: "der",
 			prehash: false,
 		});
+
 		const result = Promise.resolve(signature);
 		return result;
 	}

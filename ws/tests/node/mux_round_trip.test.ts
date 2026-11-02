@@ -16,6 +16,12 @@ const TEXT = new TextDecoder();
 const REPLY_BODY = new Uint8Array([0xca, 0x11, 0xba, 0xc4]);
 
 /**
+ * A silence past the server's 30-second operation timeout, which ends a
+ * session that sends nothing.
+ */
+const PAST_READ_DEADLINE_MS = 35_000;
+
+/**
  * Concurrent streams and the bodies that identify them.
  */
 const STREAMS = [
@@ -232,7 +238,7 @@ describe.each(LANES)(
 					.build();
 				await expect(client.emit(after)).rejects.toMatchObject({
 					name: TRANSPORT_ERROR_NAME,
-					code: "Draining",
+					code: "ConnectionClosed",
 				});
 			});
 		});
@@ -302,7 +308,7 @@ describe.each(LANES)(
 					.build();
 				await expect(client.emit(after)).rejects.toMatchObject({
 					name: TRANSPORT_ERROR_NAME,
-					code: "Draining",
+					code: "ConnectionClosed",
 				});
 			});
 		});
@@ -329,7 +335,7 @@ describe.each(LANES)(
 			});
 		});
 
-		it("rejects a stream opened after shutdown with the Draining code", async () => {
+		it("rejects a stream opened after a finished shutdown as closed", async () => {
 			await withClient(connect, async (client) => {
 				// Arrange: prove the session is healthy, then drain it.
 				const before = await frame(new Uint8Array([0xb0, 0x0a]))
@@ -345,7 +351,7 @@ describe.each(LANES)(
 					.build();
 				await expect(client.emit(after)).rejects.toMatchObject({
 					name: TRANSPORT_ERROR_NAME,
-					code: "Draining",
+					code: "ConnectionClosed",
 				});
 			});
 		});
@@ -466,16 +472,34 @@ describe.each(LANES)(
 			});
 		});
 
-		it("rejects a stream slot wait with Draining once the session drains", async () => {
+		it("rejects a stream slot wait as closed once a shutdown finishes", async () => {
 			await withClient(connect, async (client) => {
 				await client.shutdown();
 
 				await expect(client.waitForStreamSlot()).rejects.toMatchObject({
 					name: TRANSPORT_ERROR_NAME,
-					code: "Draining",
+					code: "ConnectionClosed",
 				});
 			});
 		});
+
+		it(
+			"holds an idle session past the server's read deadline",
+			async () => {
+				await withClient(connect, async (client) => {
+					await new Promise((resolve) => {
+						setTimeout(resolve, PAST_READ_DEADLINE_MS);
+					});
+
+					const after = await frame(new Uint8Array([0xb0, 0x30]))
+						.withId("mux-after-idle")
+						.withOrder(1)
+						.build();
+					await emitOrFail(client, after);
+				});
+			},
+			PAST_READ_DEADLINE_MS + 5_000,
+		);
 
 		it("settles an in-flight emit when the client closes", async () => {
 			await withClient(connect, async (client) => {

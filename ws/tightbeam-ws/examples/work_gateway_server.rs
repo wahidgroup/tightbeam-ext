@@ -1,21 +1,18 @@
 //! Cluster work-plane gateway for the e2e stack.
 //!
-//! Assembles a real cluster gateway, a hive, and a `work-probe` servlet
-//! in one process. The colony (gateway, hive, servlet) speaks encrypted
-//! TCP internally. The gateway exposes an encrypted WebSocket edge
-//! accept plane on the public port, so the browser suite exercises the
-//! genuine admission, routing, and refusal logic rather than an emulation.
+//! This process runs a cluster gateway, a hive, and a `work-probe` servlet,
+//! which speak encrypted TCP to each other. The gateway accepts clients on an
+//! encrypted WebSocket edge at the public port, so the e2e suite exercises real
+//! admission, routing, and refusal.
 //!
-//! The servlet answers the opaque work payload with a signed
-//! `pong:<payload-hex>:<signature-valid>` echo. The verdict witnesses
-//! whether the client's end-to-end signature verified on the bytes the
-//! servlet received, proving byte-for-byte forwarding through the gateway.
-//! An unregistered servlet type is refused by the gateway with a typed
-//! transit status.
+//! [`WorkProbeServlet`] reports whether the client's signature verified after
+//! the gateway forwarded the frame. The gateway refuses an unregistered servlet
+//! type with a typed transit status.
 //!
 //! Environment:
 //!   - `TBWS_SERVER_CERT`  path to the gateway certificate DER
 //!   - `TBWS_SERVER_KEY`   path to the raw 32-byte gateway signing key
+//!   - `TBWS_WORK_CERT`    path to the shared work certificate DER
 //!   - `TBWS_WORK_KEY`     path to the raw 32-byte shared work signing key
 //!   - `ECHO_WS_PORT`      listen port (default `9104`)
 
@@ -33,20 +30,18 @@ use std::sync::{Arc, OnceLock};
 use der::asn1::OctetString;
 use der::Sequence;
 use tightbeam::colony::cluster::{Cluster, ClusterConfig, ClusterTlsConfig};
-use tightbeam::colony::common::ColonyNamespace;
 use tightbeam::colony::hive::{Hive, HiveConfig, HiveTlsConfig};
 use tightbeam::colony::servlet::ServletConfig;
-use tightbeam::crypto::hash::Sha3_256;
-use tightbeam::crypto::key::Secp256k1KeyProvider;
+use tightbeam::colony::urn::ColonyNamespace;
 use tightbeam::crypto::profiles::DefaultCryptoProvider;
-use tightbeam::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey};
-use tightbeam::crypto::x509::CertificateSpec;
+use tightbeam::crypto::x509::{KeyPurposes, PeerCertificate, Signing};
 use tightbeam::policy::TransitStatus;
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::handshake::negotiation::TransportOffer;
+use tightbeam::transport::handshake::PeerAuthentication;
 use tightbeam::transport::tcp::r#async::TokioListener;
-use tightbeam::utils::urn::Urn;
-use tightbeam::{cluster, compose, hive, servlet, Beamable, TightBeamError};
+use tightbeam::urn::Urn;
+use tightbeam::{cluster, compose, hive, servlet, Beamable, Frame, TightBeamError};
 use tightbeam_ws::protocol::WsListener;
 use tightbeam_ws::testing::{env_u32, Identity, SIGNING_KEY_LEN};
 
@@ -59,9 +54,17 @@ struct WorkBody {
 	body: OctetString,
 }
 
-/// End-to-end work signing key, installed by `main` before the servlet
-/// starts so the handler never observes an empty slot.
-static WORK_KEY: OnceLock<Secp256k1SigningKey> = OnceLock::new();
+/// End-to-end work identity, installed by `main` before the servlet starts
+/// so the handler never observes an empty slot.
+static WORK_IDENTITY: OnceLock<Identity> = OnceLock::new();
+
+/// Whether `frame` carries a signature that `identity`'s certificate verifies
+/// over the bytes this end received.
+fn signature_verifies(identity: &Identity, frame: &Frame) -> bool {
+	let certificate = identity.certificate().clone();
+	let signer = PeerCertificate::<Signing<DefaultCryptoProvider>>::parse(certificate, KeyPurposes::HOUSE.signer);
+	signer.is_ok_and(|signer| frame.verify(&signer).is_ok())
+}
 
 servlet! {
 	/// Answers the opaque work payload with a signed
@@ -71,28 +74,27 @@ servlet! {
 	pub WorkProbeServlet<WorkBody, EnvConfig = ()>,
 	protocol: TokioListener,
 	handle: |req, frame, _ctx| async move {
-		// Main installs the key before the topology starts, so an empty
+		// Main installs the identity before the topology starts, so an empty
 		// slot is unreachable here. The early return keeps the handler
 		// panic-free if that startup ordering ever breaks.
-		let Some(key) = WORK_KEY.get() else {
+		let Some(identity) = WORK_IDENTITY.get() else {
 			return Err(TightBeamError::MissingConfiguration);
 		};
-		let signature_valid = frame
-			.verify::<Secp256k1Signature, Sha3_256>(key.verifying_key())
-			.is_ok();
 
+		let signature_valid = signature_verifies(identity, &frame);
 		let payload_hex = hex_string(req.body.as_bytes());
 		let reply = WorkBody {
 			body: OctetString::new(format!("pong:{payload_hex}:{signature_valid}").into_bytes())?,
 		};
 
-		let unsigned = compose! {
-			V0: id: &frame.metadata.id,
+		let mut signed = compose! {
+			V1: id: frame.metadata().id(),
 				message: reply
 		}?;
 
-		let provider = Secp256k1KeyProvider::from(key.clone());
-		Ok(Some(unsigned.sign_with_provider::<Sha3_256, _>(&provider).await?))
+		let signer = identity.signing_identity().map_err(|_| TightBeamError::MissingConfiguration)?;
+		signed.sign_with_provider(&signer).await?;
+		Ok(Some(signed))
 	}
 }
 
@@ -126,34 +128,17 @@ fn servlet_urn(name: &str) -> Result<Urn<'static>, BoxError> {
 	Ok(ColonyNamespace::default().servlet(name)?)
 }
 
-// The five config builders below have a twin in tests/work_plane.rs. The
+// The four config builders below have a twin in tests/work_plane.rs. The
 // colony feature is dev-only, so no shared module can host these
 // colony-typed helpers. Mirror any edit here in the test twin.
-
-/// The identity's signing key as a key provider for TLS configs.
-fn key_provider(identity: &Identity) -> Result<Arc<Secp256k1KeyProvider>, BoxError> {
-	let key = Secp256k1SigningKey::from_bytes(&identity.signing_key_bytes().into())?;
-	Ok(Arc::new(Secp256k1KeyProvider::from(key)))
-}
-
-/// The identity's certificate as a built certificate spec.
-fn certificate_spec(identity: &Identity) -> CertificateSpec {
-	CertificateSpec::Built(Box::new(identity.certificate().clone()))
-}
 
 /// Gateway config: the provisioned identity for TLS, the same identity as
 /// the hive-plane trust anchor, a loopback TCP colony bind, the public
 /// WebSocket edge on the fixed port, and an eight-stream mux offer shared
 /// with every accepted connection (including the browser).
 fn cluster_conf(identity: &Identity, port: u32) -> Result<ClusterConfig, BoxError> {
-	let tls = ClusterTlsConfig {
-		certificate: certificate_spec(identity),
-		key: key_provider(identity)?,
-		validators: vec![],
-		client_validators: vec![],
-		hive_trust: Some(identity.trust_anchor()?),
-		peer_trust: None,
-	};
+	let tls = ClusterTlsConfig::from_identity(identity.signing_identity()?, KeyPurposes::HOUSE)?;
+	let tls = tls.with_hive_trust(Some(identity.trust_anchor()?));
 
 	let mut conf = ClusterConfig::new(tls);
 	conf.bind_addr = Some("127.0.0.1:0".into());
@@ -165,15 +150,12 @@ fn cluster_conf(identity: &Identity, port: u32) -> Result<ClusterConfig, BoxErro
 /// Hive config: control-plane TLS from the provisioned identity plus the
 /// trust anchor for dialing the gateway and the servlet.
 fn hive_conf(identity: &Identity) -> Result<HiveConfig, BoxError> {
-	let hive_tls = Arc::new(HiveTlsConfig {
-		certificate: certificate_spec(identity),
-		key: key_provider(identity)?,
-		validators: vec![],
-	});
+	let authentication = PeerAuthentication::Anonymous;
+	let hive_tls = HiveTlsConfig::from_identity(identity.signing_identity()?, authentication, KeyPurposes::HOUSE)?;
 
 	let mut conf = HiveConfig {
 		trust_store: Some(identity.trust_anchor()?),
-		hive_tls: Some(hive_tls),
+		hive_tls: Some(Arc::new(hive_tls)),
 		..Default::default()
 	};
 	conf.pool.mux_offer = Some(Arc::new(TransportOffer::mux(8)));
@@ -186,24 +168,26 @@ fn servlet_conf(
 	identity: &Identity,
 ) -> Result<ServletConfig<TokioListener, WorkBody, DefaultCryptoProvider>, BoxError> {
 	Ok(ServletConfig::<TokioListener, WorkBody, DefaultCryptoProvider>::builder()
-		.with_certificate(certificate_spec(identity), key_provider(identity)?, vec![])?
+		.with_identity(identity.signing_identity()?, vec![])
 		.with_mux_offer(Some(TransportOffer::mux(8)))
 		.with_config(Arc::new(()))
 		.build())
 }
 
-/// Load the raw 32-byte end-to-end work signing key named by
+/// Load the end-to-end work identity named by `TBWS_WORK_CERT` and
 /// `TBWS_WORK_KEY`.
-fn load_work_key() -> Result<Secp256k1SigningKey, BoxError> {
-	let path = env::var("TBWS_WORK_KEY").map_err(|_| "TBWS_WORK_KEY is not set")?;
-	let bytes = fs::read(&path)?;
+fn load_work_identity() -> Result<Identity, BoxError> {
+	let cert_path = env::var("TBWS_WORK_CERT").map_err(|_| "TBWS_WORK_CERT is not set")?;
+	let key_path = env::var("TBWS_WORK_KEY").map_err(|_| "TBWS_WORK_KEY is not set")?;
 
+	let certificate = fs::read(&cert_path)?;
+	let bytes = fs::read(&key_path)?;
 	let scalar: [u8; SIGNING_KEY_LEN] = bytes
 		.as_slice()
 		.try_into()
 		.map_err(|_| "work key file must hold exactly 32 bytes")?;
 
-	Ok(Secp256k1SigningKey::from_bytes(&scalar.into())?)
+	Ok(Identity::from_der(&certificate, &scalar)?)
 }
 
 #[tokio::main]
@@ -213,14 +197,16 @@ async fn main() -> Result<(), BoxError> {
 
 	// The handler reads the slot on every work item, so it must be full
 	// before the topology starts serving.
-	let _ = WORK_KEY.set(load_work_key()?);
+	let _ = WORK_IDENTITY.set(load_work_identity()?);
 
 	let trace = TraceCollector::default();
 	let gateway = WorkPlaneGateway::start(Arc::new(trace.share()), cluster_conf(&identity, port)?).await?;
 
-	let servlet = WorkProbeServlet::start(Arc::new(trace.share()), Some(servlet_conf(&identity)?)).await?;
+	let servlet = WorkProbeServlet::start(Arc::new(trace.share()), servlet_conf(&identity)?).await?;
 	let mut hive = WorkProbeHive::new(Some(hive_conf(&identity)?))?;
-	hive.register(servlet_urn("work-probe")?, servlet, |t| WorkProbeServlet::start(t, None))?;
+	hive.register(servlet_urn("work-probe")?, servlet, |t| {
+		WorkProbeServlet::start(t, ServletConfig::cleartext())
+	})?;
 	hive.establish(Arc::new(trace.share())).await?;
 
 	// The colony plane binds loopback with an ephemeral port, so the hive

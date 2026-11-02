@@ -6,16 +6,17 @@
 use core::str::FromStr;
 
 use tokio::net::{TcpListener, TcpStream};
-use tokio_tungstenite::{accept_async, connect_async, MaybeTlsStream};
+use tokio_tungstenite::{accept_async_with_config, connect_async_with_config, MaybeTlsStream};
 
-use tightbeam::crypto::aead::RuntimeAead;
+use tightbeam::crypto::aead::{RecvCipher, SendCipher};
 use tightbeam::crypto::profiles::{CryptoProvider, DefaultCryptoProvider};
 use tightbeam::prelude::TightBeamSocketAddr;
 use tightbeam::transport::{
-	AsyncListenerTrait, EncryptedProtocol, PersistentConnection, Protocol, TransportEncryptionConfig, TransportError,
+	AsyncListenerTrait, EncryptedProtocol, EndpointConfig, PersistentConnection, Protocol, TcpTransport,
+	TransportEncryptionConfig, TransportError, TransportLimits,
 };
 
-use crate::io::{map_ws_error, WsStream, WsTransport};
+use crate::io::{bounded_config, map_ws_error, WsStream, WsTransport};
 
 /// The byte stream shared by both ends of a WebSocket connection.
 type WsInner = MaybeTlsStream<TcpStream>;
@@ -25,16 +26,26 @@ fn io_error(error: std::io::Error) -> TransportError {
 }
 
 /// A tightbeam listener that speaks the protocol over WebSocket connections.
+///
+/// Every accepted transport builds from the one [`EndpointConfig`] the
+/// listener holds, so the listener's provisioning and ceilings reach each
+/// connection.
 pub struct WsListener<P: CryptoProvider = DefaultCryptoProvider> {
 	listener: TcpListener,
-	config: Option<TransportEncryptionConfig<P>>,
+	config: EndpointConfig<P>,
 }
 
 impl<P: CryptoProvider> WsListener<P> {
 	/// Bind a cleartext listener to `addr` (e.g. `127.0.0.1:0`).
-	pub async fn bind(addr: &str) -> crate::Result<Self> {
-		let listener = TcpListener::bind(addr).await?;
-		Ok(Self { listener, config: None })
+	///
+	/// Accepted transports carry no confidentiality, integrity, or peer
+	/// authentication (CWE-319), so the name says it. An encrypted bind goes
+	/// through [`EncryptedProtocol::bind_with`].
+	pub async fn bind_cleartext(addr: impl AsRef<str>) -> crate::Result<Self> {
+		let listener = TcpListener::bind(addr.as_ref()).await?;
+		let config = EndpointConfig::cleartext();
+
+		Ok(Self { listener, config })
 	}
 
 	/// The local address the listener is bound to.
@@ -43,31 +54,32 @@ impl<P: CryptoProvider> WsListener<P> {
 	}
 }
 
-impl<P: CryptoProvider + Send + Sync> WsListener<P> {
-	/// Accept the next connection, applying server encryption when configured.
+impl<P: CryptoProvider + Send + Sync + 'static> WsListener<P> {
+	/// Accept the next connection as a transport built from this listener's
+	/// configuration.
 	///
 	/// Inherent accept used by the `server!` macro loop.
 	/// Yields the raw [`std::net::SocketAddr`] (see also
 	/// [`AsyncListenerTrait::accept`]).
 	pub async fn accept(&self) -> Result<(WsTransport<WsInner, P>, std::net::SocketAddr), TransportError> {
 		let (tcp, addr) = self.listener.accept().await.map_err(io_error)?;
-		let websocket = accept_async(MaybeTlsStream::Plain(tcp)).await.map_err(map_ws_error)?;
-		let mut transport = WsTransport::from(WsStream::new(websocket));
+		let ceilings = bounded_config(self.config.limits());
 
-		if let Some(config) = &self.config {
-			transport = transport.with_server_encryption(config.clone());
-		}
+		let upgraded = accept_async_with_config(MaybeTlsStream::Plain(tcp), Some(ceilings)).await;
+		let websocket = upgraded.map_err(map_ws_error)?;
+		let transport = TcpTransport::new(WsStream::new(websocket), self.config.clone());
 
 		Ok((transport, addr))
 	}
 }
 
-impl<P: CryptoProvider + Send + Sync> Protocol for WsListener<P> {
+impl<P: CryptoProvider + Send + Sync + 'static> Protocol for WsListener<P> {
 	type Listener = WsListener<P>;
 	type Stream = WsStream<WsInner>;
 	type Transport = WsTransport<WsInner, P>;
 	type Error = TransportError;
 	type Address = TightBeamSocketAddr;
+	type CryptoProvider = P;
 
 	fn default_bind_address() -> Result<Self::Address, Self::Error> {
 		let addr = std::net::SocketAddr::from_str("127.0.0.1:0")
@@ -75,27 +87,35 @@ impl<P: CryptoProvider + Send + Sync> Protocol for WsListener<P> {
 		Ok(TightBeamSocketAddr(addr))
 	}
 
-	async fn bind(addr: Self::Address) -> Result<(Self::Listener, Self::Address), Self::Error> {
+	async fn bind_cleartext(addr: Self::Address) -> Result<(Self::Listener, Self::Address), Self::Error> {
 		let listener = TcpListener::bind(addr.0).await.map_err(io_error)?;
 		let bound = listener.local_addr().map_err(io_error)?;
-		Ok((Self { listener, config: None }, TightBeamSocketAddr(bound)))
+		let config = EndpointConfig::cleartext();
+
+		Ok((Self { listener, config }, TightBeamSocketAddr(bound)))
 	}
 
 	async fn connect(addr: Self::Address) -> Result<Self::Stream, Self::Error> {
 		let url = format!("ws://{}/", addr.0);
-		let (websocket, _response) = connect_async(url).await.map_err(map_ws_error)?;
+
+		// The dial runs ahead of the endpoint configuration, so the socket
+		// takes the default ceilings. The transport narrows each read to the
+		// ceiling of its own phase.
+		let ceilings = bounded_config(&TransportLimits::default());
+		let dialed = connect_async_with_config(url, Some(ceilings), false).await;
+		let (websocket, _response) = dialed.map_err(map_ws_error)?;
+
 		Ok(WsStream::new(websocket))
 	}
 
-	fn create_transport(stream: Self::Stream) -> Self::Transport {
-		WsTransport::from(stream)
+	fn create_transport(stream: Self::Stream, config: EndpointConfig<P>) -> Self::Transport {
+		TcpTransport::new(stream, config)
 	}
 }
 
-impl<P: CryptoProvider + Send + Sync> EncryptedProtocol for WsListener<P> {
-	type Encryptor = RuntimeAead;
-	type Decryptor = RuntimeAead;
-	type CryptoProvider = P;
+impl<P: CryptoProvider + Send + Sync + 'static> EncryptedProtocol for WsListener<P> {
+	type Encryptor = SendCipher;
+	type Decryptor = RecvCipher;
 
 	async fn bind_with(
 		addr: Self::Address,
@@ -103,11 +123,13 @@ impl<P: CryptoProvider + Send + Sync> EncryptedProtocol for WsListener<P> {
 	) -> Result<(Self::Listener, Self::Address), Self::Error> {
 		let listener = TcpListener::bind(addr.0).await.map_err(io_error)?;
 		let bound = listener.local_addr().map_err(io_error)?;
-		Ok((Self { listener, config: Some(config) }, TightBeamSocketAddr(bound)))
+		let config = EndpointConfig::try_from(config)?;
+
+		Ok((Self { listener, config }, TightBeamSocketAddr(bound)))
 	}
 }
 
-impl<P: CryptoProvider + Send + Sync> AsyncListenerTrait for WsListener<P> {
+impl<P: CryptoProvider + Send + Sync + 'static> AsyncListenerTrait for WsListener<P> {
 	async fn accept(&self) -> Result<(Self::Transport, Self::Address), Self::Error> {
 		let (transport, addr) = WsListener::accept(self).await?;
 		Ok((transport, TightBeamSocketAddr(addr)))
@@ -117,9 +139,9 @@ impl<P: CryptoProvider + Send + Sync> AsyncListenerTrait for WsListener<P> {
 /// Pooling support: lets WebSocket endpoints sit behind tightbeam's
 /// `ConnectionPool` (and therefore the colony stack), reusing one
 /// encrypted, multiplexed connection across leases.
-impl<P: CryptoProvider + Send + Sync> PersistentConnection for WsListener<P> {
+impl<P: CryptoProvider + Send + Sync + 'static> PersistentConnection for WsListener<P> {
 	fn is_connected(transport: &Self::Transport) -> bool {
-		transport.is_alive()
+		transport.is_leasable()
 	}
 
 	fn try_close(_transport: &mut Self::Transport) {

@@ -6,12 +6,12 @@
 
 [advisories]
 ignore = [
-	# rsa: Marvin Attack timing side-channel. No fixed upgrade available.
-	# Pulled transitively by cms 0.2.3's `builder` feature, which welds in the
-	# RSA KeyTrans recipient path. tightbeam uses only KARI/ECDH key agreement,
-	# so the affected RSA code path is never exercised.
-	"RUSTSEC-2023-0071",
-
 	# paste: crate is archived as there is nothing further to do.
 	"RUSTSEC-2024-0436",
+
+	# crypto-bigint 0.5.5: timing variability in operations meant to run in
+	# constant time. Pulled transitively by elliptic-curve through tightbeam-rs.
+	# The fixed release needs the RustCrypto line built on der 0.8, and cms
+	# still uses der 0.7. tightbeam accepts this advisory in its SECURITY.md.
+	"RUSTSEC-2026-0387",
 ]

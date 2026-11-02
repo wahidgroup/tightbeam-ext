@@ -9,7 +9,7 @@ This crate adds topic membership and publish fan-out on the existing tightbeam m
 - `Topic` validates names as a `/`-separated hierarchy with exact match semantics. Command prefixes are reserved.
 - `TopicRegistry` owns membership and publishing. The registry builds every update frame itself, so stamps never depend on callers. `RegistryOptions::max_subscriptions_per_connection` (default 64) caps live subscriptions per connection.
 - `PubsubCommands` answers the wire commands inside an existing serve handler. Everything else falls through to the application's routes.
-- `serve_connection` performs the per-connection ceremony in one call: drivers, registration, dispatch, and cleanup. `serve_connection_as` attaches an identity. `unrouted` serves command-only.
+- `serve_connection` performs the per-connection ceremony in one call: drivers, keepalive, registration, dispatch, and cleanup. `keep_alive` pings a peer on any other link that must outlive the read deadline of a quiet session. `serve_connection_as` attaches an identity. `unrouted` serves command-only.
 - `SubscribePolicy` and `PublishPolicy` expose `authorize(identity, &Topic)` and own the `PermissionDenied` decision. Default is `AllowAll`.
 - `DeliveryPolicy` defines what a full subscriber queue does: `DropOldest` (default, counted), `DropNew`, or `Disconnect`. A slow client never stalls the topic fan-out.
 - `Backplane` provides sequencing and cross-node distribution. `Local` (in-process, the default) covers one node. See [Scaling out](#scaling-out).
@@ -81,13 +81,13 @@ Sharing one `Local` spans registries in one process. An implementation over Redi
 
 Topic names travel in `Frame.metadata.id` as UTF-8 bytes. Refusals use tightbeam's gRPC-canonical `TransitStatus`.
 
-| Direction         | Frame id        | Meaning                                      | Answer                                                          |
-| ----------------- | --------------- | -------------------------------------------- | --------------------------------------------------------------- |
-| client to server  | `sub/<topic>`   | subscribe                                    | `Ok`, or `PermissionDenied` / `Unavailable` / `ResourceExhausted` / `InvalidArgument` |
-| client to server  | `unsub/<topic>` | unsubscribe (idempotent)                     | `Ok`                                                            |
-| client to server  | `pub/<topic>`   | publish the body payload (opt-in)            | `Ok`, or `PermissionDenied` / `Unavailable` / `InvalidArgument` |
-| server to client  | `<topic>`       | update: payload in body, sequence in `order` | `Ok`, or `ResourceExhausted` / `Unimplemented` (drop-and-count) |
-| server to client  | `end/<topic>`   | completion (quiesce)                         | `Ok`                                                            |
+| Direction        | Frame id        | Meaning                                      | Answer                                                                                |
+| ---------------- | --------------- | -------------------------------------------- | ------------------------------------------------------------------------------------- |
+| client to server | `sub/<topic>`   | subscribe                                    | `Ok`, or `PermissionDenied` / `Unavailable` / `ResourceExhausted` / `InvalidArgument` |
+| client to server | `unsub/<topic>` | unsubscribe (idempotent)                     | `Ok`                                                                                  |
+| client to server | `pub/<topic>`   | publish the body payload (opt-in)            | `Ok`, or `PermissionDenied` / `Unavailable` / `InvalidArgument`                       |
+| server to client | `<topic>`       | update: payload in body, sequence in `order` | `Ok`, or `ResourceExhausted` / `Unimplemented` (drop-and-count)                       |
+| server to client | `end/<topic>`   | completion (quiesce)                         | `Ok`                                                                                  |
 
 Both sides dispatch on the same prefixes. The Rust server, per accepted connection:
 
@@ -106,14 +106,14 @@ The TypeScript client answers the same rows, one route each:
 
 ```ts
 const manager = new SubscriptionManager(client, {
-	// Non-topic server pushes. Unmatched ids answer Unimplemented.
-	fallback: async (update) => handleAppStream(update),
+  // Non-topic server pushes. Unmatched ids answer Unimplemented.
+  fallback: async (update) => handleAppStream(update),
 });
 
 // Registers the topic route, then emits `sub/prices`.
 const prices = await manager.subscribe("prices", { codec: Opaque });
 for await (const { message, frame } of prices) {
-	render(message, frame.order);
+  render(message, frame.order);
 }
 
 await manager.publish("prices", payload, Opaque); // emits `pub/prices`

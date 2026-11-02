@@ -112,8 +112,9 @@ export function connectionClosed(operation: string): TransportError {
  * `code` is the tightbeam-rs error variant name, machine-readable and
  * stable across releases. The codes callers most often branch on:
  *
- * - `ConnectionClosed`: the peer or network ended the connection.
- * - `Draining`: GoAway sent or received. No new streams.
+ * - `ConnectionClosed`: the connection ended. It outranks `Draining`, so a
+ *   finished `shutdown()` reads as closed.
+ * - `Draining`: GoAway sent or received on a live connection. No new streams.
  * - `StreamsExhausted`: the local stream cap is full. Retry after a
  *   response frees a slot.
  *
