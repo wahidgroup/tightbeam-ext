@@ -37,6 +37,12 @@ const SIGNING_KEY = Secp256k1SigningKey.fromBytes(new Uint8Array(32).fill(1));
 const TOPIC_KEY = new Uint8Array(32).fill(7);
 
 /**
+ * The identifier that names {@link TOPIC_KEY} in each sealed envelope,
+ * matching the demo processor's `PROCESSED_TOPIC_KEY_ID`.
+ */
+const TOPIC_KEY_ID = new TextEncoder().encode("pubsub-demo-processed");
+
+/**
  * The demo server's registry is shared by every connection of the whole
  * suite run, so each test isolates itself on its own topic.
  */
@@ -365,7 +371,7 @@ describe("pub/sub round-trips against the dockerized demo server", () => {
 			 * async window an envelope layer opens inside a delivery, so
 			 * unsubscribe can land while the update is in flight.
 			 */
-			const key = Aes256Gcm.fromKey(TOPIC_KEY);
+			const key = Aes256Gcm.fromKey(TOPIC_KEY, TOPIC_KEY_ID);
 			const stalled: BodyDecryptor = {
 				decrypt: async (sealed) => {
 					decrypting = true;
@@ -555,7 +561,7 @@ describe("pub/sub round-trips against the dockerized demo server", () => {
 			 */
 			const secrets = envelope(Opaque)
 				.signed(SIGNING_KEY)
-				.sealed(Aes256Gcm.fromKey(TOPIC_KEY));
+				.sealed(Aes256Gcm.fromKey(TOPIC_KEY, TOPIC_KEY_ID));
 
 			const subscription = await manager.subscribe(topic, {
 				envelope: secrets,

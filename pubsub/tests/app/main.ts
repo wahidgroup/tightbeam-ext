@@ -1,19 +1,19 @@
 /**
- * Live board example app for the pubsub extension.
+ * Browser page that the live and processed board specs drive.
  *
- * Connects over mutual-auth ECIES to the demo server named in the `endpoint`
- * query parameter (pinning `cert`, presenting `clientCert` / `clientKey`,
- * paying the demo session-budget invoice), subscribes to the `topic` query
- * parameter, and renders every update into the DOM as it arrives.
+ * The page connects to a demo server over mutual-auth HPKE, pays the demo
+ * session-budget invoice, and subscribes to one topic. {@link publishEnvelope}
+ * and {@link receiveEnvelope} declare the layers of each direction, and
+ * {@link renderUpdate} adds each update to the board.
  *
- * Every message travels as a full tightbeam frame under a typed
- * {@link Envelope}: the envelope declares the layers once (signed by
- * the publisher, sealed with `seal=1`) and both builds outgoing frames
- * and unwraps received ones, enforcing the declarations. On the
- * processed board (`processed=1`) the backend servlet rebuilds the
- * frame, so receiving declares the servlet's seal and no signature.
- * Each rendered item carries `data-verified` and `data-sealed` badges
- * from the receiving envelope's declarations, which `unwrap` proved.
+ * # Query parameters
+ *
+ * - `endpoint`: the demo server to connect to.
+ * - `topic`: the topic to subscribe to and publish on.
+ * - `cert`: the server certificate to pin, in base64.
+ * - `clientCert`, `clientKey`: the client identity to present, in base64.
+ * - `seal=1`: seal notes under {@link TOPIC_KEY}.
+ * - `processed=1`: receive the frames that the backend servlet rebuilds.
  */
 
 import type {
@@ -41,6 +41,12 @@ const DECODER = new TextDecoder();
  * under (`processed=1`).
  */
 const TOPIC_KEY = new Uint8Array(32).fill(7);
+
+/**
+ * The identifier that names {@link TOPIC_KEY} in each sealed envelope,
+ * matching the demo processor's `PROCESSED_TOPIC_KEY_ID`.
+ */
+const TOPIC_KEY_ID = new TextEncoder().encode("pubsub-demo-processed");
 
 /**
  * The typed message every note board publishes.
@@ -125,7 +131,7 @@ function publishEnvelope(
 ): Envelope<Note> {
 	const signed = envelope(Notes).signed(publisherKey);
 	if (seal) {
-		return signed.sealed(Aes256Gcm.fromKey(TOPIC_KEY));
+		return signed.sealed(Aes256Gcm.fromKey(TOPIC_KEY, TOPIC_KEY_ID));
 	}
 
 	return signed;
@@ -142,7 +148,9 @@ function receiveEnvelope(
 	publisherKey: Secp256k1SigningKey,
 ): Envelope<Note> {
 	if (processed) {
-		return envelope(Notes).sealed(Aes256Gcm.fromKey(TOPIC_KEY));
+		return envelope(Notes).sealed(
+			Aes256Gcm.fromKey(TOPIC_KEY, TOPIC_KEY_ID),
+		);
 	}
 
 	return publishEnvelope(seal, publisherKey);

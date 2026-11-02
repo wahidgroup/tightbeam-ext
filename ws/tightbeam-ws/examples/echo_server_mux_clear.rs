@@ -1,16 +1,12 @@
 //! Multiplexed cleartext echo server for the tightbeam WebSocket transport.
 //!
-//! Splits each connection into exclusive cleartext halves and serves concurrent
-//! client streams with the shared echo handler. Cleartext multiplexing has no
-//! handshake negotiation: both endpoints MUST configure the same symmetric
-//! concurrency cap, or their enforcement diverges. The connection carries NO
-//! confidentiality or integrity protection.
+//! The server serves each client stream with the handler that `TBWS_ECHO_BODY`
+//! selects. In the `streaming` and `unary` modes, a frame id can select a
+//! command in place of the echo, as [`echo_stream`] lists.
 //!
-//! Two-way behavior: a request whose frame id starts with `call-me` makes the
-//! server initiate its own stream back to the client carrying the same frame.
-//! The client's answer becomes the response on the original stream. A `sink`
-//! id accepts without a response frame, a `drain-calm` id drains the session.
-//! Everything else echoes.
+//! Both endpoints MUST configure the same concurrency cap, because no handshake
+//! negotiates it. The connection carries NO confidentiality or integrity
+//! protection.
 //!
 //! Environment:
 //!   - `ECHO_WS_PORT`     listen port (default `9101`)
@@ -34,7 +30,7 @@ type ServerTransport = WsTransport<MaybeTlsStream<TcpStream>>;
 
 /// Serve one multiplexed cleartext connection until it ends.
 async fn serve_connection(transport: ServerTransport, cap: u32) -> Result<(), BoxError> {
-	let (reader, writer) = transport.into_split_cleartext()?;
+	let (reader, writer) = transport.into_split()?;
 
 	let mux = MuxTransport::new(reader, writer, MuxRole::Server, MuxSettings::symmetric(cap));
 	let (handle, reader_driver, writer_driver, responder) = mux.into_parts();
@@ -61,7 +57,7 @@ async fn main() -> Result<(), BoxError> {
 	let cap = env_u32("MUX_STREAMS", 8);
 	let addr = format!("0.0.0.0:{port}");
 
-	let listener = WsListener::bind(&addr).await?;
+	let listener = WsListener::bind_cleartext(&addr).await?;
 	println!("[echo-mux-clear] multiplexed cleartext tightbeam-ws echo server listening on ws://{addr}");
 
 	loop {

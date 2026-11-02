@@ -1,12 +1,12 @@
 //! Encrypted transport assembly for the browser WebSocket client.
 //! Compiled only for `wasm32` targets.
 //!
-//! Builds tightbeam's transport-level ECIES machinery over a `gloo`
+//! Builds tightbeam's transport-level HPKE machinery over a `gloo`
 //! WebSocket ([`GlooStream`]) for the multiplexed client (`MuxWsClient`).
 //!
 //! The session profile is a compile-time choice, exactly as with a native
 //! tightbeam-rs transport: [`build_transport_with`] assembles the transport
-//! for any [`CryptoProvider`] monomorphization, while the shipped bindings
+//! for any [`HandshakeProvider`] monomorphization, while the shipped bindings
 //! instantiate the tightbeam default profile.
 
 use std::sync::Arc;
@@ -14,18 +14,21 @@ use std::sync::Arc;
 use gloo_net::websocket::futures::WebSocket;
 use wasm_bindgen::prelude::*;
 
-use tightbeam::crypto::hash::Sha3_256;
+use tightbeam::crypto::key::Secp256k1KeyProvider;
 use tightbeam::crypto::policy::Secp256k1Policy;
-use tightbeam::crypto::profiles::{CryptoProvider, DefaultCryptoProvider};
+use tightbeam::crypto::profiles::DefaultCryptoProvider;
 use tightbeam::crypto::sign::ecdsa::Secp256k1SigningKey;
-use tightbeam::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, TrustBuilder};
+use tightbeam::crypto::sign::SigningIdentity;
+use tightbeam::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, NoRevocation, TrustBuilder};
+use tightbeam::crypto::x509::KeyCurves;
 use tightbeam::der::{Decode, Encode};
-use tightbeam::transport::handshake::HandshakeKeyManager;
-use tightbeam::transport::X509ClientConfig;
+use tightbeam::transport::handshake::HandshakeProvider;
 use tightbeam::x509::Certificate;
 use tightbeam::Frame;
 
-use crate::fault::{to_js, validation};
+use crate::clock::BrowserClock;
+use crate::fault::{to_js, transport_to_js, validation};
+use crate::protocol::BrowserSocket;
 use crate::signer::{JsSigningKeyProvider, TransportSigner};
 use crate::socket::{open_observed, SocketMonitor};
 use crate::stream::{GlooStream, WsTransport};
@@ -44,45 +47,14 @@ pub(crate) struct ClientIdentity<'a> {
 	pub(crate) signing_key: &'a [u8],
 }
 
-/// Client identity material decoded for the target provider, presented to
-/// the server for mutual authentication.
-pub struct ClientCredentials<P: CryptoProvider> {
-	/// The certificate presented to the server.
-	pub certificate: Arc<Certificate>,
-	/// The signing capability proving possession of the certificate key.
-	pub key_manager: Arc<HandshakeKeyManager<P>>,
-}
-
-impl<P> ClientCredentials<P>
-where
-	P: CryptoProvider + Send + Sync + 'static,
-{
-	/// Decode a certificate plus external signer into credentials for any
-	/// compile-time crypto provider: the key stays in JavaScript, only OIDs
-	/// and signature bytes cross the boundary.
-	///
-	/// The signer's output MUST verify under `P`'s signature algorithm.
-	/// Custom-profile builds pair this with [`build_transport_with`].
-	pub fn from_signer(cert_der: &[u8], signer: TransportSigner) -> Result<Self, JsValue> {
-		let certificate = Certificate::from_der(cert_der).map_err(to_js)?;
-		let cert_spki = certificate.tbs_certificate.subject_public_key_info.to_der().map_err(to_js)?;
-		let provider = JsSigningKeyProvider::new(signer, &cert_spki)?.into_provider();
-		let key_manager = HandshakeKeyManager::new(provider);
-
-		let credentials = Self { certificate: Arc::new(certificate), key_manager: Arc::new(key_manager) };
-		Ok(credentials)
-	}
-}
-
 /// Build the tightbeam-profile trust store: a single anchor pinning
-/// `server_cert_der`, validated under SHA3-256 digests and the secp256k1
-/// certificate policy (matching [`DefaultCryptoProvider`]).
+/// `server_cert_der`, validated under the secp256k1 certificate policy
+/// (matching [`DefaultCryptoProvider`]) on the host's clock.
 pub fn profile_trust_store(server_cert_der: &[u8]) -> Result<Arc<dyn CertificateTrust>, JsValue> {
 	let server_cert = Certificate::from_der(server_cert_der).map_err(to_js)?;
-	let store = CertificateTrustBuilder::<Sha3_256>::from(Secp256k1Policy)
-		.with_certificate(server_cert)
-		.map_err(to_js)?
-		.build();
+	let builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation)
+		.with_clock(Arc::new(BrowserClock));
+	let store = builder.with_certificate(server_cert).map_err(to_js)?.build();
 
 	let trust_store: Arc<dyn CertificateTrust> = Arc::new(store);
 	Ok(trust_store)
@@ -90,7 +62,7 @@ pub fn profile_trust_store(server_cert_der: &[u8]) -> Result<Arc<dyn Certificate
 
 /// Assemble an encrypted transport for any compile-time crypto provider
 /// over an already-opened `socket`: attach the trust store, and optionally
-/// present client credentials for mutual authentication.
+/// present `identity` for mutual authentication.
 ///
 /// The provider is chosen by the caller's monomorphization. The trust store
 /// MUST validate under the same algorithms or every handshake fails. Custom
@@ -100,32 +72,31 @@ pub fn profile_trust_store(server_cert_der: &[u8]) -> Result<Arc<dyn Certificate
 pub fn build_transport_with<P>(
 	socket: WebSocket,
 	trust_store: Arc<dyn CertificateTrust>,
-	credentials: Option<ClientCredentials<P>>,
-) -> WsTransport<P>
+	identity: Option<SigningIdentity>,
+) -> Result<WsTransport<P>, JsValue>
 where
-	P: CryptoProvider + Send + Sync,
+	P: HandshakeProvider,
 {
-	let stream = GlooStream::from(socket);
-	let mut transport = WsTransport::<P>::from(stream).with_trust_store(trust_store);
-	if let Some(credentials) = credentials {
-		transport = transport.with_client_identity(credentials.certificate, credentials.key_manager);
-	}
-
-	transport
+	BrowserSocket::pinned(GlooStream::from(socket), trust_store, identity).map_err(transport_to_js)
 }
 
-/// Decode profile identity bytes into credentials for the default provider.
+/// A cleartext transport over `socket`, on the host's clock. It carries no
+/// confidentiality, integrity, or peer authentication.
+pub(crate) fn cleartext_transport(socket: WebSocket) -> Result<WsTransport, JsValue> {
+	BrowserSocket::cleartext(GlooStream::from(socket)).map_err(transport_to_js)
+}
+
+/// Decode profile identity bytes into the identity of the default provider.
 ///
 /// The `Arc` satisfies tightbeam's shared-ownership API. Wasm is
 /// single-threaded, so the missing `Send + Sync` never matters.
 #[allow(clippy::arc_with_non_send_sync)]
-fn profile_credentials(identity: ClientIdentity<'_>) -> Result<ClientCredentials<DefaultCryptoProvider>, JsValue> {
-	let certificate = Arc::new(Certificate::from_der(identity.cert_der).map_err(to_js)?);
+fn profile_identity(identity: ClientIdentity<'_>) -> Result<SigningIdentity, JsValue> {
+	let certificate = Certificate::from_der(identity.cert_der).map_err(to_js)?;
 	let signing_key = signing_key_from_bytes(identity.signing_key)?;
-	let key_manager = Arc::new(HandshakeKeyManager::from(signing_key));
+	let provider = Arc::new(Secp256k1KeyProvider::from(signing_key));
 
-	let credentials = ClientCredentials { certificate, key_manager };
-	Ok(credentials)
+	SigningIdentity::new(certificate, provider).map_err(to_js)
 }
 
 /// Assemble the default-profile encrypted transport from raw DER inputs,
@@ -136,13 +107,13 @@ pub(crate) fn build_transport(
 	identity: Option<ClientIdentity<'_>>,
 ) -> Result<(WsTransport, SocketMonitor), JsValue> {
 	let trust_store = profile_trust_store(server_cert_der)?;
-	let credentials = match identity {
-		Some(identity) => Some(profile_credentials(identity)?),
+	let identity = match identity {
+		Some(identity) => Some(profile_identity(identity)?),
 		None => None,
 	};
 
 	let observed = open_observed(url)?;
-	let transport = build_transport_with(observed.socket, trust_store, credentials);
+	let transport = build_transport_with(observed.socket, trust_store, identity)?;
 	Ok((transport, observed.monitor))
 }
 
@@ -155,10 +126,10 @@ pub(crate) fn build_signer_transport(
 	signer: TransportSigner,
 ) -> Result<(WsTransport, SocketMonitor), JsValue> {
 	let trust_store = profile_trust_store(server_cert_der)?;
-	let credentials = ClientCredentials::<DefaultCryptoProvider>::from_signer(client_cert_der, signer)?;
+	let identity = JsSigningKeyProvider::identity::<DefaultCryptoProvider>(signer, client_cert_der)?;
 
 	let observed = open_observed(url)?;
-	let transport = build_transport_with(observed.socket, trust_store, Some(credentials));
+	let transport = build_transport_with(observed.socket, trust_store, Some(identity))?;
 	Ok((transport, observed.monitor))
 }
 

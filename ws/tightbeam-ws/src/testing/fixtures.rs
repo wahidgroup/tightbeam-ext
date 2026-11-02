@@ -12,14 +12,14 @@ use std::time::Duration;
 use std::{env, fs};
 
 use tightbeam::cert;
+use tightbeam::crypto::key::Secp256k1KeyProvider;
 use tightbeam::crypto::profiles::DefaultCryptoProvider;
 use tightbeam::crypto::sign::ecdsa::{Secp256k1SigningKey, Secp256k1VerifyingKey};
-use tightbeam::crypto::sign::Sha3Signer;
+use tightbeam::crypto::sign::{Sha3Signer, SigningIdentity};
 use tightbeam::crypto::x509::store::CertificateTrust;
 use tightbeam::der::{Decode, Encode};
 use tightbeam::random::OsRng;
 use tightbeam::spki::SubjectPublicKeyInfoOwned;
-use tightbeam::transport::handshake::HandshakeKeyManager;
 use tightbeam::transport::TransportEncryptionConfig;
 use tightbeam::x509::Certificate;
 use tightbeam::TightBeamError;
@@ -35,17 +35,22 @@ const SERVER_CERT_ENV: &str = "TBWS_SERVER_CERT";
 /// Environment variable naming the raw 32-byte server signing key file.
 const SERVER_KEY_ENV: &str = "TBWS_SERVER_KEY";
 
-/// A self-signed X.509 identity: a certificate paired with its secp256k1
-/// signing key.
+/// A self-signed X.509 identity: an end-entity certificate paired with its
+/// secp256k1 signing key.
+///
+/// The certificate asserts `digitalSignature`, which a handshake and a frame
+/// signature read, and it names no `extendedKeyUsage`, so it serves the
+/// server, client, and signer roles alike. A CA certificate asserts only
+/// `keyCertSign`, and the signing use refuses it.
 pub struct Identity {
 	certificate: Certificate,
 	signing_key: Secp256k1SigningKey,
 }
 
 impl Identity {
-	/// Issue a fresh self-signed root identity valid for `validity` from now.
-	pub fn mint_root(subject: &str, serial: u32, validity: Duration) -> Result<Self> {
-		Ok(mint_root(subject, serial, validity)?)
+	/// Issue a fresh self-signed identity valid for `validity` from now.
+	pub fn mint(subject: &str, serial: u32, validity: Duration) -> Result<Self> {
+		Ok(mint(subject, serial, validity)?)
 	}
 
 	/// Reconstruct an identity from a DER certificate and a raw 32-byte key,
@@ -83,19 +88,19 @@ impl Identity {
 		self.signing_key.to_bytes().into()
 	}
 
-	/// Build the server-side transport encryption config that presents this
-	/// identity during the ECIES handshake.
-	pub fn server_config(&self) -> TransportEncryptionConfig<DefaultCryptoProvider> {
-		let key_manager = HandshakeKeyManager::from(self.signing_key.clone());
-		TransportEncryptionConfig::new(self.certificate.clone(), key_manager)
+	/// This identity as the certificate and key provider a handshake and a
+	/// frame signature take, for a server's reply and a mutual client's
+	/// Finished alike.
+	pub fn signing_identity(&self) -> Result<SigningIdentity> {
+		let key = Arc::new(Secp256k1KeyProvider::from(self.signing_key.clone()));
+		let identity = SigningIdentity::new(self.certificate.clone(), key).map_err(TightBeamError::from)?;
+		Ok(identity)
 	}
 
-	/// Client materials for mutual-auth dials that reuse this identity
-	/// (demo relay under paywall).
-	pub fn client_identity(&self) -> (Arc<Certificate>, Arc<HandshakeKeyManager<DefaultCryptoProvider>>) {
-		let certificate = Arc::new(self.certificate.clone());
-		let key_manager = Arc::new(HandshakeKeyManager::from(self.signing_key.clone()));
-		(certificate, key_manager)
+	/// Build the server-side transport encryption config that presents this
+	/// identity during the HPKE handshake.
+	pub fn server_config(&self) -> Result<TransportEncryptionConfig<DefaultCryptoProvider>> {
+		Ok(TransportEncryptionConfig::new(self.signing_identity()?))
 	}
 
 	/// Build a single-anchor trust store pinning this identity's certificate,
@@ -110,19 +115,20 @@ fn required_path(name: &str) -> core::result::Result<String, IoError> {
 	env::var(name).map_err(|_| IoError::new(ErrorKind::NotFound, format!("{name} is not set")))
 }
 
-fn mint_root(subject: &str, serial: u32, validity: Duration) -> core::result::Result<Identity, TightBeamError> {
+fn mint(subject: &str, serial: u32, validity: Duration) -> core::result::Result<Identity, TightBeamError> {
 	let signing_key = Secp256k1SigningKey::random(&mut OsRng);
 	let verifying_key = Secp256k1VerifyingKey::from(&signing_key);
 	let spki = SubjectPublicKeyInfoOwned::from_key(verifying_key)?;
 	let signer = Sha3Signer::from(&signing_key);
 
 	let certificate = cert!(
-		profile: Root,
+		profile: Leaf,
 		subject: subject,
+		issuer: subject,
 		serial: serial,
 		duration: validity,
-		signer: &signer,
-		subject_public_key: spki
+		subject_public_key: spki,
+		signer: &signer
 	)?;
 
 	Ok(Identity { certificate, signing_key })

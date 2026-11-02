@@ -9,11 +9,12 @@ use std::env;
 use std::sync::Arc;
 
 use tightbeam::der::asn1::OctetString;
+use tightbeam::marker::MaybeSendFuture;
 use tightbeam::transport::handshake::negotiation::{
 	AuthorizationGrant, AuthorizationRefusal, MuxBudgets, TransportAuthorizer, TransportOffer,
 };
 use tightbeam::transport::handshake::receipt::{ApprovalRefusal, ReceiptApprover, SessionReceipt};
-use tightbeam::utils::marker::MaybeSendFuture;
+use tightbeam::x509::Certificate;
 use tightbeam::TightBeamError;
 
 /// Invoice bytes embedded in every grant and renewal challenge.
@@ -112,6 +113,7 @@ impl TransportAuthorizer for DemoPaywall {
 		&'a self,
 		_receipt: &'a SessionReceipt,
 		response: Option<&'a [u8]>,
+		_client: &'a Certificate,
 	) -> MaybeSendFuture<'a, Result<(), AuthorizationRefusal>> {
 		Box::pin(async move {
 			if response == Some(self.expected_payment.as_bytes()) {
@@ -172,6 +174,7 @@ mod tests {
 	use tightbeam::asn1::DigestInfo;
 	use tightbeam::oids::HASH_SHA3_256;
 	use tightbeam::spki::AlgorithmIdentifier;
+	use tightbeam::testing::{TestCertificate, TestKey};
 	use tightbeam::transport::handshake::negotiation::TransportOffer;
 
 	#[tokio::test]
@@ -181,8 +184,8 @@ mod tests {
 			expected_payment: OctetString::new(DEMO_PAYMENT).expect("payment"),
 			ceiling: MuxBudgets { client_to_server: 100, server_to_client: 200 },
 		};
-		let offer = TransportOffer::mux(8).with_budgets(MuxBudgets { client_to_server: 10_000, server_to_client: 50 });
 
+		let offer = TransportOffer::mux(8).with_budgets(MuxBudgets { client_to_server: 10_000, server_to_client: 50 });
 		let grant = paywall.authorize(&offer).await.expect("grant");
 		assert_eq!(grant.budgets, Some(MuxBudgets { client_to_server: 100, server_to_client: 50 }));
 	}
@@ -191,8 +194,11 @@ mod tests {
 	async fn settle_accepts_only_demo_payment() {
 		let paywall = DemoPaywall::open().expect("paywall");
 		let receipt = stub_receipt();
-		paywall.settle(&receipt, Some(DEMO_PAYMENT)).await.expect("paid");
-		let refused = paywall.settle(&receipt, Some(b"wrong")).await;
+		let client = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+
+		paywall.settle(&receipt, Some(DEMO_PAYMENT), &client).await.expect("paid");
+
+		let refused = paywall.settle(&receipt, Some(b"wrong"), &client).await;
 		assert!(matches!(refused, Err(AuthorizationRefusal { code: DEMO_INVOICE_REFUSAL })));
 	}
 

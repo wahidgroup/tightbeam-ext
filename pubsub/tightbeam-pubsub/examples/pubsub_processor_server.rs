@@ -1,18 +1,13 @@
 //! Backend payload processor servlet for the processed-board demo.
 //!
-//! Runs only as a backend process: browsers never reach it. The demo
-//! server's `RelayBackplane` dials it over a multiplexed encrypted
-//! tightbeam-ws connection and relays every publish through it. The
-//! servlet answers each request with the transformed inner frame,
-//! which is what the registry then sequences and fans out.
+//! The demo server's `RelayBackplane` dials this servlet over a multiplexed
+//! encrypted tightbeam-ws connection and relays each publish through it. The
+//! registry then sequences and fans out the inner frame in each answer.
 //!
-//! Each relayed payload is a full tightbeam frame (the frame-in-frame
-//! pattern) whose body is a JSON note. The servlet lifts the inner
-//! frame, uppercases the note's `text`, and rebuilds an unsigned inner
-//! frame around the transformed note: mid-stream transformation and the
-//! publisher's signature are mutually exclusive by design. The rebuilt
-//! body is sealed under the demo's pre-shared AES-256-GCM key, so the
-//! server encrypts messages back to subscribers holding the key.
+//! Each relayed payload is an inner tightbeam frame whose body is a JSON note.
+//! [`transformed`] uppercases the note's `text` and rebuilds the frame, sealed
+//! under [`PROCESSED_TOPIC_KEY`]. The rebuilt frame is unsigned, because the
+//! changed note invalidates the publisher's signature.
 //!
 //! Environment:
 //!   - `TBWS_SERVER_CERT`       path to the server certificate DER
@@ -52,10 +47,13 @@ type BoxError = Box<dyn Error + Send + Sync>;
 /// The transport an accepted WebSocket connection follows.
 type ServerTransport = WsTransport<MaybeTlsStream<TcpStream>>;
 
-/// The demo's pre-shared, deterministic AES-256-GCM key. Subscribers
-/// declare it in their envelope (`sealed(Aes256Gcm.fromKey(...))`). A
+/// The demo's pre-shared, deterministic key-encryption key. Subscribers
+/// declare it in their envelope (`sealed(Aes256Gcm.fromKey(key, keyId))`). A
 /// production servlet would provision per-topic keys instead.
 const PROCESSED_TOPIC_KEY: [u8; 32] = [0x07; 32];
+
+/// The `kekid` that names [`PROCESSED_TOPIC_KEY`] in each sealed envelope.
+const PROCESSED_TOPIC_KEY_ID: &[u8] = b"pubsub-demo-processed";
 
 /// Uppercase the `text` of the JSON note carried by the inner frame in
 /// `payload`, and return the DER of a rebuilt (unsigned) inner frame
@@ -71,8 +69,10 @@ fn transformed(payload: &[u8]) -> Result<Vec<u8>, BoxError> {
 
 	object.insert("text".to_owned(), Value::String(uppercased));
 
-	let id = String::from_utf8_lossy(&inner.metadata.id).into_owned();
-	let rebuilt = sealed_command_frame(&id, inner.metadata.order, &serde_json::to_vec(&note)?, &PROCESSED_TOPIC_KEY)?;
+	let id = String::from_utf8_lossy(inner.metadata().id()).into_owned();
+	let order = inner.metadata().order();
+	let note = serde_json::to_vec(&note)?;
+	let rebuilt = sealed_command_frame(&id, order, &note, &PROCESSED_TOPIC_KEY, PROCESSED_TOPIC_KEY_ID)?;
 	Ok(rebuilt.to_der()?)
 }
 
@@ -90,8 +90,8 @@ async fn process_stream(frame: Arc<Frame>) -> ResponsePackage {
 		}
 	};
 
-	let id = String::from_utf8_lossy(&frame.metadata.id).into_owned();
-	match command_frame(&id, frame.metadata.order, &processed) {
+	let id = String::from_utf8_lossy(frame.metadata().id()).into_owned();
+	match command_frame(&id, frame.metadata().order(), &processed) {
 		Ok(answer) => ResponsePackage::new(TransitStatus::Ok, Some(answer)),
 		Err(error) => {
 			eprintln!("[pubsub-processor] answer build failed: {error}");
@@ -147,7 +147,7 @@ async fn main() -> Result<(), BoxError> {
 	let paywall = paywall_enabled();
 
 	let identity = Identity::from_env()?;
-	let mut config = identity.server_config();
+	let mut config = identity.server_config()?;
 	if paywall {
 		let client_cert =
 			env::var("TBWS_CLIENT_CERT").map_err(|_| "TBWS_PAYWALL requires TBWS_CLIENT_CERT (mutual auth)")?;

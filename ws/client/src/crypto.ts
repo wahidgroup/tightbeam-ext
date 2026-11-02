@@ -4,8 +4,8 @@
 
 import {
 	Aes256Gcm as WasmAes256Gcm,
-	EciesSecp256k1Decryptor as WasmEciesDecryptor,
-	EciesSecp256k1Encryptor as WasmEciesEncryptor,
+	HpkeSecp256k1Decryptor as WasmHpkeDecryptor,
+	HpkeSecp256k1Encryptor as WasmHpkeEncryptor,
 	Secp256k1SigningKey as WasmSecp256k1SigningKey,
 	Secp256k1VerifyingKey as WasmSecp256k1VerifyingKey,
 	Sha3_256 as WasmSha3_256,
@@ -25,6 +25,8 @@ import { ValidationError } from "./builder/errors.js";
  *   {@link https://datatracker.ietf.org/doc/html/rfc8878 RFC 8878}
  * - RFC 3274, Compressed Data Content Type:
  *   {@link https://datatracker.ietf.org/doc/html/rfc3274 RFC 3274}
+ * - RFC 9629, Using Key Encapsulation Mechanism (KEM) Algorithms in CMS:
+ *   {@link https://datatracker.ietf.org/doc/html/rfc9629 RFC 9629}
  */
 export const PROFILE_OIDS = {
 	/**
@@ -40,9 +42,9 @@ export const PROFILE_OIDS = {
 	 */
 	aes256Gcm: "2.16.840.1.101.3.4.1.46",
 	/**
-	 * ECIES over secp256k1 (HKDF-SHA3-256 + AES-256-GCM).
+	 * DHKEM over secp256k1, the profile recipient KEM.
 	 */
-	eciesSecp256k1: "1.3.132.1.12.0",
+	dhkemSecp256k1: "1.3.6.1.4.1.64586.2.3",
 	/**
 	 * Zstandard, the profile compression.
 	 */
@@ -52,10 +54,10 @@ export const PROFILE_OIDS = {
 	 */
 	zlib: "1.2.840.113549.1.9.16.3.8",
 	/**
-	 * id-ct-compressedData (RFC 3274): the content type recorded in the
-	 * compactness info when the compressor names none.
+	 * id-data (RFC 5652): the content type recorded in the compactness info
+	 * and in an envelope when the caller names none.
 	 */
-	compressedContent: "1.2.840.113549.1.9.16.1.9",
+	data: "1.2.840.113549.1.7.1",
 } as const;
 
 /**
@@ -74,20 +76,26 @@ export interface Hasher {
 }
 
 /**
- * A sealed frame body: the pieces recorded in the frame's confidentiality
- * info alongside the ciphertext that replaces the body.
+ * A sealed frame body: the CMS envelope recorded in the frame's
+ * confidentiality info, and the ciphertext that replaces the body. The
+ * ciphertext travels detached from the envelope (RFC 5652 § 6.1).
+ *
+ * # Sources
+ *
+ * - RFC 5083, CMS Authenticated-Enveloped-Data Content Type:
+ *   {@link https://datatracker.ietf.org/doc/html/rfc5083 RFC 5083}
  */
 export interface EncryptedBody {
 	/**
-	 * The dotted OID of the encryption algorithm.
+	 * The dotted OID of the content-encryption algorithm.
 	 */
 	readonly algorithmOid: string;
 
 	/**
-	 * The DER-encoded algorithm parameters (e.g. the nonce), when the
-	 * scheme has any.
+	 * The DER `AuthEnvelopedData`: the recipient, the content type, the
+	 * nonce, and the tag, with its content detached.
 	 */
-	readonly parametersDer?: Uint8Array;
+	readonly envelopeDer: Uint8Array;
 
 	/**
 	 * The ciphertext.
@@ -101,10 +109,12 @@ export interface EncryptedBody {
  */
 export interface BodyEncryptor {
 	/**
-	 * Seal `bodyDer`, resolving with the algorithm OID, its parameters,
-	 * and the ciphertext.
+	 * Seal `bodyDer`, resolving with its envelope and ciphertext.
+	 *
+	 * @param contentOid - Dotted content-type OID the envelope authenticates,
+	 * or `id-data` when omitted.
 	 */
-	encrypt(bodyDer: Uint8Array): Promise<EncryptedBody>;
+	encrypt(bodyDer: Uint8Array, contentOid?: string): Promise<EncryptedBody>;
 }
 
 /**
@@ -130,9 +140,15 @@ export interface VerifiableFrame {
 	toDer(): Uint8Array;
 
 	/**
-	 * To-be-signed octets for external verifiers.
+	 * To-be-signed octets.
 	 */
 	tbs(): Uint8Array;
+
+	/**
+	 * The digest the frame's signature verifies over: the digest of its CMS
+	 * signed attributes, which bind {@link tbs}.
+	 */
+	signaturePrehash(): Uint8Array;
 
 	/**
 	 * Carried signature metadata, when present.
@@ -158,19 +174,24 @@ export interface FrameVerifier {
 }
 
 /**
- * A frame signer. Anything that can produce a signature over the to-be-signed
- * bytes qualifies - a local {@link Secp256k1SigningKey}, wallets, passkeys,
- * HSMs, remote KMS backends. An external signer's private key never enters
- * wasm memory.
+ * A frame signer. Anything that can sign a digest under the profile signature
+ * qualifies - a local {@link Secp256k1SigningKey}, wallets, passkeys, HSMs,
+ * remote KMS backends. An external signer's private key never enters wasm
+ * memory.
+ *
+ * A frame carries a CMS `SignerInfo`, whose form the wasm profile fixes, so a
+ * signer signs ECDSA over secp256k1 with SHA3-256.
  */
 export interface Signatory {
 	/**
-	 * The dotted OID of the signature algorithm this signer implements.
+	 * The dotted OID of the signature algorithm this signer implements. The
+	 * codec refuses any OID but `PROFILE_OIDS.ecdsaWithSha3_256`.
 	 */
 	readonly signatureAlgorithmOid: string;
 
 	/**
-	 * The dotted OID of the digest the signature is computed over.
+	 * The dotted OID of the digest the signature algorithm names. The codec
+	 * refuses any OID but `PROFILE_OIDS.sha3_256`.
 	 */
 	readonly digestAlgorithmOid: string;
 
@@ -182,14 +203,19 @@ export interface Signatory {
 	readonly verifier?: FrameVerifier;
 
 	/**
-	 * The subject-key-identifier octets naming this signer in the frame.
+	 * The subject-key-identifier octets naming this signer's certificate in
+	 * the frame (RFC 7093 § 2 method 1 for a profile key).
 	 */
 	signerId(): Uint8Array;
 
 	/**
-	 * Sign the to-be-signed bytes, resolving with the raw signature octets.
+	 * Sign `prehash` directly, with no rehash, resolving with a DER
+	 * `ECDSA-Sig-Value` (RFC 3279 § 2.2.3).
+	 *
+	 * The prehash is the digest of the frame's CMS signed attributes, which
+	 * bind its to-be-signed bytes (RFC 5652 § 5.4).
 	 */
-	sign(tbs: Uint8Array): Promise<Uint8Array>;
+	signPrehash(prehash: Uint8Array): Promise<Uint8Array>;
 }
 
 /**
@@ -230,14 +256,14 @@ function requireAlgorithm(sealed: EncryptedBody, expectedOid: string): void {
  */
 function takeSealedBody(sealed: {
 	algorithmOid: string;
-	parametersDer?: Uint8Array;
+	envelopeDer: Uint8Array;
 	ciphertext: Uint8Array;
 	free(): void;
 }): EncryptedBody {
 	try {
 		const encryptedBody = {
 			algorithmOid: sealed.algorithmOid,
-			parametersDer: sealed.parametersDer,
+			envelopeDer: sealed.envelopeDer,
 			ciphertext: sealed.ciphertext,
 		};
 		return encryptedBody;
@@ -375,41 +401,53 @@ export class Secp256k1SigningKey implements Signatory {
 	}
 
 	/**
-	 * Sign the SHA3-256 digest of `tbs` in the wasm module, resolving with
-	 * the raw 64-byte `r || s` signature.
+	 * Sign `prehash` in the wasm module, with no rehash, resolving with a
+	 * DER `ECDSA-Sig-Value`.
 	 */
-	sign(tbs: Uint8Array): Promise<Uint8Array> {
-		const signature = this.inner.signTbs(tbs);
+	signPrehash(prehash: Uint8Array): Promise<Uint8Array> {
+		const signature = this.inner.signPrehash(prehash);
 		const result = Promise.resolve(signature);
 		return result;
 	}
 }
 
 /**
- * The profile symmetric {@link BodyEncryptor} and {@link BodyDecryptor}:
- * AES-256-GCM under a 32-byte shared key. The shared key both seals and
- * opens.
+ * The profile symmetric {@link BodyEncryptor} and {@link BodyDecryptor}: a
+ * 32-byte shared key-encryption key that wraps a fresh AES-256-GCM content
+ * key per seal (RFC 5652 § 6.2.3). The shared key both seals and opens, and
+ * every holder names it by one `keyId`.
  */
 export class Aes256Gcm implements BodyEncryptor, BodyDecryptor {
 	private constructor(private readonly inner: WasmAes256Gcm) {}
 
 	/**
-	 * Wrap a raw 32-byte key.
+	 * Wrap a raw 32-byte key and the identifier that names it.
 	 *
-	 * @throws ValidationError when the key length is wrong.
+	 * An envelope carries `keyId` in the clear, and an open refuses an
+	 * envelope that names another key.
+	 *
+	 * @throws ValidationError when the key length is wrong or `keyId` is
+	 * empty.
 	 */
-	static fromKey(key: Uint8Array): Aes256Gcm {
+	static fromKey(key: Uint8Array, keyId: Uint8Array): Aes256Gcm {
 		requireLength(key, [32], "key");
+		if (keyId.length === 0) {
+			throw new ValidationError("KEY_ID_REQUIRED", [
+				{ path: "keyId", message: "Field keyId must not be empty" },
+			]);
+		}
 
-		const aes256Gcm = new Aes256Gcm(WasmAes256Gcm.fromKey(key));
+		const aes256Gcm = new Aes256Gcm(WasmAes256Gcm.fromKey(key, keyId));
 		return aes256Gcm;
 	}
 
 	/**
-	 * Seal `bodyDer` under a fresh nonce.
+	 * Seal `bodyDer` under a fresh content key.
 	 */
-	encrypt(bodyDer: Uint8Array): Promise<EncryptedBody> {
-		const encryptedBody = takeSealedBody(this.inner.seal(bodyDer));
+	encrypt(bodyDer: Uint8Array, contentOid?: string): Promise<EncryptedBody> {
+		const encryptedBody = takeSealedBody(
+			this.inner.seal(bodyDer, contentOid),
+		);
 		const result = Promise.resolve(encryptedBody);
 		return result;
 	}
@@ -422,8 +460,8 @@ export class Aes256Gcm implements BodyEncryptor, BodyDecryptor {
 	async decrypt(sealed: EncryptedBody): Promise<Uint8Array> {
 		requireAlgorithm(sealed, PROFILE_OIDS.aes256Gcm);
 
-		const plaintext = this.inner.open(
-			sealed.parametersDer,
+		const plaintext = await this.inner.open(
+			sealed.envelopeDer,
 			sealed.ciphertext,
 		);
 		return plaintext;
@@ -431,12 +469,20 @@ export class Aes256Gcm implements BodyEncryptor, BodyDecryptor {
 }
 
 /**
- * The profile asymmetric {@link BodyEncryptor}: ECIES to a recipient
- * public key (secp256k1 + HKDF-SHA3-256 + AES-256-GCM). Only the holder of
- * the matching secret key can open the body.
+ * The profile asymmetric {@link BodyEncryptor}: HPKE to a recipient public
+ * key (DHKEM over secp256k1 with an AES-256-GCM content key, in a CMS
+ * `KEMRecipientInfo`). Only the holder of the matching secret key can open
+ * the body.
+ *
+ * # Sources
+ *
+ * - RFC 9180, Hybrid Public Key Encryption:
+ *   {@link https://datatracker.ietf.org/doc/html/rfc9180 RFC 9180}
+ * - RFC 9629, Using Key Encapsulation Mechanism (KEM) Algorithms in CMS:
+ *   {@link https://datatracker.ietf.org/doc/html/rfc9629 RFC 9629}
  */
-export class EciesEncryptor implements BodyEncryptor {
-	private constructor(private readonly inner: WasmEciesEncryptor) {}
+export class HpkeEncryptor implements BodyEncryptor {
+	private constructor(private readonly inner: WasmHpkeEncryptor) {}
 
 	/**
 	 * Wrap the recipient's SEC1-encoded public key (33-byte compressed or
@@ -444,11 +490,11 @@ export class EciesEncryptor implements BodyEncryptor {
 	 *
 	 * @throws ValidationError when the encoding length is wrong.
 	 */
-	static fromBytes(recipientPublicKey: Uint8Array): EciesEncryptor {
+	static fromBytes(recipientPublicKey: Uint8Array): HpkeEncryptor {
 		requireLength(recipientPublicKey, [33, 65], "recipientPublicKey");
 
-		const encryptor = new EciesEncryptor(
-			WasmEciesEncryptor.fromBytes(recipientPublicKey),
+		const encryptor = new HpkeEncryptor(
+			WasmHpkeEncryptor.fromBytes(recipientPublicKey),
 		);
 		return encryptor;
 	}
@@ -456,30 +502,31 @@ export class EciesEncryptor implements BodyEncryptor {
 	/**
 	 * Seal `bodyDer` to the recipient under a fresh ephemeral key.
 	 */
-	encrypt(bodyDer: Uint8Array): Promise<EncryptedBody> {
-		const encryptedBody = takeSealedBody(this.inner.seal(bodyDer));
+	encrypt(bodyDer: Uint8Array, contentOid?: string): Promise<EncryptedBody> {
+		const encryptedBody = takeSealedBody(
+			this.inner.seal(bodyDer, contentOid),
+		);
+
 		const result = Promise.resolve(encryptedBody);
 		return result;
 	}
 }
 
 /**
- * The matching profile {@link BodyDecryptor} for ECIES-sealed bodies:
- * holds the raw 32-byte recipient secret key.
+ * The matching profile {@link BodyDecryptor} for HPKE-sealed bodies: holds
+ * the raw 32-byte recipient secret key.
  */
-export class EciesDecryptor implements BodyDecryptor {
-	private constructor(private readonly inner: WasmEciesDecryptor) {}
+export class HpkeDecryptor implements BodyDecryptor {
+	private constructor(private readonly inner: WasmHpkeDecryptor) {}
 
 	/**
 	 * Wrap the raw 32-byte recipient secret key.
-	 *
-	 * @throws ValidationError when the key length is wrong.
 	 */
-	static fromBytes(secretKey: Uint8Array): EciesDecryptor {
+	static fromBytes(secretKey: Uint8Array): HpkeDecryptor {
 		requireLength(secretKey, [32], "secretKey");
 
-		const decryptor = new EciesDecryptor(
-			WasmEciesDecryptor.fromBytes(secretKey),
+		const decryptor = new HpkeDecryptor(
+			WasmHpkeDecryptor.fromBytes(secretKey),
 		);
 		return decryptor;
 	}
@@ -487,13 +534,13 @@ export class EciesDecryptor implements BodyDecryptor {
 	/**
 	 * Open a body sealed to this recipient.
 	 *
-	 * @throws ValidationError when the sealed algorithm is not ECIES.
+	 * @throws ValidationError when the sealed algorithm is not AES-256-GCM.
 	 */
 	async decrypt(sealed: EncryptedBody): Promise<Uint8Array> {
-		requireAlgorithm(sealed, PROFILE_OIDS.eciesSecp256k1);
+		requireAlgorithm(sealed, PROFILE_OIDS.aes256Gcm);
 
-		const plaintext = this.inner.open(
-			sealed.parametersDer,
+		const plaintext = await this.inner.open(
+			sealed.envelopeDer,
 			sealed.ciphertext,
 		);
 		return plaintext;

@@ -6,17 +6,15 @@ TypeScript/WebAssembly client for the [tightbeam](https://crates.io/crates/tight
 
 > Warning: This project is under active development. Public APIs MAY change without notice.
 
-**Security Disclaimer:** A SECURITY AUDIT HAS NOT BEEN CONDUCTED. USE AT YOUR OWN RISK.
-
 ## Abstract
 
 This package is tightbeam in TypeScript. The frame codec (the ASN.1 DER engine) is the Rust implementation itself, compiled from [`tightbeam-ws-wasm`](../tightbeam-ws-wasm) with `wasm-pack`. The TypeScript layer adds the builder, the typed message envelope, validation, and connection handling. The tightbeam-rs surface carries over under the same names:
 
 - The builder: `withSigner`, `withEncryptor`, `withMessageHasher`, the version floor rules, `assertVersion`.
 - The `Frame`: `verify`, `frameIntegrityVerdict`, `messageCommitmentVerdict`, `decryptMessage`, and the same enums with the same ordinals (`Version`, `MessagePriority`).
-- The transport: multiplexed bidirectional streams, ECIES sessions, GoAway semantics, gRPC status codes on refusals.
+- The transport: multiplexed bidirectional streams, HPKE sessions, GoAway semantics, gRPC status codes on refusals.
 
-Cryptography is caller-supplied. Every security operation goes through a capability interface (`Hasher`, `BodyEncryptor`, `BodyDecryptor`, `Signatory`, `BodyCompressor`, `BodyInflator`) identified by the dotted algorithm OID it writes into the frame. The tightbeam profile (SHA3-256, secp256k1 ECDSA, AES-256-GCM, ECIES, zstd) is included as wasm-backed implementations. Any other hash, cipher, signer, or compressor plugs in through the same interfaces.
+Cryptography is caller-supplied. Every security operation goes through a capability interface (`Hasher`, `BodyEncryptor`, `BodyDecryptor`, `Signatory`, `BodyCompressor`, `BodyInflator`) identified by the dotted algorithm OID it writes into the frame. The tightbeam profile (SHA3-256, secp256k1 ECDSA, AES-256-GCM, HPKE, zstd) is included as wasm-backed implementations. Any other hash, cipher, signer, or compressor plugs in through the same interfaces.
 
 Two wasm bundles ship in the package, a `web` build and a `nodejs` build, selected automatically through the package `imports` map. Node ≥ 24 uses its global `WebSocket`, no shim required.
 
@@ -24,7 +22,7 @@ Two wasm bundles ship in the package, a `web` build and a `nodejs` build, select
 
 - [Install](#install)
 - [Cleartext round-trip](#cleartext-round-trip)
-- [Encrypted sessions (ECIES)](#encrypted-sessions-ecies)
+- [Encrypted sessions (HPKE)](#encrypted-sessions-hpke)
     - [Session budgets (mutual auth only)](#session-budgets-mutual-auth-only)
 - [Two-way streams](#two-way-streams)
     - [Progressive body streaming](#progressive-body-streaming)
@@ -87,9 +85,9 @@ client.close();
 - the security markers (`signed`, `messageIntegrity`, `frameIntegrity`, `confidential`) with their carried infos (`signatureInfo`, `messageIntegrityInfo`, `frameIntegrityInfo`, `confidentialityInfo`)
 - the methods under [Verification and decryption](#verification-and-decryption)
 
-## Encrypted sessions (ECIES)
+## Encrypted sessions (HPKE)
 
-The server is authenticated by pinning its DER certificate. The ECIES handshake also negotiates stream multiplexing (HTTP/2-style, tightbeam's `transport-multiplex`). The `maxPeerStreams` option caps concurrent server-initiated streams (default 8), and the server's advertisement caps this client's concurrent emits. Connecting to a server that does not offer multiplexing rejects.
+The server is authenticated by pinning its DER certificate. The HPKE handshake also negotiates stream multiplexing (HTTP/2-style, tightbeam's `transport-multiplex`). The `maxPeerStreams` option caps concurrent server-initiated streams (default 8), and the server's advertisement caps this client's concurrent emits. Connecting to a server that does not offer multiplexing rejects.
 
 ```ts
 import { TightbeamWsClient } from "@wahidgroup/tightbeam-ws-client";
@@ -108,7 +106,7 @@ const mutual = await TightbeamWsClient.connectMutual(
 
 When the certificate key lives in an external key store (WebAuthn, a wallet, a KMS bridge), pass a `TransportSigner` instead of the raw scalar. The handshake hands it the transcript prehash to sign, so the private key never crosses into wasm. The contract is algorithm-agnostic: the signer signs the prehash directly (no rehash) and returns whatever signature encoding the session profile verifies.
 
-Under the default-profile build that is a secp256k1 signature as 64-byte `r || s`. A custom-profile build expects its own profile's encoding (see the [`tightbeam-ws-wasm` README](../tightbeam-ws-wasm/README.md)).
+Under the default-profile build that is a secp256k1 signature as a DER `ECDSA-Sig-Value` (RFC 3279 § 2.2.3). A custom-profile build expects its own profile's encoding (see the [`tightbeam-ws-wasm` README](../tightbeam-ws-wasm/README.md)).
 
 ```ts
 import type { TransportSigner } from "@wahidgroup/tightbeam-ws-client";
@@ -127,7 +125,7 @@ const external = await TightbeamWsClient.connectMutual(
 );
 ```
 
-The session profile (secp256k1 ECIES, AES-256-GCM records, SHA3-256 certificates) is a compile-time choice, the same as for a native tightbeam-rs transport. A deployment on a different provider rebuilds the wasm layer against its own `CryptoProvider` (see the [`tightbeam-ws-wasm` README](../tightbeam-ws-wasm/README.md)). Frame-level cryptography stays caller-supplied regardless.
+The session profile (HPKE over secp256k1, AES-256-GCM records, SHA3-256 certificates) is a compile-time choice, the same as for a native tightbeam-rs transport. A deployment on a different provider rebuilds the wasm layer against its own `CryptoProvider` (see the [`tightbeam-ws-wasm` README](../tightbeam-ws-wasm/README.md)). Frame-level cryptography stays caller-supplied regardless.
 
 ### Session budgets (mutual auth only)
 
@@ -365,7 +363,7 @@ try {
 	await mux.emit(built);
 } catch (error) {
 	if (isTransportError(error) && error.code === "Draining") {
-		// GoAway received: reconnect before emitting again.
+		// GoAway received on a live connection: reconnect before emitting again.
 	}
 }
 ```
@@ -387,16 +385,12 @@ const response = await mux.emit(built);
 
 ## Keepalive
 
-Multiplexed sessions have a protocol-level liveness probe (RFC 9113 § 6.7 analog). `ping()` resolves when the peer acknowledges. No stream is allocated and no application handler runs on the peer, so a periodic ping doubles as an idle keepalive for browsers, whose sockets cannot send WebSocket protocol pings from JavaScript:
+A native tightbeam server runs each read under its operation timeout, 30 seconds by default, and ends a session that sends nothing for that long. A client holds its session open by pinging its peer every 10 seconds, so an idle session needs no code from you.
+
+`ping()` is the same protocol-level liveness probe (RFC 9113 § 6.7 analog), for an application that measures the link itself. It resolves when the peer acknowledges. No stream is allocated and no application handler runs on the peer.
 
 ```ts
-const interval = setInterval(() => {
-	void mux.ping({ signal: AbortSignal.timeout(5_000) }).catch(() => {
-		clearInterval(interval);
-		// Draining, ConnectionClosed, or deadline: reconnect via the
-		// closed promise.
-	});
-}, 30_000);
+await mux.ping({ signal: AbortSignal.timeout(5_000) });
 ```
 
 Browsers answer WebSocket protocol pings automatically. This probe covers the application level, where silence is otherwise indistinguishable from idleness.
@@ -413,7 +407,7 @@ Every `with*` returns a new immutable builder. `build()` validates the spec and 
 ```ts
 import {
 	Aes256Gcm,
-	EciesEncryptor,
+	HpkeEncryptor,
 	MessagePriority,
 	Secp256k1SigningKey,
 	Sha3_256,
@@ -430,9 +424,9 @@ const built = await frame(body)
 	.withLifetime(60) // V2+
 	.withPreviousHash({ algorithmOid, digest }) // V2+
 	.withMatrix(2, new Uint8Array([0, 1, 1, 0])) // V3+
-	.withMessageHasher(new Sha3_256(), salt) // V2+: body commitment
+	.withMessageHasher(new Sha3_256(), salt) // V2+: body commitment, salt of 16+ octets
 	.withWitnessHasher(new Sha3_256()) // V2+: frame integrity
-	.withEncryptor(Aes256Gcm.fromKey(key)) // V1+: body encryption
+	.withEncryptor(Aes256Gcm.fromKey(key, keyId)) // V1+: body encryption
 	.withSigner(signingKey) // V1+: secp256k1 signature
 	.assertVersion(Version.V2) // fail the build unless it lands on V2
 	.build();
@@ -440,7 +434,7 @@ const built = await frame(body)
 
 - The version floor is derived from the requested fields, or pinned with `withVersion(Version.V2)`. `assertVersion` fails the build when the effective version differs from the assertion.
 - `withMessageHasher` / `withWitnessHasher` take any `Hasher`. The profile hasher is `Sha3_256`.
-- `withEncryptor` takes any `BodyEncryptor`: the profile symmetric cipher (`Aes256Gcm.fromKey(k)`, opened with the shared key), the profile asymmetric encryptor to a recipient (`EciesEncryptor.fromBytes(recipientPublicKey)`, opened with the recipient secret), or your own scheme. The frame has a single body-encryption slot.
+- `withEncryptor` takes any `BodyEncryptor`: the profile symmetric cipher (`Aes256Gcm.fromKey(k, keyId)`, opened with the shared key, which every holder names by one `keyId`), the profile asymmetric encryptor to a recipient (`HpkeEncryptor.fromBytes(recipientPublicKey)`, opened with the recipient secret), or your own scheme. The frame has a single body-encryption slot.
 - Structurally invalid specs reject with a `ValidationError` carrying per-field issues.
 
 ## Typed messages
@@ -499,14 +493,15 @@ const sha3_512Hasher: Hasher = {
 	digest: async (data) => sha3_512(data),
 };
 
-// Any signer: the builder hands the implementation the to-be-signed bytes
-// and attaches the returned signature, so an external signer's private key
-// never enters wasm memory (wallets, passkeys, HSMs, remote KMS).
+// Any signer of the profile signature: the builder hands the implementation
+// the digest of the frame's CMS signed attributes and attaches the returned
+// DER signature, so an external signer's private key never enters wasm memory
+// (wallets, passkeys, HSMs, remote KMS).
 const walletSigner: Signatory = {
 	signatureAlgorithmOid: "2.16.840.1.101.3.4.3.10",
 	digestAlgorithmOid: "2.16.840.1.101.3.4.2.8",
-	signerId: () => walletKeyId, // subject-key-identifier octets
-	sign: async (tbs) => wallet.sign(tbs),
+	signerId: () => walletKeyId, // subject key identifier of its certificate
+	signPrehash: async (prehash) => wallet.signDigest(prehash),
 };
 
 const built = await frame(body)
@@ -515,13 +510,13 @@ const built = await frame(body)
 	.build();
 ```
 
-`BodyEncryptor` / `BodyDecryptor` follow the same shape: `encrypt(bodyDer)` resolves with `{ algorithmOid, parametersDer, ciphertext }`, and `decrypt(sealed)` receives the carried pieces and resolves with the plaintext body DER. The `PROFILE_OIDS` constant exports the profile identifiers.
+`BodyEncryptor` / `BodyDecryptor` follow the same shape: `encrypt(bodyDer, contentOid?)` resolves with `{ algorithmOid, envelopeDer, ciphertext }`, where `envelopeDer` is a DER CMS `AuthEnvelopedData` (RFC 5083) with its content detached, and `decrypt(sealed)` receives the carried pieces and resolves with the plaintext body DER. The `PROFILE_OIDS` constant exports the profile identifiers.
 
 ## Compression
 
 Compression is a capability too: a `BodyCompressor` shrinks the body DER and names its algorithm by OID, a `BodyInflator` reverses it. The builder compresses after the message commitment (the commitment is over the uncompressed body) and before encryption (peers encrypt the compressed bytes), matching tightbeam-rs.
 
-The profile compression is included: `ZstdCompression` (zstd in the seekable format, `PROFILE_OIDS.zstd`) is wire-compatible with tightbeam-rs `ZstdCompression` and backed by a lazily loaded wasm build of libzstd. Clients that never compress never load it. Its decompression output is capped (16 MiB by default, matching tightbeam-rs, tunable with `new ZstdCompression(maxOutput)`), and the cap is enforced against the stream's declared size before anything is allocated.
+The profile compression is included: `ZstdCompression` (one zstd frame, `PROFILE_OIDS.zstd`) is wire-compatible with tightbeam-rs `ZstdCompression` and backed by a lazily loaded wasm build of libzstd. Clients that never compress never load it. Its decompression output is capped (16 MiB by default, matching tightbeam-rs, tunable with `new ZstdCompression(maxOutput)`), and the cap is enforced against the stream's declared size before anything is allocated.
 
 ```ts
 import {
@@ -575,10 +570,10 @@ A compressed frame reports `compressed: true` and carries `compactnessInfo` (`{ 
 
 ## Verification and decryption
 
-Verification is on the `Frame` itself. Verdicts are `"verified" | "absent" | "algorithm-mismatch" | "mismatch"`. The verdict methods recompute under any `Hasher` (profile SHA3-256 by default). For frames signed under non-profile schemes, verify `signatureInfo.signature` over `tbs()` with your own library.
+Verification is on the `Frame` itself. Verdicts are `"verified" | "absent" | "algorithm-mismatch" | "mismatch"`. The verdict methods recompute under any `Hasher` (profile SHA3-256 by default). For an external verifier, verify `signatureInfo.signature`, a DER `ECDSA-Sig-Value`, over `signaturePrehash()` with your own library.
 
 ```ts
-import { Aes256Gcm, EciesDecryptor } from "@wahidgroup/tightbeam-ws-client";
+import { Aes256Gcm, HpkeDecryptor } from "@wahidgroup/tightbeam-ws-client";
 
 response.verify(signingKey.verifyingKey()); // profile scheme: throws when invalid
 await response.frameIntegrityVerdict(); // "verified" | "absent" | ...
@@ -587,14 +582,15 @@ await response.messageCommitmentVerdict(salt); // checks the body commitment
 
 // Open an encrypted body with the matching cipher or recipient secret,
 // decoding the plaintext under any codec (Opaque for raw bytes):
-await response.decryptMessage(Aes256Gcm.fromKey(key), Opaque);
+await response.decryptMessage(Aes256Gcm.fromKey(key, keyId), Opaque);
 await response.decryptMessage(
-	EciesDecryptor.fromBytes(recipientSecretKey),
+	HpkeDecryptor.fromBytes(recipientSecretKey),
 	Chat,
 );
 
 // Raw surfaces for external verification:
 response.tbs(); // to-be-signed bytes
+response.signaturePrehash(); // digest the signature verifies over
 response.witnessInput(); // frame-integrity preimage
 response.signatureInfo; // { algorithmOid, digestAlgorithmOid, signature }
 ```
@@ -612,7 +608,7 @@ import {
 
 const notes = envelope(Notes) // any MessageCodec<T>
 	.signed(signingKey)
-	.sealed(Aes256Gcm.fromKey(topicKey))
+	.sealed(Aes256Gcm.fromKey(topicKey, topicKeyId))
 	.compressed(new ZstdCompression());
 
 // Sender: the layers are already applied, the metadata stays yours.
@@ -626,7 +622,7 @@ Envelopes are immutable and reusable across every frame of the conversation. Eac
 
 - `signed(signatory)` signs on build. A profile `Secp256k1SigningKey` derives its own verifying key for unwrap. Any other `Signatory` (wallet, passkey, HSM) needs `verified(key)` alongside it before `unwrap` can check the signature.
 - `verified(key)` is the read-only half for parties without the signing key: `unwrap` requires a signature verifying under `key`, and `frame()` refuses to build (a verify-only envelope MUST NOT silently send unsigned frames).
-- `sealed(keys)` takes a `BodyEncryptor`, a `BodyDecryptor`, or both at once. `Aes256Gcm` is both. An ECIES pair splits: the publisher declares `sealed(EciesEncryptor.fromBytes(recipientPublic))`, the recipient `sealed(EciesDecryptor.fromBytes(recipientSecret))`.
+- `sealed(keys)` takes a `BodyEncryptor`, a `BodyDecryptor`, or both at once. `Aes256Gcm` is both. An HPKE pair splits: the publisher declares `sealed(HpkeEncryptor.fromBytes(recipientPublic))`, the recipient `sealed(HpkeDecryptor.fromBytes(recipientSecret))`.
 - `compressed(compression)` is a transport optimization, not a security property: an uncompressed received frame still unwraps.
 
 One-sided parties compose only their half:
@@ -635,14 +631,14 @@ One-sided parties compose only their half:
 // A subscriber that verifies and opens, but never signs or sends.
 const readOnly = envelope(Notes)
 	.verified(publisherKey)
-	.sealed(EciesDecryptor.fromBytes(recipientSecret));
+	.sealed(HpkeDecryptor.fromBytes(recipientSecret));
 ```
 
 The `authenticated` and `confidential` getters report the declarations. Because `unwrap` enforces them, they are proven properties of every unwrapped frame: a UI badges them instead of probing frames. The pubsub manager accepts an envelope wherever it accepts a codec ([`@wahidgroup/tightbeam-pubsub-client`](../../pubsub/client)), publishing frame-in-frame so the layers survive the broker end to end.
 
 ## Detached commitments
 
-A commitment can also live outside a frame (`tightbeam::crypto::commitment::Opening`): publish a hiding digest now, disclose the opening `(salt, body)` later, and any holder of the digest verifies the disclosure. The preimage is the same length-framed `salt || body` the in-frame message commitment uses, so a detached commitment and a frame-carried one are interchangeable.
+A commitment can also live outside a frame (`tightbeam::crypto::commitment::Opening`): publish a hiding digest now, disclose the opening `(salt, body)` later, and any holder of the digest verifies the disclosure. The preimage is the same mode-prefixed `salt || body` the in-frame message commitment uses, so a detached commitment and a frame-carried one are interchangeable.
 
 ```ts
 import { Opening, Sha3_256 } from "@wahidgroup/tightbeam-ws-client";

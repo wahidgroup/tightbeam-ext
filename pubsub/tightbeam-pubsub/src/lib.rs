@@ -18,8 +18,8 @@
 //!   [`with_publish`](PubsubCommands::with_publish) opts in, a
 //!   [`PublishPolicy`] for client `pub/<topic>` commands).
 //! - [`serve_connection`]: the whole per-connection ceremony in one
-//!   call: drivers, registration, command dispatch, application
-//!   fallthrough, cleanup.
+//!   call: drivers, keepalive, registration, command dispatch,
+//!   application fallthrough, cleanup.
 //! - [`quiesce`](TopicRegistry::quiesce): completes every topic with an
 //!   `end/<topic>` push, then refuses new work, so the caller can drain
 //!   connections with an orderly closure analog.
@@ -51,5 +51,7 @@ pub use policy::{
 	AccessVerdict, AllowAll, DeliveryPolicy, DeliveryVerdict, DropOldest, PublishPolicy, SubscribePolicy,
 };
 pub use registry::{ConnectionId, PublishError, RegisterError, RegistryOptions, SubscriberId, TopicRegistry};
-pub use serve::{serve_connection, serve_connection_as, unrouted, AppRoutes, ConnectionContext};
+pub use serve::{
+	keep_alive, serve_connection, serve_connection_as, unrouted, AppRoutes, ConnectionContext, KEEPALIVE_INTERVAL,
+};
 pub use topic::{Topic, TopicError, END_PREFIX, PUB_PREFIX, SUB_PREFIX, UNSUB_PREFIX};

@@ -8,8 +8,8 @@ import { Version, versionFromOrdinal } from "./builder/version.js";
 import { initClient } from "./index.js";
 import {
 	Aes256Gcm,
-	EciesDecryptor,
-	EciesEncryptor,
+	HpkeDecryptor,
+	HpkeEncryptor,
 	PROFILE_OIDS,
 	Secp256k1SigningKey,
 	Secp256k1VerifyingKey,
@@ -17,6 +17,8 @@ import {
 } from "./crypto.js";
 
 await initClient();
+
+const KEY_ID = new TextEncoder().encode("tbws/test/kek/v1");
 
 /**
  * Lowercase hex encoding of `bytes` (no Node `Buffer`).
@@ -93,15 +95,15 @@ describe("key wrappers", () => {
 		},
 		{
 			name: "Aes256Gcm with a 16-byte key",
-			make: () => Aes256Gcm.fromKey(new Uint8Array(16)),
+			make: () => Aes256Gcm.fromKey(new Uint8Array(16), KEY_ID),
 		},
 		{
-			name: "EciesEncryptor with a bad SEC1 length",
-			make: () => EciesEncryptor.fromBytes(new Uint8Array(31)),
+			name: "HpkeEncryptor with a bad SEC1 length",
+			make: () => HpkeEncryptor.fromBytes(new Uint8Array(31)),
 		},
 		{
-			name: "EciesDecryptor with a short secret",
-			make: () => EciesDecryptor.fromBytes(new Uint8Array(16)),
+			name: "HpkeDecryptor with a short secret",
+			make: () => HpkeDecryptor.fromBytes(new Uint8Array(16)),
 		},
 	];
 
@@ -160,27 +162,27 @@ describe("profile encryptors", () => {
 	const BODY_DER = new Uint8Array([0x30, 0x03, 0x04, 0x01, 0x7f]);
 
 	it("Aes256Gcm seals and opens a body DER", async () => {
-		const cipher = Aes256Gcm.fromKey(new Uint8Array(32).fill(3));
+		const cipher = Aes256Gcm.fromKey(new Uint8Array(32).fill(3), KEY_ID);
 		const sealed = await cipher.encrypt(BODY_DER);
 		expect(sealed.algorithmOid).toBe(PROFILE_OIDS.aes256Gcm);
-		expect(sealed.parametersDer).toBeDefined();
+		expect(sealed.envelopeDer.length).toBeGreaterThan(0);
 		expect(sealed.ciphertext).not.toEqual(BODY_DER);
 
 		await expect(cipher.decrypt(sealed)).resolves.toEqual(BODY_DER);
 	});
 
-	it("EciesEncryptor seals to a recipient the EciesDecryptor opens", async () => {
+	it("HpkeEncryptor seals to a recipient the HpkeDecryptor opens", async () => {
 		const secret = new Uint8Array(32).fill(1);
 		const recipient = Secp256k1SigningKey.fromBytes(secret)
 			.verifyingKey()
 			.toSec1Bytes();
 
 		const sealed =
-			await EciesEncryptor.fromBytes(recipient).encrypt(BODY_DER);
-		expect(sealed.algorithmOid).toBe(PROFILE_OIDS.eciesSecp256k1);
+			await HpkeEncryptor.fromBytes(recipient).encrypt(BODY_DER);
+		expect(sealed.algorithmOid).toBe(PROFILE_OIDS.aes256Gcm);
 
 		await expect(
-			EciesDecryptor.fromBytes(secret).decrypt(sealed),
+			HpkeDecryptor.fromBytes(secret).decrypt(sealed),
 		).resolves.toEqual(BODY_DER);
 	});
 
@@ -188,12 +190,14 @@ describe("profile encryptors", () => {
 		{
 			name: "Aes256Gcm",
 			decrypt: (sealed: Parameters<Aes256Gcm["decrypt"]>[0]) =>
-				Aes256Gcm.fromKey(new Uint8Array(32).fill(3)).decrypt(sealed),
+				Aes256Gcm.fromKey(new Uint8Array(32).fill(3), KEY_ID).decrypt(
+					sealed,
+				),
 		},
 		{
-			name: "EciesDecryptor",
-			decrypt: (sealed: Parameters<EciesDecryptor["decrypt"]>[0]) =>
-				EciesDecryptor.fromBytes(new Uint8Array(32).fill(1)).decrypt(
+			name: "HpkeDecryptor",
+			decrypt: (sealed: Parameters<HpkeDecryptor["decrypt"]>[0]) =>
+				HpkeDecryptor.fromBytes(new Uint8Array(32).fill(1)).decrypt(
 					sealed,
 				),
 		},
@@ -202,6 +206,7 @@ describe("profile encryptors", () => {
 		async ({ decrypt }) => {
 			const sealed = {
 				algorithmOid: "1.2.3.4",
+				envelopeDer: new Uint8Array([0x30, 0x00]),
 				ciphertext: new Uint8Array([1, 2, 3]),
 			};
 

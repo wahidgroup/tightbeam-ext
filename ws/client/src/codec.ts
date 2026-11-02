@@ -11,12 +11,14 @@ import {
 	setCompactness,
 	setConfidentiality,
 	setMessageIntegrity,
-	tbsBytes,
+	signingPrehash,
 	witnessInput,
 } from "#wasm";
 
 import type { FrameCodec, FrameSpec } from "./builder/index.js";
-import { effectiveVersion } from "./builder/index.js";
+import { ValidationError, effectiveVersion } from "./builder/index.js";
+import type { Signatory } from "./crypto.js";
+import { PROFILE_OIDS } from "./crypto.js";
 
 const EMPTY_SALT = new Uint8Array();
 
@@ -52,12 +54,11 @@ export class WasmFrameCodec implements FrameCodec {
 		}
 
 		if (spec.encryptor !== undefined) {
-			const sealed = await spec.encryptor.encrypt(sealInput);
+			const contentOid = spec.contentOid ?? spec.message?.contentOid;
+			const sealed = await spec.encryptor.encrypt(sealInput, contentOid);
 			der = setConfidentiality(
 				der,
-				spec.contentOid ?? spec.message?.contentOid,
-				sealed.algorithmOid,
-				sealed.parametersDer,
+				sealed.envelopeDer,
 				sealed.ciphertext,
 			);
 		}
@@ -66,17 +67,34 @@ export class WasmFrameCodec implements FrameCodec {
 			der = attachWitness(der, spec.frameIntegrity.algorithmOid, digest);
 		}
 		if (spec.signer !== undefined) {
-			const signature = await spec.signer.sign(tbsBytes(der));
-			der = attachSignature(
-				der,
-				signature,
-				spec.signer.signatureAlgorithmOid,
-				spec.signer.digestAlgorithmOid,
-				spec.signer.signerId(),
+			requireProfileSigner(spec.signer);
+
+			const signerId = spec.signer.signerId();
+			const signature = await spec.signer.signPrehash(
+				signingPrehash(der, signerId),
 			);
+			der = attachSignature(der, signature, signerId);
 		}
 
 		return der;
+	}
+}
+
+/**
+ * Reject a signer outside the profile signature, the one form the wasm
+ * engine's CMS `SignerInfo` carries.
+ */
+function requireProfileSigner(signer: Signatory): void {
+	if (
+		signer.signatureAlgorithmOid !== PROFILE_OIDS.ecdsaWithSha3_256 ||
+		signer.digestAlgorithmOid !== PROFILE_OIDS.sha3_256
+	) {
+		throw new ValidationError("ALGORITHM_MISMATCH", [
+			{
+				path: "signer.signatureAlgorithmOid",
+				message: `Signs with ${signer.signatureAlgorithmOid}, but a frame carries ${PROFILE_OIDS.ecdsaWithSha3_256}`,
+			},
+		]);
 	}
 }
 

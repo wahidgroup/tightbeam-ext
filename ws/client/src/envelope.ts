@@ -2,12 +2,6 @@
  * Composed frame processing: declare the layers once - serialization,
  * compression, sealing, signing - and use the same declaration in both
  * directions.
- *
- * The frame format fixes the layering, so an envelope takes declarations
- * rather than a free-form pipeline. `frame()` begins a builder with them
- * applied. `unwrap()` reverses them and ENFORCES them. A declared signature
- * or seal that a received frame lacks REJECTS instead of degrading, so a
- * peer cannot downgrade the conversation by omission.
  */
 
 import type {
@@ -54,7 +48,7 @@ function envelopeError(code: string, message: string): ValidationError {
  * ```ts
  * const notes = envelope(Notes)
  *     .signed(publisherKey)
- *     .sealed(Aes256Gcm.fromKey(topicKey));
+ *     .sealed(Aes256Gcm.fromKey(topicKey, topicKeyId));
  *
  * const sent = await notes.frame(note).withId("note-1").build();
  * const received = await notes.unwrap(relayed); // Note
@@ -114,7 +108,7 @@ export class Envelope<T> {
 	/**
 	 * Declare confidentiality: `frame()` seals the body, and `unwrap()`
 	 * REJECTS a cleartext frame. `keys` contributes whichever halves it
-	 * implements - `Aes256Gcm` both, an ECIES pair one each.
+	 * implements - `Aes256Gcm` both, an HPKE pair one each.
 	 */
 	sealed(keys: BodyEncryptor | BodyDecryptor): Envelope<T> {
 		let patch: Partial<Layers> = {};

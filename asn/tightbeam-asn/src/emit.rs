@@ -5,7 +5,7 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-use tightbeam_derive::Errorizable;
+use tightbeam::Errorizable;
 
 /// Failure while discovering pairs or writing façades.
 #[derive(Debug, Errorizable)]

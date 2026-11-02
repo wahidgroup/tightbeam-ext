@@ -55,7 +55,7 @@
 		"@types/node": "24.0.4",
 		"@wahidgroup/lint-rules": "0.1.2",
 		"typescript": "5.9.3",
-		"vitest": "4.1.1"
+		"vitest": "4.1.12"
 	},
 	"publishConfig": {
 		"registry": "https://npm.pkg.github.com"

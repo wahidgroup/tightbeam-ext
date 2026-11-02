@@ -51,7 +51,7 @@ services:
 
   # Cluster work-plane gateway: a real gateway, hive, and work-probe servlet
   # in one process. The browser pins the server certificate for transport
-  # encryption and shares the client key as the end-to-end work signing key.
+  # encryption and shares the client identity as the end-to-end work signer.
   work-gateway:
     image: ${ECHO_IMAGE:-tightbeam-ws-echo:dev}
     command: ["work-gateway-server"]
@@ -59,6 +59,7 @@ services:
       ECHO_WS_PORT: "9104"
       TBWS_SERVER_CERT: /certs/server.cert.der
       TBWS_SERVER_KEY: /certs/server.key
+      TBWS_WORK_CERT: /certs/client.cert.der
       TBWS_WORK_KEY: /certs/client.key
     volumes:
       - ${CERT_DIR:?}:/certs:ro

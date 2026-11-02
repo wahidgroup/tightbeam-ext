@@ -20,13 +20,13 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::{future_to_promise, JsFuture};
 
 use tightbeam::der::Decode;
+use tightbeam::marker::MaybeSend;
 use tightbeam::policy::TransitStatus;
 use tightbeam::transport::multiplex::{
 	MuxDispatch, MuxHandle, MuxResponder, ReplySink, RequestSink, StreamBody, StreamRoute,
 };
 use tightbeam::transport::{ResponsePackage, TransportResult};
-use tightbeam::utils::marker::MaybeSend;
-use tightbeam::utils::urn::Urn;
+use tightbeam::urn::Urn;
 use tightbeam::Frame;
 
 use crate::fault::{debug_coded, transport_to_js, validation};
@@ -394,11 +394,11 @@ pub(crate) fn parse_stream_target(target: &str) -> Result<Urn<'static>, JsValue>
 
 /// Format a servlet URN for JS without going through [`Display`].
 fn urn_target_string(urn: &Urn<'_>) -> String {
-	let mut target = String::with_capacity(4 + urn.nid.len() + 1 + urn.nss.len());
+	let mut target = String::with_capacity(4 + urn.nid().len() + 1 + urn.nss().len());
 	target.push_str("urn:");
-	target.push_str(urn.nid.as_ref());
+	target.push_str(urn.nid());
 	target.push(':');
-	target.push_str(urn.nss.as_ref());
+	target.push_str(urn.nss());
 	target
 }
 
@@ -426,9 +426,13 @@ struct JsStreamingDispatch {
 }
 
 impl MuxDispatch for JsStreamingDispatch {
-	fn streaming(&self, body: StreamBody, route: StreamRoute) -> impl Future<Output = ResponsePackage> + MaybeSend {
+	fn streaming(
+		&self,
+		body: StreamBody,
+		route: StreamRoute,
+	) -> impl Future<Output = TransportResult<ResponsePackage>> + MaybeSend {
 		let current = self.handler.borrow().clone();
-		async move { respond_streaming_via_js(current, body, route).await }
+		async move { Ok(respond_streaming_via_js(current, body, route).await) }
 	}
 }
 
@@ -443,9 +447,9 @@ impl MuxDispatch for JsDuplexDispatch {
 		body: StreamBody,
 		reply: ReplySink,
 		route: StreamRoute,
-	) -> impl Future<Output = TransitStatus> + MaybeSend {
+	) -> impl Future<Output = TransportResult<TransitStatus>> + MaybeSend {
 		let current = self.handler.borrow().clone();
-		async move { respond_duplex_via_js(current, body, reply, route).await }
+		async move { Ok(respond_duplex_via_js(current, body, reply, route).await) }
 	}
 }
 

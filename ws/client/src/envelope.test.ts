@@ -6,8 +6,8 @@ import type { MessageCodec } from "./message.js";
 import { Aes256Gcm, Secp256k1SigningKey } from "./crypto.js";
 import { ZstdCompression } from "./compress.js";
 import {
-	EciesDecryptor,
-	EciesEncryptor,
+	HpkeDecryptor,
+	HpkeEncryptor,
 	ValidationError,
 	envelope,
 	initClient,
@@ -24,6 +24,7 @@ import { NobleSignatory } from "./testing/noble_signatory.js";
 const SIGNING_KEY = Secp256k1SigningKey.fromBytes(new Uint8Array(32).fill(1));
 const OTHER_KEY = Secp256k1SigningKey.fromBytes(new Uint8Array(32).fill(2));
 const TOPIC_KEY = new Uint8Array(32).fill(7);
+const TOPIC_KEY_ID = new TextEncoder().encode("tbws/test/topic/v1");
 
 const ENCODER = new TextEncoder();
 const DECODER = new TextDecoder();
@@ -64,7 +65,8 @@ function profileBackedSignatory(options: {
 		signatureAlgorithmOid: SIGNING_KEY.signatureAlgorithmOid,
 		digestAlgorithmOid: SIGNING_KEY.digestAlgorithmOid,
 		signerId: (): Uint8Array => SIGNING_KEY.signerId(),
-		sign: (tbs: Uint8Array): Promise<Uint8Array> => SIGNING_KEY.sign(tbs),
+		signPrehash: (prehash: Uint8Array): Promise<Uint8Array> =>
+			SIGNING_KEY.signPrehash(prehash),
 	};
 
 	if (options.verifier === undefined) {
@@ -105,7 +107,9 @@ const ROUND_TRIPS: RoundTrip[] = [
 	},
 	{
 		name: "sealed",
-		notes: envelope(Notes).sealed(Aes256Gcm.fromKey(TOPIC_KEY)),
+		notes: envelope(Notes).sealed(
+			Aes256Gcm.fromKey(TOPIC_KEY, TOPIC_KEY_ID),
+		),
 		signed: false,
 		sealed: true,
 		compressed: false,
@@ -121,7 +125,7 @@ const ROUND_TRIPS: RoundTrip[] = [
 		name: "all layers",
 		notes: envelope(Notes)
 			.signed(SIGNING_KEY)
-			.sealed(Aes256Gcm.fromKey(TOPIC_KEY))
+			.sealed(Aes256Gcm.fromKey(TOPIC_KEY, TOPIC_KEY_ID))
 			.compressed(new ZstdCompression()),
 		signed: true,
 		sealed: true,
@@ -144,7 +148,6 @@ describe("Envelope round-trips", () => {
 
 	it("keeps the builder's metadata surface", async () => {
 		const notes = envelope(Notes).signed(SIGNING_KEY);
-
 		const built = await notes
 			.frame(NOTE)
 			.withId("note-1")
@@ -176,17 +179,17 @@ describe("Envelope one-sided parties", () => {
 		},
 	);
 
-	it("ECIES halves compose one side each", async () => {
+	it("HPKE halves compose one side each", async () => {
 		const recipientSecret = new Uint8Array(32).fill(3);
 		const recipientPublic = Secp256k1SigningKey.fromBytes(recipientSecret)
 			.verifyingKey()
 			.toSec1Bytes();
 
 		const publisher = envelope(Notes).sealed(
-			EciesEncryptor.fromBytes(recipientPublic),
+			HpkeEncryptor.fromBytes(recipientPublic),
 		);
 		const subscriber = envelope(Notes).sealed(
-			EciesDecryptor.fromBytes(recipientSecret),
+			HpkeDecryptor.fromBytes(recipientSecret),
 		);
 
 		const built = await publisher.frame(NOTE).build();
@@ -225,7 +228,6 @@ describe("Envelope Signatory.verifier", () => {
 describe("Envelope enforcement", () => {
 	it("rejects an unsigned frame when authenticity is declared", async () => {
 		const unsigned = await envelope(Notes).frame(NOTE).build();
-
 		const strict = envelope(Notes).signed(SIGNING_KEY);
 		await expect(strict.unwrap(unsigned)).rejects.toMatchObject({
 			code: "ENVELOPE_UNSIGNED",
@@ -246,8 +248,9 @@ describe("Envelope enforcement", () => {
 
 	it("rejects a cleartext frame when confidentiality is declared", async () => {
 		const cleartext = await envelope(Notes).frame(NOTE).build();
-
-		const strict = envelope(Notes).sealed(Aes256Gcm.fromKey(TOPIC_KEY));
+		const strict = envelope(Notes).sealed(
+			Aes256Gcm.fromKey(TOPIC_KEY, TOPIC_KEY_ID),
+		);
 		await expect(strict.unwrap(cleartext)).rejects.toMatchObject({
 			code: "ENVELOPE_CLEARTEXT",
 		});
@@ -255,7 +258,7 @@ describe("Envelope enforcement", () => {
 
 	it("rejects a sealed frame when no opener is declared", async () => {
 		const sealed = await envelope(Notes)
-			.sealed(Aes256Gcm.fromKey(TOPIC_KEY))
+			.sealed(Aes256Gcm.fromKey(TOPIC_KEY, TOPIC_KEY_ID))
 			.frame(NOTE)
 			.build();
 
@@ -288,7 +291,6 @@ describe("Envelope enforcement", () => {
 describe("Envelope wrap-side strictness", () => {
 	it("a verify-only envelope refuses to build", () => {
 		const readOnly = envelope(Notes).verified(SIGNING_KEY.verifyingKey());
-
 		expect(() => readOnly.frame(NOTE)).toThrow(ValidationError);
 		expect(() => readOnly.frame(NOTE)).toThrow(
 			expect.objectContaining({ code: "ENVELOPE_SIGNER" }),
@@ -298,7 +300,7 @@ describe("Envelope wrap-side strictness", () => {
 	it("an open-only envelope refuses to build", () => {
 		const recipientSecret = new Uint8Array(32).fill(3);
 		const readOnly = envelope(Notes).sealed(
-			EciesDecryptor.fromBytes(recipientSecret),
+			HpkeDecryptor.fromBytes(recipientSecret),
 		);
 
 		expect(() => readOnly.frame(NOTE)).toThrow(ValidationError);
@@ -309,7 +311,6 @@ describe("Envelope wrap-side strictness", () => {
 
 	it("an external signatory without a verifier refuses to unwrap", async () => {
 		const external = envelope(Notes).signed(profileBackedSignatory({}));
-
 		const built = await external.frame(NOTE).build();
 		await expect(external.unwrap(built)).rejects.toMatchObject({
 			code: "ENVELOPE_VERIFIER",

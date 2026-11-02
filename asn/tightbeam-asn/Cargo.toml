@@ -29,11 +29,11 @@ required-features = ["emit"]
 [features]
 default = []
 wasm = ["dep:wasm-bindgen", "dep:js-sys"]
-emit = ["dep:tightbeam-derive"]
+emit = ["dep:tightbeam-rs"]
 
 [dependencies]
 tightbeam-asn-derive = { version = "0.1.0", path = "../tightbeam-asn-derive" }
-tightbeam-derive = { version = "0.1.7", optional = true }
+tightbeam-rs = { workspace = true, optional = true }
 der = { workspace = true, features = ["alloc", "derive", "oid"] }
 js-sys = { workspace = true, optional = true }
 wasm-bindgen = { workspace = true, optional = true }

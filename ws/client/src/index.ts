@@ -48,8 +48,8 @@ export type {
 } from "./compress.js";
 export {
 	Aes256Gcm,
-	EciesDecryptor,
-	EciesEncryptor,
+	HpkeDecryptor,
+	HpkeEncryptor,
 	PROFILE_OIDS,
 	Secp256k1SigningKey,
 	Secp256k1VerifyingKey,
@@ -678,7 +678,7 @@ function wrapDuplexStream(stream: WasmDuplexStream): DuplexStream {
 
 /**
  * A multiplexed tightbeam client over a single WebSocket session,
- * ECIES-encrypted ({@link connect}, {@link connectMutual}) or cleartext
+ * HPKE-encrypted ({@link connect}, {@link connectMutual}) or cleartext
  * ({@link connectCleartext}).
  */
 export class TightbeamWsClient extends SocketLifecycle<MuxWsClient> {
@@ -1135,9 +1135,9 @@ export class TightbeamWsClient extends SocketLifecycle<MuxWsClient> {
 	 * Resolves once a new stream would be admitted. Replaces polling
 	 * {@link hasStreamHeadroom} in a loop, with the same advisory caveat.
 	 *
-	 * Rejects with `Draining` once no stream will ever be admitted again,
-	 * or with the abort reason of {@link WaitOptions.signal} when the
-	 * caller gives up first.
+	 * Rejects with `Draining` or `ConnectionClosed` once no stream will ever
+	 * be admitted again, or with the abort reason of
+	 * {@link WaitOptions.signal} when the caller gives up first.
 	 */
 	async waitForStreamSlot(options?: WaitOptions): Promise<void> {
 		this.requireLive("waitForStreamSlot");
@@ -1203,7 +1203,8 @@ export class TightbeamWsClient extends SocketLifecycle<MuxWsClient> {
 	/**
 	 * Connection-level liveness probe: resolves when the peer's ack
 	 * arrives. No stream is allocated and the peer's application handler
-	 * never runs, so a periodic ping doubles as an idle keepalive.
+	 * never runs. A client already pings on its own to hold an idle session
+	 * open, so call this to measure the link.
 	 *
 	 * Rejects with `Draining` while the connection winds down,
 	 * `ConnectionClosed` when it is gone, and the abort reason of

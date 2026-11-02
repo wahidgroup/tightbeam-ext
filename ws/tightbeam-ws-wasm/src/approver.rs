@@ -13,9 +13,9 @@ use wasm_bindgen_futures::JsFuture;
 
 use tightbeam::der::asn1::OctetString;
 use tightbeam::der::Encode;
+use tightbeam::marker::MaybeSendFuture;
 use tightbeam::transport::handshake::negotiation::MuxBudgets;
 use tightbeam::transport::handshake::receipt::{ApprovalRefusal, ReceiptApprover, SessionReceipt};
-use tightbeam::utils::marker::MaybeSendFuture;
 
 use crate::fault::validation;
 

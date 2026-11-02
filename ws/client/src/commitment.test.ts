@@ -15,13 +15,11 @@ import { initClient } from "./index.js";
 await initClient();
 
 const TEXT = new TextEncoder();
-
 const HASHER = new Sha3_256();
-
 const BODY = bodyPreimage(TEXT.encode("committed body"));
 const OTHER_BODY = bodyPreimage(TEXT.encode("some other body"));
-const SALT = TEXT.encode("blinding-salt");
-const OTHER_SALT = TEXT.encode("some-other-salt");
+const SALT = TEXT.encode("blinding-salt-of-the-body");
+const OTHER_SALT = TEXT.encode("some-other-blinding-salt");
 const EMPTY_SALT = new Uint8Array();
 
 /**
@@ -33,7 +31,7 @@ const INTEROP_BODY = bodyPreimage(
 );
 const INTEROP_SALT = TEXT.encode("opening-interop-salt");
 const INTEROP_COMMITMENT_HEX =
-	"60b6ac6b45c68572acafa88fa74257e84fc9dc71397a1a99265ecb454bf5e639";
+	"678bec1605c349a2af6ceaa627569d31d57759ee2fbeffd2ac33026df930e04e";
 
 function bytesFromHex(hex: string): Uint8Array {
 	const bytes = new Uint8Array(hex.length / 2);
@@ -98,10 +96,18 @@ describe("Opening", () => {
 		expect(commitment.digest).not.toEqual(plainDigest);
 	});
 
-	it("reproduces the plain body digest under an empty salt", async () => {
-		const plainDigest = await HASHER.digest(BODY);
+	it("digests the plain mode byte and the body under an empty salt", async () => {
+		const plainPreimage = new Uint8Array(BODY.length + 1);
+		plainPreimage.set(BODY, 1);
+
+		const plainDigest = await HASHER.digest(plainPreimage);
 		const { commitment } = await Opening.prove(HASHER, BODY, EMPTY_SALT);
 		expect(commitment.digest).toEqual(plainDigest);
+	});
+
+	it("refuses a salt too short to hide the body", async () => {
+		const shortSalt = new Uint8Array(15);
+		await expect(Opening.prove(HASHER, BODY, shortSalt)).rejects.toThrow();
 	});
 
 	it("reproduces the commitment tightbeam-rs publishes over the shared fixture", async () => {

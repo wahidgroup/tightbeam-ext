@@ -1,3 +1,5 @@
+import { expect, test } from "@playwright/test";
+
 import type {
 	MuxCallbackResult,
 	MuxConcurrentResult,
@@ -5,8 +7,6 @@ import type {
 	MuxLifecycleResult,
 	MuxRefusalResult,
 } from "../app/main.js";
-import { expect, test } from "@playwright/test";
-
 import { certBase64, muxClearEndpoint, muxEndpoint } from "../env.js";
 import { openApp } from "./helpers.js";
 
@@ -67,7 +67,7 @@ test("probes the mux lifecycle surface from the browser", async ({ page }) => {
 		pendingIdle: true,
 		liveReasonEmpty: true,
 		abandonedPingRejection: "ping abandoned",
-		drainCode: "Draining",
+		drainCode: "ConnectionClosed",
 		localReasonEmpty: true,
 	});
 });

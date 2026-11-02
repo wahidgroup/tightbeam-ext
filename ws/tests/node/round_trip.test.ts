@@ -3,8 +3,8 @@ import { describe, expect, it } from "vitest";
 import type { MessageCodec } from "@wahidgroup/tightbeam-ws-client";
 import {
 	Aes256Gcm,
-	EciesDecryptor,
-	EciesEncryptor,
+	HpkeDecryptor,
+	HpkeEncryptor,
 	Opaque,
 	PROFILE_OIDS,
 	Secp256k1SigningKey,
@@ -42,7 +42,8 @@ async function withEchoClient(
 const TEXT = new TextDecoder();
 const BODY = new Uint8Array([0xde, 0xad, 0xbe, 0xef]);
 const SIGNING_KEY = Secp256k1SigningKey.fromBytes(new Uint8Array(32).fill(3));
-const SALT = new Uint8Array([0x5a, 0x5a]);
+const KEY_ID = new TextEncoder().encode("tbws/e2e/kek/v1");
+const SALT = new Uint8Array(16).fill(0x5a);
 
 describe("Node round-trips against the dockerized echo server", () => {
 	it("round-trips a frame over Node's global WebSocket", async () => {
@@ -84,7 +85,7 @@ describe("Node round-trips against the dockerized echo server", () => {
 	});
 
 	it("round-trips an AES-256-GCM sealed body and opens it with the key", async () => {
-		const cipher = Aes256Gcm.fromKey(new Uint8Array(32).fill(7));
+		const cipher = Aes256Gcm.fromKey(new Uint8Array(32).fill(7), KEY_ID);
 
 		await withEchoClient(async (client) => {
 			const built = await frame(BODY)
@@ -105,22 +106,22 @@ describe("Node round-trips against the dockerized echo server", () => {
 		});
 	});
 
-	it("seals a body to a recipient with ECIES and opens it with the secret", async () => {
+	it("seals a body to a recipient with HPKE and opens it with the secret", async () => {
 		const recipientSecret = new Uint8Array(32).fill(3);
 		const recipientPublic = SIGNING_KEY.verifyingKey().toSec1Bytes();
 
 		await withEchoClient(async (client) => {
 			const built = await frame(BODY)
-				.withId("node-ecies")
+				.withId("node-hpke")
 				.withOrder(8)
-				.withEncryptor(EciesEncryptor.fromBytes(recipientPublic))
+				.withEncryptor(HpkeEncryptor.fromBytes(recipientPublic))
 				.build();
 
 			const response = await emitOrFail(client, built);
 			expect(response.confidential).toBe(true);
 			expect(response.bodyDer).not.toEqual(BODY);
 
-			const decryptor = EciesDecryptor.fromBytes(recipientSecret);
+			const decryptor = HpkeDecryptor.fromBytes(recipientSecret);
 			await expect(
 				response.decryptMessage(decryptor, Opaque),
 			).resolves.toEqual(BODY);
@@ -129,7 +130,7 @@ describe("Node round-trips against the dockerized echo server", () => {
 
 	it("round-trips a compressed, sealed body and recovers it with the inflator", async () => {
 		const zstd = new ZstdCompression();
-		const cipher = Aes256Gcm.fromKey(new Uint8Array(32).fill(7));
+		const cipher = Aes256Gcm.fromKey(new Uint8Array(32).fill(7), KEY_ID);
 
 		await withEchoClient(async (client) => {
 			const built = await frame(BODY)
@@ -203,7 +204,7 @@ describe("Node round-trips against the dockerized echo server", () => {
 		});
 	});
 
-	it("round-trips over an ECIES-encrypted session", async () => {
+	it("round-trips over an HPKE-encrypted session", async () => {
 		const serverCert = certBytes("server.cert.der");
 
 		await withClient(

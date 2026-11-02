@@ -39,7 +39,7 @@ required-features = ["testing"]
 tightbeam-rs = { workspace = true, features = [
     "tcp",
     "tokio",
-    "transport-ecies",
+    "transport-hpke",
     "transport-multiplex",
     "transport-policy",
 ] }

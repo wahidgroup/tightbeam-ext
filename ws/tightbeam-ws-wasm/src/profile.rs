@@ -4,16 +4,21 @@
 //! (`Secp256k1SigningKey`, `Aes256Gcm`, …). Module-level free functions do
 //! not take raw key material.
 
-use wasm_bindgen::prelude::*;
+use std::rc::Rc;
 
+use js_sys::{Promise, Uint8Array};
+use wasm_bindgen::prelude::*;
+use wasm_bindgen_futures::future_to_promise;
+
+use tightbeam::asn1::ObjectIdentifier;
 use tightbeam::crypto::sign::ecdsa::{
 	Secp256k1SigningKey as ProfileSigningKey, Secp256k1VerifyingKey as ProfileVerifyingKey,
 };
 use tightbeam::spki::EncodePublicKey;
+use tightbeam::TightBeamError;
 
 use crate::build::{
-	self, Aes256GcmKey, EciesSecp256k1Decryptor as ProfileEciesDecryptor,
-	EciesSecp256k1Encryptor as ProfileEciesEncryptor,
+	self, Aes256GcmKey, HpkeSecp256k1Decryptor as ProfileHpkeDecryptor, HpkeSecp256k1Encryptor as ProfileHpkeEncryptor,
 };
 
 /// secp256k1 private keys are 32 octets.
@@ -28,23 +33,45 @@ pub struct SealedBody {
 
 #[wasm_bindgen]
 impl SealedBody {
-	/// The encryption algorithm OID (dotted form).
+	/// The content-encryption algorithm OID (dotted form).
 	#[wasm_bindgen(getter, js_name = algorithmOid)]
 	pub fn algorithm_oid(&self) -> String {
 		self.inner.algorithm_oid.clone()
 	}
 
-	/// The algorithm parameters DER (e.g. the nonce), when the scheme has
-	/// any.
-	#[wasm_bindgen(getter, js_name = parametersDer)]
-	pub fn parameters_der(&self) -> Option<Vec<u8>> {
-		self.inner.parameters_der.clone()
+	/// The DER `AuthEnvelopedData`, its content detached.
+	#[wasm_bindgen(getter, js_name = envelopeDer)]
+	pub fn envelope_der(&self) -> Vec<u8> {
+		self.inner.envelope_der.clone()
 	}
 
 	/// The ciphertext replacing the frame body.
 	#[wasm_bindgen(getter)]
 	pub fn ciphertext(&self) -> Vec<u8> {
 		self.inner.ciphertext.clone()
+	}
+}
+
+/// Surface an open as a promise of the plaintext body DER.
+fn plaintext_promise(
+	opening: impl core::future::Future<Output = Result<Vec<u8>, TightBeamError>> + 'static,
+) -> Promise {
+	future_to_promise(async move {
+		let plaintext = opening.await.map_err(|error| JsError::new(&error.to_string()))?;
+		Ok(Uint8Array::from(plaintext.as_slice()).into())
+	})
+}
+
+/// Parse an optional dotted content-type OID from the boundary.
+fn content_oid_from(content_oid: Option<String>) -> Result<Option<ObjectIdentifier>, JsError> {
+	match content_oid {
+		Some(dotted) => {
+			let oid = dotted
+				.parse()
+				.map_err(|_| JsError::new("contentOid is not a valid dotted OID"))?;
+			Ok(Some(oid))
+		}
+		None => Ok(None),
 	}
 }
 
@@ -96,16 +123,17 @@ impl Secp256k1SigningKey {
 			.map_err(|error| JsError::new(&error.to_string()))
 	}
 
-	/// Subject-key-identifier octets for `attachSignature`.
+	/// Subject-key-identifier octets for `signingPrehash` and
+	/// `attachSignature`.
 	#[wasm_bindgen(js_name = signerId)]
 	pub fn signer_id(&self) -> Result<Vec<u8>, JsError> {
 		build::signer_id(self.inner.verifying_key()).map_err(|error| JsError::new(&error.to_string()))
 	}
 
-	/// Sign the SHA3-256 digest of `tbs` as compact 64-byte `r || s`.
-	#[wasm_bindgen(js_name = signTbs)]
-	pub fn sign_tbs(&self, tbs: Vec<u8>) -> Result<Vec<u8>, JsError> {
-		build::sign_tbs(&self.inner, tbs).map_err(|error| JsError::new(&error.to_string()))
+	/// Sign `prehash` directly, with no rehash, as a DER `ECDSA-Sig-Value`.
+	#[wasm_bindgen(js_name = signPrehash)]
+	pub fn sign_prehash(&self, prehash: Vec<u8>) -> Result<Vec<u8>, JsError> {
+		build::sign_prehash(&self.inner, prehash).map_err(|error| JsError::new(&error.to_string()))
 	}
 }
 
@@ -144,81 +172,88 @@ impl Secp256k1VerifyingKey {
 	}
 }
 
-/// Profile AES-256-GCM under a 32-byte shared key.
+/// Profile key-encryption key: a 32-byte shared key, named by `keyId`, that
+/// wraps a fresh AES-256-GCM content key per seal.
 #[wasm_bindgen(js_name = Aes256Gcm)]
 pub struct Aes256Gcm {
-	inner: Aes256GcmKey,
+	inner: Rc<Aes256GcmKey>,
 }
 
 #[wasm_bindgen]
 impl Aes256Gcm {
-	/// Construct from a raw 32-byte key.
+	/// Construct from a raw 32-byte key and the identifier that names it to
+	/// every holder.
 	#[wasm_bindgen(js_name = fromKey)]
-	pub fn from_key(key: Vec<u8>) -> Result<Aes256Gcm, JsError> {
-		let inner = Aes256GcmKey::new(key).map_err(|error| JsError::new(&error.to_string()))?;
-		Ok(Aes256Gcm { inner })
+	pub fn from_key(key: Vec<u8>, key_id: Vec<u8>) -> Result<Aes256Gcm, JsError> {
+		let inner = Aes256GcmKey::new(key, key_id).map_err(|error| JsError::new(&error.to_string()))?;
+		Ok(Aes256Gcm { inner: Rc::new(inner) })
 	}
 
-	/// Seal `plaintext` under a fresh nonce.
+	/// Seal `plaintext` of type `content_oid` under a fresh content key.
 	#[wasm_bindgen]
-	pub fn seal(&self, plaintext: Vec<u8>) -> Result<SealedBody, JsError> {
-		let sealed = self.inner.seal(plaintext).map_err(|error| JsError::new(&error.to_string()))?;
+	pub fn seal(&self, plaintext: Vec<u8>, content_oid: Option<String>) -> Result<SealedBody, JsError> {
+		let content_oid = content_oid_from(content_oid)?;
+		let sealed = self.inner.seal(plaintext, content_oid);
+		let sealed = sealed.map_err(|error| JsError::new(&error.to_string()))?;
+
 		Ok(SealedBody { inner: sealed })
 	}
 
 	/// Open a sealed body with this key.
-	#[wasm_bindgen]
-	pub fn open(&self, parameters_der: Option<Vec<u8>>, ciphertext: Vec<u8>) -> Result<Vec<u8>, JsError> {
-		self.inner
-			.open(parameters_der, ciphertext)
-			.map_err(|error| JsError::new(&error.to_string()))
+	#[wasm_bindgen(unchecked_return_type = "Promise<Uint8Array>")]
+	pub fn open(&self, envelope_der: Vec<u8>, ciphertext: Vec<u8>) -> Promise {
+		let inner = Rc::clone(&self.inner);
+		plaintext_promise(async move { inner.open(envelope_der, ciphertext).await })
 	}
 }
 
-/// Profile ECIES encryptor (secp256k1 + HKDF-SHA3-256 + AES-256-GCM).
-#[wasm_bindgen(js_name = EciesSecp256k1Encryptor)]
-pub struct EciesSecp256k1Encryptor {
-	inner: ProfileEciesEncryptor,
+/// Profile HPKE encryptor (DHKEM over secp256k1 with an AES-256-GCM content
+/// key).
+#[wasm_bindgen(js_name = HpkeSecp256k1Encryptor)]
+pub struct HpkeSecp256k1Encryptor {
+	inner: ProfileHpkeEncryptor,
 }
 
 #[wasm_bindgen]
-impl EciesSecp256k1Encryptor {
+impl HpkeSecp256k1Encryptor {
 	/// Construct from the recipient's SEC1 public key.
 	#[wasm_bindgen(js_name = fromBytes)]
-	pub fn from_bytes(recipient_public_key: Vec<u8>) -> Result<EciesSecp256k1Encryptor, JsError> {
+	pub fn from_bytes(recipient_public_key: Vec<u8>) -> Result<HpkeSecp256k1Encryptor, JsError> {
 		let inner =
-			ProfileEciesEncryptor::from_sec1(recipient_public_key).map_err(|error| JsError::new(&error.to_string()))?;
-		Ok(EciesSecp256k1Encryptor { inner })
+			ProfileHpkeEncryptor::from_sec1(recipient_public_key).map_err(|error| JsError::new(&error.to_string()))?;
+		Ok(HpkeSecp256k1Encryptor { inner })
 	}
 
-	/// Seal `plaintext` to the recipient under a fresh ephemeral key.
+	/// Seal `plaintext` of type `content_oid` to the recipient under a fresh
+	/// ephemeral key.
 	#[wasm_bindgen]
-	pub fn seal(&self, plaintext: Vec<u8>) -> Result<SealedBody, JsError> {
-		let sealed = self.inner.seal(plaintext).map_err(|error| JsError::new(&error.to_string()))?;
+	pub fn seal(&self, plaintext: Vec<u8>, content_oid: Option<String>) -> Result<SealedBody, JsError> {
+		let content_oid = content_oid_from(content_oid)?;
+		let sealed = self.inner.seal(plaintext, content_oid);
+		let sealed = sealed.map_err(|error| JsError::new(&error.to_string()))?;
 		Ok(SealedBody { inner: sealed })
 	}
 }
 
-/// Profile ECIES decryptor holding the recipient secp256k1 secret.
-#[wasm_bindgen(js_name = EciesSecp256k1Decryptor)]
-pub struct EciesSecp256k1Decryptor {
-	inner: ProfileEciesDecryptor,
+/// Profile HPKE decryptor holding the recipient secp256k1 secret.
+#[wasm_bindgen(js_name = HpkeSecp256k1Decryptor)]
+pub struct HpkeSecp256k1Decryptor {
+	inner: Rc<ProfileHpkeDecryptor>,
 }
 
 #[wasm_bindgen]
-impl EciesSecp256k1Decryptor {
+impl HpkeSecp256k1Decryptor {
 	/// Construct from a raw 32-byte recipient secret key.
 	#[wasm_bindgen(js_name = fromBytes)]
-	pub fn from_bytes(secret_key: Vec<u8>) -> Result<EciesSecp256k1Decryptor, JsError> {
-		let inner = ProfileEciesDecryptor::new(secret_key).map_err(|error| JsError::new(&error.to_string()))?;
-		Ok(EciesSecp256k1Decryptor { inner })
+	pub fn from_bytes(secret_key: Vec<u8>) -> Result<HpkeSecp256k1Decryptor, JsError> {
+		let inner = ProfileHpkeDecryptor::new(secret_key).map_err(|error| JsError::new(&error.to_string()))?;
+		Ok(HpkeSecp256k1Decryptor { inner: Rc::new(inner) })
 	}
 
 	/// Open a body sealed to this recipient.
-	#[wasm_bindgen]
-	pub fn open(&self, parameters_der: Option<Vec<u8>>, ciphertext: Vec<u8>) -> Result<Vec<u8>, JsError> {
-		self.inner
-			.open(parameters_der, ciphertext)
-			.map_err(|error| JsError::new(&error.to_string()))
+	#[wasm_bindgen(unchecked_return_type = "Promise<Uint8Array>")]
+	pub fn open(&self, envelope_der: Vec<u8>, ciphertext: Vec<u8>) -> Promise {
+		let inner = Rc::clone(&self.inner);
+		plaintext_promise(async move { inner.open(envelope_der, ciphertext).await })
 	}
 }

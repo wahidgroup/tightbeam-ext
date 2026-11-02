@@ -12,7 +12,9 @@
 
 use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
+use tightbeam::constants::DEFAULT_OPERATION_TIMEOUT;
 use tightbeam::policy::TransitStatus;
 use tightbeam::transport::io::{EnvelopeSink, EnvelopeSource};
 use tightbeam::transport::multiplex::{MuxHandle, MuxTransport};
@@ -22,6 +24,30 @@ use tightbeam::Frame;
 use crate::dispatch::PubsubCommands;
 use crate::policy::SubscribePolicy;
 use crate::registry::ConnectionId;
+
+/// How often a served connection pings its peer: a third of the default
+/// operation deadline, so one lost probe leaves the link inside the deadline.
+pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(DEFAULT_OPERATION_TIMEOUT.as_secs() / 3);
+
+/// Ping the peer of `handle` every `interval` until the connection ends, so an
+/// idle link outlives the read deadline of both ends.
+///
+/// A probe and its ack each count as a read on the end that receives them, and
+/// neither allocates a stream nor reaches the peer's application handler. An
+/// operator that lowers the operation timeout passes an interval below it.
+pub async fn keep_alive(handle: MuxHandle, interval: Duration) {
+	let mut ticks = tokio::time::interval(interval);
+
+	// The first tick completes at once, and a new link needs no probe.
+	ticks.tick().await;
+
+	loop {
+		ticks.tick().await;
+		if handle.ping().await.is_err() {
+			return;
+		}
+	}
+}
 
 /// What one served connection's application handler works with.
 #[derive(Clone)]
@@ -116,6 +142,7 @@ where
 	let (handle, reader, writer, responder) = mux.into_parts();
 	let reader_task = tokio::spawn(reader.drive());
 	let writer_task = tokio::spawn(writer.drive());
+	let keepalive_task = tokio::spawn(keep_alive(handle.clone(), KEEPALIVE_INTERVAL));
 
 	let registry = commands.registry().clone();
 	let connection = match identity {
@@ -138,7 +165,44 @@ where
 		.await;
 
 	registry.drop_connection(connection);
+	keepalive_task.abort();
 	reader_task.abort();
 	writer_task.abort();
 	outcome
+}
+
+#[cfg(test)]
+mod tests {
+	use std::time::Duration;
+
+	use tokio::time::timeout;
+
+	use super::*;
+	use crate::testing::memory_mux_pair;
+
+	/// A keepalive holds its task while the peer answers, and its task ends
+	/// with the connection, so a served connection leaks no pinger.
+	#[tokio::test]
+	async fn keep_alive_runs_until_the_connection_ends() {
+		let (client, server) = memory_mux_pair(4);
+		let (_client_handle, client_reader, client_writer, _client_responder) = client.into_parts();
+		let (server_handle, server_reader, server_writer, _server_responder) = server.into_parts();
+
+		let peer_reader = tokio::spawn(client_reader.drive());
+		let peer_writer = tokio::spawn(client_writer.drive());
+		tokio::spawn(server_reader.drive());
+		tokio::spawn(server_writer.drive());
+
+		let mut pinger = tokio::spawn(keep_alive(server_handle, Duration::from_millis(1)));
+
+		let held = timeout(Duration::from_millis(50), &mut pinger).await;
+		assert!(held.is_err(), "the keepalive must run while the peer answers");
+
+		peer_reader.abort();
+		peer_writer.abort();
+		drop(_client_handle);
+
+		let ended = timeout(Duration::from_secs(5), pinger).await;
+		assert!(ended.is_ok(), "the keepalive must end with the connection");
+	}
 }

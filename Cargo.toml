@@ -12,7 +12,7 @@ members = [
 [workspace.package]
 authors = ["Tanveer Wahid <tan@wahid.email>"]
 edition = "2021"
-rust-version = "1.85.1"
+rust-version = "1.88.0"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/wahidgroup/tightbeam-ext"
 homepage = "https://github.com/wahidgroup/tightbeam-ext"
@@ -21,7 +21,7 @@ keywords = ["websocket", "transport", "messaging", "protocol", "tightbeam"]
 categories = ["network-programming", "asynchronous"]
 
 [workspace.dependencies]
-tightbeam-rs = { version = "0.14.0", default-features = false }
+tightbeam-rs = { version = "0.17.0", default-features = false }
 tokio = { version = "1.53.1", default-features = false }
 tokio-tungstenite = { version = "0.30.0", default-features = false }
 futures-util = { version = "0.3.33", default-features = false }

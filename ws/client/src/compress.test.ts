@@ -5,8 +5,8 @@ import { ZstdCompression } from "./compress.js";
 import { Opaque, ValidationError, frame, initClient } from "./index.js";
 
 /**
- * The profile zstd compression: seekable-format streams that must
- * interoperate with tightbeam-rs `ZstdCompression` (zeekstd).
+ * The profile zstd compression: one zstd frame that must interoperate with
+ * tightbeam-rs `ZstdCompression`.
  */
 
 await initClient();
@@ -21,14 +21,20 @@ const INTEROP_PAYLOAD = new TextEncoder().encode(
 );
 
 /**
- * A body compressed by Rust `ZstdCompression` (zeekstd) over
- * {@link INTEROP_PAYLOAD}: the profile inflator must open the stream a
- * tightbeam peer sends.
+ * One zstd frame over {@link INTEROP_PAYLOAD} that declares no content size,
+ * as a streaming encoder writes: the profile inflator must open it within
+ * its ceiling.
  */
-const ZEEKSTD_FIXTURE_HEX =
+const UNSIZED_FRAME_HEX =
 	"28b52ffd00586d0100440274696768746265616d207a73746420696e7465726f7020" +
-	"6669787475726520626f6479200100cc1f4a3d015e2a4d1811000000360000002001" +
-	"00000100000000b1ea928f";
+	"6669787475726520626f6479200100cc1f4a3d01";
+
+/**
+ * The seek table a seekable-format writer appends after a frame. tightbeam-rs
+ * refuses it, so the profile writes none.
+ */
+const SEEK_TABLE_HEX =
+	"5e2a4d1811000000360000002001000001000000" + "00b1ea928f";
 
 function bytesFromHex(hex: string): Uint8Array {
 	const bytes = new Uint8Array(hex.length / 2);
@@ -52,10 +58,10 @@ describe("ZstdCompression", () => {
 		);
 	});
 
-	it("opens a stream compressed by tightbeam-rs (zeekstd)", async () => {
+	it("opens a frame that declares no content size", async () => {
 		const compressed = {
 			algorithmOid: PROFILE_OIDS.zstd,
-			data: bytesFromHex(ZEEKSTD_FIXTURE_HEX),
+			data: bytesFromHex(UNSIZED_FRAME_HEX),
 		};
 
 		await expect(zstd.decompress(compressed)).resolves.toEqual(
@@ -63,7 +69,16 @@ describe("ZstdCompression", () => {
 		);
 	});
 
-	it("splits bodies beyond the 2 MiB frame policy into multiple frames", async () => {
+	it("writes one frame with no seek table", async () => {
+		const compressed = await zstd.compress(INTEROP_PAYLOAD);
+		const hex = Array.from(compressed.data, (octet) =>
+			octet.toString(16).padStart(2, "0"),
+		).join("");
+		expect(hex.startsWith("28b52ffd")).toBe(true);
+		expect(hex.includes(SEEK_TABLE_HEX.slice(0, 8))).toBe(false);
+	});
+
+	it("round-trips a body past one megabyte", async () => {
 		const large = new Uint8Array(2 * 1024 * 1024 + 1).fill(0x61);
 
 		const compressed = await zstd.compress(large);
@@ -79,15 +94,13 @@ describe("ZstdCompression", () => {
 		);
 	});
 
-	it("rejects a stream without a seekable seek table", async () => {
+	it("rejects bytes that open no zstd frame", async () => {
 		const compressed = {
 			algorithmOid: PROFILE_OIDS.zstd,
 			data: new Uint8Array(32).fill(0xff),
 		};
 
-		await expect(zstd.decompress(compressed)).rejects.toThrow(
-			ValidationError,
-		);
+		await expect(zstd.decompress(compressed)).rejects.toThrow();
 	});
 
 	it("rejects a declared output size beyond the ceiling before decompressing", async () => {

@@ -8,10 +8,12 @@
 
 #![cfg(not(target_arch = "wasm32"))]
 
-use tightbeam::colony::cluster::{ClusterRequest, ClusterWorkRequest, ClusterWorkResponse};
+use tightbeam::colony::protocol::{ClusterRequest, ClusterWorkRequest, ClusterWorkResponse};
+use tightbeam::der::Decode;
 use tightbeam::policy::TransitStatus;
-use tightbeam::utils::urn::Urn;
-use tightbeam::{encode, Frame, Metadata, TightBeamError, Version};
+use tightbeam::urn::Urn;
+use tightbeam::{encode, Frame, TightBeamError, Version};
+use tightbeam_ws_wasm::build::FrameConfig;
 use tightbeam_ws_wasm::{WorkReply, WorkRequestEnvelope};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -23,25 +25,26 @@ fn ping_urn() -> Result<Urn<'static>, BoxError> {
 
 /// A distinctive end-to-end frame standing in for the caller's signed
 /// work (the pin is byte fidelity, not signature validity).
-fn work_frame(id: &[u8], order: u64) -> Frame {
-	let mut metadata = Metadata::default();
-	metadata.id = id.to_vec();
-	metadata.order = order;
+fn work_frame(id: &[u8], order: u64) -> Result<Frame, BoxError> {
+	carrier(id, order, vec![0x04, 0x03, 0x01, 0x02, 0x03])
+}
 
-	Frame {
-		version: Version::V0,
-		metadata,
-		message: vec![0x04, 0x03, 0x01, 0x02, 0x03],
-		integrity: None,
-		nonrepudiation: None,
-	}
+/// A V0 frame that carries `message` as its body.
+fn carrier(id: &[u8], order: u64, message: Vec<u8>) -> Result<Frame, BoxError> {
+	let config = FrameConfig {
+		version: Some(Version::V0),
+		id: id.to_vec(),
+		order,
+		message,
+		..FrameConfig::default()
+	};
+
+	Ok(Frame::from_der(&config.build()?)?)
 }
 
 /// The gateway reply frame carrying an upstream-encoded work response.
 fn reply_carrier(response: &ClusterWorkResponse) -> Result<Frame, BoxError> {
-	let mut carrier = work_frame(b"reply", 0);
-	carrier.message = encode(response)?;
-	Ok(carrier)
+	carrier(b"reply", 0, encode(response)?)
 }
 
 /// Resolve a locally decoded reply built from upstream-encoded `response`.
@@ -52,12 +55,13 @@ fn served_via_local_codec(response: &ClusterWorkResponse) -> Result<Result<Frame
 
 #[test]
 fn local_envelope_matches_upstream_cluster_request_bytes() -> Result<(), BoxError> {
-	let work = work_frame(b"pin-work", 21);
+	let work = work_frame(b"pin-work", 21)?;
 
 	let upstream = encode(&ClusterRequest::Work(ClusterWorkRequest::new(ping_urn()?, &work)?))?;
 	let local_bytes = WorkRequestEnvelope::new(ping_urn()?, &work)?.into_transport_frame()?;
 	assert_eq!(
-		local_bytes.message, upstream,
+		local_bytes.message(),
+		upstream,
 		"local codec envelope bytes must match the canonical ClusterRequest::Work encoding"
 	);
 	Ok(())
@@ -65,15 +69,16 @@ fn local_envelope_matches_upstream_cluster_request_bytes() -> Result<(), BoxErro
 
 #[test]
 fn local_wrapper_matches_upstream_transport_conventions() -> Result<(), BoxError> {
-	let work = work_frame(b"pin-wrapper", 3);
+	let work = work_frame(b"pin-wrapper", 3)?;
 	let wrapper = WorkRequestEnvelope::new(ping_urn()?, &work)?.into_transport_frame()?;
 	assert_eq!(
-		wrapper.metadata.id, work.metadata.id,
+		wrapper.metadata().id(),
+		work.metadata().id(),
 		"wrapper must reuse the work frame id for correlation, as upstream work_transport does"
 	);
-	assert_eq!(wrapper.version, Version::V0, "wrapper must stay a V0 hop-local frame");
+	assert_eq!(wrapper.version(), Version::V0, "wrapper must stay a V0 hop-local frame");
 	assert!(
-		wrapper.integrity.is_none() && wrapper.nonrepudiation.is_none(),
+		wrapper.integrity().is_none() && wrapper.nonrepudiation().is_none(),
 		"wrapper must carry no integrity or nonrepudiation of its own"
 	);
 	Ok(())
@@ -81,7 +86,7 @@ fn local_wrapper_matches_upstream_transport_conventions() -> Result<(), BoxError
 
 #[test]
 fn local_codec_serves_upstream_ok_reply_byte_for_byte() -> Result<(), BoxError> {
-	let servlet_frame = work_frame(b"pin-reply", 9);
+	let servlet_frame = work_frame(b"pin-reply", 9)?;
 	let served = served_via_local_codec(&ClusterWorkResponse::ok(encode(&servlet_frame)?))??;
 	assert_eq!(
 		encode(&served)?,
@@ -105,7 +110,7 @@ fn local_codec_maps_upstream_refusal_to_work_refused() -> Result<(), BoxError> {
 fn local_codec_refuses_upstream_non_ok_reply_with_payload() -> Result<(), BoxError> {
 	let stray = ClusterWorkResponse {
 		status: TransitStatus::ResourceExhausted,
-		payload: Some(encode(&work_frame(b"stray", 1))?),
+		payload: Some(encode(&work_frame(b"stray", 1)?)?),
 	};
 
 	let served = served_via_local_codec(&stray)?;

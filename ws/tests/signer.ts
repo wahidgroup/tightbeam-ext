@@ -22,6 +22,7 @@ function copyBytes(view: ArrayLike<number>): Uint8Array {
 	for (let index = 0; index < view.length; index += 1) {
 		out[index] = Number(view[index]);
 	}
+
 	return out;
 }
 
@@ -71,7 +72,7 @@ export class NobleTransportSigner implements TransportSigner {
 		const digest = copyBytes(prehash);
 		const signature = secp256k1.sign(digest, this.secret, {
 			prehash: false,
-			format: "compact",
+			format: "der",
 			lowS: true,
 		});
 

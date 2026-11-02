@@ -4,8 +4,8 @@ use std::env;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use tightbeam::Errorizable;
 use tightbeam_asn::emit::{emit_from_paths, EmitError, EmitOptions};
-use tightbeam_derive::Errorizable;
 
 #[derive(Debug, Errorizable)]
 enum CliError {

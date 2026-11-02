@@ -1,6 +1,6 @@
 //! Generate X.509 identity fixtures for the encrypted end-to-end stack.
 //!
-//! Creates a server and a client self-signed root identity and writes each as
+//! Creates a server and a client self-signed identity and writes each as
 //! a DER certificate plus a raw 32-byte signing key under `CERT_DIR`.
 //!
 //! Usage:
@@ -34,8 +34,8 @@ fn main() -> Result<(), BoxError> {
 	let dir = Path::new(&dir);
 	fs::create_dir_all(dir)?;
 
-	let server = Identity::mint_root("CN=tightbeam-ws echo,O=tightbeam-ws,C=US", 1, ONE_YEAR)?;
-	let client = Identity::mint_root("CN=tightbeam-ws client,O=tightbeam-ws,C=US", 2, ONE_YEAR)?;
+	let server = Identity::mint("CN=tightbeam-ws echo,O=tightbeam-ws,C=US", 1, ONE_YEAR)?;
+	let client = Identity::mint("CN=tightbeam-ws client,O=tightbeam-ws,C=US", 2, ONE_YEAR)?;
 
 	write_identity(dir, "server", &server)?;
 	write_identity(dir, "client", &client)?;

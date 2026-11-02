@@ -171,8 +171,8 @@ fn payload_of(update: &Frame) -> Vec<u8> {
 
 /// Assert one update's wrapper stamps and payload.
 fn expect_update(update: &Frame, id: &[u8], order: u64, payload: &[u8]) {
-	assert_eq!(update.metadata.id, id, "the update should route by the topic id");
-	assert_eq!(update.metadata.order, order, "the update should carry the dense stamp");
+	assert_eq!(update.metadata().id(), id, "the update should route by the topic id");
+	assert_eq!(update.metadata().order(), order, "the update should carry the dense stamp");
 	assert_eq!(payload_of(update), payload, "the payload should round-trip");
 }
 
@@ -237,10 +237,15 @@ async fn publish_frame_relays_the_inner_frame_untouched() {
 
 	let application = frame_of(&payload_of(&update));
 	assert_eq!(
-		application.metadata.id, b"order-42",
+		application.metadata().id(),
+		b"order-42",
 		"the inner id should stay the application's"
 	);
-	assert_eq!(application.metadata.order, 7, "the inner order should stay the application's");
+	assert_eq!(
+		application.metadata().order(),
+		7,
+		"the inner order should stay the application's"
+	);
 }
 
 #[tokio::test]
@@ -307,20 +312,27 @@ async fn quiescing_one_node_leaves_the_backplane_live() {
 	quiesced(&node_a);
 
 	let end = on_a.next_update().await;
-	assert_eq!(end.metadata.id, b"end/prices", "the quiesced node should complete its topics");
-	assert_eq!(end.metadata.order, 2, "quiesce claims the next dense stamp for end/");
+	assert_eq!(
+		end.metadata().id(),
+		b"end/prices",
+		"the quiesced node should complete its topics"
+	);
+	assert_eq!(end.metadata().order(), 2, "quiesce claims the next dense stamp for end/");
 
 	published(&node_b, "prices", b"tock");
 
 	let update = on_b.next_update().await;
-	assert_eq!(update.metadata.order, 3, "the live node should continue after the end/ stamp");
+	assert_eq!(
+		update.metadata().order(),
+		3,
+		"the live node should continue after the end/ stamp"
+	);
 }
 
 #[tokio::test]
 async fn command_refusals_carry_their_statuses() {
 	let registry = TopicRegistry::default();
 	let peer = connect(&registry, DenyForbidden, 1).await;
-
 	assert_eq!(
 		refusal(peer.request("sub/forbidden/keys").await),
 		TransportFailure::PermissionDenied,
@@ -346,7 +358,7 @@ async fn quiesce_completes_topics_and_refuses_new_work() {
 	assert_eq!(signaled, 1, "the one subscriber should be signaled");
 
 	let end = peer.next_update().await;
-	assert_eq!(end.metadata.id, b"end/prices", "quiesce should complete the topic");
+	assert_eq!(end.metadata().id(), b"end/prices", "quiesce should complete the topic");
 
 	let refused = peer.request("sub/chat").await;
 	assert_eq!(
@@ -374,7 +386,7 @@ async fn slow_consumer_drops_oldest_and_continues() {
 	published(&registry, "prices", b"1");
 
 	let first = peer.next_update().await;
-	assert_eq!(first.metadata.order, 1, "the first update should be in flight");
+	assert_eq!(first.metadata().order(), 1, "the first update should be in flight");
 
 	// Capacity 2: updates 2 and 3 queue, update 4 evicts update 2.
 	for payload in [b"2".as_slice(), b"3", b"4"] {
@@ -386,7 +398,7 @@ async fn slow_consumer_drops_oldest_and_continues() {
 	let after_gap = peer.next_update().await;
 	let last = peer.next_update().await;
 	assert_eq!(
-		[after_gap.metadata.order, last.metadata.order],
+		[after_gap.metadata().order(), last.metadata().order()],
 		[3, 4],
 		"the oldest queued update should be dropped, revealing a gap"
 	);

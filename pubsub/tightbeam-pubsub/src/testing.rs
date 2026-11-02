@@ -4,9 +4,9 @@
 //! upstream envelope traits over channels, so a real client/server mux
 //! pair runs in one process with no sockets.
 
-use der::asn1::OctetString;
 use tightbeam::builder::{FrameBuilder, TypeBuilder};
-use tightbeam::crypto::aead::{Aes256Gcm, Aes256GcmOid, KeyInit};
+use tightbeam::crypto::key::Aes256GcmKeyProvider;
+use tightbeam::der::asn1::OctetString;
 use tightbeam::transport::error::TransportError;
 use tightbeam::transport::handshake::negotiation::MuxSettings;
 use tightbeam::transport::multiplex::{MuxRole, MuxTransport};
@@ -30,27 +30,38 @@ pub fn command_frame(id: &str, order: u64, payload: &[u8]) -> Result<Frame, Tigh
 	build(id, order, payload)
 }
 
-/// A V1 frame whose opaque body is sealed under the profile AES-256-GCM
-/// cipher with `key`: what a TypeScript client's `sealed` envelope
+/// A V1 frame whose opaque body is sealed to the key-encryption key `kek`,
+/// which `kek_id` names: what a TypeScript client's `sealed` envelope
 /// builds. Only a key holder opens the body.
+///
+/// The body seals under a fresh AES-256-GCM content key, wrapped under `kek`
+/// in a `KEKRecipientInfo`.
 ///
 /// # Errors
 ///
-/// Returns [`TightBeamError`] when the body or AEAD construction fails.
+/// Returns [`TightBeamError`] when the body or the envelope fails to build.
 ///
 /// # Sources
 ///
-/// - NIST SP 800-38D, Galois/Counter Mode (GCM):
-///   <https://csrc.nist.gov/pubs/sp/800/38/d/final>
-pub fn sealed_command_frame(id: &str, order: u64, payload: &[u8], key: &[u8; 32]) -> Result<Frame, TightBeamError> {
+/// - RFC 5083, CMS Authenticated-Enveloped-Data Content Type:
+///   <https://datatracker.ietf.org/doc/html/rfc5083>
+/// - RFC 5652 § 6.2.3, `KEKRecipientInfo`:
+///   <https://datatracker.ietf.org/doc/html/rfc5652#section-6.2.3>
+pub fn sealed_command_frame(
+	id: &str,
+	order: u64,
+	payload: &[u8],
+	kek: &[u8; 32],
+	kek_id: &[u8],
+) -> Result<Frame, TightBeamError> {
 	let body = OpaqueBody { body: OctetString::new(payload)? };
-	let cipher = Aes256Gcm::new(&(*key).into());
+	let sealer = Aes256GcmKeyProvider::new(kek.to_vec(), kek_id.to_vec())?;
 
 	FrameBuilder::<OpaqueBody>::from(Version::V1)
 		.with_id(id)
 		.with_order(order)
 		.with_message(body)
-		.with_aead::<Aes256GcmOid, _>(cipher)
+		.with_encryptor(sealer)
 		.build()
 }
 

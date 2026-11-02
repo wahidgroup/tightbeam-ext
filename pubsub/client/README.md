@@ -131,7 +131,10 @@ for await (const { message: received, frame: wrapper } of orders) {
 The rest of the unwrap toolset applies unchanged. A sealed inner body decrypts with any `BodyDecryptor` (typed by the same codec), and a carried commitment checks against its disclosed salt:
 
 ```ts
-const order = await received.decryptMessage(new Aes256Gcm(topicKey), Orders);
+const order = await received.decryptMessage(
+	Aes256Gcm.fromKey(topicKey, topicKeyId),
+	Orders,
+);
 const verdict = await received.messageCommitmentVerdict(salt); // "verified"
 ```
 
@@ -146,7 +149,7 @@ import { Aes256Gcm, envelope } from "@wahidgroup/tightbeam-ws-client";
 
 const notes = envelope(Notes) // the Orders-style typed codec above
 	.signed(publisherKey)
-	.sealed(Aes256Gcm.fromKey(topicKey));
+	.sealed(Aes256Gcm.fromKey(topicKey, topicKeyId));
 
 // Publisher: one call builds the signed, sealed inner frame.
 await manager.publish("notes", { author: "board", text: "hello" }, notes);
@@ -160,7 +163,7 @@ await manager.subscribe("notes", {
 });
 ```
 
-The envelope's `authenticated` and `confidential` getters report the declared (and therefore enforced) properties, so a UI badges them without probing frames. Subscribers without the signing key compose their half with `verified(publisherKey)`, and an ECIES topic splits the same way (`sealed(EciesEncryptor...)` to publish, `sealed(EciesDecryptor...)` to receive). See the [ws client's Envelopes section](../../ws/client/README.md#envelopes) for the full contract.
+The envelope's `authenticated` and `confidential` getters report the declared (and therefore enforced) properties, so a UI badges them without probing frames. Subscribers without the signing key compose their half with `verified(publisherKey)`, and an HPKE topic splits the same way (`sealed(HpkeEncryptor...)` to publish, `sealed(HpkeDecryptor...)` to receive). See the [ws client's Envelopes section](../../ws/client/README.md#envelopes) for the full contract.
 
 ## Ordering and gaps
 

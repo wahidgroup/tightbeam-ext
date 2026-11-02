@@ -31,7 +31,7 @@ const cases: readonly SecureCase[] = [
 ];
 
 for (const testCase of cases) {
-	test(`round-trips over an ECIES-encrypted session: ${testCase.name}`, async ({
+	test(`round-trips over an HPKE-encrypted session: ${testCase.name}`, async ({
 		page,
 	}) => {
 		await openApp(page);

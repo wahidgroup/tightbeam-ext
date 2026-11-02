@@ -74,7 +74,7 @@ impl<P: SubscribePolicy> PubsubCommands<P> {
 	/// Answer `frame` when it is a pub/sub command. `None` hands the
 	/// frame to the application's own routes.
 	pub fn answer(&self, connection: ConnectionId, frame: &Frame) -> Option<ResponsePackage> {
-		let id = frame.metadata.id.as_slice();
+		let id = frame.metadata().id();
 		if let Some(name) = id.strip_prefix(SUB_PREFIX.as_bytes()) {
 			return Some(self.subscribe(connection, name));
 		}
@@ -289,9 +289,7 @@ mod tests {
 	#[tokio::test]
 	async fn subscribe_command_registers_and_accepts() {
 		let (commands, registry, connection, _peer) = dispatcher(AllowAll);
-
 		let answer = answered(&commands, connection, &command("sub/prices"));
-
 		assert_eq!(answer.status(), TransitStatus::Ok);
 		assert_eq!(registry.subscriber_count(&topic("prices")), 1);
 	}
@@ -309,7 +307,6 @@ mod tests {
 	#[tokio::test]
 	async fn unsubscribe_of_a_never_subscribed_topic_still_accepts() {
 		let (commands, _registry, connection, _peer) = dispatcher(AllowAll);
-
 		let answer = answered(&commands, connection, &command("unsub/prices"));
 		assert_eq!(answer.status(), TransitStatus::Ok);
 	}
@@ -317,7 +314,6 @@ mod tests {
 	#[tokio::test]
 	async fn forbidden_topic_answers_permission_denied() {
 		let (commands, registry, connection, _peer) = dispatcher(DenySecrets);
-
 		let answer = answered(&commands, connection, &command("sub/secrets/keys"));
 		assert_eq!(answer.status(), TransitStatus::PermissionDenied);
 		assert_eq!(registry.subscriber_count(&topic("secrets/keys")), 0);
@@ -326,7 +322,6 @@ mod tests {
 	#[tokio::test]
 	async fn malformed_topic_answers_invalid_argument() {
 		let (commands, _registry, connection, _peer) = dispatcher(AllowAll);
-
 		let answer = answered(&commands, connection, &command("sub/"));
 		assert_eq!(answer.status(), TransitStatus::InvalidArgument);
 	}
@@ -344,7 +339,6 @@ mod tests {
 	async fn over_quota_subscribe_answers_resource_exhausted() {
 		let options = RegistryOptions { max_subscriptions_per_connection: 1, ..RegistryOptions::default() };
 		let (commands, _registry, connection, _peer) = dispatcher_with(AllowAll, options);
-
 		assert_eq!(
 			answered(&commands, connection, &command("sub/prices")).status(),
 			TransitStatus::Ok
@@ -358,7 +352,6 @@ mod tests {
 	#[tokio::test]
 	async fn non_command_frames_pass_through() {
 		let (commands, _registry, connection, _peer) = dispatcher(AllowAll);
-
 		let answer = commands.answer(connection, &command("prices"));
 		assert!(answer.is_none());
 	}
@@ -366,7 +359,6 @@ mod tests {
 	#[tokio::test]
 	async fn pub_command_passes_through_until_publish_is_enabled() {
 		let (commands, _registry, connection, _peer) = dispatcher(AllowAll);
-
 		let answer = commands.answer(connection, &command("pub/prices"));
 		assert!(answer.is_none());
 	}
@@ -374,7 +366,6 @@ mod tests {
 	#[tokio::test]
 	async fn pub_command_publishes_when_the_policy_allows() {
 		let (commands, _registry, connection, _peer) = publisher(AllowAll, AllowAll);
-
 		let answer = answered(&commands, connection, &tick_publish());
 		assert_eq!(answer.status(), TransitStatus::Ok);
 	}
@@ -393,7 +384,6 @@ mod tests {
 	#[tokio::test]
 	async fn forbidden_publish_answers_permission_denied() {
 		let (commands, _registry, connection, _peer) = publisher(AllowAll, DenyPublish);
-
 		let answer = answered(&commands, connection, &tick_publish());
 		assert_eq!(answer.status(), TransitStatus::PermissionDenied);
 	}

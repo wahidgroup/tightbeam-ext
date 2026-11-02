@@ -6,11 +6,12 @@ tightbeam frames are DER-encoded and streamed over raw TCP by `tightbeam::transp
 
 ## Surface
 
-This crate exposes WebSocket framing for tightbeam transports. Authentication and confidentiality come from tightbeam's ECIES application-layer handshake above the socket, not from TLS on the listener itself.
+This crate exposes WebSocket framing for tightbeam transports. Authentication and confidentiality come from tightbeam's HPKE application-layer handshake above the socket, not from TLS on the listener itself.
 
 - `protocol::WsListener` implements tightbeam's `Protocol`, `EncryptedProtocol`, and `AsyncListenerTrait`.
 - `io::WsStream` and `io::WsTransport` implement `AsyncProtocolStream` over `tokio-tungstenite`.
-- Cleartext and ECIES-encrypted round-trips reuse tightbeam's transport-agnostic handshake unchanged.
+- Cleartext and HPKE-encrypted round-trips reuse tightbeam's transport-agnostic handshake unchanged.
+- Each read of a multiplexed session runs under the operation timeout of its endpoint, 30 seconds by default. A session that must outlive a silence pings its peer with `MuxHandle::ping` faster than that timeout.
 
 ## Cluster work plane
 
@@ -30,7 +31,7 @@ The gateway forwards the caller's signed frame to the servlet byte-for-byte, and
 
 ## Limitations
 
-- The listener has no native TLS acceptor: it binds `ws://` only. This does not gate security or `wss://` deployments. Authentication and confidentiality come from tightbeam's ECIES handshake above the socket. Browsers on `https://` pages connect over `wss://` by terminating TLS in front (reverse proxy, load balancer) and forwarding `ws://` to this crate.
+- The listener has no native TLS acceptor: it binds `ws://` only. This does not gate security or `wss://` deployments. Authentication and confidentiality come from tightbeam's HPKE handshake above the socket. Browsers on `https://` pages connect over `wss://` by terminating TLS in front (reverse proxy, load balancer) and forwarding `ws://` to this crate.
 
 ## Sources
 

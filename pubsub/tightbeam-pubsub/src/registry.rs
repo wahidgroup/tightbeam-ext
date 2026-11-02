@@ -949,7 +949,12 @@ mod tests {
 	}
 
 	fn queued_orders(subscriber: &Subscriber) -> Vec<u64> {
-		subscriber.lock_lane().queue.iter().map(|frame| frame.metadata.order).collect()
+		subscriber
+			.lock_lane()
+			.queue
+			.iter()
+			.map(|frame| frame.metadata().order())
+			.collect()
 	}
 
 	#[test]

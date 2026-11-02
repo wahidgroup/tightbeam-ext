@@ -1,6 +1,6 @@
 //! Multiplexed encrypted pub/sub demo server for the e2e suite.
 //!
-//! Every connection completes the ECIES handshake (negotiating
+//! Every connection completes the HPKE handshake (negotiating
 //! multiplexing inside it) and shares one [`TopicRegistry`]. The wire
 //! commands (`sub/`, `unsub/`, and client `pub/` publish) answer through
 //! [`PubsubCommands`] inside [`serve_connection`], plus one demo
@@ -44,13 +44,14 @@ use tightbeam::policy::TransitStatus;
 use tightbeam::prelude::TightBeamSocketAddr;
 use tightbeam::transport::handshake::negotiation::{TransportAuthorizer, TransportOffer};
 use tightbeam::transport::multiplex::{MuxHandle, MuxRole};
-use tightbeam::transport::{EncryptedMessageIO, EncryptedProtocol, ResponsePackage, X509ClientConfig};
+use tightbeam::transport::{ClientBuilder, ConnectionBuilder, EncryptedMessageIO, EncryptedProtocol, ResponsePackage};
 use tightbeam::x509::Certificate;
 use tightbeam::Frame;
 use tightbeam_pubsub::testing::command_frame;
 use tightbeam_pubsub::{
-	opaque_payload, serve_connection, AccessVerdict, AllowAll, Backplane, BackplaneError, ConnectionContext, Local,
-	PubsubCommands, RegistryOptions, SubscribePolicy, Topic, TopicRegistry, UpdateSink,
+	keep_alive, opaque_payload, serve_connection, AccessVerdict, AllowAll, Backplane, BackplaneError,
+	ConnectionContext, Local, PubsubCommands, RegistryOptions, SubscribePolicy, Topic, TopicRegistry, UpdateSink,
+	KEEPALIVE_INTERVAL,
 };
 use tightbeam_ws::io::{WsStream, WsTransport};
 use tightbeam_ws::mux::assemble_mux;
@@ -119,7 +120,7 @@ struct RelayBackplane {
 }
 
 impl RelayBackplane {
-	/// Dial the processor over ECIES, pin `cert_path`, and spawn the relay
+	/// Dial the processor over HPKE, pin `cert_path`, and spawn the relay
 	/// worker.
 	///
 	/// When `paywall` is set, the dial presents `client` (the stack client
@@ -134,19 +135,21 @@ impl RelayBackplane {
 	) -> Result<Arc<Self>, BoxError> {
 		let trust = pinned_trust(&fs::read(cert_path)?)?;
 		let (websocket, _response) = connect_async(endpoint).await?;
-		let transport: ServerTransport = WsTransport::from(WsStream::new(websocket));
 
 		let mut offer = TransportOffer::mux(cap);
 		if paywall {
 			offer = offer.with_budgets(budget_ceiling());
 		}
 
-		let mut transport = transport.with_trust_store(trust).with_mux_offer(Some(offer));
+		let mut builder = ClientBuilder::<WsListener>::builder().with_trust_store(trust);
 		if paywall {
-			let (cert, keys) = client.client_identity();
-			transport = transport
-				.with_client_identity(cert, keys)
-				.with_receipt_approver(FixedWallet::shared(1024)?);
+			builder = builder.with_client_identity(client.signing_identity()?);
+		}
+
+		let adopted = builder.adopt(WsStream::new(websocket))?;
+		let mut transport: ServerTransport = adopted.into_transport().with_mux_offer(Some(offer));
+		if paywall {
+			transport = transport.with_receipt_approver(FixedWallet::shared(1024)?);
 		}
 
 		transport.perform_client_handshake().await?;
@@ -177,6 +180,10 @@ impl RelayBackplane {
 	fn spawned(handle: MuxHandle) -> Arc<Self> {
 		let (requests, mut queue) = channel::<(Topic, Vec<u8>)>(RELAY_DEPTH);
 		let backplane = Arc::new(Self { local: Local::default(), requests });
+
+		// A quiet relay holds its link open through the read deadlines of
+		// both ends.
+		tokio::spawn(keep_alive(handle.clone(), KEEPALIVE_INTERVAL));
 
 		let relay = Arc::clone(&backplane);
 		tokio::spawn(async move {
@@ -264,7 +271,7 @@ impl SubscribePolicy for DenyForbidden {
 
 /// Answer one non-command stream: the demo's `poke`.
 async fn answer_stream(context: ConnectionContext, frame: Arc<Frame>) -> ResponsePackage {
-	if frame.metadata.id.as_slice() == POKE {
+	if frame.metadata().id() == POKE {
 		return answer_poke(&context.handle).await;
 	}
 
@@ -360,7 +367,7 @@ async fn main() -> Result<(), BoxError> {
 	let registry = TopicRegistry::new(options);
 	let commands = PubsubCommands::new(registry, DenyForbidden).with_publish(AllowAll);
 
-	let mut config = identity.server_config();
+	let mut config = identity.server_config()?;
 	if paywall {
 		let client_cert =
 			env::var("TBWS_CLIENT_CERT").map_err(|_| "TBWS_PAYWALL requires TBWS_CLIENT_CERT (mutual auth)")?;

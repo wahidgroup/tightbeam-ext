@@ -43,7 +43,6 @@ words:
   - gloo
   - goaway
   - gpgsign
-  - ecies
   - encryptor
   - encryptors
   - decryptor
@@ -57,6 +56,13 @@ words:
   - repr
   - parameterless
   - hkdf
+  - unref
+  - diffie
+  - dialable
+  - embedder
+  - hpke
+  - dhkem
+  - kekid
   - chacha
   - keepalive
   - prehash
@@ -78,12 +84,10 @@ words:
   - zstandard
   - encap
   - econtent
-  - zeekstd
   - inflator
   - inflators
   - compactness
   - bokuweb
-  - seekable
   - splittable
   - fract
   - microtask

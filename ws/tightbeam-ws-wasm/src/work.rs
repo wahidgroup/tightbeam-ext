@@ -8,12 +8,6 @@
 //! The native-only `tests/work_codec.rs` pin test fails on any drift
 //! between this module and the canonical colony encodings.
 //!
-//! The end-to-end envelope law holds in both directions. The caller's
-//! complete signed work frame nests in the request payload byte-for-byte,
-//! and the servlet's complete response frame returns byte-for-byte in the
-//! reply payload. The transport wrapper built here is hop-local routing
-//! only: it never synthesizes, replaces, or strips an end-to-end frame.
-//!
 //! # Wire shapes (upstream `colony/common/messages.rs`)
 //!
 //! ```text
@@ -39,8 +33,10 @@ use der::{
 };
 
 use tightbeam::policy::TransitStatus;
-use tightbeam::utils::urn::Urn;
-use tightbeam::{decode, encode, Frame, Metadata, TightBeamError, Version};
+use tightbeam::urn::Urn;
+use tightbeam::{decode, encode, Frame, TightBeamError, Version};
+
+use crate::build::FrameConfig;
 
 /// The `ClusterRequest` CHOICE context tag of the `Work` variant.
 const WORK_VARIANT_TAG: TagNumber = TagNumber::N2;
@@ -105,7 +101,7 @@ impl WorkRequestEnvelope {
 	/// original bytes keeps the end-to-end payload untouched by any
 	/// codec round trip.
 	pub(crate) fn from_encoded(servlet_type: Urn<'static>, work_der: Vec<u8>, work: &Frame) -> Self {
-		Self { servlet_type, work_der, correlation_id: work.metadata.id.clone() }
+		Self { servlet_type, work_der, correlation_id: work.metadata().id().to_vec() }
 	}
 
 	/// Wrap the envelope in the hop-local transport frame the gateway
@@ -120,10 +116,14 @@ impl WorkRequestEnvelope {
 		let tagged = ContextSpecificRef { tag_number: WORK_VARIANT_TAG, tag_mode: TagMode::Explicit, value: &body };
 		let message = encode(&tagged)?;
 
-		let mut metadata = Metadata::default();
-		metadata.id = self.correlation_id;
+		let wrapper = FrameConfig {
+			version: Some(Version::V0),
+			id: self.correlation_id,
+			message,
+			..FrameConfig::default()
+		};
 
-		Ok(Frame { version: Version::V0, metadata, message, integrity: None, nonrepudiation: None })
+		Ok(Frame::from_der(&wrapper.build()?)?)
 	}
 }
 
@@ -155,7 +155,7 @@ impl TryFrom<&Frame> for WorkReply {
 
 	/// Decode the work reply carried in the gateway reply frame's message.
 	fn try_from(frame: &Frame) -> Result<Self, Self::Error> {
-		decode(&frame.message)
+		decode(frame.message())
 	}
 }
 
@@ -256,22 +256,24 @@ mod tests {
 		Ok("urn:tightbeam::servlet:ping".parse()?)
 	}
 
-	fn work_frame(id: &[u8]) -> Frame {
-		let mut metadata = Metadata::default();
-		metadata.id = id.to_vec();
-		metadata.order = 7;
+	fn carrier(id: &[u8], message: Vec<u8>) -> AnyResult<Frame> {
+		let config = FrameConfig {
+			version: Some(Version::V0),
+			id: id.to_vec(),
+			order: 7,
+			message,
+			..FrameConfig::default()
+		};
 
-		Frame {
-			version: Version::V0,
-			metadata,
-			message: vec![0x04, 0x01, 0x2A],
-			integrity: None,
-			nonrepudiation: None,
-		}
+		Ok(Frame::from_der(&config.build()?)?)
+	}
+
+	fn work_frame(id: &[u8]) -> AnyResult<Frame> {
+		carrier(id, vec![0x04, 0x01, 0x2A])
 	}
 
 	fn transport_frame(id: &[u8]) -> AnyResult<Frame> {
-		Ok(WorkRequestEnvelope::new(ping_urn()?, &work_frame(id))?.into_transport_frame()?)
+		Ok(WorkRequestEnvelope::new(ping_urn()?, &work_frame(id)?)?.into_transport_frame()?)
 	}
 
 	fn decode_body(message: &[u8]) -> AnyResult<ProbeBody> {
@@ -285,8 +287,8 @@ mod tests {
 
 	#[test]
 	fn envelope_nests_the_work_frame_bytes_untouched() -> TestResult {
-		let work = work_frame(b"work-1");
-		let body = decode_body(&transport_frame(b"work-1")?.message)?;
+		let work = work_frame(b"work-1")?;
+		let body = decode_body(transport_frame(b"work-1")?.message())?;
 		assert_eq!(body.payload, encode(&work)?);
 		assert_eq!(body.servlet_type, ping_urn()?);
 		Ok(())
@@ -297,30 +299,28 @@ mod tests {
 		// ProbeBody decodes exactly two fields inside read_nested, so an
 		// encoded hop-budget field would fail this decode with trailing
 		// data inside the sequence.
-		decode_body(&transport_frame(b"work-2")?.message)?;
+		decode_body(transport_frame(b"work-2")?.message())?;
 		Ok(())
 	}
 
 	#[test]
 	fn transport_wrapper_is_hop_local_only() -> TestResult {
 		let wrapper = transport_frame(b"work-3")?;
-		assert_eq!(wrapper.version, Version::V0);
-		assert_eq!(wrapper.metadata.id, b"work-3");
-		assert_eq!(wrapper.metadata.order, 0);
-		assert!(wrapper.integrity.is_none());
-		assert!(wrapper.nonrepudiation.is_none());
+		assert_eq!(wrapper.version(), Version::V0);
+		assert_eq!(wrapper.metadata().id(), b"work-3");
+		assert_eq!(wrapper.metadata().order(), 0);
+		assert!(wrapper.integrity().is_none());
+		assert!(wrapper.nonrepudiation().is_none());
 		Ok(())
 	}
 
 	#[test]
 	fn served_reply_round_trips_the_servlet_frame_bytes() -> TestResult {
-		let servlet_frame = work_frame(b"reply-1");
+		let servlet_frame = work_frame(b"reply-1")?;
 		let reply_der = ProbeReply { status: TransitStatus::Ok, payload: Some(encode(&servlet_frame)?) };
 
-		let mut carrier = work_frame(b"reply-1");
-		carrier.message = encode(&reply_der)?;
-
-		let served = WorkReply::try_from(&carrier)?.served()?;
+		let reply = carrier(b"reply-1", encode(&reply_der)?)?;
+		let served = WorkReply::try_from(&reply)?.served()?;
 		assert_eq!(encode(&served)?, encode(&servlet_frame)?);
 		Ok(())
 	}
