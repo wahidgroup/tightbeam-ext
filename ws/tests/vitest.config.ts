@@ -8,6 +8,7 @@ export default defineConfig({
 		environment: "node",
 		include: ["node/**/*.test.ts"],
 		root: ".",
+		setupFiles: ["../../scripts/vitest/byte-equality.mjs"],
 		pool: "forks",
 		// A case of the lane collects garbage to show that a body keeps no chunk
 		// it yielded.

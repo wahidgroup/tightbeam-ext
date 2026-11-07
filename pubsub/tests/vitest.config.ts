@@ -8,6 +8,7 @@ export default defineConfig({
 		include: ["node/**/*.test.ts"],
 		exclude: ["node_modules"],
 		root: ".",
+		setupFiles: ["../../scripts/vitest/byte-equality.mjs"],
 	},
 	resolve: {
 		// The e2e fixtures, environment readers, and signer are shared with
