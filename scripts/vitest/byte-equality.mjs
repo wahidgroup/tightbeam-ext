@@ -1,7 +1,7 @@
 /**
  * The byte equality that every vitest suite of the repo registers as a setup
  * file. The default matcher compares a `Uint8Array` through its iterator and
- * its entries, one element at a time, at over a second per mebibyte. A suite
+ * its entries, one element at a time, at over a second per megabyte. A suite
  * that echoes a body past the stream credit would then spend its timeout in
  * the matcher rather than on the wire, so this tester compares the octets in
  * one loop.
