@@ -3,6 +3,9 @@
 //! Every trait follows the core hook style: a small object the application
 //! installs once, consulted at the relevant decision point.
 
+use tightbeam::policy::SessionContext;
+
+use crate::registry::RegistryView;
 use crate::topic::Topic;
 
 /// What to do when a subscriber's bounded update queue is full.
@@ -18,12 +21,19 @@ pub enum DeliveryVerdict {
 
 /// Decides the fate of an update when a subscriber queue is full.
 ///
-/// This crate has no per-subscription credit, so a full queue is the only
-/// backpressure signal. Every drop is a guaranteed gap at the client's gate.
+/// This crate has no per-subscription credit, so a full queue, or a full
+/// byte budget of the connection, is the only backpressure signal. Every
+/// drop is a guaranteed gap at the client's gate.
+///
+/// The registry asks with no registry lock held, and lends a
+/// [`RegistryView`] for the reads a verdict weighs. The backplane may still
+/// hold its own lock, as [`Local`](crate::Local) does while it delivers, so a
+/// policy MUST NOT publish, quiesce, or make any other call that reaches the
+/// backplane.
 pub trait DeliveryPolicy: Send + Sync {
 	/// One update does not fit `topic`'s queue for a subscriber that has
 	/// already dropped `dropped_so_far` updates. Return the verdict.
-	fn on_full(&self, topic: &Topic, dropped_so_far: u64) -> DeliveryVerdict;
+	fn on_full(&self, registry: RegistryView<'_>, topic: &Topic, dropped_so_far: u64) -> DeliveryVerdict;
 }
 
 /// The default policy: always drop the oldest queued update.
@@ -40,7 +50,7 @@ pub trait DeliveryPolicy: Send + Sync {
 pub struct DropOldest;
 
 impl DeliveryPolicy for DropOldest {
-	fn on_full(&self, _topic: &Topic, _dropped_so_far: u64) -> DeliveryVerdict {
+	fn on_full(&self, _registry: RegistryView<'_>, _topic: &Topic, _dropped_so_far: u64) -> DeliveryVerdict {
 		DeliveryVerdict::DropOldest
 	}
 }
@@ -56,22 +66,27 @@ pub enum AccessVerdict {
 
 /// Owns the `PermissionDenied` decision for `sub/` commands.
 ///
-/// `identity` is whatever the application attached at connection
-/// registration. A mutual-auth transport identity is the expected source.
+/// `session` names the peer that the handshake of the connection proved. A
+/// mutual-auth peer carries its validated certificate
+/// ([`SessionContext::peer_certificate`]), and an anonymous peer carries none.
 /// Without this hook the wire's `PermissionDenied` answer has no author.
+///
+/// The dispatcher lends a [`RegistryView`] for the reads a verdict weighs.
 pub trait SubscribePolicy: Send + Sync {
-	/// May the connection carrying `identity` subscribe to `topic`?
-	fn authorize(&self, identity: Option<&[u8]>, topic: &Topic) -> AccessVerdict;
+	/// May the peer of `session` subscribe to `topic`?
+	fn authorize(&self, registry: RegistryView<'_>, session: &SessionContext, topic: &Topic) -> AccessVerdict;
 }
 
 /// Owns the `PermissionDenied` decision for `pub/` commands.
 ///
 /// Client publish is opt-in: [`PubsubCommands`](crate::PubsubCommands)
 /// only answers `pub/` frames once a publish policy is installed with
-/// [`with_publish`](crate::PubsubCommands::with_publish).
+/// [`with_publish`](crate::PubsubCommands::with_publish). `session` names the
+/// peer as it does for a [`SubscribePolicy`], and the dispatcher lends a
+/// [`RegistryView`] for the reads a verdict weighs.
 pub trait PublishPolicy: Send + Sync {
-	/// May the connection carrying `identity` publish to `topic`?
-	fn authorize(&self, identity: Option<&[u8]>, topic: &Topic) -> AccessVerdict;
+	/// May the peer of `session` publish to `topic`?
+	fn authorize(&self, registry: RegistryView<'_>, session: &SessionContext, topic: &Topic) -> AccessVerdict;
 }
 
 /// The default policy: every subscription (and, when installed as a
@@ -80,13 +95,13 @@ pub trait PublishPolicy: Send + Sync {
 pub struct AllowAll;
 
 impl SubscribePolicy for AllowAll {
-	fn authorize(&self, _identity: Option<&[u8]>, _topic: &Topic) -> AccessVerdict {
+	fn authorize(&self, _registry: RegistryView<'_>, _session: &SessionContext, _topic: &Topic) -> AccessVerdict {
 		AccessVerdict::Allow
 	}
 }
 
 impl PublishPolicy for AllowAll {
-	fn authorize(&self, _identity: Option<&[u8]>, _topic: &Topic) -> AccessVerdict {
+	fn authorize(&self, _registry: RegistryView<'_>, _session: &SessionContext, _topic: &Topic) -> AccessVerdict {
 		AccessVerdict::Allow
 	}
 }
@@ -94,32 +109,34 @@ impl PublishPolicy for AllowAll {
 #[cfg(test)]
 mod tests {
 	use super::*;
-
-	fn topic(name: &str) -> Topic {
-		name.parse().expect("test topics should parse")
-	}
+	use crate::registry::TopicRegistry;
 
 	#[test]
 	fn drop_oldest_always_drops_the_oldest() {
 		let policy = DropOldest;
+		let registry = TopicRegistry::default();
 
-		let verdict = policy.on_full(&topic("prices"), 7);
+		let verdict = policy.on_full(registry.view(), &Topic::fixture("prices"), 7);
 		assert_eq!(verdict, DeliveryVerdict::DropOldest);
 	}
 
 	#[test]
-	fn allow_all_allows_subscriptions_without_identity() {
+	fn allow_all_allows_subscriptions_without_a_peer() {
 		let policy = AllowAll;
+		let registry = TopicRegistry::default();
+		let anonymous = SessionContext::default();
 
-		let verdict = SubscribePolicy::authorize(&policy, None, &topic("prices"));
+		let verdict = SubscribePolicy::authorize(&policy, registry.view(), &anonymous, &Topic::fixture("prices"));
 		assert_eq!(verdict, AccessVerdict::Allow);
 	}
 
 	#[test]
-	fn allow_all_allows_publishes_without_identity() {
+	fn allow_all_allows_publishes_without_a_peer() {
 		let policy = AllowAll;
+		let registry = TopicRegistry::default();
+		let anonymous = SessionContext::default();
 
-		let verdict = PublishPolicy::authorize(&policy, None, &topic("prices"));
+		let verdict = PublishPolicy::authorize(&policy, registry.view(), &anonymous, &Topic::fixture("prices"));
 		assert_eq!(verdict, AccessVerdict::Allow);
 	}
 }

@@ -1,12 +1,16 @@
-//! Fixture wire types prove AsnCodec Sequence, Enumerated, Choice, and TS emit.
+//! Fixture wire types prove AsnCodec Sequence, Enumerated, and Choice shapes.
 
 use core::fmt::Debug;
 
 use der::asn1::{OctetString, SetOfVec};
 use der::{Decode, Encode};
-use tightbeam_asn_fixtures::{
-	all_codecs_ts, sample_leaf_bundle, sample_nest_bundle, Ack, Doc, Envelope, LeafBundle, ListPad, ListResult,
-	NestBundle, Record, RegisterBody, Request, Status, StatusReport,
+
+#[allow(dead_code)]
+mod fixtures;
+
+use fixtures::{
+	sample_leaf_bundle, sample_nest_bundle, Ack, Doc, Envelope, ListPad, ListResult, NestBundle, Record, RegisterBody,
+	Request, Status, StatusReport,
 };
 
 fn assert_der_round_trip<T>(value: T)
@@ -69,55 +73,4 @@ fn leaf_and_nest_der_round_trips() {
 		triple: sample_nest_bundle().triple,
 		pair: sample_nest_bundle().pair,
 	});
-}
-
-#[test]
-fn all_codecs_ts_contains_expected_fragments() {
-	let source = all_codecs_ts();
-	for needle in [
-		"import type { MessageCodec } from \"@wahidgroup/tightbeam-ws-client\"",
-		"MessageCodec<Doc>",
-		"MessageCodec<Envelope>",
-		"MessageCodec<Status>",
-		"MessageCodec<StatusReport>",
-		"MessageCodec<ListPad>",
-		"MessageCodec<RegisterBody>",
-		"MessageCodec<Request>",
-		"MessageCodec<Ack>",
-		"MessageCodec<ListResult>",
-		"MessageCodec<Record>",
-		"MessageCodec<LeafBundle>",
-		"MessageCodec<NestBundle>",
-		"export type Status = number;",
-		"export type Request =",
-		"| { Register: RegisterBody }",
-		"| { List: ListPad }",
-		"export interface Doc {",
-		"export interface Envelope {",
-		"payload: Uint8Array;",
-		"export interface StatusReport {",
-		"status: Status;",
-		"export interface ListPad {",
-		"export interface RegisterBody {",
-		"export interface Ack {",
-		"error?: Status | null;",
-		"export interface ListResult {",
-		"records: Record[];",
-		"export interface Record {",
-		"export interface LeafBundle {",
-		"flag: boolean;",
-		"empty: null;",
-		"u64_value: bigint;",
-		"i64_value: bigint;",
-		"bits: { unusedBits: number; bytes: Uint8Array }",
-		"export interface NestBundle {",
-		"nested?: number[] | null;",
-		"deeper?: Record[] | null;",
-		"tags: string[];",
-		"triple: number[];",
-		"pair: number[];",
-	] {
-		assert!(source.contains(needle), "missing fragment: {needle}");
-	}
-	let _ = (LeafBundle::ASN_CODEC_TS, NestBundle::ASN_CODEC_TS);
 }

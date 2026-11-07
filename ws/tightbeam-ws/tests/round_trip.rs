@@ -6,6 +6,8 @@
 //! transport via the `Protocol` / `EncryptedProtocol` / `AsyncListenerTrait`
 //! implementations.
 
+#![cfg(feature = "socket")]
+
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
 

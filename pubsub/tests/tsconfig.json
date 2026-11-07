@@ -10,15 +10,19 @@
 		"noEmit": true,
 		"types": ["@playwright/test", "node"],
 		"lib": ["ES2022", "DOM", "DOM.Iterable"],
+		"resolveJsonModule": true,
 		"paths": {
-			"#ws-harness": ["../../ws/tests/node/harness.ts"]
+			"#pubsub-wire": ["../client/src/wire.generated.json"],
+			"#ws-env": ["../../ws/tests/env.ts"],
+			"#ws-fixtures": ["../../ws/tests/fixtures.ts"],
+			"#ws-signer": ["../../ws/tests/signer.ts"]
 		}
 	},
 	"include": [
 		"app",
 		"specs",
 		"node",
-		"../../ws/tests/node/harness.ts",
+		"aliases.ts",
 		"vite.config.ts",
 		"vitest.config.ts",
 		"playwright.config.ts"

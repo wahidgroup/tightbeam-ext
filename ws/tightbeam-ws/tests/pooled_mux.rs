@@ -24,8 +24,11 @@ use tightbeam_ws::testing::Identity;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// Unary echoes the frame; streaming reassembles via [`StreamBody::into_frame`];
-/// duplex echoes each request chunk on the reply sink.
+/// An echo of every stream kind.
+///
+/// - Unary echoes the frame.
+/// - Streaming reassembles the body via [`StreamBody::into_frame`].
+/// - Duplex echoes each request chunk on the reply sink.
 #[derive(Clone)]
 struct PooledEchoService;
 
@@ -54,10 +57,8 @@ impl MuxService for PooledEchoService {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn one_pooled_ws_connection_serves_multiple_stream_kinds() -> Result<(), BoxError> {
 	let identity = Identity::mint("CN=pooled echo,O=tightbeam-ws,C=US", 1, Duration::from_secs(3600))?;
-
 	let bind_addr = TightBeamSocketAddr("127.0.0.1:0".parse()?);
 	let (server, addr) = <WsListener as EncryptedProtocol>::bind_with(bind_addr, identity.server_config()?).await?;
-
 	let server_handle = server! {
 		protocol WsListener: server,
 		policies: { with_mux_offer: [ Some(TransportOffer::mux(8)) ] },

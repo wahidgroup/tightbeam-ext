@@ -9,5 +9,8 @@ export default defineConfig({
 		include: ["node/**/*.test.ts"],
 		root: ".",
 		pool: "forks",
+		// A case of the lane collects garbage to show that a body keeps no chunk
+		// it yielded.
+		execArgv: ["--expose-gc"],
 	},
 });

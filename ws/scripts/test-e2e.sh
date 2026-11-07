@@ -2,8 +2,9 @@
 set -euo pipefail
 
 # ws e2e lanes against the running stack: the Playwright browser suite,
-# then the node lane against the same echo servers. Expects the E2E_*
-# endpoints exported by scripts/test-e2e.sh (which owns the stack).
+# then the node lane against the same echo servers. Expects the stack
+# variables that scripts/test-e2e.sh (which owns the stack) exports from the
+# env file, which the suites read under their own names.
 #
 # Options (environment, set by the Makefile):
 #   E2E_UI=1     interactive Playwright UI mode
@@ -18,14 +19,6 @@ if [ ! -d "$ROOT/node_modules/@playwright/test" ]; then
 	echo "ERROR: workspace dependencies not installed; run 'make setup ws'" >&2
 	exit 1
 fi
-
-# Map this extension's E2E_* names from the exported stack variables.
-export E2E_ECHO_WS_MUX_ENDPOINT="$ECHO_WS_MUX_ENDPOINT"
-export E2E_ECHO_WS_MUX_CLEAR_ENDPOINT="$ECHO_WS_MUX_CLEAR_ENDPOINT"
-export E2E_ECHO_WS_MUX_MUTUAL_ENDPOINT="$ECHO_WS_MUX_MUTUAL_ENDPOINT"
-export E2E_ECHO_WS_MUX_DUPLEX_ENDPOINT="$ECHO_WS_MUX_DUPLEX_ENDPOINT"
-export E2E_WORK_GATEWAY_WS_ENDPOINT="$WORK_GATEWAY_WS_ENDPOINT"
-export E2E_CERT_DIR="$CERT_DIR"
 
 cd "$ROOT/tests"
 

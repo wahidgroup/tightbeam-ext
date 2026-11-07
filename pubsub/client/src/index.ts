@@ -9,22 +9,32 @@
 
 export { TopicGate } from "./gate.js";
 export type { GateVerdict } from "./gate.js";
-export { SubscriptionManager } from "./manager.js";
+export {
+	ClientPorts,
+	MAX_DEFERRED,
+	PayloadShape,
+	SubscriptionError,
+	SubscriptionManager,
+} from "./manager.js";
 export type {
+	CommandLane,
+	CommandPort,
+	DeferralBudget,
 	EndHandler,
 	GapHandler,
+	HandlerSubscription,
+	IteratingSubscription,
 	ManagerOptions,
+	PayloadSource,
+	ServePort,
+	ShapeUse,
 	SubscribeOptions,
-	Subscription,
+	Subscriber,
+	SubscriptionErrorCode,
 	SubscriptionObservers,
 	SubscriptionState,
 	Update,
 	UpdateHandler,
 } from "./manager.js";
-export {
-	END_PREFIX,
-	PUB_PREFIX,
-	SUB_PREFIX,
-	UNSUB_PREFIX,
-	assertTopic,
-} from "./topic.js";
+export { Command, Topic, TopicError } from "./topic.js";
+export type { CommandBody, TopicErrorCode } from "./topic.js";

@@ -1,0 +1,17 @@
+[package]
+name = "tightbeam-asn-names"
+description = "The TypeScript type-name rule of the tightbeam-asn derive and emitter"
+authors.workspace = true
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/tightbeam-asn-names"
+readme = "README.md"
+keywords.workspace = true
+categories.workspace = true
+
+[lib]
+name = "tightbeam_asn_names"

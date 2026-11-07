@@ -1,5 +1,6 @@
-//! Integration check that `#[derive(AsnCodec)]` implements the marker.
-
+//! Integration check that `#[derive(AsnCodec)]` implements the marker off
+//! `wasm32`, where the expansion needs no der derive.
+#![cfg(not(target_arch = "wasm32"))]
 #![allow(dead_code)]
 
 use der::asn1::{
@@ -77,7 +78,7 @@ struct LeafMarker {
 
 #[derive(AsnCodec)]
 struct NestMarker {
-	nested: Option<Vec<Option<u8>>>,
+	nested: Option<Vec<u8>>,
 	tags: SetOfVec<String>,
 	triple: SequenceOf<u8, 3>,
 	pair: SetOf<u8, 2>,

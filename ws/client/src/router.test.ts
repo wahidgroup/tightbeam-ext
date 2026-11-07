@@ -1,51 +1,40 @@
 import { describe, expect, it } from "vitest";
 
-import type { Frame, MessageCodec } from "./index.js";
-import { UnroutedTopicError, frame, route, router, wrapped } from "./index.js";
+import type { Frame } from "./index.js";
+import type { Note } from "./testing/notes.js";
+import {
+	Route,
+	Router,
+	TightbeamWsClient,
+	UnroutedTopicError,
+} from "./index.js";
+import { NotePayload } from "./testing/notes.js";
 
 /**
  * Frames built through the real builder route to the handler whose prefix
- * matches, decoded through the route's codec.
+ * matches, decoded through the route's codec or envelope.
  */
+
+const engine = await TightbeamWsClient.init();
+const Notes = engine.wrapping(NotePayload);
 
 const TEXT = new TextDecoder();
+const SIGNING_KEY = engine.signingKey(new Uint8Array(32).fill(1));
 
 /**
- * A one-field JSON message, enough to prove typed decode through a route.
+ * Notes that MUST carry a signature under {@link SIGNING_KEY}.
  */
-interface Note {
-	readonly text: string;
-}
-
-const NoteCodec: MessageCodec<Note> = wrapped({
-	encode(message: Note): Uint8Array {
-		const payload = new TextEncoder().encode(JSON.stringify(message));
-		return payload;
-	},
-	decode(payload: Uint8Array): Note {
-		const parsed: unknown = JSON.parse(TEXT.decode(payload));
-		if (
-			typeof parsed !== "object" ||
-			parsed === null ||
-			!("text" in parsed) ||
-			typeof parsed.text !== "string"
-		) {
-			throw new Error("not a note");
-		}
-
-		const note = { text: parsed.text };
-		return note;
-	},
-});
+const SignedNotes = engine.envelope(Notes).signed(SIGNING_KEY);
 
 /**
  * A frame carrying `note` under `topic`, built through the real builder.
  */
 async function noteFrame(topic: string, note: Note): Promise<Frame> {
-	const built = await frame()
+	const built = await engine
+		.frameBuilder()
 		.withId(topic)
 		.withOrder(1)
-		.withMessage(NoteCodec, note)
+		.withMessage(Notes, note)
 		.build();
 	return built;
 }
@@ -55,30 +44,30 @@ async function noteFrame(topic: string, note: Note): Promise<Frame> {
  */
 function recordingTable(): {
 	served: Record<string, Note[]>;
-	handler: (frame: Frame) => Promise<Frame | undefined>;
+	routes: Router;
 } {
 	const served: Record<string, Note[]> = {
 		"tick/": [],
 		"tick/spot/": [],
 		"chat/": [],
 	};
-	const recorder = (prefix: string) => {
-		return route(NoteCodec, (note: Note) => {
+	const recorder = (prefix: string): Route => {
+		return Route.of(Notes, (note: Note) => {
 			served[prefix]?.push(note);
 			return undefined;
 		});
 	};
 
-	const handler = router({
+	const routes = new Router({
 		"tick/": recorder("tick/"),
 		"tick/spot/": recorder("tick/spot/"),
 		"chat/": recorder("chat/"),
 	});
 
-	return { served, handler };
+	return { served, routes };
 }
 
-describe("router", () => {
+describe("Router", () => {
 	const dispatches = [
 		{ topic: "tick/AAPL", servedBy: "tick/" },
 		{ topic: "tick/spot/BTC", servedBy: "tick/spot/" },
@@ -88,56 +77,66 @@ describe("router", () => {
 	it.each(dispatches)(
 		"routes $topic to the $servedBy handler",
 		async ({ topic, servedBy }) => {
-			const { served, handler } = recordingTable();
-			const note = { text: topic };
+			const { served, routes } = recordingTable();
+			const note = { author: "ada", text: topic };
 
-			const response = await handler(await noteFrame(topic, note));
+			const response = await routes.dispatch(
+				await noteFrame(topic, note),
+			);
 			expect(response).toBeUndefined();
 			expect(served[servedBy]).toEqual([note]);
 		},
 	);
 
 	it("prefers the longest matching prefix regardless of table order", async () => {
-		const { served, handler } = recordingTable();
+		const { served, routes } = recordingTable();
 
-		await handler(await noteFrame("tick/spot/ETH", { text: "spot" }));
+		await routes.dispatch(
+			await noteFrame("tick/spot/ETH", { author: "ada", text: "spot" }),
+		);
 
-		expect(served["tick/spot/"]).toEqual([{ text: "spot" }]);
+		expect(served["tick/spot/"]).toEqual([{ author: "ada", text: "spot" }]);
 		expect(served["tick/"]).toEqual([]);
 	});
 
 	it("relays the handler's response frame", async () => {
-		const reply = await noteFrame("chat/lobby", { text: "pong" });
-		const handler = router({
-			"chat/": route(NoteCodec, () => reply),
+		const reply = await noteFrame("chat/lobby", {
+			author: "ada",
+			text: "pong",
+		});
+		const routes = new Router({
+			"chat/": Route.of(Notes, () => reply),
 		});
 
-		const response = await handler(
-			await noteFrame("chat/lobby", { text: "ping" }),
+		const response = await routes.dispatch(
+			await noteFrame("chat/lobby", { author: "ada", text: "ping" }),
 		);
-
-		expect(response?.message(NoteCodec)).toEqual({ text: "pong" });
+		expect(response?.message(Notes)).toEqual({
+			author: "ada",
+			text: "pong",
+		});
 	});
 
 	it("hands the raw frame to the handler alongside the message", async () => {
 		const topics: string[] = [];
-		const handler = router({
-			"chat/": route(NoteCodec, (note: Note, request: Frame) => {
+		const routes = new Router({
+			"chat/": Route.of(Notes, (note: Note, request: Frame) => {
 				topics.push(`${TEXT.decode(request.id)}:${note.text}`);
 				return undefined;
 			}),
 		});
 
-		await handler(await noteFrame("chat/lobby", { text: "hey" }));
+		const note = { author: "ada", text: "hey" };
+		const request = await noteFrame("chat/lobby", note);
+		await routes.dispatch(request);
 
 		expect(topics).toEqual(["chat/lobby:hey"]);
 	});
 
 	it("rejects an unrouted topic so the stream answers Unimplemented", async () => {
-		const { handler } = recordingTable();
-
-		const unrouted = handler(
-			await noteFrame("presence/lobby", { text: "?" }),
+		const { routes } = recordingTable();
+		const unrouted = routes.dispatch(
+			await noteFrame("presence/lobby", { author: "ada", text: "?" }),
 		);
 
 		await expect(unrouted).rejects.toThrow(UnroutedTopicError);
@@ -145,5 +144,46 @@ describe("router", () => {
 		await expect(unrouted).rejects.toMatchObject({
 			code: "Unimplemented",
 		});
+	});
+});
+
+describe("Route.sealed", () => {
+	it("hands the handler a message whose signature verified", async () => {
+		const served: Note[] = [];
+		const routes = new Router({
+			"chat/": Route.sealed(SignedNotes, (note: Note) => {
+				served.push(note);
+				return undefined;
+			}),
+		});
+
+		const signed = await SignedNotes.frame({
+			author: "ada",
+			text: "signed",
+		})
+			.withId("chat/lobby")
+			.build();
+		await routes.dispatch(signed);
+
+		expect(served).toEqual([{ author: "ada", text: "signed" }]);
+	});
+
+	it("refuses an unsigned frame before the handler decodes it", async () => {
+		const served: Note[] = [];
+		const routes = new Router({
+			"chat/": Route.sealed(SignedNotes, (note: Note) => {
+				served.push(note);
+				return undefined;
+			}),
+		});
+
+		const unsigned = routes.dispatch(
+			await noteFrame("chat/lobby", { author: "ada", text: "forged" }),
+		);
+
+		await expect(unsigned).rejects.toMatchObject({
+			code: "ENVELOPE_UNSIGNED",
+		});
+		expect(served).toEqual([]);
 	});
 });

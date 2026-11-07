@@ -21,7 +21,10 @@
 
 import { expect, test } from "@playwright/test";
 
-import { certBase64, pubsubProcessedEndpoint } from "../node/env.js";
+import { certBase64 } from "#ws-env";
+import { dialFactParams } from "#ws-fixtures";
+import { topicSecretParams } from "../fixtures.js";
+import { STACK } from "../node/stack.js";
 
 /**
  * The demo server's registry is shared by every connection of the whole
@@ -31,11 +34,13 @@ const RUN = Math.random().toString(36).slice(2, 10);
 
 function boardUrl(topic: string): string {
 	const params = new URLSearchParams({
-		endpoint: pubsubProcessedEndpoint,
+		endpoint: STACK.pubsubProcessedEndpoint,
 		topic,
 		cert: certBase64("server.cert.der"),
 		clientCert: certBase64("client.cert.der"),
 		clientKey: certBase64("client.key"),
+		...dialFactParams(STACK),
+		...topicSecretParams(STACK.topicSecret),
 		processed: "1",
 	});
 	return `/?${params.toString()}`;

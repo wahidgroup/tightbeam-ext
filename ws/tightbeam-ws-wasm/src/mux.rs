@@ -8,46 +8,35 @@
 //! during the HPKE handshake. Cleartext sessions have no handshake, so both
 //! endpoints configure the same symmetric cap.
 
-use core::cell::RefCell;
-use core::time::Duration;
+use core::future::Future;
+use core::mem;
 use std::rc::Rc;
-use std::sync::Arc;
 
-use js_sys::{Function, Promise, Reflect, Uint8Array};
+use futures_util::future::{abortable, AbortHandle};
+use js_sys::{Function, Promise, Uint8Array};
 use wasm_bindgen::prelude::*;
-use wasm_bindgen::JsCast;
-use wasm_bindgen_futures::{future_to_promise, spawn_local, JsFuture};
+use wasm_bindgen_futures::{future_to_promise, spawn_local};
 
 use web_sys::AbortSignal;
 
-use tightbeam::clock::Clock;
-use tightbeam::constants::DEFAULT_OPERATION_TIMEOUT;
-use tightbeam::der::asn1::OctetString;
-use tightbeam::der::{Decode, Encode};
-use tightbeam::policy::TransitStatus;
-use tightbeam::transport::envelopes::GoAwayReason;
-use tightbeam::transport::handshake::negotiation::{MuxBudgets, MuxSettings, TransportOffer};
-use tightbeam::transport::handshake::receipt::ReceiptApprover;
-use tightbeam::transport::multiplex::{MultiplexedProtocol, MuxHandle, MuxResponder, MuxRole, MuxTransport};
-use tightbeam::transport::{EncryptedMessageIO, EnvelopeSink, EnvelopeSource, ResponsePackage};
+use tightbeam::colony::work::{ClusterWorkRequest, ClusterWorkResponse};
+use tightbeam::der::Decode;
+use tightbeam::transport::handshake::negotiation::MuxSettings;
+use tightbeam::transport::handshake::HandshakeProvider;
+use tightbeam::transport::multiplex::{
+	MultiplexedProtocol, MuxDispatch, MuxHandle, MuxResponder, MuxRole, MuxTransport,
+};
+use tightbeam::transport::{EncryptedMessageIO, EnvelopeSink, EnvelopeSource, TransportResult};
 use tightbeam::{Frame, TightBeamError};
 
-use crate::approver::{approver_from_js, authorization_from_js, budgets_from_js};
-use crate::clock::BrowserClock;
-use crate::fault::{to_js, transport_to_js, validation, work_error_to_js};
-use crate::promise::{bytes_or_undefined, race_abort, race_optional_abort};
-use crate::secure::{build_signer_transport, build_transport, cleartext_transport, response_der, ClientIdentity};
-use crate::signer::TransportSigner;
-use crate::socket::{open_observed, SocketMonitor};
-use crate::stream::WsTransport;
-use crate::streaming::{
-	parse_stream_target, start_serve_duplex, start_serve_streaming, MuxDuplexStream, MuxRequestStream,
-};
-use crate::work::{WorkReply, WorkRequestEnvelope};
-
-/// How often a client pings its peer: a third of the default operation
-/// deadline, so one lost probe leaves the link inside the deadline.
-const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(DEFAULT_OPERATION_TIMEOUT.as_secs() / 3);
+use crate::fault::{JsFault, RefusalCode};
+use crate::goaway::GoAwayLabel;
+use crate::promise::{AbortRace, JsBytes, JsResponse, Record};
+use crate::protocol::BrowserSocket;
+use crate::secure::{Dial, DialOptions, MutualDialOptions, MutualIdentity};
+use crate::socket::{OpeningSocket, SocketMonitor};
+use crate::stream::{GlooStream, WsTransport};
+use crate::streaming::{MuxDuplexStream, MuxRequestStream, ServeHandler, StreamTarget};
 
 /// Peer-serve dispatch shape claimed by the first `serve*` call.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -57,109 +46,327 @@ enum ServeMode {
 	Duplex,
 }
 
-/// Optional budget / settlement knobs for a mutual-auth dial.
-struct SessionOffer {
-	budgets: Option<MuxBudgets>,
-	authorization: Option<OctetString>,
-	approver: Option<Arc<dyn ReceiptApprover>>,
-}
-
-impl SessionOffer {
-	fn from_js(value: &JsValue) -> Result<Self, JsValue> {
-		if value.is_undefined() || value.is_null() {
-			return Ok(Self { budgets: None, authorization: None, approver: None });
+impl ServeMode {
+	/// The stable name of this mode in error messages.
+	fn label(self) -> &'static str {
+		match self {
+			Self::Unary => "unary",
+			Self::Streaming => "streaming",
+			Self::Duplex => "duplex",
 		}
-
-		let budgets = budgets_from_js(&Reflect::get(value, &JsValue::from_str("budgets"))?)?;
-		let authorization = authorization_from_js(&Reflect::get(value, &JsValue::from_str("authorization"))?)?;
-		let approver = approver_from_js(&Reflect::get(value, &JsValue::from_str("approveReceipt"))?)?;
-
-		Ok(Self { budgets, authorization, approver })
 	}
 
-	fn into_offer(self, max_peer_streams: u32) -> (TransportOffer, Option<Arc<dyn ReceiptApprover>>) {
-		let mut offer = TransportOffer::mux(max_peer_streams);
-		if let Some(budgets) = self.budgets {
-			offer = offer.with_budgets(budgets);
+	/// Start the serve loop of this mode over `responder` on `connection`. Each
+	/// stream the loop dispatches reads the function that `handler` holds at
+	/// that moment.
+	fn start(self, responder: MuxResponder, handler: ServeHandler, connection: Rc<Connection>) {
+		match self {
+			Self::Unary => Self::run(responder, handler.unary(), connection),
+			Self::Streaming => Self::run(responder, handler.streaming(), connection),
+			Self::Duplex => Self::run(responder, handler.duplex(), connection),
 		}
-		if let Some(token) = self.authorization {
-			offer = offer.with_authorization(token);
-		}
+	}
 
-		(offer, self.approver)
+	/// Run the serve loop of `responder` over `dispatch` on the browser
+	/// executor.
+	///
+	/// The loop holds `connection` as a WebSocket with listeners holds its
+	/// socket. A serving client therefore stays open after the application
+	/// frees or drops it, until `close()`, the peer's close, or a GoAway ends
+	/// the connection. The loop then ends once the streams in flight settle.
+	fn run(responder: MuxResponder, dispatch: impl MuxDispatch + 'static, connection: Rc<Connection>) {
+		spawn_local(async move {
+			// The terminal status of the loop already reached the peer
+			// (GoAway), so nothing is left to report.
+			let _ = responder.serve_with(dispatch).await;
+			drop(connection);
+		});
+	}
+
+	/// The refusal of a claim in `requested` once a loop in this mode started.
+	fn conflict(self, requested: Self) -> JsFault {
+		let current = self.label();
+		let requested = requested.label();
+		let message = format!("peer serve mode is {current}. Cannot switch to {requested} after the responder started");
+
+		RefusalCode::ServeModeConflict.because(message)
 	}
 }
 
-/// TypeScript shape of the goaway reason getter.
+/// TypeScript shape of the claim a `serve*` call makes.
 #[wasm_bindgen(typescript_custom_section)]
-const GOAWAY_REASON_TS: &'static str = r#"
+const SERVE_CLAIM_TS: &'static str = r#"
 /**
- * Reason carried by the peer's GoAway (RFC 9113 § 6.8 analog).
- *
- * "Application" is a code outside the protocol-reserved range. Read the
- * raw value from `goawayCode`.
- *
- * # Sources
- *
- * - RFC 9113 § 6.8, GOAWAY frame:
- *   <https://datatracker.ietf.org/doc/html/rfc9113#section-6.8>
+ * How a `serve*` call claims the stream dispatch: `shared`, the default,
+ * lets a later call in the same mode swap the handler, and `exclusive`
+ * refuses every later call.
  */
-export type GoAwayReason =
-	| "Shutdown"
-	| "ProtocolError"
-	| "EnhanceYourCalm"
-	| "BudgetExhausted"
-	| "SettlementFailed"
-	| "Application";
-
-/**
- * Optional budget / settlement knobs for mutual-auth dials.
- */
-export interface SessionOffer {
-	budgets?: { clientToServer: number; serverToClient: number };
-	authorization?: Uint8Array;
-	approveReceipt?: (input: {
-		receiptDer: Uint8Array;
-		challenge?: Uint8Array;
-	}) => Uint8Array | undefined | Promise<Uint8Array | undefined>;
-}
+export type ServeClaim = "shared" | "exclusive";
 "#;
 
-/// The JS label for a [`GoAwayReason`].
-fn goaway_label(reason: GoAwayReason) -> String {
-	let label = match reason {
-		GoAwayReason::Shutdown => "Shutdown",
-		GoAwayReason::ProtocolError => "ProtocolError",
-		GoAwayReason::EnhanceYourCalm => "EnhanceYourCalm",
-		GoAwayReason::BudgetExhausted => "BudgetExhausted",
-		GoAwayReason::SettlementFailed => "SettlementFailed",
-		GoAwayReason::Application(_) => "Application",
-	};
+/// Whether a `serve*` claim leaves the dispatch open to later claims.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Claim {
+	/// A later claim in the same mode swaps the handler.
+	Shared,
+	/// Every later claim refuses, because one owner dispatches the streams
+	/// and composes the routes of the application under itself.
+	Exclusive,
+}
 
-	label.to_owned()
+/// A claim as JavaScript passes it: the label `shared` or `exclusive`, or
+/// `undefined` for `shared`.
+impl TryFrom<&JsValue> for Claim {
+	type Error = JsFault;
+
+	/// # Errors
+	///
+	/// - `InvalidServeClaim` -- the value is neither `undefined` nor one of the two labels.
+	fn try_from(claim: &JsValue) -> Result<Self, Self::Error> {
+		let Some(label) = Record::present(claim.clone()) else {
+			return Ok(Self::Shared);
+		};
+
+		match label.as_string().as_deref() {
+			Some("shared") => Ok(Self::Shared),
+			Some("exclusive") => Ok(Self::Exclusive),
+			_ => Err(RefusalCode::InvalidServeClaim.because("a serve claim is \"shared\" or \"exclusive\"")),
+		}
+	}
+}
+
+/// The peer-serve state of a client.
+enum Serving {
+	/// No `serve*` call has run, so the responder waits for the first one.
+	Idle(MuxResponder),
+	/// The first `serve*` call claimed `mode` under `claim` and started its
+	/// loop, which reads the function in `handler` for each stream it
+	/// dispatches.
+	Started { mode: ServeMode, handler: ServeHandler, claim: Claim },
+}
+
+impl Serving {
+	/// Serve peer streams of `connection` in `mode` with `handler` under
+	/// `claim`.
+	///
+	/// The first claim starts the serve loop of `mode`. A later shared claim
+	/// in the same mode swaps the handler of a shared loop for the streams
+	/// dispatched after it.
+	///
+	/// # Errors
+	///
+	/// - `ServeDispatchClaimed` -- an exclusive claim owns the dispatch.
+	/// - `ServeDispatchShared` -- an exclusive claim meets a running shared handler.
+	/// - `ServeModeConflict` -- an earlier claim started a loop in another mode.
+	fn claim(
+		&mut self,
+		mode: ServeMode,
+		handler: Function,
+		claim: Claim,
+		connection: &Rc<Connection>,
+	) -> Result<(), JsFault> {
+		let slot = match self {
+			Self::Started { claim: Claim::Exclusive, .. } => {
+				let message = "stream dispatch is exclusively claimed on this client (a SubscriptionManager?). Route \
+				               application streams through the claimant instead of calling serve again";
+				return Err(RefusalCode::ServeDispatchClaimed.because(message));
+			}
+			Self::Started { .. } if claim == Claim::Exclusive => {
+				let message = "a shared handler already serves this client, so an exclusive claim would replace it";
+				return Err(RefusalCode::ServeDispatchShared.because(message));
+			}
+			Self::Started { mode: current, handler: slot, .. } if *current == mode => {
+				slot.replace(handler);
+				return Ok(());
+			}
+			Self::Started { mode: current, .. } => return Err(current.conflict(mode)),
+			Self::Idle(_) => ServeHandler::new(handler),
+		};
+
+		let started = Self::Started { mode, handler: slot.clone(), claim };
+		if let Self::Idle(responder) = mem::replace(self, started) {
+			mode.start(responder, slot, Rc::clone(connection));
+		}
+
+		Ok(())
+	}
+}
+
+/// A transport that splits into a multiplexed session on the browser
+/// executor.
+///
+/// The split spawns the reader and writer pumps and the keepalive, and hands
+/// them back as a [`MuxTasks`] set that ends them when it drops. Pump failures
+/// reach callers as `ConnectionClosed` on their pending streams.
+pub trait BrowserMux {
+	/// Split into a stream handle, a responder, and the tasks that drive them.
+	///
+	/// # Errors
+	///
+	/// - [`TransportError::InvalidState`](tightbeam::transport::TransportError::InvalidState) --
+	///   the peer did not negotiate multiplexing.
+	/// - [`TransportError`](tightbeam::transport::TransportError) -- the transport fails to split
+	///   into its halves.
+	fn split(self) -> TransportResult<(MuxHandle, MuxResponder, MuxTasks)>;
+}
+
+impl<R, W> BrowserMux for MuxTransport<R, W>
+where
+	R: EnvelopeSource + 'static,
+	W: EnvelopeSink + 'static,
+{
+	fn split(self) -> TransportResult<(MuxHandle, MuxResponder, MuxTasks)> {
+		let (handle, reader_driver, writer_driver, responder) = self.into_parts();
+
+		// The drivers have nowhere to report, because each failure reaches
+		// the callers whose streams it ends.
+		let reader = MuxTasks::spawn(async move {
+			let _ = reader_driver.drive().await;
+		});
+		let writer = MuxTasks::spawn(async move {
+			let _ = writer_driver.drive().await;
+		});
+
+		// An idle session outlives the read deadline of a native peer. The
+		// keepalive ends with the first failed ping, and the connection's own
+		// failure reaches callers on their pending streams.
+		let pings = handle.clone().keep_alive();
+		let keepalive = MuxTasks::spawn(async move {
+			let _ = pings.await;
+		});
+
+		let tasks = MuxTasks { reader, writer, keepalive };
+		Ok((handle, responder, tasks))
+	}
+}
+
+impl<P: HandshakeProvider> BrowserMux for WsTransport<P> {
+	/// Split a handshaken transport. The handshake decides whether the peer
+	/// negotiated multiplexing, and [`WsTransport::into_mux`] refuses a
+	/// transport whose peer did not.
+	fn split(self) -> TransportResult<(MuxHandle, MuxResponder, MuxTasks)> {
+		self.into_mux(MuxRole::Client)?.split()
+	}
+}
+
+/// The tasks that drive one split session: the reader and writer pumps and
+/// the keepalive.
+///
+/// The tasks run on the browser executor until the set drops, or until the
+/// connection ends on its own.
+#[must_use = "dropping the set ends the tasks that carry the session"]
+pub struct MuxTasks {
+	reader: AbortHandle,
+	writer: AbortHandle,
+	keepalive: AbortHandle,
+}
+
+impl MuxTasks {
+	/// Spawn `task` on the browser executor, and return the handle that ends
+	/// it.
+	fn spawn(task: impl Future<Output = ()> + 'static) -> AbortHandle {
+		let (task, handle) = abortable(task);
+		spawn_local(async move {
+			// An ended task has nothing to report.
+			let _ = task.await;
+		});
+
+		handle
+	}
+}
+
+/// Dropping the set ends each task at its next poll, which drops the drivers
+/// and fails every stream still pending on the session.
+impl Drop for MuxTasks {
+	fn drop(&mut self) {
+		self.reader.abort();
+		self.writer.abort();
+		self.keepalive.abort();
+	}
+}
+
+/// One live connection of a client: its stream handle, its socket, and the
+/// tasks that drive them.
+///
+/// The client, each stream it opens, each call in flight, and a started serve
+/// loop hold the connection. The socket closes and the tasks end when the last
+/// holder drops, so a freed client leaves the socket to the work that still
+/// uses it.
+pub(crate) struct Connection {
+	handle: MuxHandle,
+	monitor: SocketMonitor,
+	/// Ends the pumps and the keepalive as the connection drops.
+	_tasks: MuxTasks,
+}
+
+impl Connection {
+	/// The stream handle, for a stream that opens on this connection and
+	/// holds it.
+	pub(crate) fn handle(&self) -> &MuxHandle {
+		&self.handle
+	}
+
+	/// Emit `frame_der` on a fresh stream and encode the optional response
+	/// for JavaScript.
+	async fn emit(&self, frame_der: Vec<u8>) -> Result<JsValue, JsFault> {
+		let frame = Frame::from_der(&frame_der)?;
+		let response = self.handle.emit_on_stream(&frame).await?;
+
+		JsValue::try_from(JsResponse(response))
+	}
+
+	/// Submit `work_frame_der` to `target` through the gateway on a fresh
+	/// stream and resolve with the servlet frame's DER.
+	///
+	/// The carrier nests the caller's DER and reads its id in place, and the
+	/// reply hands back the servlet's DER as it arrived. The end-to-end frame
+	/// crosses the boundary untouched in both directions, and the servlet
+	/// parses it.
+	async fn submit_work(&self, target: &str, work_frame_der: Vec<u8>) -> Result<JsValue, JsFault> {
+		let StreamTarget(servlet_type) = StreamTarget::try_from(target)?;
+		let carrier = ClusterWorkRequest::transport_frame_from_der(servlet_type, &work_frame_der)?;
+
+		let reply = self.handle.emit_on_stream(&carrier).await?;
+		let reply = reply.ok_or(TightBeamError::MissingResponse);
+		let response = reply.and_then(|reply| reply.decode_message::<ClusterWorkResponse>());
+		let (_, served_der) = response.and_then(ClusterWorkResponse::into_served_der)?;
+
+		Ok(Uint8Array::from(served_der.as_slice()).into())
+	}
+}
+
+/// The last holder's drop closes the socket. The task set then ends the pumps
+/// and the keepalive as it drops.
+impl Drop for Connection {
+	fn drop(&mut self) {
+		self.monitor.close();
+	}
 }
 
 /// A multiplexed tightbeam client over a single browser WebSocket session.
 ///
-/// Concurrent unary [`request`](Self::request) calls share the connection.
-/// Progressive bodies use [`open_stream`](Self::open_stream) /
-/// [`open_stream_to`](Self::open_stream_to) and duplex
-/// [`open_duplex`](Self::open_duplex) / [`open_duplex_to`](Self::open_duplex_to).
-/// Peer-initiated work is answered by [`serve`](Self::serve),
-/// [`serve_streaming`](Self::serve_streaming), or
-/// [`serve_duplex`](Self::serve_duplex) (mutually exclusive on first claim).
+/// - Concurrent unary [`request`](Self::request) calls share the connection.
+/// - Progressive bodies use [`open_stream`](Self::open_stream) and
+///   [`open_stream_to`](Self::open_stream_to).
+/// - Duplex bodies use [`open_duplex`](Self::open_duplex) and
+///   [`open_duplex_to`](Self::open_duplex_to).
+/// - [`serve`](Self::serve), [`serve_streaming`](Self::serve_streaming), and
+///   [`serve_duplex`](Self::serve_duplex) answer peer-initiated work. The first
+///   claim picks the mode.
 ///
-/// Async operations run on cloned handles instead of borrowing the wasm
-/// object: `free()` is safe with requests in flight, which then settle
-/// with `ConnectionClosed` once the socket closes.
+/// # Lifetime
+///
+/// The connection lives as long as its last holder, as a WebSocket does.
+///
+/// - Each call in flight and each stream the client opens hold the connection.
+/// - A started serve loop holds it, so a serving client stays open until it closes.
+/// - `free()` releases the hold of the client alone.
+/// - [`close`](Self::close) consumes the client and closes the socket at once, whatever still
+///   holds the connection.
 #[wasm_bindgen]
 pub struct MuxWsClient {
-	handle: MuxHandle,
-	responder: Option<MuxResponder>,
-	handler: Rc<RefCell<Function>>,
-	monitor: SocketMonitor,
-	/// First-chosen peer-serve mode. Same-mode handler swaps stay allowed.
-	serve_mode: Option<ServeMode>,
+	connection: Rc<Connection>,
+	serving: Serving,
 	/// Usable outbound credits for this epoch (`None` = unmetered).
 	usable_send_budget: Option<u64>,
 }
@@ -169,126 +376,146 @@ impl MuxWsClient {
 	/// Open a server-authenticated multiplexed session to `url`, pinning
 	/// `server_cert_der` as the sole trusted server certificate.
 	///
-	/// `max_peer_streams` is the concurrency cap this client grants the
-	/// server for server-initiated streams. The server's own advertisement
-	/// caps this client's concurrent requests. Rejects when the server does
-	/// not negotiate multiplexing.
+	/// - `options.maxPeerStreams` caps the server-initiated streams. The server's own
+	///   advertisement caps the requests of this client.
+	/// - `options.signal` aborts the dial and the handshake. The socket closes and the promise
+	///   rejects with the abort reason of the signal.
 	///
-	/// `signal` aborts the dial and handshake: the socket closes and the
-	/// promise rejects with the signal's abort reason.
-	#[wasm_bindgen(js_name = connect)]
-	pub async fn connect(
+	/// The call reads `server_cert_der` and `options` before it returns, so
+	/// the caller may reuse the buffer at once.
+	///
+	/// # Errors
+	///
+	/// The call throws these:
+	///
+	/// - `InvalidBytes` -- `server_cert_der` is not a `Uint8Array`.
+	/// - The errors of the [`DialOptions`] parse, among them `InvalidStreamCap` and
+	///   `SessionOfferRequiresMutual`.
+	///
+	/// The promise rejects as [`connect_mutual`](Self::connect_mutual) does for a server dial.
+	#[wasm_bindgen(js_name = connect, unchecked_return_type = "Promise<MuxWsClient>")]
+	pub fn connect(
 		url: &str,
-		server_cert_der: &[u8],
-		max_peer_streams: u32,
-		signal: Option<AbortSignal>,
-	) -> Result<MuxWsClient, JsValue> {
-		if let Some(reason) = abort_reason(&signal) {
-			return Err(reason);
-		}
-
-		let (transport, monitor) = build_transport(url, server_cert_der, None)?;
-		Self::establish(
-			transport,
-			monitor,
-			max_peer_streams,
-			signal,
-			SessionOffer { budgets: None, authorization: None, approver: None },
-		)
-		.await
+		server_cert_der: JsBytes,
+		#[wasm_bindgen(unchecked_param_type = "ConnectOptions | undefined")] options: JsValue,
+	) -> Result<Promise, JsFault> {
+		let options = DialOptions::try_from(&options)?;
+		let dial = Dial::Server(server_cert_der.read()?);
+		Ok(Self::dial(url, dial, options))
 	}
 
 	/// Open a cleartext multiplexed session to `url`. Resolves once the
 	/// socket is open, so a failed dial rejects here (`ConnectionClosed`)
 	/// rather than on the first emit.
 	///
-	/// `signal` aborts the dial: the socket closes and the promise
+	/// `options.signal` aborts the dial: the socket closes and the promise
 	/// rejects with the signal's abort reason.
-	#[wasm_bindgen(js_name = connectCleartext)]
-	pub async fn connect_cleartext(
+	///
+	/// # Errors
+	///
+	/// - The errors of the cleartext [`DialOptions`] parse, which the call throws.
+	#[wasm_bindgen(js_name = connectCleartext, unchecked_return_type = "Promise<MuxWsClient>")]
+	pub fn connect_cleartext(
 		url: &str,
-		streams: u32,
-		signal: Option<AbortSignal>,
-	) -> Result<MuxWsClient, JsValue> {
-		if let Some(reason) = abort_reason(&signal) {
-			return Err(reason);
-		}
+		#[wasm_bindgen(unchecked_param_type = "CleartextConnectOptions | undefined")] options: JsValue,
+	) -> Result<Promise, JsFault> {
+		let options = DialOptions::cleartext(&options)?;
+		let url = url.to_owned();
 
-		let observed = open_observed(url)?;
-		Self::await_open(&observed.monitor, signal).await?;
+		Ok(future_to_promise(async move {
+			let signal = options.signal();
+			if let Some(reason) = signal.aborted_reason() {
+				return Err(reason);
+			}
 
-		let transport = cleartext_transport(observed.socket)?;
-		let (reader, writer) = transport.into_split().map_err(transport_to_js)?;
-		let mux = MuxTransport::new(reader, writer, MuxRole::Client, MuxSettings::symmetric(streams));
-		let (handle, responder) = spawn_mux(mux);
+			let (opening, carrier) = OpeningSocket::open(&url)?;
+			let opened = opening.opened();
+			let ((), monitor) = opening.within(signal, opened).await?;
 
-		Ok(Self::assemble(handle, responder, observed.monitor, None))
+			let stream = GlooStream::from(carrier);
+			let transport: WsTransport = BrowserSocket::cleartext(stream).map_err(JsFault::from)?;
+			let (reader, writer) = transport.into_split().map_err(JsFault::from)?;
+			let settings = MuxSettings::symmetric(options.streams());
+			let mux = MuxTransport::new(reader, writer, MuxRole::Client, settings);
+			let parts = mux.split().map_err(JsFault::from)?;
+
+			let client = Self::assemble(parts, monitor, None);
+			Ok(client.into())
+		}))
 	}
 
-	/// Wait for a dial to complete, racing `signal` when given: an abort
-	/// closes the socket and yields the signal's abort reason.
-	async fn await_open(monitor: &SocketMonitor, signal: Option<AbortSignal>) -> Result<(), JsValue> {
-		let opening = async {
-			JsFuture::from(monitor.opened()).await?;
-			Ok(())
-		};
+	/// As [`connect`](Self::connect), and present a client certificate for
+	/// mutual authentication.
+	///
+	/// `identity` names the pinned server certificate, the client certificate,
+	/// and the key that proves it. The key is one of these:
+	///
+	/// - The raw 32-byte secp256k1 scalar. Its wasm copy wipes as the dial drops it.
+	/// - An external `TransportSigner` (WebAuthn, wallet, KMS bridge). The key stays in
+	///   its JavaScript backend.
+	///
+	/// The call reads `identity` and `options` before it returns, so the caller
+	/// may reuse their buffers at once.
+	///
+	/// # Errors
+	///
+	/// The call throws these:
+	///
+	/// - The errors of the [`MutualDialOptions`] parse, among them `InvalidStreamCap`.
+	/// - `InvalidBytes` -- a certificate or `options.authorization` is not a `Uint8Array`.
+	/// - `InvalidClientKey` -- the key is neither a `Uint8Array` nor an object.
+	/// - `InvalidSigningKey` -- the scalar is not 32 octets, or names no key.
+	/// - `InvalidSigner` -- the signer's `signPrehash` is not a function.
+	/// - `InvalidOid` -- the signer's `algorithmOid` is no object identifier.
+	/// - `InvalidBudgets` -- a budget in `options.budgets` is no whole, non-negative number.
+	/// - `InvalidAuthorization` -- `options.authorization` does not fit an `OCTET STRING`.
+	/// - `InvalidApproveReceipt` -- `options.approveReceipt` is not a function.
+	///
+	/// The promise rejects with these:
+	///
+	/// - `InvalidCertificate` -- the client certificate is no DER certificate.
+	/// - `Signer` -- the client certificate carries another key than the signer's, or the signer
+	///   names another algorithm than the profile.
+	/// - `InvalidUrl` -- the browser refuses to open a socket to `url`.
+	/// - `ConnectionClosed` -- the socket closes before the handshake completes.
+	/// - The [`TransportError`](tightbeam::transport::TransportError) variant of a failed
+	///   handshake.
+	/// - `InvalidState` -- the server does not negotiate multiplexing.
+	/// - The abort reason of `options.signal`.
+	#[wasm_bindgen(js_name = connectMutual, unchecked_return_type = "Promise<MuxWsClient>")]
+	pub fn connect_mutual(
+		url: &str,
+		#[wasm_bindgen(unchecked_param_type = "MutualIdentity")] identity: JsValue,
+		#[wasm_bindgen(unchecked_param_type = "MutualConnectOptions | undefined")] options: JsValue,
+	) -> Result<Promise, JsFault> {
+		let options = MutualDialOptions::try_from(&options)?;
+		let identity = MutualIdentity::try_from(&identity)?;
 
-		let Some(signal) = signal else {
-			return opening.await;
-		};
-
-		let outcome = race_abort(&signal, opening).await;
-		if signal.aborted() {
-			monitor.close();
-		}
-
-		outcome
+		let (options, offer) = options.into_parts();
+		let dial = Dial::Mutual { identity, offer };
+		Ok(Self::dial(url, dial, options))
 	}
 
-	/// As [`connect`](Self::connect), additionally presenting
-	/// `client_cert_der` and the raw 32-byte secp256k1 `client_signing_key`
-	/// for mutual authentication.
-	#[wasm_bindgen(js_name = connectMutual)]
-	pub async fn connect_mutual(
-		url: &str,
-		server_cert_der: &[u8],
-		client_cert_der: &[u8],
-		client_signing_key: &[u8],
-		max_peer_streams: u32,
-		signal: Option<AbortSignal>,
-		#[wasm_bindgen(unchecked_param_type = "SessionOffer | undefined")] session: JsValue,
-	) -> Result<MuxWsClient, JsValue> {
-		if let Some(reason) = abort_reason(&signal) {
-			return Err(reason);
-		}
+	/// Dial `url` as `dial` describes, and resolve with the client once the
+	/// handshake completes. Every argument is already read, so the future
+	/// holds no reference to the caller's values.
+	fn dial(url: &str, dial: Dial, options: DialOptions) -> Promise {
+		let url = url.to_owned();
 
-		let identity = ClientIdentity { cert_der: client_cert_der, signing_key: client_signing_key };
-		let (transport, monitor) = build_transport(url, server_cert_der, Some(identity))?;
-		let session = SessionOffer::from_js(&session)?;
+		future_to_promise(async move {
+			let signal = options.signal();
+			if let Some(reason) = signal.aborted_reason() {
+				return Err(reason);
+			}
 
-		Self::establish(transport, monitor, max_peer_streams, signal, session).await
-	}
+			let (transport, opening) = dial.transport(&url, options.streams())?;
+			let negotiated = Self::negotiate(transport);
+			let (session, monitor) = opening.within(signal, negotiated).await?;
 
-	/// As [`connectMutual`](Self::connect_mutual), but proving possession
-	/// through an external `signer` (WebAuthn, wallet, KMS bridge) instead
-	/// of raw key bytes: the key never crosses into wasm.
-	#[wasm_bindgen(js_name = connectMutualWithSigner)]
-	pub async fn connect_mutual_with_signer(
-		url: &str,
-		server_cert_der: &[u8],
-		client_cert_der: &[u8],
-		signer: TransportSigner,
-		max_peer_streams: u32,
-		signal: Option<AbortSignal>,
-		#[wasm_bindgen(unchecked_param_type = "SessionOffer | undefined")] session: JsValue,
-	) -> Result<MuxWsClient, JsValue> {
-		if let Some(reason) = abort_reason(&signal) {
-			return Err(reason);
-		}
-
-		let (transport, monitor) = build_signer_transport(url, server_cert_der, client_cert_der, signer)?;
-		let session = SessionOffer::from_js(&session)?;
-		Self::establish(transport, monitor, max_peer_streams, signal, session).await
+			let (parts, usable) = session;
+			let client = Self::assemble(parts, monitor, usable);
+			Ok(client.into())
+		})
 	}
 
 	/// Send a DER-encoded tightbeam [`Frame`] on a fresh stream and resolve
@@ -298,9 +525,11 @@ impl MuxWsClient {
 	/// Concurrent calls interleave on the connection. Responses correlate
 	/// by stream ID.
 	#[wasm_bindgen(js_name = request, unchecked_return_type = "Promise<Uint8Array | undefined>")]
-	pub fn request(&self, frame_der: Vec<u8>) -> Promise {
-		let handle = self.handle.clone();
-		future_to_promise(async move { run_stream_emit(handle, frame_der).await })
+	pub fn request(&self, frame_der: JsBytes) -> Promise {
+		let frame_der = frame_der.read();
+		let connection = Rc::clone(&self.connection);
+
+		future_to_promise(async move { Ok(connection.emit(frame_der?).await?) })
 	}
 
 	/// As [`request`](Self::request), racing the emit against `signal`.
@@ -308,12 +537,18 @@ impl MuxWsClient {
 	/// An abort cancels the stream and rejects with the signal's abort reason.
 	/// Timeouts compose as `AbortSignal.timeout(ms)`.
 	#[wasm_bindgen(js_name = requestWithSignal, unchecked_return_type = "Promise<Uint8Array | undefined>")]
-	pub fn request_with_signal(&self, frame_der: Vec<u8>, signal: AbortSignal) -> Promise {
-		let handle = self.handle.clone();
+	pub fn request_with_signal(&self, frame_der: JsBytes, signal: AbortSignal) -> Promise {
+		let frame_der = frame_der.read();
+		let connection = Rc::clone(&self.connection);
 
 		// Dropping the emit future is the cancellation: tightbeam frees
 		// the stream and notifies the peer from the drop guard.
-		future_to_promise(async move { race_abort(&signal, run_stream_emit(handle, frame_der)).await })
+		future_to_promise(async move {
+			let frame_der = frame_der?;
+			let emitted = async { Ok(connection.emit(frame_der).await?) };
+			let raced = signal.race(emitted).await;
+			raced.outcome()
+		})
 	}
 
 	/// Submit a signed end-to-end work frame to the servlet type addressed
@@ -327,10 +562,12 @@ impl MuxWsClient {
 	/// bytes. A gateway refusal rejects with code `WorkRefused` and the
 	/// refusal's transit status name on `status`.
 	#[wasm_bindgen(js_name = submitWork, unchecked_return_type = "Promise<Uint8Array>")]
-	pub fn submit_work(&self, target: &str, work_frame_der: Vec<u8>) -> Promise {
-		let handle = self.handle.clone();
+	pub fn submit_work(&self, target: &str, work_frame_der: JsBytes) -> Promise {
+		let work_frame_der = work_frame_der.read();
+		let connection = Rc::clone(&self.connection);
 		let target = target.to_owned();
-		future_to_promise(async move { run_submit_work(handle, &target, work_frame_der).await })
+
+		future_to_promise(async move { Ok(connection.submit_work(&target, work_frame_der?).await?) })
 	}
 
 	/// As [`submitWork`](Self::submit_work), racing the submission against
@@ -339,54 +576,59 @@ impl MuxWsClient {
 	/// An abort cancels the stream and rejects with the signal's abort reason.
 	/// Timeouts compose as `AbortSignal.timeout(ms)`.
 	#[wasm_bindgen(js_name = submitWorkWithSignal, unchecked_return_type = "Promise<Uint8Array>")]
-	pub fn submit_work_with_signal(&self, target: &str, work_frame_der: Vec<u8>, signal: AbortSignal) -> Promise {
-		let handle = self.handle.clone();
+	pub fn submit_work_with_signal(&self, target: &str, work_frame_der: JsBytes, signal: AbortSignal) -> Promise {
+		let work_frame_der = work_frame_der.read();
+		let connection = Rc::clone(&self.connection);
 		let target = target.to_owned();
 
 		// Dropping the submission future is the cancellation: tightbeam
 		// frees the stream and notifies the peer from the drop guard.
-		future_to_promise(async move { race_abort(&signal, run_submit_work(handle, &target, work_frame_der)).await })
+		future_to_promise(async move {
+			let work_frame_der = work_frame_der?;
+			let submitted = async { Ok(connection.submit_work(&target, work_frame_der).await?) };
+			let raced = signal.race(submitted).await;
+			raced.outcome()
+		})
 	}
 
 	/// Serve server-initiated streams with `handler`.
 	///
-	/// The handler receives the request frame DER as a `Uint8Array` and
-	/// returns (or resolves with) the response frame DER, or `undefined`/`null`
-	/// for a bodiless acceptance. A rejection whose `code` names a gRPC
-	/// canonical status (the client's `StreamRefusal`) answers the stream with
-	/// that status. Any other throwing or rejecting handler answers `Unknown`.
+	/// The handler receives the request frame DER as a `Uint8Array`, and
+	/// returns or resolves with one of these:
 	///
-	/// Callable repeatedly. The latest handler serves every stream dispatched
-	/// after the call, and streams already in flight finish on the handler they
-	/// started with. Handlers for distinct streams run concurrently.
+	/// - The response frame DER.
+	/// - `undefined` or `null`, which accepts the stream without a body.
+	/// - A rejection whose `code` names a gRPC canonical status (the client's
+	///   `StreamRefusal`), which answers with that status.
+	/// - Any other throw or rejection, which answers `Unknown`.
 	///
-	/// Mutually exclusive with [`serveStreaming`](Self::serve_streaming) and
-	/// [`serveDuplex`](Self::serve_duplex): the first call consumes the
-	/// responder. A later call in a different mode rejects with
-	/// `ServeModeConflict`.
+	/// The call is repeatable. The latest handler serves every stream that
+	/// dispatches after the call, and a stream in flight finishes on its own
+	/// handler. Handlers for distinct streams run concurrently.
+	///
+	/// # Errors
+	///
+	/// The first `serve*` call starts the loop and picks its mode. Each later
+	/// call refuses as [`claim`](Serving::claim) states.
+	///
+	/// - `ServeModeConflict` -- the loop serves another mode.
+	/// - `ServeDispatchClaimed` -- an `exclusive` claim owns the dispatch.
+	/// - `ServeDispatchShared` -- an `exclusive` claim meets a running shared handler.
+	/// - `InvalidServeClaim` -- `claim` is neither `undefined`, `shared`, nor `exclusive`.
 	#[wasm_bindgen(js_name = serve)]
-	pub fn serve(&mut self, handler: Function) -> Result<(), JsValue> {
-		self.claim_serve(ServeMode::Unary)?;
-		self.handler.replace(handler);
-
-		// The first call starts the serve loop
-		if let Some(responder) = self.responder.take() {
-			let slot = Rc::clone(&self.handler);
-			spawn_local(async move {
-				// The serve loop ends with the connection. Its terminal
-				// status already reached the peer (GoAway), so nothing is
-				// left to report.
-				let _ = responder.serve(move |frame| respond_via_js(slot.borrow().clone(), frame)).await;
-			});
-		}
-
-		Ok(())
+	pub fn serve(
+		&mut self,
+		handler: Function,
+		#[wasm_bindgen(unchecked_param_type = "ServeClaim | undefined")] claim: JsValue,
+	) -> Result<(), JsFault> {
+		let claim = Claim::try_from(&claim)?;
+		self.serving.claim(ServeMode::Unary, handler, claim, &self.connection)
 	}
 
 	/// Progressive request body: push chunks, then close for a Frame reply.
 	#[wasm_bindgen(js_name = openStream)]
-	pub fn open_stream(&self) -> Result<MuxRequestStream, JsValue> {
-		MuxRequestStream::open(&self.handle)
+	pub fn open_stream(&self) -> Result<MuxRequestStream, JsFault> {
+		MuxRequestStream::open(Rc::clone(&self.connection))
 	}
 
 	/// Progressive request routed to a servlet URN (`urn:<nid>:<nss>`).
@@ -394,8 +636,8 @@ impl MuxWsClient {
 	/// The Open carries the origin hop-budget sentinel so the first
 	/// gateway applies its `max_hops` clamp.
 	#[wasm_bindgen(js_name = openStreamTo)]
-	pub fn open_stream_to(&self, target: &str) -> Result<MuxRequestStream, JsValue> {
-		MuxRequestStream::open_to(&self.handle, target)
+	pub fn open_stream_to(&self, target: &str) -> Result<MuxRequestStream, JsFault> {
+		MuxRequestStream::open_to(Rc::clone(&self.connection), target)
 	}
 
 	/// Full-duplex body streaming on one stream id.
@@ -403,8 +645,8 @@ impl MuxWsClient {
 	/// Pushes reach the wire eagerly, so awaiting a reply chunk
 	/// between pushes (a chunk-for-chunk conversation) is sound.
 	#[wasm_bindgen(js_name = openDuplex)]
-	pub fn open_duplex(&self) -> Result<MuxDuplexStream, JsValue> {
-		MuxDuplexStream::open(&self.handle)
+	pub fn open_duplex(&self) -> Result<MuxDuplexStream, JsFault> {
+		MuxDuplexStream::open(Rc::clone(&self.connection))
 	}
 
 	/// Duplex stream routed to a servlet URN (`urn:<nid>:<nss>`).
@@ -412,43 +654,44 @@ impl MuxWsClient {
 	/// As [`open_stream_to`](Self::open_stream_to): the Open carries the
 	/// origin hop-budget sentinel for the first gateway's `max_hops` clamp.
 	#[wasm_bindgen(js_name = openDuplexTo)]
-	pub fn open_duplex_to(&self, target: &str) -> Result<MuxDuplexStream, JsValue> {
-		MuxDuplexStream::open_to(&self.handle, target)
+	pub fn open_duplex_to(&self, target: &str) -> Result<MuxDuplexStream, JsFault> {
+		MuxDuplexStream::open_to(Rc::clone(&self.connection), target)
 	}
 
 	/// Serve peer streams as progressive bodies. The handler receives a
 	/// [`MuxStreamBody`](crate::streaming::MuxStreamBody) and the Open's
-	/// route (`{ target?, hopsRemaining }`), and returns a Frame DER
-	/// (or `undefined`). Consumes the responder on first call. A later
-	/// call in a different mode rejects with `ServeModeConflict`.
+	/// route (`{ target?, hopsRemaining }`), and returns a Frame DER (or
+	/// `undefined`).
+	///
+	/// # Errors
+	///
+	/// - The errors of [`serve`](Self::serve).
 	#[wasm_bindgen(js_name = serveStreaming)]
-	pub fn serve_streaming(&mut self, handler: Function) -> Result<(), JsValue> {
-		self.claim_serve(ServeMode::Streaming)?;
-		self.handler.replace(handler);
-
-		if let Some(responder) = self.responder.take() {
-			start_serve_streaming(responder, Rc::clone(&self.handler));
-		}
-
-		Ok(())
+	pub fn serve_streaming(
+		&mut self,
+		handler: Function,
+		#[wasm_bindgen(unchecked_param_type = "ServeClaim | undefined")] claim: JsValue,
+	) -> Result<(), JsFault> {
+		let claim = Claim::try_from(&claim)?;
+		self.serving.claim(ServeMode::Streaming, handler, claim, &self.connection)
 	}
 
 	/// Serve peer streams as duplex bodies. The handler receives a
 	/// [`MuxStreamBody`](crate::streaming::MuxStreamBody),
 	/// [`MuxReplySink`](crate::streaming::MuxReplySink), and the Open's
 	/// route, and resolves with a gRPC status name or `undefined` (`Ok`).
-	/// Consumes the responder. A later call in a different mode rejects
-	/// with `ServeModeConflict`.
+	///
+	/// # Errors
+	///
+	/// - The errors of [`serve`](Self::serve).
 	#[wasm_bindgen(js_name = serveDuplex)]
-	pub fn serve_duplex(&mut self, handler: Function) -> Result<(), JsValue> {
-		self.claim_serve(ServeMode::Duplex)?;
-		self.handler.replace(handler);
-
-		if let Some(responder) = self.responder.take() {
-			start_serve_duplex(responder, Rc::clone(&self.handler));
-		}
-
-		Ok(())
+	pub fn serve_duplex(
+		&mut self,
+		handler: Function,
+		#[wasm_bindgen(unchecked_param_type = "ServeClaim | undefined")] claim: JsValue,
+	) -> Result<(), JsFault> {
+		let claim = Claim::try_from(&claim)?;
+		self.serving.claim(ServeMode::Duplex, handler, claim, &self.connection)
 	}
 
 	/// Connection-level liveness probe
@@ -463,15 +706,16 @@ impl MuxWsClient {
 	/// abort reason and a late ack is ignored.
 	#[wasm_bindgen(js_name = ping, unchecked_return_type = "Promise<void>")]
 	pub fn ping(&self, signal: Option<AbortSignal>) -> Promise {
-		let handle = self.handle.clone();
+		let connection = Rc::clone(&self.connection);
 
 		future_to_promise(async move {
 			let ping = async move {
-				handle.ping().await.map_err(transport_to_js)?;
+				connection.handle.ping().await.map_err(JsFault::from)?;
 				Ok(JsValue::UNDEFINED)
 			};
 
-			race_optional_abort(signal, ping).await
+			let raced = signal.race(ping).await;
+			raced.outcome()
 		})
 	}
 
@@ -481,7 +725,7 @@ impl MuxWsClient {
 	/// returns, so callers still handle the `StreamsExhausted` rejection.
 	#[wasm_bindgen(getter, js_name = hasStreamHeadroom)]
 	pub fn has_stream_headroom(&self) -> bool {
-		self.handle.has_stream_headroom()
+		self.connection.handle.has_stream_headroom()
 	}
 
 	/// Whether any locally-initiated stream still awaits its response.
@@ -490,7 +734,7 @@ impl MuxWsClient {
 	/// pre-close check, not a synchronization primitive.
 	#[wasm_bindgen(getter, js_name = hasPendingStreams)]
 	pub fn has_pending_streams(&self) -> bool {
-		self.handle.has_pending_streams()
+		self.connection.handle.has_pending_streams()
 	}
 
 	/// Resolves once a new locally-initiated stream would be admitted.
@@ -502,44 +746,45 @@ impl MuxWsClient {
 	/// gives up first.
 	#[wasm_bindgen(js_name = waitForStreamSlot, unchecked_return_type = "Promise<void>")]
 	pub fn wait_for_stream_slot(&self, signal: Option<AbortSignal>) -> Promise {
-		let handle = self.handle.clone();
+		let connection = Rc::clone(&self.connection);
 		future_to_promise(async move {
 			let admitted = async move {
-				handle.wait_for_stream_slot().await.map_err(transport_to_js)?;
+				connection.handle.wait_for_stream_slot().await.map_err(JsFault::from)?;
 				Ok(JsValue::UNDEFINED)
 			};
 
-			race_optional_abort(signal, admitted).await
+			let raced = signal.race(admitted).await;
+			raced.outcome()
 		})
 	}
 
 	/// Reason carried by the peer's GoAway, or `undefined` while the
 	/// connection is live or was shut down locally.
 	///
-	/// Reconnect policies branch on this: `Shutdown` invites an immediate
-	/// reconnect, `EnhanceYourCalm` calls for backoff, and `ProtocolError`
+	/// Reconnect policies branch on this: `shutdown` invites an immediate
+	/// reconnect, `enhance-your-calm` calls for backoff, and `protocol-error`
 	/// points at a bug rather than a transient fault.
-	#[wasm_bindgen(getter, js_name = goawayReason, unchecked_return_type = "GoAwayReason | undefined")]
-	pub fn goaway_reason(&self) -> Option<String> {
-		self.handle.goaway_reason().map(goaway_label)
+	#[wasm_bindgen(getter, js_name = goawayReason)]
+	pub fn goaway_reason(&self) -> Option<GoAwayLabel> {
+		self.connection.handle.goaway_reason().map(GoAwayLabel::from)
 	}
 
 	/// Numeric code behind [`goawayReason`](Self::goaway_reason), or
 	/// `undefined` when that getter is `undefined`. Distinguishes
-	/// application-defined codes that all label as `"Application"`.
+	/// application-defined codes that all label as `"application"`.
 	#[wasm_bindgen(getter, js_name = goawayCode)]
 	pub fn goaway_code(&self) -> Option<u32> {
-		self.handle.goaway_reason().map(u32::from)
+		self.connection.handle.goaway_reason().map(u32::from)
 	}
 
 	/// Gracefully shut the connection down: sends GoAway, lets in-flight
 	/// streams drain, then stops the writer.
 	#[wasm_bindgen(js_name = shutdown, unchecked_return_type = "Promise<void>")]
 	pub fn shutdown(&self) -> Promise {
-		let handle = self.handle.clone();
+		let connection = Rc::clone(&self.connection);
 
 		future_to_promise(async move {
-			handle.shutdown().await.map_err(transport_to_js)?;
+			connection.handle.shutdown().await.map_err(JsFault::from)?;
 			Ok(JsValue::UNDEFINED)
 		})
 	}
@@ -548,18 +793,18 @@ impl MuxWsClient {
 	/// so the peer's reconnect policy can branch on it.
 	///
 	/// `reason` is a label or a numeric code. Codes outside the reserved
-	/// range are application-defined. The label `"Application"` alone
+	/// range are application-defined. The label `"application"` alone
 	/// carries no code and is rejected.
 	#[wasm_bindgen(js_name = shutdownWith, unchecked_return_type = "Promise<void>")]
 	pub fn shutdown_with(
 		&self,
-		#[wasm_bindgen(unchecked_param_type = "GoAwayReason | number")] reason: JsValue,
+		#[wasm_bindgen(unchecked_param_type = "Exclude<GoAwayReason, \"application\"> | number")] reason: JsValue,
 	) -> Promise {
-		let handle = self.handle.clone();
+		let connection = Rc::clone(&self.connection);
+		let reason = GoAwayLabel::shutdown_reason(&reason);
 
 		future_to_promise(async move {
-			let reason = reason_from_js(&reason)?;
-			handle.shutdown_with(reason).await.map_err(transport_to_js)?;
+			connection.handle.shutdown_with(reason?).await.map_err(JsFault::from)?;
 			Ok(JsValue::UNDEFINED)
 		})
 	}
@@ -567,7 +812,7 @@ impl MuxWsClient {
 	/// The negotiated cap on concurrent locally-initiated streams.
 	#[wasm_bindgen(getter, js_name = maxConcurrentStreams)]
 	pub fn max_concurrent_streams(&self) -> u32 {
-		self.handle.max_concurrent_streams()
+		self.connection.handle.max_concurrent_streams()
 	}
 
 	/// Usable outbound session-budget credits for this epoch, or
@@ -584,7 +829,7 @@ impl MuxWsClient {
 	/// in-band renewal.
 	#[wasm_bindgen(getter, js_name = sessionReceiptDer, unchecked_return_type = "Uint8Array | undefined")]
 	pub fn session_receipt_der(&self) -> Option<Uint8Array> {
-		let stored = self.handle.session_receipt()?;
+		let stored = self.connection.handle.session_receipt()?;
 		let der = stored.to_der().ok()?;
 		Some(Uint8Array::from(der.as_slice()))
 	}
@@ -592,299 +837,330 @@ impl MuxWsClient {
 	/// A promise resolving with a `SocketCloseInfo` when the socket closes.
 	#[wasm_bindgen(getter, js_name = closed, unchecked_return_type = "Promise<SocketCloseInfo>")]
 	pub fn closed(&self) -> Promise {
-		self.monitor.closed()
+		self.connection.monitor.closed()
 	}
 
 	/// The socket's readyState (0 CONNECTING, 1 OPEN, 2 CLOSING, 3 CLOSED).
 	#[wasm_bindgen(getter, js_name = readyState)]
 	pub fn ready_state(&self) -> u16 {
-		self.monitor.ready_state()
+		self.connection.monitor.ready_state()
 	}
 
 	/// Close the underlying socket without a graceful drain (see
 	/// [`shutdown`](Self::shutdown)). The `closed` promise resolves once
 	/// the close completes.
+	///
+	/// The close consumes the client, so read `closed` before the call.
 	#[wasm_bindgen(js_name = close)]
-	pub fn close(&self) {
-		self.monitor.close();
+	pub fn close(self) {
+		self.connection.monitor.close();
 	}
 
-	/// Handshake with the mux offer, split, and spawn the driver pumps,
-	/// racing the whole establishment against `signal` when one is given.
-	async fn establish(
-		transport: WsTransport,
-		monitor: SocketMonitor,
-		max_peer_streams: u32,
-		signal: Option<AbortSignal>,
-		session: SessionOffer,
-	) -> Result<MuxWsClient, JsValue> {
-		let Some(signal) = signal else {
-			return Self::negotiate(transport, monitor, max_peer_streams, session).await;
-		};
-
-		let negotiated = Self::negotiate(transport, monitor.clone(), max_peer_streams, session);
-		let outcome = race_abort(&signal, negotiated).await;
-		if signal.aborted() {
-			monitor.close();
-		}
-
-		outcome
-	}
-
-	/// Handshake with the mux offer, split, and spawn the driver pumps.
+	/// Handshake with the mux offer the transport holds, split, and spawn the
+	/// driver pumps. Resolves with the split parts and the usable send budget
+	/// the handshake negotiated.
 	async fn negotiate(
 		mut transport: WsTransport,
-		monitor: SocketMonitor,
-		max_peer_streams: u32,
-		session: SessionOffer,
-	) -> Result<MuxWsClient, JsValue> {
-		let (offer, approver) = session.into_offer(max_peer_streams);
-		transport = transport.with_mux_offer(Some(offer));
-		if let Some(approver) = approver {
-			transport = transport.with_receipt_approver(approver);
-		}
-		transport.perform_client_handshake().await.map_err(transport_to_js)?;
+	) -> Result<((MuxHandle, MuxResponder, MuxTasks), Option<u64>), JsValue> {
+		transport.perform_client_handshake().await.map_err(JsFault::from)?;
 
-		let settings = transport
-			.negotiated_mux()
-			.ok_or_else(|| JsValue::from_str("the server did not negotiate multiplexing"))?;
-		let usable = settings.usable_send_budget();
-		let (handle, responder) = split_mux(transport)?;
-		Ok(Self::assemble(handle, responder, monitor, usable))
+		let usable = transport.negotiated_mux().and_then(|settings| settings.usable_send_budget());
+		let parts = transport.split().map_err(JsFault::from)?;
+		Ok((parts, usable))
 	}
 
-	/// Assemble a client with an inert handler slot. The slot is only
-	/// read by the serve loop, which [`serve`](Self::serve) fills before
-	/// spawning.
+	/// Assemble a client over the split `parts` and the socket that `monitor`
+	/// observes. Its responder waits for the first `serve*` call.
 	fn assemble(
-		handle: MuxHandle,
-		responder: MuxResponder,
+		parts: (MuxHandle, MuxResponder, MuxTasks),
 		monitor: SocketMonitor,
 		usable_send_budget: Option<u64>,
 	) -> Self {
-		let inert = Function::new_no_args("");
-		Self {
-			handle,
-			responder: Some(responder),
-			handler: Rc::new(RefCell::new(inert)),
-			monitor,
-			serve_mode: None,
-			usable_send_budget,
+		let (handle, responder, tasks) = parts;
+		let connection = Rc::new(Connection { handle, monitor, _tasks: tasks });
+		let serving = Serving::Idle(responder);
+
+		Self { connection, serving, usable_send_budget }
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use futures_util::future::ready;
+	use futures_util::FutureExt;
+	use js_sys::{Function, Object, Promise, Reflect, Uint8Array};
+	use tightbeam::transport::handshake::negotiation::MuxSettings;
+	use tightbeam::transport::multiplex::{MuxHandle, MuxRole, MuxTransport};
+	use tightbeam::transport::{TransportError, TransportResult};
+	use wasm_bindgen::{JsCast, JsValue};
+	use wasm_bindgen_futures::JsFuture;
+	use wasm_bindgen_test::wasm_bindgen_test;
+	use web_sys::AbortSignal;
+
+	use super::{BrowserMux, MuxWsClient};
+	use crate::fault::Refused;
+	use crate::promise::JsBytes;
+	use crate::protocol::BrowserSocket;
+	use crate::socket::tests::UNREACHED_URL;
+	use crate::socket::{OpeningSocket, SocketMonitor};
+	use crate::stream::{GlooStream, WsTransport};
+	use crate::streaming::MuxRequestStream;
+
+	/// The readyState of a socket that is still connecting.
+	const CONNECTING: u16 = 0;
+
+	/// The readyState of a socket whose close has begun.
+	const CLOSING: u16 = 2;
+
+	/// The monitor that `opening` hands over for a step that settles at once
+	/// under no signal.
+	fn monitor_of(opening: OpeningSocket) -> SocketMonitor {
+		let no_signal: Option<AbortSignal> = None;
+		let step = ready(Ok::<(), JsValue>(()));
+		let settled = opening.within(&no_signal, step).now_or_never();
+
+		let ready_step = settled.expect("a race under no signal settles at once");
+		let ((), monitor) = ready_step.expect("a ready step settles Ok");
+		monitor
+	}
+
+	/// A cleartext client over a socket that is still connecting, the monitor
+	/// of that socket, and a handle that holds no part of the connection.
+	fn connecting_client() -> (MuxWsClient, SocketMonitor, MuxHandle) {
+		let (opening, carrier) = OpeningSocket::open(UNREACHED_URL).expect("the socket should construct");
+		let monitor = monitor_of(opening);
+		let stream = GlooStream::from(carrier);
+		let provisioned: TransportResult<WsTransport> = BrowserSocket::cleartext(stream);
+		let transport = provisioned.expect("the cleartext transport should provision");
+		let (reader, writer) = transport.into_split().expect("the transport should split");
+
+		let mux = MuxTransport::new(reader, writer, MuxRole::Client, MuxSettings::symmetric(1));
+		let (handle, responder, tasks) = mux.split().expect("the mux should split");
+		let probe = handle.clone();
+		let client = MuxWsClient::assemble((handle, responder, tasks), monitor.clone(), None);
+
+		(client, monitor, probe)
+	}
+
+	/// A progressive request stream on `client`.
+	fn open_stream(client: &MuxWsClient) -> MuxRequestStream {
+		client.open_stream().expect("a client with headroom should open a stream")
+	}
+
+	/// A serve handler that accepts each stream without a body.
+	fn accepting() -> Function {
+		Function::new_no_args("return undefined")
+	}
+
+	/// The exclusive serve claim, as JavaScript passes it.
+	fn exclusive() -> JsValue {
+		JsValue::from_str("exclusive")
+	}
+
+	/// The options object `{ [field]: value }`.
+	fn options(field: &str, value: JsValue) -> JsValue {
+		let object = Object::new();
+		let set = Reflect::set(&object, &JsValue::from_str(field), &value);
+		set.expect("a fresh object should take the field");
+
+		object.into()
+	}
+
+	/// The identity a mutual dial presents, with a raw scalar for its key.
+	fn identity() -> JsValue {
+		let object = Object::new();
+		let certificate = Uint8Array::from([0x30u8].as_slice());
+		let scalar = Uint8Array::from([1u8; 32].as_slice());
+		for (field, value) in [
+			("serverCertDer", &certificate),
+			("clientCertDer", &certificate),
+			("clientKey", &scalar),
+		] {
+			let set = Reflect::set(&object, &JsValue::from_str(field), value);
+			set.expect("a fresh object should take the field");
 		}
+
+		object.into()
 	}
 
-	/// Record `mode` as the peer-serve mode, or reject a cross-mode swap.
-	fn claim_serve(&mut self, mode: ServeMode) -> Result<(), JsValue> {
-		match self.serve_mode {
-			None => {
-				self.serve_mode = Some(mode);
-				Ok(())
-			}
-			Some(current) if current == mode => Ok(()),
-			Some(current) => Err(validation(
-				"ServeModeConflict",
-				&format!(
-					"peer serve mode is {}. Cannot switch to {} after the responder started",
-					serve_mode_label(current),
-					serve_mode_label(mode),
-				),
-			)),
-		}
-	}
-}
+	/// The code each connector throws for the options `{ [field]: value }`, in
+	/// the order connect, connectMutual, connectCleartext.
+	fn dial_codes(value: f64) -> [Option<String>; 3] {
+		let server = MuxWsClient::connect(UNREACHED_URL, bytes(&[0x30]), options("maxPeerStreams", value.into()));
+		let mutual = MuxWsClient::connect_mutual(UNREACHED_URL, identity(), options("maxPeerStreams", value.into()));
+		let cleartext = MuxWsClient::connect_cleartext(UNREACHED_URL, options("streams", value.into()));
 
-/// Stable label for [`ServeMode`] in error messages.
-fn serve_mode_label(mode: ServeMode) -> &'static str {
-	match mode {
-		ServeMode::Unary => "unary",
-		ServeMode::Streaming => "streaming",
-		ServeMode::Duplex => "duplex",
-	}
-}
-
-/// Parse a JavaScript GoAway reason: a label for the reserved variants,
-/// or a numeric code (application-defined outside the reserved range).
-fn reason_from_js(value: &JsValue) -> Result<GoAwayReason, JsValue> {
-	if let Some(code) = value.as_f64() {
-		if code.fract() != 0.0 || !(0.0..=f64::from(u32::MAX)).contains(&code) {
-			return Err(JsValue::from_str("a numeric GoAway reason must be a u32 code"));
-		}
-
-		return Ok(GoAwayReason::from(code as u32));
+		[server.code(), mutual.code(), cleartext.code()]
 	}
 
-	match value.as_string().as_deref() {
-		Some("Shutdown") => Ok(GoAwayReason::Shutdown),
-		Some("ProtocolError") => Ok(GoAwayReason::ProtocolError),
-		Some("EnhanceYourCalm") => Ok(GoAwayReason::EnhanceYourCalm),
-		Some("BudgetExhausted") => Ok(GoAwayReason::BudgetExhausted),
-		Some("SettlementFailed") => Ok(GoAwayReason::SettlementFailed),
-		_ => Err(JsValue::from_str(
-			"a GoAway reason is \"Shutdown\", \"ProtocolError\", \"EnhanceYourCalm\", \"BudgetExhausted\", \"SettlementFailed\", or a numeric code",
-		)),
-	}
-}
-
-/// The abort reason of an already-aborted optional signal.
-fn abort_reason(signal: &Option<AbortSignal>) -> Option<JsValue> {
-	let signal = signal.as_ref()?;
-	if signal.aborted() {
-		return Some(signal.reason());
+	/// `octets` as a JavaScript byte parameter.
+	fn bytes(octets: &[u8]) -> JsBytes {
+		Uint8Array::from(octets).unchecked_into()
 	}
 
-	None
-}
-
-/// Emit `frame_der` on a fresh stream and encode the optional response
-/// for JavaScript.
-async fn run_stream_emit(handle: MuxHandle, frame_der: Vec<u8>) -> Result<JsValue, JsValue> {
-	let frame = Frame::from_der(&frame_der).map_err(to_js)?;
-	let response = handle.emit_on_stream(&frame).await.map_err(transport_to_js)?;
-	let der = response_der(response)?;
-
-	Ok(bytes_or_undefined(der))
-}
-
-/// Submit `work_frame_der` to `target` through the gateway on a fresh
-/// stream and resolve with the servlet frame's DER.
-///
-/// The decoded frame only validates the bytes and supplies the wrapper's
-/// correlation id. The envelope nests the caller's original DER, so the
-/// end-to-end frame crosses the boundary untouched in both directions.
-async fn run_submit_work(handle: MuxHandle, target: &str, work_frame_der: Vec<u8>) -> Result<JsValue, JsValue> {
-	let servlet_type = parse_stream_target(target)?;
-	let work = Frame::from_der(&work_frame_der).map_err(to_js)?;
-
-	let envelope = WorkRequestEnvelope::from_encoded(servlet_type, work_frame_der, &work);
-	let transport = envelope.into_transport_frame().map_err(|error| work_error_to_js(&error))?;
-
-	let reply = handle.emit_on_stream(&transport).await.map_err(transport_to_js)?;
-	let reply = reply.ok_or_else(|| work_error_to_js(&TightBeamError::MissingResponse))?;
-
-	let served = WorkReply::try_from(&reply)
-		.and_then(WorkReply::served_der)
-		.map_err(|error| work_error_to_js(&error))?;
-
-	Ok(Uint8Array::from(served.as_slice()).into())
-}
-
-/// Split a handshaken, mux-negotiated transport into a stream handle and
-/// responder, spawning the driver pumps on the browser executor.
-///
-/// Generic over the compile-time crypto provider: custom-profile builds
-/// call this after driving their own handshake on a transport that carried
-/// a mux offer (`with_mux_offer`). Rejects when the peer did not
-/// negotiate multiplexing.
-pub fn split_mux(transport: WsTransport) -> Result<(MuxHandle, MuxResponder), JsValue> {
-	if transport.negotiated_mux().is_none() {
-		return Err(JsValue::from_str("the server did not negotiate multiplexing"));
+	/// Start the unary serve loop of `client` with a handler that accepts each
+	/// stream without a body.
+	fn serve(client: &mut MuxWsClient) {
+		let handler = accepting();
+		let served = client.serve(handler, JsValue::UNDEFINED);
+		served.expect("an idle client should start its serve loop");
 	}
 
-	let mux = transport.into_mux(MuxRole::Client).map_err(transport_to_js)?;
-	Ok(spawn_mux(mux))
-}
-
-/// Spawn the driver pumps of an assembled mux (encrypting or
-/// cleartext) on the browser executor.
-fn spawn_mux<R, W>(mux: MuxTransport<R, W>) -> (MuxHandle, MuxResponder)
-where
-	R: EnvelopeSource + 'static,
-	W: EnvelopeSink + 'static,
-{
-	let (handle, reader_driver, writer_driver, responder) = mux.into_parts();
-
-	// Pump failures reach callers as ConnectionClosed on their pending
-	// streams. The drivers themselves have nowhere to report.
-	spawn_local(async move {
-		let _ = reader_driver.drive().await;
-	});
-	spawn_local(async move {
-		let _ = writer_driver.drive().await;
-	});
-	spawn_local(keep_alive(handle.clone()));
-
-	(handle, responder)
-}
-
-/// Ping the peer until the connection ends, so an idle session outlives the
-/// read deadline of a native peer. A failed ping ends the loop, and the
-/// connection's own failure reaches callers on their pending streams.
-async fn keep_alive(handle: MuxHandle) {
-	loop {
-		BrowserClock.sleep(KEEPALIVE_INTERVAL).await;
-		if handle.ping().await.is_err() {
-			return;
-		}
-	}
-}
-
-/// Drive one server-initiated stream through the JavaScript handler.
-async fn respond_via_js(handler: Function, frame: Arc<Frame>) -> ResponsePackage {
-	match call_handler(&handler, &frame).await {
-		Ok(response) => response,
-		Err(rejection) => ResponsePackage::new(refusal_for(&rejection), None),
-	}
-}
-
-/// Map a handler rejection to its wire status.
-///
-/// A rejection carrying a `code` string that names a gRPC canonical
-/// status  answers with that status. Every other throw is an unclassified
-/// handler failure and answers `Unknown`.
-fn refusal_for(rejection: &JsValue) -> TransitStatus {
-	let code = Reflect::get(rejection, &JsValue::from_str("code"))
-		.ok()
-		.and_then(|value| value.as_string());
-
-	match code {
-		Some(name) => status_from_code(&name),
-		None => TransitStatus::Unknown,
-	}
-}
-
-/// Parse a gRPC canonical status name into its refusal status.
-///
-/// `Ok` is absent on purpose: a rejection cannot claim success. Names
-/// outside the registry fall back to `Unknown`.
-pub(crate) fn status_from_code(name: &str) -> TransitStatus {
-	match name {
-		"Cancelled" => TransitStatus::Cancelled,
-		"InvalidArgument" => TransitStatus::InvalidArgument,
-		"DeadlineExceeded" => TransitStatus::DeadlineExceeded,
-		"NotFound" => TransitStatus::NotFound,
-		"AlreadyExists" => TransitStatus::AlreadyExists,
-		"PermissionDenied" => TransitStatus::PermissionDenied,
-		"ResourceExhausted" => TransitStatus::ResourceExhausted,
-		"FailedPrecondition" => TransitStatus::FailedPrecondition,
-		"Aborted" => TransitStatus::Aborted,
-		"OutOfRange" => TransitStatus::OutOfRange,
-		"Unimplemented" => TransitStatus::Unimplemented,
-		"Internal" => TransitStatus::Internal,
-		"Unavailable" => TransitStatus::Unavailable,
-		"DataLoss" => TransitStatus::DataLoss,
-		"Unauthenticated" => TransitStatus::Unauthenticated,
-		_ => TransitStatus::Unknown,
-	}
-}
-
-/// Call the JS handler with the request DER and decode its resolution:
-/// `undefined`/`null` accepts without a body, bytes decode as the
-/// response frame.
-async fn call_handler(handler: &Function, frame: &Frame) -> Result<ResponsePackage, JsValue> {
-	let request_der = frame.to_der().map_err(to_js)?;
-	let argument = Uint8Array::from(request_der.as_slice());
-
-	let returned = handler.call1(&JsValue::UNDEFINED, &argument)?;
-	let settled = match returned.dyn_into::<Promise>() {
-		Ok(promise) => JsFuture::from(promise).await?,
-		Err(value) => value,
-	};
-
-	if settled.is_undefined() || settled.is_null() {
-		return Ok(ResponsePackage::new(TransitStatus::Ok, None));
+	/// Let every task that a wake queued run once. The wait stays on the
+	/// microtask queue, so no socket event arrives in it.
+	async fn next_tick() {
+		let resolved = Promise::resolve(&JsValue::UNDEFINED);
+		let _ = JsFuture::from(resolved).await;
 	}
 
-	let response_der = Uint8Array::from(settled).to_vec();
-	let response = Frame::from_der(&response_der).map_err(to_js)?;
-	Ok(ResponsePackage::new(TransitStatus::Ok, Some(response)))
+	#[wasm_bindgen_test]
+	fn a_freed_client_closes_its_socket() {
+		let (client, monitor, _probe) = connecting_client();
+		drop(client);
+		assert_eq!(monitor.ready_state(), CLOSING);
+	}
+
+	#[wasm_bindgen_test]
+	fn a_freed_serving_client_keeps_its_socket() {
+		let (mut client, monitor, _probe) = connecting_client();
+		serve(&mut client);
+		drop(client);
+		assert_eq!(monitor.ready_state(), CONNECTING);
+		monitor.close();
+	}
+
+	#[wasm_bindgen_test]
+	fn a_closed_serving_client_closes_its_socket() {
+		let (mut client, monitor, _probe) = connecting_client();
+		serve(&mut client);
+		client.close();
+		assert_eq!(monitor.ready_state(), CLOSING);
+	}
+
+	#[wasm_bindgen_test]
+	async fn a_freed_client_ends_its_tasks() {
+		let (client, _monitor, probe) = connecting_client();
+		drop(client);
+
+		next_tick().await;
+		let opened = probe.open_stream();
+		assert!(matches!(opened, Err(TransportError::ConnectionClosed)));
+	}
+
+	#[wasm_bindgen_test]
+	async fn a_live_stream_keeps_the_socket_of_a_freed_client() {
+		let (client, monitor, _probe) = connecting_client();
+		let stream = open_stream(&client);
+		drop(client);
+
+		let chunk = Uint8Array::from([1u8].as_slice());
+		let pushed = JsFuture::from(stream.push(chunk.unchecked_into())).await;
+		assert!(pushed.is_ok());
+		assert_eq!(monitor.ready_state(), CONNECTING);
+	}
+
+	#[wasm_bindgen_test]
+	fn the_last_stream_of_a_freed_client_closes_its_socket() {
+		let (client, monitor, _probe) = connecting_client();
+		let stream = open_stream(&client);
+		drop(client);
+		drop(stream);
+		assert_eq!(monitor.ready_state(), CLOSING);
+	}
+
+	#[wasm_bindgen_test]
+	fn an_exclusive_claim_refuses_a_later_serve() {
+		let (mut client, _monitor, _probe) = connecting_client();
+		let _claimed = client.serve(accepting(), exclusive());
+
+		let later = client.serve(accepting(), JsValue::UNDEFINED);
+		assert_eq!(later.code().as_deref(), Some("ServeDispatchClaimed"));
+	}
+
+	#[wasm_bindgen_test]
+	fn an_exclusive_claim_refuses_another_mode() {
+		let (mut client, _monitor, _probe) = connecting_client();
+		let _claimed = client.serve(accepting(), exclusive());
+
+		let later = client.serve_streaming(accepting(), JsValue::UNDEFINED);
+		assert_eq!(later.code().as_deref(), Some("ServeDispatchClaimed"));
+	}
+
+	#[wasm_bindgen_test]
+	fn an_exclusive_claim_refuses_a_second_exclusive_claim() {
+		let (mut client, _monitor, _probe) = connecting_client();
+		let _claimed = client.serve(accepting(), exclusive());
+
+		let later = client.serve(accepting(), exclusive());
+		assert_eq!(later.code().as_deref(), Some("ServeDispatchClaimed"));
+	}
+
+	#[wasm_bindgen_test]
+	fn an_exclusive_claim_refuses_to_replace_a_shared_handler() {
+		let (mut client, _monitor, _probe) = connecting_client();
+		serve(&mut client);
+
+		let later = client.serve(accepting(), exclusive());
+		assert_eq!(later.code().as_deref(), Some("ServeDispatchShared"));
+	}
+
+	#[wasm_bindgen_test]
+	fn a_shared_claim_takes_a_later_handler_in_its_mode() {
+		let (mut client, _monitor, _probe) = connecting_client();
+		serve(&mut client);
+
+		let later = client.serve(accepting(), JsValue::UNDEFINED);
+		assert!(later.is_ok());
+	}
+
+	#[wasm_bindgen_test]
+	fn a_claim_in_another_mode_conflicts() {
+		let (mut client, _monitor, _probe) = connecting_client();
+		serve(&mut client);
+
+		let later = client.serve_streaming(accepting(), JsValue::UNDEFINED);
+		assert_eq!(later.code().as_deref(), Some("ServeModeConflict"));
+	}
+
+	#[wasm_bindgen_test]
+	fn a_stream_cap_of_zero_fraction_negative_or_nan_is_refused() {
+		let codes = [dial_codes(0.0), dial_codes(1.5), dial_codes(-1.0), dial_codes(f64::NAN)];
+		let refused = [
+			Some(String::from("InvalidStreamCap")),
+			Some(String::from("InvalidStreamCap")),
+			Some(String::from("InvalidStreamCap")),
+		];
+		assert_eq!(codes, [refused.clone(), refused.clone(), refused.clone(), refused]);
+	}
+
+	#[wasm_bindgen_test]
+	fn a_server_dial_refuses_a_session_knob() {
+		let authorization = Uint8Array::from([1u8].as_slice());
+		let server = MuxWsClient::connect(
+			UNREACHED_URL,
+			bytes(&[0x30]),
+			options("authorization", authorization.clone().into()),
+		);
+
+		let cleartext = MuxWsClient::connect_cleartext(UNREACHED_URL, options("authorization", authorization.into()));
+		let codes = [server.code(), cleartext.code()];
+		assert_eq!(
+			codes,
+			[
+				Some(String::from("SessionOfferRequiresMutual")),
+				Some(String::from("SessionOfferRequiresMutual"))
+			]
+		);
+	}
+
+	#[wasm_bindgen_test]
+	fn a_serve_claim_other_than_shared_or_exclusive_is_refused() {
+		let (mut client, _monitor, _probe) = connecting_client();
+		let unary = client.serve(accepting(), JsValue::TRUE).code();
+		let streaming = client.serve_streaming(accepting(), JsValue::from_str("Exclusive")).code();
+		let duplex = client.serve_duplex(accepting(), JsValue::from_f64(1.0)).code();
+
+		let codes = [unary.as_deref(), streaming.as_deref(), duplex.as_deref()];
+		assert_eq!(codes, [Some("InvalidServeClaim"); 3]);
+	}
 }

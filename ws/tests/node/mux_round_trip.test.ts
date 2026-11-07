@@ -2,18 +2,30 @@ import { describe, expect, it } from "vitest";
 
 import type { ConnectOptions } from "@wahidgroup/tightbeam-ws-client";
 import {
-	Opaque,
+	ClientTransportError,
 	StreamRefusal,
-	TRANSPORT_ERROR_NAME,
 	TightbeamWsClient,
-	frame,
 } from "@wahidgroup/tightbeam-ws-client";
 
-import { certBytes, muxClearEndpoint, muxEndpoint } from "../env.js";
-import { emitOrFail, withClient } from "./harness.js";
+import { certBytes } from "../env.js";
+import { emitOrFail, withClient } from "../fixtures.js";
+import { STACK } from "../stack.js";
+
+/**
+ * The options of every cleartext dial: the stream cap of the stack, which no
+ * handshake negotiates.
+ */
+const CLEARTEXT = { streams: STACK.streams };
+
+const ENGINE = await TightbeamWsClient.init();
 
 const TEXT = new TextDecoder();
 const REPLY_BODY = new Uint8Array([0xca, 0x11, 0xba, 0xc4]);
+
+/**
+ * The servlet a routed call-back names.
+ */
+const SERVLET = "urn:tb:echo";
 
 /**
  * A silence past the server's 30-second operation timeout, which ends a
@@ -38,8 +50,8 @@ const LANES = [
 	{
 		lane: "encrypted",
 		connect: (options?: ConnectOptions): Promise<TightbeamWsClient> =>
-			TightbeamWsClient.connect(
-				muxEndpoint,
+			ENGINE.connect(
+				STACK.muxEndpoint,
 				certBytes("server.cert.der"),
 				options,
 			),
@@ -47,7 +59,10 @@ const LANES = [
 	{
 		lane: "cleartext",
 		connect: (options?: ConnectOptions): Promise<TightbeamWsClient> =>
-			TightbeamWsClient.connectCleartext(muxClearEndpoint, options),
+			ENGINE.connectCleartext(STACK.muxClearEndpoint, {
+				...options,
+				...CLEARTEXT,
+			}),
 	},
 ] as const;
 
@@ -57,7 +72,7 @@ describe.each(LANES)(
 		it("correlates each concurrent response to the stream that emitted it", async () => {
 			await withClient(connect, async (client) => {
 				const emits = STREAMS.map(async (stream, index) => {
-					const built = await frame(stream.body)
+					const built = await ENGINE.frameBuilder(stream.body)
 						.withId(stream.id)
 						.withOrder(index + 1)
 						.build();
@@ -71,7 +86,7 @@ describe.each(LANES)(
 					TEXT.decode(response.id),
 				);
 				const echoedBodies = responses.map((response) =>
-					response.message(Opaque),
+					response.message(ENGINE.opaque),
 				);
 
 				expect(echoedIds).toEqual([
@@ -93,7 +108,7 @@ describe.each(LANES)(
 				client.serve(async (request) => {
 					served.push(TEXT.decode(request.id));
 
-					const reply = await frame(REPLY_BODY)
+					const reply = await ENGINE.frameBuilder(REPLY_BODY)
 						.withId("client-reply")
 						.withOrder(2)
 						.build();
@@ -104,7 +119,9 @@ describe.each(LANES)(
 				 * The `call-me` id makes the server call this client back and
 				 * relay the handler's reply as the response on this stream.
 				 */
-				const built = await frame(new Uint8Array([0xb0, 0x09]))
+				const built = await ENGINE.frameBuilder(
+					new Uint8Array([0xb0, 0x09]),
+				)
 					.withId("call-me-node")
 					.withOrder(1)
 					.build();
@@ -112,7 +129,7 @@ describe.each(LANES)(
 				const response = await emitOrFail(client, built);
 				expect(served).toEqual(["call-me-node"]);
 				expect(TEXT.decode(response.id)).toBe("client-reply");
-				expect(response.message(Opaque)).toEqual(REPLY_BODY);
+				expect(response.message(ENGINE.opaque)).toEqual(REPLY_BODY);
 			});
 		});
 
@@ -125,7 +142,9 @@ describe.each(LANES)(
 				 */
 				client.serve(() => null);
 
-				const built = await frame(new Uint8Array([0xb0, 0x24]))
+				const built = await ENGINE.frameBuilder(
+					new Uint8Array([0xb0, 0x24]),
+				)
 					.withId("call-me-bodiless")
 					.withOrder(1)
 					.build();
@@ -145,12 +164,38 @@ describe.each(LANES)(
 					throw new StreamRefusal("NotFound", "nothing here");
 				});
 
-				const built = await frame(new Uint8Array([0xb0, 0x23]))
+				const built = await ENGINE.frameBuilder(
+					new Uint8Array([0xb0, 0x23]),
+				)
 					.withId("call-me-refused")
 					.withOrder(1)
 					.build();
 				await expect(client.emit(built)).rejects.toMatchObject({
-					name: TRANSPORT_ERROR_NAME,
+					name: ClientTransportError.NAME,
+					code: "NotFound",
+				});
+			});
+		});
+
+		it("relays a StreamRefusal code from a streaming handler back to the caller", async () => {
+			await withClient(connect, async (client) => {
+				/*
+				 * The twin of the unary relay: the echo server opens a
+				 * routed progressive call-back, the streaming handler
+				 * refuses it, and the code round-trips to the caller.
+				 */
+				client.serveStreaming(() => {
+					throw new StreamRefusal("NotFound", "nothing here");
+				});
+
+				const built = await ENGINE.frameBuilder(
+					new Uint8Array([0xb0, 0x25]),
+				)
+					.withId(`call-me-stream:${SERVLET}`)
+					.withOrder(1)
+					.build();
+				await expect(client.emit(built)).rejects.toMatchObject({
+					name: ClientTransportError.NAME,
 					code: "NotFound",
 				});
 			});
@@ -165,7 +210,9 @@ describe.each(LANES)(
 				 * Open parks in the responder queue until the handler
 				 * registers.
 				 */
-				const built = await frame(new Uint8Array([0xb0, 0x0f]))
+				const built = await ENGINE.frameBuilder(
+					new Uint8Array([0xb0, 0x0f]),
+				)
 					.withId("call-me-early")
 					.withOrder(1)
 					.build();
@@ -176,7 +223,7 @@ describe.each(LANES)(
 				client.serve(async (request) => {
 					served.push(TEXT.decode(request.id));
 
-					const reply = await frame(REPLY_BODY)
+					const reply = await ENGINE.frameBuilder(REPLY_BODY)
 						.withId("late-reply")
 						.withOrder(2)
 						.build();
@@ -195,7 +242,7 @@ describe.each(LANES)(
 			await withClient(connect, async (client) => {
 				const makeHandler = (replyId: string) => {
 					return async () => {
-						const reply = await frame(REPLY_BODY)
+						const reply = await ENGINE.frameBuilder(REPLY_BODY)
 							.withId(replyId)
 							.withOrder(2)
 							.build();
@@ -203,7 +250,9 @@ describe.each(LANES)(
 					};
 				};
 				const callMe = async (idText: string, order: number) => {
-					const built = await frame(new Uint8Array([0xb0, 0x12]))
+					const built = await ENGINE.frameBuilder(
+						new Uint8Array([0xb0, 0x12]),
+					)
 						.withId(idText)
 						.withOrder(order)
 						.build();
@@ -213,10 +262,9 @@ describe.each(LANES)(
 
 				client.serve(makeHandler("first-handler"));
 				const beforeSwap = await callMe("call-me-once", 1);
-
 				client.serve(makeHandler("second-handler"));
-				const afterSwap = await callMe("call-me-again", 3);
 
+				const afterSwap = await callMe("call-me-again", 3);
 				expect(beforeSwap).toBe("first-handler");
 				expect(afterSwap).toBe("second-handler");
 			});
@@ -232,22 +280,28 @@ describe.each(LANES)(
 			await withClient(connect, async (client) => {
 				await client.shutdownWith(42);
 
-				const after = await frame(new Uint8Array([0xb0, 0x21]))
+				const after = await ENGINE.frameBuilder(
+					new Uint8Array([0xb0, 0x21]),
+				)
 					.withId("mux-after-numeric")
 					.withOrder(1)
 					.build();
 				await expect(client.emit(after)).rejects.toMatchObject({
-					name: TRANSPORT_ERROR_NAME,
+					name: ClientTransportError.NAME,
 					code: "ConnectionClosed",
 				});
 			});
 		});
 
-		it("rejects the bare Application label as a GoAway reason", async () => {
+		it("rejects the bare application label as a GoAway reason", async () => {
 			await withClient(connect, async (client) => {
 				await expect(
-					client.shutdownWith("Application"),
-				).rejects.toMatch("a GoAway reason is");
+					// @ts-expect-error A bare label fails at runtime.
+					client.shutdownWith("application"),
+				).rejects.toMatchObject({
+					name: ClientTransportError.NAME,
+					code: "InvalidGoAwayReason",
+				});
 			});
 		});
 
@@ -266,10 +320,13 @@ describe.each(LANES)(
 					const controller = new AbortController();
 					controllers.push(controller);
 
-					const built = await frame(new Uint8Array([0xb0, 0x20]))
+					const built = await ENGINE.frameBuilder(
+						new Uint8Array([0xb0, 0x20]),
+					)
 						.withId(`call-me-hold-${index}`)
 						.withOrder(index + 1)
 						.build();
+
 					const hold = client
 						.emit(built, { signal: controller.signal })
 						.catch((error: unknown) => error);
@@ -278,12 +335,14 @@ describe.each(LANES)(
 
 				await expect.poll(() => client.hasStreamHeadroom).toBe(false);
 
-				const overflow = await frame(new Uint8Array([0xb0, 0x22]))
+				const overflow = await ENGINE.frameBuilder(
+					new Uint8Array([0xb0, 0x22]),
+				)
 					.withId("mux-overflow")
 					.withOrder(1)
 					.build();
 				await expect(client.emit(overflow)).rejects.toMatchObject({
-					name: TRANSPORT_ERROR_NAME,
+					name: ClientTransportError.NAME,
 					code: "StreamsExhausted",
 				});
 
@@ -294,20 +353,23 @@ describe.each(LANES)(
 				for (const controller of controllers) {
 					controller.abort(new Error("cap release"));
 				}
+
 				await Promise.all(holds);
 			});
 		});
 
 		it("drains the session with an advertised reason on shutdownWith", async () => {
 			await withClient(connect, async (client) => {
-				await client.shutdownWith("EnhanceYourCalm");
+				await client.shutdownWith("enhance-your-calm");
 
-				const after = await frame(new Uint8Array([0xb0, 0x10]))
+				const after = await ENGINE.frameBuilder(
+					new Uint8Array([0xb0, 0x10]),
+				)
 					.withId("mux-after-calm")
 					.withOrder(1)
 					.build();
 				await expect(client.emit(after)).rejects.toMatchObject({
-					name: TRANSPORT_ERROR_NAME,
+					name: ClientTransportError.NAME,
 					code: "ConnectionClosed",
 				});
 			});
@@ -338,19 +400,25 @@ describe.each(LANES)(
 		it("rejects a stream opened after a finished shutdown as closed", async () => {
 			await withClient(connect, async (client) => {
 				// Arrange: prove the session is healthy, then drain it.
-				const before = await frame(new Uint8Array([0xb0, 0x0a]))
+				const before = await ENGINE.frameBuilder(
+					new Uint8Array([0xb0, 0x0a]),
+				)
 					.withId("mux-before-shutdown")
 					.withOrder(1)
 					.build();
+
 				await emitOrFail(client, before);
 				await client.shutdown();
 
-				const after = await frame(new Uint8Array([0xb0, 0x0b]))
+				const after = await ENGINE.frameBuilder(
+					new Uint8Array([0xb0, 0x0b]),
+				)
 					.withId("mux-after-shutdown")
 					.withOrder(2)
 					.build();
+
 				await expect(client.emit(after)).rejects.toMatchObject({
-					name: TRANSPORT_ERROR_NAME,
+					name: ClientTransportError.NAME,
 					code: "ConnectionClosed",
 				});
 			});
@@ -358,7 +426,9 @@ describe.each(LANES)(
 
 		it("rejects an aborted emit with the signal's abort reason", async () => {
 			await withClient(connect, async (client) => {
-				const built = await frame(new Uint8Array([0xb0, 0x0c]))
+				const built = await ENGINE.frameBuilder(
+					new Uint8Array([0xb0, 0x0c]),
+				)
 					.withId("mux-aborted")
 					.withOrder(1)
 					.build();
@@ -367,6 +437,7 @@ describe.each(LANES)(
 				const pending = client.emit(built, {
 					signal: controller.signal,
 				});
+
 				controller.abort(new Error("cancelled by test"));
 
 				await expect(pending).rejects.toThrow("cancelled by test");
@@ -382,9 +453,10 @@ describe.each(LANES)(
 		it("reports stream headroom until the session drains", async () => {
 			await withClient(connect, async (client) => {
 				const healthy = client.hasStreamHeadroom;
-				await client.shutdown();
-				const draining = client.hasStreamHeadroom;
 
+				await client.shutdown();
+
+				const draining = client.hasStreamHeadroom;
 				expect(healthy).toBe(true);
 				expect(draining).toBe(false);
 			});
@@ -397,12 +469,15 @@ describe.each(LANES)(
 				 * and with it this emit, pending until the abort below.
 				 */
 				client.serve(() => new Promise(() => undefined));
-				const idle = client.hasPendingStreams;
 
-				const built = await frame(new Uint8Array([0xb0, 0x11]))
+				const idle = client.hasPendingStreams;
+				const built = await ENGINE.frameBuilder(
+					new Uint8Array([0xb0, 0x11]),
+				)
 					.withId("call-me-pending")
 					.withOrder(1)
 					.build();
+
 				const controller = new AbortController();
 				const pending = client.emit(built, {
 					signal: controller.signal,
@@ -445,10 +520,13 @@ describe.each(LANES)(
 				 * the emit never settles on its own and is aborted once
 				 * the reason surfaces.
 				 */
-				const drain = await frame(new Uint8Array([0xb0, 0x0d]))
+				const drain = await ENGINE.frameBuilder(
+					new Uint8Array([0xb0, 0x0d]),
+				)
 					.withId("drain-calm")
 					.withOrder(1)
 					.build();
+
 				const controller = new AbortController();
 				const pending = client.emit(drain, {
 					signal: controller.signal,
@@ -456,7 +534,7 @@ describe.each(LANES)(
 
 				await expect
 					.poll(() => client.goawayReason)
-					.toBe("EnhanceYourCalm");
+					.toBe("enhance-your-calm");
 				expect(client.goawayCode).toBe(2);
 
 				controller.abort(new Error("drain observed"));
@@ -477,7 +555,7 @@ describe.each(LANES)(
 				await client.shutdown();
 
 				await expect(client.waitForStreamSlot()).rejects.toMatchObject({
-					name: TRANSPORT_ERROR_NAME,
+					name: ClientTransportError.NAME,
 					code: "ConnectionClosed",
 				});
 			});
@@ -491,7 +569,9 @@ describe.each(LANES)(
 						setTimeout(resolve, PAST_READ_DEADLINE_MS);
 					});
 
-					const after = await frame(new Uint8Array([0xb0, 0x30]))
+					const after = await ENGINE.frameBuilder(
+						new Uint8Array([0xb0, 0x30]),
+					)
 						.withId("mux-after-idle")
 						.withOrder(1)
 						.build();
@@ -505,18 +585,20 @@ describe.each(LANES)(
 			await withClient(connect, async (client) => {
 				client.serve(() => new Promise(() => undefined));
 
-				const built = await frame(new Uint8Array([0xb0, 0x0e]))
+				const built = await ENGINE.frameBuilder(
+					new Uint8Array([0xb0, 0x0e]),
+				)
 					.withId("call-me-parked")
 					.withOrder(1)
 					.build();
+
 				const pending = client.emit(built);
-
-				client.close();
-
+				const closing = client.close();
 				await expect(pending).rejects.toMatchObject({
-					name: TRANSPORT_ERROR_NAME,
+					name: ClientTransportError.NAME,
 					code: "ConnectionClosed",
 				});
+				await closing;
 			});
 		});
 
@@ -534,7 +616,7 @@ describe.each(LANES)(
 				const observed = client.closed;
 
 				await client.shutdown();
-				client.close();
+				await client.close();
 
 				/*
 				 * The close code and cleanliness vary by runtime and by who
@@ -560,7 +642,9 @@ describe("released client behavior", () => {
 		{
 			name: "emit",
 			run: async (client: TightbeamWsClient): Promise<void> => {
-				const built = await frame(new Uint8Array([0xb0, 0x0f]))
+				const built = await ENGINE.frameBuilder(
+					new Uint8Array([0xb0, 0x0f]),
+				)
 					.withId("post-close")
 					.withOrder(1)
 					.build();
@@ -594,7 +678,7 @@ describe("released client behavior", () => {
 		{
 			name: "shutdownWith",
 			run: async (client: TightbeamWsClient): Promise<void> => {
-				await client.shutdownWith("Shutdown");
+				await client.shutdownWith("shutdown");
 			},
 		},
 	] as const;
@@ -602,23 +686,27 @@ describe("released client behavior", () => {
 	it.each(OPERATIONS)(
 		"rejects $name on a released client with ConnectionClosed",
 		async ({ run }) => {
-			const client =
-				await TightbeamWsClient.connectCleartext(muxClearEndpoint);
-			client.close();
+			const client = await ENGINE.connectCleartext(
+				STACK.muxClearEndpoint,
+				CLEARTEXT,
+			);
+			await client.close();
 
 			await expect(run(client)).rejects.toMatchObject({
-				name: TRANSPORT_ERROR_NAME,
+				name: ClientTransportError.NAME,
 				code: "ConnectionClosed",
 			});
 		},
 	);
 
 	it("keeps the lifecycle surfaces readable after close", async () => {
-		const client =
-			await TightbeamWsClient.connectCleartext(muxClearEndpoint);
+		const client = await ENGINE.connectCleartext(
+			STACK.muxClearEndpoint,
+			CLEARTEXT,
+		);
 		const capBeforeClose = client.maxConcurrentStreams;
 
-		client.close();
+		await client.close();
 
 		expect(client.readyState).toBe(WebSocket.CLOSED);
 		expect(client.maxConcurrentStreams).toBe(capBeforeClose);
@@ -637,15 +725,16 @@ describe("released client behavior", () => {
 
 describe("connector options", () => {
 	it("applies the symmetric cap from cleartext options", async () => {
-		const client = await TightbeamWsClient.connectCleartext(
-			muxClearEndpoint,
-			{ streams: 3 },
+		const options = { streams: 3 };
+		const client = await ENGINE.connectCleartext(
+			STACK.muxClearEndpoint,
+			options,
 		);
 
 		try {
 			expect(client.maxConcurrentStreams).toBe(3);
 		} finally {
-			client.close();
+			await client.close();
 		}
 	});
 });
@@ -657,11 +746,10 @@ describe("cleartext dial readiness", () => {
 		 * before it opens.
 		 */
 		const deadEndpoint = "ws://127.0.0.1:9";
-
 		await expect(
-			TightbeamWsClient.connectCleartext(deadEndpoint),
+			ENGINE.connectCleartext(deadEndpoint),
 		).rejects.toMatchObject({
-			name: TRANSPORT_ERROR_NAME,
+			name: ClientTransportError.NAME,
 			code: "ConnectionClosed",
 		});
 	});

@@ -16,6 +16,7 @@ categories.workspace = true
 proc-macro = true
 
 [dependencies]
+tightbeam-asn-names = { version = "0.1.0", path = "../tightbeam-asn-names" }
 proc-macro2 = "1"
 quote = "1"
 syn = { version = "3.0.3", features = ["full"] }

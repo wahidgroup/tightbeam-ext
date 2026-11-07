@@ -17,7 +17,48 @@ categories.workspace = true
 name = "tightbeam_ws"
 
 [features]
-testing = []
+default = ["socket"]
+# The envelope rules of a WebSocket half. They build on the tightbeam
+# transport alone, so the wasm32 browser client shares them. Upstream
+# refuses `async-transport` without a handshake protocol, so `wire` names
+# `transport-hpke`, the protocol both clients run.
+wire = ["tightbeam-rs/std", "tightbeam-rs/async-transport", "tightbeam-rs/transport-hpke"]
+# The tokio-tungstenite listener, dial, and stream.
+socket = [
+    "wire",
+    "dep:tokio",
+    "tokio/net",
+    "tokio/rt",
+    "tokio/io-util",
+    "tokio/macros",
+    "tokio/sync",
+    "tokio/time",
+    "dep:tokio-tungstenite",
+    "dep:futures-util",
+    "tightbeam-rs/tcp",
+    "tightbeam-rs/tokio",
+    "tightbeam-rs/transport-hpke",
+    "tightbeam-rs/transport-multiplex",
+    "tightbeam-rs/transport-policy",
+]
+# The owner of one accepted multiplexed connection: its transport gate, its
+# tasks, and the handle a push-capable service emits on. It names no socket,
+# so a transport-generic server such as tightbeam-pubsub depends on it alone.
+serve = [
+    "dep:tokio",
+    "tokio/rt",
+    "tokio/sync",
+    "tokio/time",
+    "tightbeam-rs/std",
+    "tightbeam-rs/tokio",
+    "tightbeam-rs/transport-hpke",
+    "tightbeam-rs/transport-multiplex",
+]
+# A link built from parts, for an in-memory test link that runs no handshake.
+# The parts name any gate and any session, so only test support enables it.
+link-parts = ["serve"]
+testing = ["socket", "serve"]
+colony = ["testing", "tightbeam-rs/colony"]
 
 [[example]]
 name = "gen_certs"
@@ -33,26 +74,20 @@ required-features = ["testing"]
 
 [[example]]
 name = "work_gateway_server"
-required-features = ["testing"]
+required-features = ["colony"]
 
 [dependencies]
-tightbeam-rs = { workspace = true, features = [
-    "tcp",
-    "tokio",
-    "transport-hpke",
-    "transport-multiplex",
-    "transport-policy",
-] }
-tokio = { workspace = true, features = ["net", "rt", "io-util", "macros"] }
-tokio-tungstenite = { workspace = true, features = ["connect", "handshake"] }
-futures-util = { workspace = true, features = ["std", "sink"] }
+tightbeam-rs = { workspace = true }
+tokio = { workspace = true, optional = true }
+tokio-tungstenite = { workspace = true, optional = true, features = ["connect", "handshake"] }
+futures-util = { workspace = true, optional = true, features = ["std", "sink"] }
 
 [dev-dependencies]
 # The der crate backs the Sequence derive in the work-gateway example,
 # whose expansion references the crate by its absolute path.
 der = { workspace = true, features = ["alloc", "derive", "oid"] }
 husky-rs = { workspace = true }
-tightbeam-rs = { workspace = true, features = ["testing", "colony"] }
+tightbeam-rs = { workspace = true, features = ["testing"] }
 tokio = { workspace = true, features = [
     "rt-multi-thread",
     "macros",

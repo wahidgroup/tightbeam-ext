@@ -2,45 +2,65 @@
 
 WebSocket transport for the [tightbeam](https://crates.io/crates/tightbeam-rs) messaging protocol.
 
-tightbeam frames are DER-encoded and streamed over raw TCP by `tightbeam::transport::tcp`. This crate carries the same DER envelopes as WebSocket binary frames, one envelope per message, so browsers and other WebSocket clients can speak tightbeam.
+## Status
 
-## Surface
+This project is under active development. Public APIs MAY change without notice. No security audit has been conducted. Use this software at your own risk.
 
-This crate exposes WebSocket framing for tightbeam transports. Authentication and confidentiality come from tightbeam's HPKE application-layer handshake above the socket, not from TLS on the listener itself.
+## Abstract
 
-- `protocol::WsListener` implements tightbeam's `Protocol`, `EncryptedProtocol`, and `AsyncListenerTrait`.
-- `io::WsStream` and `io::WsTransport` implement `AsyncProtocolStream` over `tokio-tungstenite`.
-- Cleartext and HPKE-encrypted round-trips reuse tightbeam's transport-agnostic handshake unchanged.
-- Each read of a multiplexed session runs under the operation timeout of its endpoint, 30 seconds by default. A session that must outlive a silence pings its peer with `MuxHandle::ping` faster than that timeout.
+tightbeam streams DER-encoded envelopes over raw TCP. This crate carries the same envelopes as WebSocket binary messages ([RFC 6455](https://datatracker.ietf.org/doc/html/rfc6455)), one envelope per message, so browsers and other WebSocket clients speak tightbeam. It plugs into the transport traits of tightbeam, so the handshake, the policies, multiplexing, and pooling of tightbeam run over it unchanged.
 
-## Cluster work plane
+## Install
 
-tightbeam's `colony` feature routes signed work frames through a cluster gateway to hive-registered servlets. The WebSocket transport is the browser edge, not the colony interior: declare the gateway with `cluster! { ..., protocol: TokioListener, edge: WsListener }` and set `ClusterConfig::edge_bind_addr`. The colony (gateway, hives, servlets) keeps its TCP protocol, and the gateway binds a second WebSocket accept plane that admits `Work` frames only; control frames (registration, ads, gossip) are refused at the edge.
-
-The upstream `SubmitWork` blanket implementation already covers `GenericClient<WsListener>`, so no code in this crate changes for it. `tests/work_plane.rs` proves the round trip and a typed `WorkRefused` refusal from a WebSocket edge client through a real TCP gateway, hive, and servlet topology:
-
-```rust
-let served = client.submit_work_to(servlet_urn, &signed_work_frame).await?;
+```sh
+cargo add tightbeam-ws
 ```
 
-The gateway forwards the caller's signed frame to the servlet byte-for-byte, and the servlet's complete signed response frame returns the same way. Enable `colony` on `tightbeam-rs` in your own manifest to use it.
+## Quick start
+
+```rust
+use tightbeam::{server, Frame};
+use tightbeam_ws::protocol::WsListener;
+
+# async fn serve() -> Result<(), Box<dyn std::error::Error>> {
+let listener: WsListener = WsListener::bind_cleartext("127.0.0.1:9101").await?;
+let server_handle = server! {
+	protocol WsListener: listener,
+	handle: |message: Frame| async move {
+		// Echo the frame back
+		Ok(Some(message))
+	}
+};
+# server_handle.abort();
+# Ok(())
+# }
+```
+
+The listener serves in the clear here, and `bind_cleartext` says so: its connections are plaintext, unprotected, and unauthenticated (CWE-319). An encrypted listener binds with its certificate, and each connection runs the tightbeam handshake.
+
+## Transport
+
+`WsListener` is a tightbeam protocol: it binds, accepts, and dials WebSocket connections, and its stream holds every read and write to the envelope rules of the wire. The browser engine shares those rules. Implementation: [docs/ws.md](../../docs/ws.md#listener).
+
+## Security
+
+Authentication and confidentiality come from the tightbeam handshake above the socket, so the listener binds `ws://` and leaves TLS to a terminator in front of it. A listener that serves no anonymous peer requires mutual authentication. Implementation: [docs/ws.md](../../docs/ws.md#limitations).
+
+## Push-capable servers
+
+The `serve` feature owns one accepted multiplexed connection and lends its service the handle that server-initiated streams leave on. `tightbeam-pubsub` serves through it. Implementation: [docs/ws.md](../../docs/ws.md#accepted-links).
+
+## Cluster edge
+
+A tightbeam cluster gateway binds a WebSocket edge that admits signed work frames from browsers, while the colony keeps its TCP protocol. Implementation: [docs/ws.md](../../docs/ws.md#cluster-work-plane).
 
 ## Features
 
-- `testing` - test-support module with X.509 identity fixtures and the shared multiplexed echo behavior for encrypted end-to-end tests and examples (`gen_certs`, `echo_server_mux`, `echo_server_mux_clear`, `work_gateway_server`).
-
-## Limitations
-
-- The listener has no native TLS acceptor: it binds `ws://` only. This does not gate security or `wss://` deployments. Authentication and confidentiality come from tightbeam's HPKE handshake above the socket. Browsers on `https://` pages connect over `wss://` by terminating TLS in front (reverse proxy, load balancer) and forwarding `ws://` to this crate.
-
-## Sources
-
-- RFC 6455, The WebSocket Protocol:
-  <https://datatracker.ietf.org/doc/html/rfc6455>
+`socket`, on by default, holds the listener and the dial. `wire`, `serve`, `link-parts`, `testing`, and `colony` select the other parts. Implementation: [docs/ws.md](../../docs/ws.md#features).
 
 ## Related
 
-The browser counterpart lives in [tightbeam-ws-wasm](../tightbeam-ws-wasm), packaged for npm as `@wahidgroup/tightbeam-ws-client` ([client](../client)). See the [repository README](../../README.md) for development and release workflows.
+The browser engine is [tightbeam-ws-wasm](../tightbeam-ws-wasm), packaged for npm as `@wahidgroup/tightbeam-ws-client` ([client](../client)). See the [repository README](../../README.md) for development and release workflows.
 
 ## License
 

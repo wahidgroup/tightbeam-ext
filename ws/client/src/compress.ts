@@ -1,13 +1,13 @@
 /**
- * Compression capabilities and the tightbeam profile implementation.
+ * Compression capabilities.
  *
- * The tightbeam profile compression is one zstd frame
- * (`PROFILE_OIDS.zstd`), provided by {@link ZstdCompression}. The
- * platform-native `CompressionStream("deflate")` pairs with
- * `PROFILE_OIDS.zlib` for a dependency-free alternative.
- *
- * Inflators SHOULD cap their output size. A wire-supplied body can be a
- * decompression bomb.
+ * - The profile compression is zstd, which the engine implements
+ *   (`Engine.zstd`), so the browser admits the compressed bodies a native
+ *   peer admits.
+ * - The platform-native `CompressionStream("deflate")` pairs with the zlib
+ *   OID of the profile for a dependency-free alternative.
+ * - Inflators SHOULD cap their output size, because a wire-supplied body can
+ *   be a decompression bomb.
  *
  * # Sources
  *
@@ -15,230 +15,194 @@
  *   {@link https://cwe.mitre.org/data/definitions/409.html CWE-409}
  */
 
-import { ValidationError } from "./builder/errors.js";
-import { PROFILE_OIDS } from "./crypto.js";
+import type { CompressedBody, ZstdCompression } from "#wasm";
+
+import type { OidName } from "./views.js";
+import { OidView } from "./views.js";
+
+export type { CompressedBody } from "#wasm";
 
 /**
- * A compressed frame body: the pieces installed in the frame's compactness
- * info alongside the compressed bytes.
- */
-export interface CompressedBody {
-	/**
-	 * The dotted OID of the compression algorithm.
-	 */
-	readonly algorithmOid: string;
-	/**
-	 * The DER-encoded algorithm parameters, when the scheme has any.
-	 */
-	readonly parametersDer?: Uint8Array;
-	/**
-	 * Content-type OID of the uncompressed body. Defaults to `id-data` when
-	 * omitted.
-	 */
-	readonly contentOid?: string;
-	/**
-	 * The compressed bytes replacing the frame body.
-	 */
-	readonly data: Uint8Array;
-}
-
-/**
- * A body-compression capability. Implement it with any compression library.
+ * A body-compression capability, in the shape of the tightbeam-rs
+ * `Compressor`: the algorithm it applies, and the compression. Implement it
+ * with any compression library.
  */
 export interface BodyCompressor {
 	/**
-	 * Compress a body DER, resolving with the compressed bytes and the
-	 * algorithm identifiers recorded in the frame.
+	 * The compression algorithm this compressor applies, which the frame
+	 * records. `withCompressor` copies it once.
 	 */
-	compress(bodyDer: Uint8Array): Promise<CompressedBody>;
+	readonly algorithmOid: OidName;
+
+	/**
+	 * Compress a body DER, answering the compressed bytes and the parameters
+	 * the algorithm defines.
+	 */
+	compress(bodyDer: Uint8Array): CompressedBody | Promise<CompressedBody>;
 }
 
 /**
- * A body-decompression capability: receives the carried compactness pieces
- * and resolves with the uncompressed body DER.
+ * A body-decompression capability, in the shape of the tightbeam-rs
+ * `Inflator`: the algorithm it reverses, the parameters it admits, and the
+ * decompression.
  */
 export interface BodyInflator {
 	/**
-	 * Decompress a carried body, resolving with the body DER.
-	 *
-	 * @throws when the algorithm does not match this implementation or the
-	 * bytes are not a valid stream (implementations SHOULD also reject
-	 * output exceeding a caller-chosen cap).
+	 * The compression algorithm this inflator reverses.
 	 */
-	decompress(compressed: CompressedBody): Promise<Uint8Array>;
+	readonly algorithmOid: OidName;
+
+	/**
+	 * Whether `parametersDer`, the parameters the compactness info of a frame
+	 * names for {@link algorithmOid}, take a form this algorithm defines, such
+	 * as a level inside its valid range.
+	 *
+	 * `Frame.open` asks before it decrypts or inflates anything, so a body
+	 * no inflator reverses costs no work.
+	 */
+	admitsParameters(parametersDer?: Uint8Array): boolean;
+
+	/**
+	 * Decompress compressed bytes, answering the body DER.
+	 *
+	 * @throws when the bytes are not a valid stream (implementations SHOULD
+	 * also refuse output past a caller-chosen cap).
+	 */
+	decompress(data: Uint8Array): Uint8Array | Promise<Uint8Array>;
 }
 
 /**
- * The default decompression ceiling, matching tightbeam-rs
- * `DEFAULT_MAX_DECOMPRESSED_LEN` (16 MiB).
+ * A compressor held past the call that received it: the compression of the
+ * caller's compressor, under a copy of the algorithm it names. Every frame
+ * records that algorithm, and the caller keeps its own handle. The holder
+ * has no release, so the glue reclaims the copy with it.
  */
-const DEFAULT_MAX_OUTPUT = 16 * 1024 * 1024;
+export class HeldCompressor implements BodyCompressor {
+	readonly algorithmOid: OidView;
 
-/**
- * The magic number that opens a zstd frame (RFC 8878 § 3.1.1).
- */
-const ZSTD_FRAME_MAGIC = 0xfd2fb528;
+	readonly #compressor: BodyCompressor;
 
-/**
- * Octets of the magic number and the frame header descriptor.
- */
-const ZSTD_DESCRIPTOR_END = 5;
-
-/**
- * Octets of the window descriptor, which a single-segment frame omits.
- */
-const ZSTD_WINDOW_DESCRIPTOR = 1;
-
-/**
- * Octets of `Frame_Content_Size`, by `Frame_Content_Size_flag`.
- */
-const CONTENT_SIZE_FIELD = [1, 2, 4, 8] as const;
-
-/**
- * Octets of `Dictionary_ID`, by `Dictionary_ID_flag`.
- */
-const DICTIONARY_ID_FIELD = [0, 1, 2, 4] as const;
-
-/**
- * The `Frame_Content_Size` of a two-octet field counts from 256
- * (RFC 8878 § 3.1.1.4).
- */
-const TWO_OCTET_CONTENT_SIZE_OFFSET = 256;
-
-/**
- * The zstd module surface consumed by {@link ZstdCompression}.
- */
-interface ZstdModule {
-	compress(data: Uint8Array, level?: number): Uint8Array;
-	decompress(
-		data: Uint8Array,
-		options?: { defaultHeapSize?: number },
-	): Uint8Array;
-}
-
-let zstdLoading: Promise<ZstdModule> | undefined;
-
-/**
- * Load and initialize the bundled libzstd wasm module once. Subsequent
- * calls await the same load. The load is lazy, so clients that never
- * compress never pay for it.
- */
-function zstdModule(): Promise<ZstdModule> {
-	if (zstdLoading === undefined) {
-		zstdLoading = (async (): Promise<ZstdModule> => {
-			const zstd = await import("@bokuweb/zstd-wasm");
-			await zstd.init();
-			return zstd;
-		})();
+	constructor(compressor: BodyCompressor) {
+		this.algorithmOid = OidView.copyOf(compressor.algorithmOid);
+		this.#compressor = compressor;
 	}
 
-	return zstdLoading;
-}
-
-/**
- * Reject a carried body whose algorithm OID is not the profile zstd OID.
- */
-function requireZstd(compressed: CompressedBody): void {
-	if (compressed.algorithmOid !== PROFILE_OIDS.zstd) {
-		throw new ValidationError("ALGORITHM_MISMATCH", [
-			{
-				path: "compactness.algorithmOid",
-				message: `Compressed with ${compressed.algorithmOid}, but this inflator opens ${PROFILE_OIDS.zstd}`,
-			},
-		]);
+	compress(bodyDer: Uint8Array): CompressedBody | Promise<CompressedBody> {
+		const compressed = this.#compressor.compress(bodyDer);
+		return compressed;
 	}
 }
 
 /**
- * The decompressed size a zstd frame declares in its header, or `undefined`
- * for a frame that declares none or bytes that open no frame
- * (RFC 8878 § 3.1.1.1).
+ * An inflator held past the call that received it: the inflation of the
+ * caller's inflator, under a copy of the algorithm it names, held as
+ * {@link HeldCompressor} holds its copy.
  */
-function declaredContentSize(data: Uint8Array): number | undefined {
-	if (data.length < ZSTD_DESCRIPTOR_END) {
-		return undefined;
+export class HeldInflator implements BodyInflator {
+	readonly algorithmOid: OidView;
+
+	readonly #inflator: BodyInflator;
+
+	constructor(inflator: BodyInflator) {
+		this.algorithmOid = OidView.copyOf(inflator.algorithmOid);
+		this.#inflator = inflator;
 	}
 
-	const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
-	if (view.getUint32(0, true) !== ZSTD_FRAME_MAGIC) {
-		return undefined;
+	admitsParameters(parametersDer?: Uint8Array): boolean {
+		const admitted = this.#inflator.admitsParameters(parametersDer);
+		return admitted;
 	}
 
-	const descriptor = view.getUint8(4);
-	const sizeFlag = descriptor >> 6;
-	const singleSegment = (descriptor & 0x20) !== 0;
-	if (sizeFlag === 0 && !singleSegment) {
-		return undefined;
-	}
-
-	let offset =
-		ZSTD_DESCRIPTOR_END + (DICTIONARY_ID_FIELD[descriptor & 0x03] ?? 0);
-	if (!singleSegment) {
-		offset += ZSTD_WINDOW_DESCRIPTOR;
-	}
-
-	const sizeField = CONTENT_SIZE_FIELD[sizeFlag] ?? 0;
-	if (data.length < offset + sizeField) {
-		return undefined;
-	}
-
-	switch (sizeField) {
-		case 1:
-			return view.getUint8(offset);
-		case 2:
-			return view.getUint16(offset, true) + TWO_OCTET_CONTENT_SIZE_OFFSET;
-		case 4:
-			return view.getUint32(offset, true);
-		default:
-			return Number(view.getBigUint64(offset, true));
+	decompress(data: Uint8Array): Uint8Array | Promise<Uint8Array> {
+		const inflated = this.#inflator.decompress(data);
+		return inflated;
 	}
 }
 
 /**
- * The tightbeam profile compression: one zstd frame (`PROFILE_OIDS.zstd`).
- * tightbeam-rs `ZstdCompression` refuses any octet past that frame. The libzstd
- * wasm build loads on first use.
+ * The key of the ceiling a {@link ZstdView} inflates within, which the frame
+ * inflate path reads. The package exports no path to it, so the ceiling
+ * stays inside the package.
+ */
+export const CEILING: unique symbol = Symbol("ceiling");
+
+/**
+ * The engine zstd of one realm at one ceiling, which `Engine.zstd` lends.
  *
- * `maxOutput` bounds decompression, at 16 MiB by default:
- *
- * - A frame that declares a larger size throws `OUTPUT_LIMIT_EXCEEDED` before any allocation.
- * - A frame that declares no size decompresses into a `maxOutput`-octet buffer, and overflow throws.
- *
- * # Sources
- *
- * - RFC 8878, Zstandard Compression and the application/zstd Media Type:
- *   {@link https://datatracker.ietf.org/doc/html/rfc8878 RFC 8878}
- * - CWE-409, Improper Handling of Highly Compressed Data (Data Amplification):
- *   {@link https://cwe.mitre.org/data/definitions/409.html CWE-409}
+ * The realm owns the one handle every view reaches, so the view has no
+ * `free` and no `[Symbol.dispose]`. The view holds the ceiling the engine
+ * parsed once, and each inflate passes it to the engine, so a ceiling leaves
+ * no handle behind.
  */
-export class ZstdCompression implements BodyCompressor, BodyInflator {
-	constructor(private readonly maxOutput: number = DEFAULT_MAX_OUTPUT) {}
+export class ZstdView implements BodyCompressor, BodyInflator {
+	/**
+	 * The profile zstd, which this compression applies and reverses.
+	 */
+	readonly algorithmOid: OidView;
 
-	async compress(bodyDer: Uint8Array): Promise<CompressedBody> {
-		const zstd = await zstdModule();
+	readonly #zstd: ZstdCompression;
 
-		const data = zstd.compress(bodyDer);
-		const compressed = { algorithmOid: PROFILE_OIDS.zstd, data };
+	/**
+	 * The largest output an inflate yields, in octets.
+	 */
+	readonly #ceiling: number;
+
+	private constructor(
+		zstd: ZstdCompression,
+		algorithmOid: OidView,
+		ceiling: number,
+	) {
+		this.#zstd = zstd;
+		this.algorithmOid = algorithmOid;
+		this.#ceiling = ceiling;
+	}
+
+	/**
+	 * A view of `zstd`, which the realm owns, applying `algorithmOid` and
+	 * inflating within `ceiling`, a whole number the engine parsed.
+	 */
+	static over(
+		zstd: ZstdCompression,
+		algorithmOid: OidView,
+		ceiling: number,
+	): ZstdView {
+		const view = new ZstdView(zstd, algorithmOid, ceiling);
+		return view;
+	}
+
+	/**
+	 * The ceiling of each inflate, for the frame inflate path.
+	 */
+	get [CEILING](): number {
+		return this.#ceiling;
+	}
+
+	/**
+	 * Whether `parametersDer` take a form zstd defines: absent, or a level
+	 * inside the range libzstd accepts.
+	 */
+	admitsParameters(parametersDer?: Uint8Array): boolean {
+		const admitted = this.#zstd.admitsParameters(parametersDer);
+		return admitted;
+	}
+
+	/**
+	 * Compress `bodyDer` at the `Fastest` level of ruzstd.
+	 */
+	compress(bodyDer: Uint8Array): CompressedBody {
+		const compressed = this.#zstd.compress(bodyDer);
 		return compressed;
 	}
 
-	async decompress(compressed: CompressedBody): Promise<Uint8Array> {
-		requireZstd(compressed);
-
-		const declaredOutput = declaredContentSize(compressed.data);
-		if (declaredOutput !== undefined && declaredOutput > this.maxOutput) {
-			throw new ValidationError("OUTPUT_LIMIT_EXCEEDED", [
-				{
-					path: "compactness.data",
-					message: `Decompressed size ${declaredOutput} exceeds the ${this.maxOutput}-byte ceiling`,
-				},
-			]);
-		}
-
-		const zstd = await zstdModule();
-		const bodyDer = zstd.decompress(compressed.data, {
-			defaultHeapSize: this.maxOutput,
-		});
-		return bodyDer;
+	/**
+	 * Inflate `data`, which holds exactly one frame, within the ceiling.
+	 *
+	 * @throws TightbeamTransportError whose `code` names the `ZstdRefusal`:
+	 * `WindowTooLarge`, `OutputLimitExceeded`, `Truncated`, `TrailingBytes`,
+	 * `Stalled`, or `Malformed`.
+	 */
+	decompress(data: Uint8Array): Uint8Array {
+		const inflated = this.#zstd.decompress(data, this.#ceiling);
+		return inflated;
 	}
 }

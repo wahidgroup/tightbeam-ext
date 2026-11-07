@@ -2,7 +2,7 @@ import { secp256k1 } from "@noble/curves/secp256k1.js";
 import { sha3_256, sha3_512 } from "@noble/hashes/sha3.js";
 import { describe, expect, it } from "vitest";
 
-import { bodyPreimage } from "#wasm";
+import type { Version } from "#wasm";
 
 import type {
 	BodyCompressor,
@@ -10,31 +10,17 @@ import type {
 	CompressedBody,
 } from "./compress.js";
 import type {
+	Aes256Gcm,
 	BodyDecryptor,
 	BodyEncryptor,
 	EncryptedBody,
 	Hasher,
 } from "./crypto.js";
-import type { Frame, FrameBuilder, MessageCodec } from "./index.js";
-import { MessagePriority } from "./builder/priority.js";
-import { Version } from "./builder/version.js";
-import {
-	Aes256Gcm,
-	HpkeDecryptor,
-	HpkeEncryptor,
-	PROFILE_OIDS,
-	Secp256k1SigningKey,
-	Secp256k1VerifyingKey,
-	Sha3_256,
-} from "./crypto.js";
-import {
-	Framed,
-	Opaque,
-	ValidationError,
-	frame,
-	initClient,
-	wrapped,
-} from "./index.js";
+import type { FrameBuilder, MessageCodec } from "./index.js";
+import type { Note } from "./testing/notes.js";
+import type { OidName } from "./views.js";
+import { Frame, TightbeamWsClient, ValidationError } from "./index.js";
+import { NotePayload } from "./testing/notes.js";
 import {
 	NobleFrameVerifier,
 	NobleSignatory,
@@ -46,11 +32,29 @@ import {
  * caller-supplied (noble-backed) ones.
  */
 
+const engine = await TightbeamWsClient.init();
+const Notes = engine.wrapping(NotePayload);
+
 const BODY = new Uint8Array([1, 2, 3, 4]);
-const SIGNING_KEY = Secp256k1SigningKey.fromBytes(new Uint8Array(32).fill(1));
+const SIGNING_KEY = engine.signingKey(new Uint8Array(32).fill(1));
 const AES_KEY = new Uint8Array(32).fill(7);
 const KEY_ID = new TextEncoder().encode("tbws/test/kek/v1");
-const EMPTY_SALT = new Uint8Array();
+
+/**
+ * An encryptor whose ciphertext is one DER value, an empty OCTET STRING, so
+ * the carried body parses as DER although the frame is sealed. A profile
+ * ciphertext parses as DER only by chance.
+ */
+const DER_CIPHERTEXT: BodyEncryptor = {
+	encrypt: async (bodyDer: Uint8Array, contentOid: OidName) => {
+		const cipher = engine.aes256Gcm({ key: AES_KEY, keyId: KEY_ID });
+		const sealed = await cipher.encrypt(bodyDer, contentOid);
+
+		const ciphertext = new Uint8Array([0x04, 0x00]);
+		const derCiphertext = { ...sealed, ciphertext };
+		return derCiphertext;
+	},
+};
 
 /**
  * The SHA3-512 OID, an algorithm outside the tightbeam profile.
@@ -58,12 +62,21 @@ const EMPTY_SALT = new Uint8Array();
 const SHA3_512_OID = "2.16.840.1.101.3.4.2.10";
 
 /**
+ * A codec whose message is the body DER itself, the way a schema codec may
+ * hand back the bytes it validated.
+ */
+const RAW_BODY: MessageCodec<Uint8Array> = {
+	encode: (bodyDer) => bodyDer,
+	decode: (bodyDer) => bodyDer,
+};
+
+/**
  * A {@link Hasher} backed by an independent JavaScript digest (noble),
  * standing in for any bring-your-own hash library.
  */
 class NobleHasher implements Hasher {
 	constructor(
-		readonly algorithmOid: string,
+		readonly algorithmOid: OidName,
 		private readonly hash: (data: Uint8Array) => Uint8Array,
 	) {}
 
@@ -74,17 +87,162 @@ class NobleHasher implements Hasher {
 	}
 }
 
-await initClient();
+/**
+ * The plain-digest salt, which a frame committed without a salt verifies
+ * under.
+ */
+const EMPTY_SALT = engine.salt(new Uint8Array());
+
+describe("Engine.frame", () => {
+	it("refuses bytes that are no frame at construction", () => {
+		expect(() => engine.frame(new Uint8Array([1, 2, 3]))).toThrow(
+			expect.objectContaining({ code: "SerializationError" }),
+		);
+	});
+
+	it("keeps its own copy of the DER it parses", async () => {
+		const built = await engine.frameBuilder(BODY).withId("copy-in").build();
+		const received = built.toDer();
+		const parsed = engine.frame(received);
+
+		received.fill(0);
+
+		expect(parsed.toDer()).toEqual(built.toDer());
+	});
+});
+
+describe("Frame.response", () => {
+	it("reads no frame from a response without one", () => {
+		expect(Frame.response(engine, undefined)).toBeUndefined();
+	});
+
+	it("parses the frame a response carries", async () => {
+		const built = await engine
+			.frameBuilder(BODY)
+			.withId("response")
+			.build();
+
+		const response = Frame.response(engine, built.toDer());
+		expect(response?.toDer()).toEqual(built.toDer());
+	});
+});
+
+describe("Frame.toDer", () => {
+	it("hands out a copy, so a write to it leaves the frame unchanged", async () => {
+		const built = await engine
+			.frameBuilder(BODY)
+			.withId("copy-out")
+			.build();
+
+		const handed = built.toDer();
+		handed.fill(0);
+		expect(built.toDer()).not.toEqual(handed);
+	});
+});
+
+describe("Frame byte getters", () => {
+	it("hand out the body as a copy, so a write to it leaves open unchanged", async () => {
+		const built = await engine
+			.frameBuilder(BODY)
+			.withId("body-out")
+			.build();
+
+		const handed = built.bodyDer;
+		handed.fill(0);
+
+		const opened = await built.open(engine.opaque);
+		expect(opened).toEqual(BODY);
+	});
+
+	it("hand out the opened body as a copy, so a write to it leaves the next open unchanged", async () => {
+		const cleartextBodyDer = engine.opaque.encode(BODY);
+		const built = await engine
+			.frameBuilder(BODY)
+			.withId("opened-out")
+			.build();
+
+		const handed = await built.open(RAW_BODY);
+		handed.fill(0);
+
+		const opened = await built.open(RAW_BODY);
+		expect(opened).toEqual(cleartextBodyDer);
+	});
+
+	it("hand out the sealing envelope as a copy, so a write to it leaves open unchanged", async () => {
+		const cipher = engine.aes256Gcm({ key: AES_KEY, keyId: KEY_ID });
+		const built = await engine
+			.frameBuilder(BODY)
+			.withEncryptor(cipher)
+			.build();
+
+		const sealing = built.confidentialityInfo;
+		const handed = sealing?.envelopeDer ?? new Uint8Array();
+
+		handed.fill(0);
+
+		const opened = await built.open(engine.opaque, { opener: cipher });
+		expect(opened).toEqual(BODY);
+	});
+
+	it("hand out the commitment digest as a copy, so a write to it leaves the verdict unchanged", async () => {
+		const committed = await engine
+			.frameBuilder(BODY)
+			.withMessageHasher(engine.sha3_256)
+			.build();
+
+		const commitment = committed.messageIntegrityInfo;
+		const handed = commitment?.digest ?? new Uint8Array();
+		handed.fill(0);
+
+		const verdict = await committed.messageCommitmentVerdict(EMPTY_SALT);
+		expect(verdict).toBe("verified");
+	});
+
+	it("hand out the id as a copy", async () => {
+		const built = await engine.frameBuilder(BODY).withId("id-out").build();
+		const handed = built.id;
+		handed.fill(0);
+		expect(built.id).not.toEqual(handed);
+	});
+
+	it("hand out the signature as a copy", async () => {
+		const built = await engine
+			.frameBuilder(BODY)
+			.withSigner(SIGNING_KEY)
+			.build();
+
+		const handed = built.signatureInfo?.signature ?? new Uint8Array();
+		handed.fill(0);
+
+		expect(built.signatureInfo?.signature).not.toEqual(handed);
+	});
+
+	it("hand out the matrix as a copy", async () => {
+		const matrix = new Uint8Array([0, 1, 1, 0]);
+		const built = await engine
+			.frameBuilder(BODY)
+			.withMatrix(2, matrix)
+			.build();
+
+		const handed = built.matrix?.data ?? new Uint8Array();
+		handed.fill(0);
+
+		expect(built.matrix?.data).not.toEqual(handed);
+	});
+});
 
 describe("Frame metadata round-trip", () => {
 	it("reads back a cleartext V0 frame", async () => {
 		const expectedId = new TextEncoder().encode("clear-1");
-
-		const built = await frame(BODY).withId("clear-1").withOrder(7).build();
-		expect(built.version).toBe(Version.V0);
+		const built = await engine
+			.frameBuilder(BODY)
+			.withId("clear-1")
+			.withOrder(7)
+			.build();
+		expect(built.version).toBe(engine.Version.V0);
 		expect(built.id).toEqual(expectedId);
 		expect(built.order).toBe(7n);
-		expect(built.message(Opaque)).toEqual(BODY);
+		expect(built.message(engine.opaque)).toEqual(BODY);
 		expect(built.signed).toBe(false);
 		expect(built.messageIntegrity).toBe(false);
 		expect(built.frameIntegrity).toBe(false);
@@ -99,32 +257,33 @@ describe("Frame metadata round-trip", () => {
 		const digest = new Uint8Array(32).fill(0xaa);
 		const matrix = new Uint8Array([0, 1, 1, 0]);
 
-		const built = await frame(BODY)
+		const built = await engine
+			.frameBuilder(BODY)
 			.withId("rich")
 			.withOrder(21)
-			.withPriority(MessagePriority.Expedited)
+			.withPriority(engine.MessagePriority.Expedited)
 			.withLifetime(300)
-			.withPreviousHash({
-				algorithmOid: SHA3_512_OID,
-				digest,
-			})
+			.withPreviousHash(
+				engine.digestInfo(engine.oid(SHA3_512_OID), digest),
+			)
 			.withMatrix(2, matrix)
 			.build();
-		expect(built.version).toBe(Version.V3);
-		expect(built.priority).toBe(MessagePriority.Expedited);
+		expect(built.version).toBe(engine.Version.V3);
+		expect(built.priority).toBe(engine.MessagePriority.Expedited);
 		expect(built.lifetime).toBe(300n);
-		expect(built.previousFrame?.algorithmOid).toBe(SHA3_512_OID);
+		expect(built.previousFrame?.algorithmOid.toString()).toBe(SHA3_512_OID);
 		expect(built.previousFrame?.digest).toEqual(digest);
 		expect(built.matrix?.n).toBe(2);
 		expect(built.matrix?.data).toEqual(matrix);
 	});
 
 	it("honors a matching version assertion against the real codec", async () => {
-		const built = await frame(BODY)
+		const built = await engine
+			.frameBuilder(BODY)
 			.withSigner(SIGNING_KEY)
-			.assertVersion(Version.V1)
+			.assertVersion(engine.Version.V1)
 			.build();
-		expect(built.version).toBe(Version.V1);
+		expect(built.version).toBe(engine.Version.V1);
 	});
 });
 
@@ -134,21 +293,23 @@ describe("Framed (frame-in-frame)", () => {
 	 * a pub/sub update relays it.
 	 */
 	async function relayed(): Promise<{ inner: Frame; relay: Frame }> {
-		const inner = await frame(BODY)
+		const inner = await engine
+			.frameBuilder(BODY)
 			.withId("order-42")
 			.withOrder(7)
-			.withPriority(MessagePriority.Expedited)
+			.withPriority(engine.MessagePriority.Expedited)
 			.withLifetime(60)
 			.withSigner(SIGNING_KEY)
 			.build();
 
-		const wrapper = await frame()
+		const wrapper = await engine
+			.frameBuilder()
 			.withId("orders")
 			.withOrder(1)
-			.withMessage(Framed, inner)
+			.withMessage(engine.framed, inner)
 			.build();
 
-		const relay = wrapper.message(Framed);
+		const relay = wrapper.message(engine.framed);
 		return { inner, relay };
 	}
 
@@ -166,82 +327,103 @@ describe("Framed (frame-in-frame)", () => {
 		const { relay } = await relayed();
 		expect(relay.id).toEqual(new TextEncoder().encode("order-42"));
 		expect(relay.order).toBe(7n);
-		expect(relay.priority).toBe(MessagePriority.Expedited);
+		expect(relay.priority).toBe(engine.MessagePriority.Expedited);
 		expect(relay.lifetime).toBe(60n);
-		expect(relay.message(Opaque)).toEqual(BODY);
+		expect(relay.message(engine.opaque)).toEqual(BODY);
 	});
 });
 
-describe("version floor matches tightbeam-rs", () => {
+describe("the engine decides the version floor", () => {
 	interface FloorCase {
 		field: string;
 		expected: Version;
 		make: () => FrameBuilder;
 	}
 
-	const aeadEncryptor = Aes256Gcm.fromKey(AES_KEY, KEY_ID);
+	const aeadEncryptor = engine.aes256Gcm({ key: AES_KEY, keyId: KEY_ID });
 	const recipientPublic = SIGNING_KEY.verifyingKey().toSec1Bytes();
-	const hpkeEncryptor = HpkeEncryptor.fromBytes(recipientPublic);
+	const hpkeEncryptor = engine.hpkeEncryptor(recipientPublic);
 
 	const cases: FloorCase[] = [
 		{
 			field: "bare payload",
-			expected: Version.V0,
-			make: () => frame(BODY),
+			expected: engine.Version.V0,
+			make: () => engine.frameBuilder(BODY),
 		},
 		{
 			field: "signer",
-			expected: Version.V1,
-			make: () => frame(BODY).withSigner(SIGNING_KEY),
+			expected: engine.Version.V1,
+			make: () => engine.frameBuilder(BODY).withSigner(SIGNING_KEY),
 		},
 		{
 			field: "aead encryptor",
-			expected: Version.V1,
-			make: () => frame(BODY).withEncryptor(aeadEncryptor),
+			expected: engine.Version.V1,
+			make: () => engine.frameBuilder(BODY).withEncryptor(aeadEncryptor),
 		},
 		{
 			field: "hpke encryptor",
-			expected: Version.V1,
-			make: () => frame(BODY).withEncryptor(hpkeEncryptor),
+			expected: engine.Version.V1,
+			make: () => engine.frameBuilder(BODY).withEncryptor(hpkeEncryptor),
 		},
 		{
 			field: "priority",
-			expected: Version.V2,
-			make: () => frame(BODY).withPriority(MessagePriority.Standard),
+			expected: engine.Version.V2,
+			make: () =>
+				engine
+					.frameBuilder(BODY)
+					.withPriority(engine.MessagePriority.Standard),
 		},
 		{
 			field: "lifetime",
-			expected: Version.V2,
-			make: () => frame(BODY).withLifetime(60),
+			expected: engine.Version.V2,
+			make: () => engine.frameBuilder(BODY).withLifetime(60),
 		},
 		{
 			field: "previous hash",
-			expected: Version.V2,
+			expected: engine.Version.V2,
 			make: () =>
-				frame(BODY).withPreviousHash({
-					algorithmOid: PROFILE_OIDS.sha3_256,
-					digest: new Uint8Array(32).fill(1),
-				}),
+				engine
+					.frameBuilder(BODY)
+					.withPreviousHash(
+						engine.digestInfo(
+							engine.profile.sha3_256,
+							new Uint8Array(32).fill(1),
+						),
+					),
 		},
 		{
 			field: "message hasher",
-			expected: Version.V2,
-			make: () => frame(BODY).withMessageHasher(new Sha3_256()),
+			expected: engine.Version.V1,
+			make: () =>
+				engine.frameBuilder(BODY).withMessageHasher(engine.sha3_256),
 		},
 		{
 			field: "witness hasher",
-			expected: Version.V2,
-			make: () => frame(BODY).withWitnessHasher(new Sha3_256()),
+			expected: engine.Version.V1,
+			make: () =>
+				engine.frameBuilder(BODY).withWitnessHasher(engine.sha3_256),
+		},
+		{
+			field: "signer and priority",
+			expected: engine.Version.V2,
+			make: () =>
+				engine
+					.frameBuilder(BODY)
+					.withSigner(SIGNING_KEY)
+					.withPriority(engine.MessagePriority.Standard),
 		},
 		{
 			field: "matrix",
-			expected: Version.V3,
-			make: () => frame(BODY).withMatrix(2, new Uint8Array([0, 1, 1, 0])),
+			expected: engine.Version.V3,
+			make: () =>
+				engine
+					.frameBuilder(BODY)
+					.withMatrix(2, new Uint8Array([0, 1, 1, 0])),
 		},
 	];
 
 	it.each(cases)(
-		"derives V$expected for $field on both sides of the boundary",
+		"derives V$expected for $field from GatedField::since",
 		async ({ expected, make }) => {
 			const built = await make().assertVersion(expected).build();
 			expect(built.version).toBe(expected);
@@ -251,40 +433,48 @@ describe("version floor matches tightbeam-rs", () => {
 
 describe("Frame.verify", () => {
 	it("verifies a locally signed frame with the derived key", async () => {
-		const built = await frame(BODY)
+		const built = await engine
+			.frameBuilder(BODY)
 			.withId("signed")
 			.withOrder(1)
 			.withSigner(SIGNING_KEY)
 			.build();
-
 		expect(built.signed).toBe(true);
-		expect(built.signatureInfo?.algorithmOid).toBe(
-			PROFILE_OIDS.ecdsaWithSha3_256,
+		expect(built.signatureInfo?.algorithmOid.toString()).toBe(
+			engine.profile.ecdsaWithSha3_256.toString(),
 		);
-		expect(built.signatureInfo?.digestAlgorithmOid).toBe(
-			PROFILE_OIDS.sha3_256,
+		expect(built.signatureInfo?.digestAlgorithmOid.toString()).toBe(
+			engine.profile.sha3_256.toString(),
 		);
 		expect(() => built.verify(SIGNING_KEY.verifyingKey())).not.toThrow();
 	});
 
 	it("rejects verification under the wrong key", async () => {
-		const other = Secp256k1SigningKey.fromBytes(new Uint8Array(32).fill(2));
+		const other = engine.signingKey(new Uint8Array(32).fill(2));
 		const otherKey = other.verifyingKey();
 
-		const signed = await frame(BODY).withSigner(SIGNING_KEY).build();
+		const signed = await engine
+			.frameBuilder(BODY)
+			.withSigner(SIGNING_KEY)
+			.build();
 		expect(() => signed.verify(otherKey)).toThrow();
 	});
 
 	it("rejects verification of an unsigned frame", async () => {
-		const unsigned = await frame(BODY).build();
+		const unsigned = await engine.frameBuilder(BODY).build();
 		expect(() => unsigned.verify(SIGNING_KEY.verifyingKey())).toThrow();
 	});
 
 	it("verifies a profile signature externally from its prehash and signatureInfo", async () => {
-		const built = await frame(BODY).withSigner(SIGNING_KEY).build();
+		const built = await engine
+			.frameBuilder(BODY)
+			.withSigner(SIGNING_KEY)
+			.build();
 
 		const info = built.signatureInfo;
-		expect(info?.algorithmOid).toBe(PROFILE_OIDS.ecdsaWithSha3_256);
+		expect(info?.algorithmOid.toString()).toBe(
+			engine.profile.ecdsaWithSha3_256.toString(),
+		);
 
 		const signature = info?.signature ?? new Uint8Array();
 		const publicKey = SIGNING_KEY.verifyingKey().toSec1Bytes();
@@ -296,34 +486,35 @@ describe("Frame.verify", () => {
 		);
 		expect(valid).toBe(true);
 	});
+});
 
-	it("refuses a signer outside the profile signature", async () => {
-		const foreign = {
-			...SIGNING_KEY,
-			signatureAlgorithmOid: "1.3.101.112",
-			digestAlgorithmOid: PROFILE_OIDS.sha3_256,
-			signerId: (): Uint8Array => SIGNING_KEY.signerId(),
-			signPrehash: (prehash: Uint8Array): Promise<Uint8Array> =>
-				SIGNING_KEY.signPrehash(prehash),
-		};
+describe("Frame preimages", () => {
+	it("an unsigned frame refuses its prehash as the engine does and still reads its witness", async () => {
+		const unsigned = await engine
+			.frameBuilder(BODY)
+			.withWitnessHasher(engine.sha3_256)
+			.build();
+		const missing = expect.objectContaining({ code: "MissingSignature" });
 
-		await expect(frame(BODY).withSigner(foreign).build()).rejects.toThrow(
-			ValidationError,
+		expect(() => unsigned.signaturePrehash()).toThrow(missing);
+		await expect(unsigned.frameIntegrityVerdict()).resolves.toBe(
+			"verified",
 		);
 	});
 });
 
 describe("Frame.frameIntegrityVerdict", () => {
 	it.each([
-		{ name: "profile SHA3-256", hasher: new Sha3_256() },
+		{ name: "profile SHA3-256", hasher: engine.sha3_256 },
 		{
 			name: "noble SHA3-512 (bring-your-own)",
-			hasher: new NobleHasher(SHA3_512_OID, sha3_512),
+			hasher: new NobleHasher(engine.oid(SHA3_512_OID), sha3_512),
 		},
 	])(
 		"reports verified under the matching $name hasher",
 		async ({ hasher }) => {
-			const witnessed = await frame(BODY)
+			const witnessed = await engine
+				.frameBuilder(BODY)
 				.withWitnessHasher(hasher)
 				.build();
 
@@ -334,15 +525,19 @@ describe("Frame.frameIntegrityVerdict", () => {
 	);
 
 	it("reports absent for an unwitnessed frame", async () => {
-		const bare = await frame(BODY).build();
+		const bare = await engine.frameBuilder(BODY).build();
 		await expect(bare.frameIntegrityVerdict()).resolves.toBe("absent");
 	});
 
 	it("reports algorithm-mismatch when checked under the wrong hasher", async () => {
-		const nobleSha3_512 = new NobleHasher(SHA3_512_OID, sha3_512);
-		const profileHasher = new Sha3_256();
+		const nobleSha3_512 = new NobleHasher(
+			engine.oid(SHA3_512_OID),
+			sha3_512,
+		);
 
-		const witnessed = await frame(BODY)
+		const profileHasher = engine.sha3_256;
+		const witnessed = await engine
+			.frameBuilder(BODY)
 			.withWitnessHasher(nobleSha3_512)
 			.build();
 
@@ -352,10 +547,14 @@ describe("Frame.frameIntegrityVerdict", () => {
 	});
 
 	it("agrees across implementations of the same algorithm", async () => {
-		const nobleSha3_256 = new NobleHasher(PROFILE_OIDS.sha3_256, sha3_256);
-		const profileHasher = new Sha3_256();
+		const nobleSha3_256 = new NobleHasher(
+			engine.profile.sha3_256,
+			sha3_256,
+		);
 
-		const witnessed = await frame(BODY)
+		const profileHasher = engine.sha3_256;
+		const witnessed = await engine
+			.frameBuilder(BODY)
 			.withWitnessHasher(nobleSha3_256)
 			.build();
 
@@ -366,11 +565,14 @@ describe("Frame.frameIntegrityVerdict", () => {
 });
 
 describe("Frame.messageCommitmentVerdict", () => {
-	const SALT = new TextEncoder().encode("commitment-salt-value");
+	const SALT_OCTETS = new TextEncoder().encode("commitment-salt-value");
+	const SALT = engine.salt(SALT_OCTETS);
 
 	it("reports verified for the disclosed salt", async () => {
-		const committed = await frame(BODY)
-			.withMessageHasher(new Sha3_256(), SALT)
+		const committed = await engine
+			.frameBuilder(BODY)
+			.withMessageHasher(engine.sha3_256)
+			.withCommitment(engine.salt(SALT_OCTETS))
 			.build();
 
 		await expect(committed.messageCommitmentVerdict(SALT)).resolves.toBe(
@@ -379,10 +581,14 @@ describe("Frame.messageCommitmentVerdict", () => {
 	});
 
 	it("reports mismatch for the wrong salt", async () => {
-		const wrongSalt = new TextEncoder().encode("the-wrong-salt-value");
+		const wrongSalt = engine.salt(
+			new TextEncoder().encode("the-wrong-salt-value"),
+		);
 
-		const committed = await frame(BODY)
-			.withMessageHasher(new Sha3_256(), SALT)
+		const committed = await engine
+			.frameBuilder(BODY)
+			.withMessageHasher(engine.sha3_256)
+			.withCommitment(engine.salt(SALT_OCTETS))
 			.build();
 
 		await expect(
@@ -391,9 +597,22 @@ describe("Frame.messageCommitmentVerdict", () => {
 	});
 
 	it("reports absent for a frame without a commitment", async () => {
-		const bare = await frame(BODY).build();
+		const bare = await engine.frameBuilder(BODY).build();
 		await expect(bare.messageCommitmentVerdict(SALT)).resolves.toBe(
 			"absent",
+		);
+	});
+
+	it("refuses a sealed frame whose ciphertext parses as one DER value", async () => {
+		const sealed = await engine
+			.frameBuilder(BODY)
+			.withMessageHasher(engine.sha3_256)
+			.withCommitment(engine.salt(SALT_OCTETS))
+			.withEncryptor(DER_CIPHERTEXT)
+			.build();
+
+		await expect(sealed.messageCommitmentVerdict(SALT)).rejects.toThrow(
+			expect.objectContaining({ code: "FRAME_CONFIDENTIAL" }),
 		);
 	});
 });
@@ -402,120 +621,212 @@ describe("external Signatory across the wasm boundary", () => {
 	const EXTERNAL_SECRET = new Uint8Array(32).fill(5);
 
 	it("attaches a noble-produced signature that wasm verification accepts", async () => {
-		const signatory = new NobleSignatory(EXTERNAL_SECRET);
-		const built = await frame(BODY)
+		const signatory = new NobleSignatory(engine, EXTERNAL_SECRET);
+		const built = await engine
+			.frameBuilder(BODY)
 			.withId("external")
 			.withOrder(11)
 			.withSigner(signatory)
 			.build();
 		expect(built.signed).toBe(true);
 
-		const verifyingKey = Secp256k1VerifyingKey.fromSec1Bytes(
-			signatory.publicKey(),
-		);
+		const verifyingKey = engine.verifyingKey(signatory.publicKey());
 		expect(() => built.verify(verifyingKey)).not.toThrow();
 	});
 
 	it("verifies through the signatory's BYO FrameVerifier", async () => {
-		const signatory = new NobleSignatory(EXTERNAL_SECRET);
-		const built = await frame(BODY).withSigner(signatory).build();
+		const signatory = new NobleSignatory(engine, EXTERNAL_SECRET);
+		const built = await engine
+			.frameBuilder(BODY)
+			.withSigner(signatory)
+			.build();
 		expect(() => built.verify(signatory.verifier)).not.toThrow();
 	});
 
 	it("rejects a BYO FrameVerifier under the wrong public key", async () => {
-		const signatory = new NobleSignatory(EXTERNAL_SECRET);
-		const built = await frame(BODY).withSigner(signatory).build();
-		const wrong = new NobleFrameVerifier(
-			secp256k1.getPublicKey(new Uint8Array(32).fill(9), true),
+		const signatory = new NobleSignatory(engine, EXTERNAL_SECRET);
+		const built = await engine
+			.frameBuilder(BODY)
+			.withSigner(signatory)
+			.build();
+		const wrongKey = secp256k1.getPublicKey(
+			new Uint8Array(32).fill(9),
+			true,
 		);
 
+		const wrong = new NobleFrameVerifier(engine, wrongKey);
 		expect(() => built.verify(wrong)).toThrow();
 	});
 
 	it("rejects verification of the external signature under another key", async () => {
-		const signatory = new NobleSignatory(EXTERNAL_SECRET);
-		const built = await frame(BODY).withSigner(signatory).build();
+		const signatory = new NobleSignatory(engine, EXTERNAL_SECRET);
+		const built = await engine
+			.frameBuilder(BODY)
+			.withSigner(signatory)
+			.build();
 		expect(() => built.verify(SIGNING_KEY.verifyingKey())).toThrow();
 	});
 
 	it("validates the spec before anything crosses to the signatory", async () => {
-		const signatory = new NobleSignatory(EXTERNAL_SECRET);
-		const attempt = frame().withSigner(signatory).build();
+		const released = engine.signingKey(new Uint8Array(32).fill(9));
+		released[Symbol.dispose]();
 
+		const attempt = engine.frameBuilder().withSigner(released).build();
 		await expect(attempt).rejects.toThrow(ValidationError);
-		expect(signatory.seen).toEqual([]);
 	});
 });
 
 describe("FrameVerifier capability", () => {
 	it("accepts the profile signing key's verifier getter", async () => {
-		const built = await frame(BODY).withSigner(SIGNING_KEY).build();
+		const built = await engine
+			.frameBuilder(BODY)
+			.withSigner(SIGNING_KEY)
+			.build();
 		expect(() => built.verify(SIGNING_KEY.verifier)).not.toThrow();
 	});
 });
 
 describe("Frame.decryptMessage", () => {
 	it("round-trips an AES-256-GCM sealed body", async () => {
-		const cipher = Aes256Gcm.fromKey(AES_KEY, KEY_ID);
-		const cleartextBodyDer = bodyPreimage(BODY);
+		const cipher = engine.aes256Gcm({ key: AES_KEY, keyId: KEY_ID });
+		const cleartextBodyDer = engine.opaque.encode(BODY);
 
-		const built = await frame(BODY).withEncryptor(cipher).build();
+		const built = await engine
+			.frameBuilder(BODY)
+			.withEncryptor(cipher)
+			.build();
 		expect(built.confidential).toBe(true);
-		expect(built.confidentialityInfo?.algorithmOid).toBe(
-			PROFILE_OIDS.aes256Gcm,
+		expect(built.confidentialityInfo?.algorithmOid.toString()).toBe(
+			engine.profile.aes256Gcm.toString(),
 		);
 		expect(built.bodyDer).not.toEqual(cleartextBodyDer);
 
-		await expect(built.decryptMessage(cipher, Opaque)).resolves.toEqual(
-			BODY,
-		);
+		await expect(
+			built.decryptMessage(cipher, engine.opaque),
+		).resolves.toEqual(BODY);
 	});
 
 	it("rejects the wrong AEAD key", async () => {
-		const cipher = Aes256Gcm.fromKey(AES_KEY, KEY_ID);
+		const cipher = engine.aes256Gcm({ key: AES_KEY, keyId: KEY_ID });
 		const wrongKey = new Uint8Array(32).fill(9);
-		const wrong = Aes256Gcm.fromKey(wrongKey, KEY_ID);
+		const wrong = engine.aes256Gcm({ key: wrongKey, keyId: KEY_ID });
 
-		const built = await frame(BODY).withEncryptor(cipher).build();
-		await expect(built.decryptMessage(wrong, Opaque)).rejects.toThrow();
+		const built = await engine
+			.frameBuilder(BODY)
+			.withEncryptor(cipher)
+			.build();
+		await expect(
+			built.decryptMessage(wrong, engine.opaque),
+		).rejects.toThrow();
 	});
 
 	it("round-trips an HPKE body sealed to a recipient", async () => {
 		const recipientSecret = new Uint8Array(32).fill(1);
 		const recipientPublic = SIGNING_KEY.verifyingKey().toSec1Bytes();
-		const encryptor = HpkeEncryptor.fromBytes(recipientPublic);
-		const cleartextBodyDer = bodyPreimage(BODY);
+		const encryptor = engine.hpkeEncryptor(recipientPublic);
+		const cleartextBodyDer = engine.opaque.encode(BODY);
 
-		const built = await frame(BODY).withEncryptor(encryptor).build();
+		const built = await engine
+			.frameBuilder(BODY)
+			.withEncryptor(encryptor)
+			.build();
 		expect(built.confidential).toBe(true);
-		expect(built.confidentialityInfo?.algorithmOid).toBe(
-			PROFILE_OIDS.aes256Gcm,
+		expect(built.confidentialityInfo?.algorithmOid.toString()).toBe(
+			engine.profile.aes256Gcm.toString(),
 		);
 		expect(built.bodyDer).not.toEqual(cleartextBodyDer);
 
-		const decryptor = HpkeDecryptor.fromBytes(recipientSecret);
-		await expect(built.decryptMessage(decryptor, Opaque)).resolves.toEqual(
-			BODY,
-		);
+		const decryptor = engine.hpkeDecryptor(recipientSecret);
+		await expect(
+			built.decryptMessage(decryptor, engine.opaque),
+		).resolves.toEqual(BODY);
 	});
 
 	it("rejects the wrong HPKE secret", async () => {
 		const recipientPublic = SIGNING_KEY.verifyingKey().toSec1Bytes();
-		const encryptor = HpkeEncryptor.fromBytes(recipientPublic);
-		const built = await frame(BODY).withEncryptor(encryptor).build();
+		const encryptor = engine.hpkeEncryptor(recipientPublic);
+		const built = await engine
+			.frameBuilder(BODY)
+			.withEncryptor(encryptor)
+			.build();
 
 		const wrongSecret = new Uint8Array(32).fill(2);
-		const wrong = HpkeDecryptor.fromBytes(wrongSecret);
-		await expect(built.decryptMessage(wrong, Opaque)).rejects.toThrow();
+		const wrong = engine.hpkeDecryptor(wrongSecret);
+		await expect(
+			built.decryptMessage(wrong, engine.opaque),
+		).rejects.toThrow();
 	});
 
 	it("rejects decryption of a cleartext frame", async () => {
-		const cipher = Aes256Gcm.fromKey(AES_KEY, KEY_ID);
-		const cleartext = await frame(BODY).build();
+		const cipher = engine.aes256Gcm({ key: AES_KEY, keyId: KEY_ID });
+		const cleartext = await engine.frameBuilder(BODY).build();
 
-		await expect(cleartext.decryptMessage(cipher, Opaque)).rejects.toThrow(
-			ValidationError,
-		);
+		await expect(
+			cleartext.decryptMessage(cipher, engine.opaque),
+		).rejects.toThrow(ValidationError);
+	});
+});
+
+describe("Frame.open", () => {
+	/**
+	 * A key other than {@link AES_KEY}, under the same identifier, whose open
+	 * of the seal fails.
+	 */
+	const WRONG_KEY = new Uint8Array(32).fill(8);
+
+	/**
+	 * A compressor that labels its output zlib and keeps the bytes as they
+	 * are, standing in for any compression the profile inflator refuses.
+	 */
+	const ZLIB_LABEL: BodyCompressor = {
+		algorithmOid: engine.profile.zlib,
+		compress: (bodyDer: Uint8Array): CompressedBody => ({ data: bodyDer }),
+	};
+
+	it("opens a sealed and compressed body with named capabilities", async () => {
+		const cipher = engine.aes256Gcm({ key: AES_KEY, keyId: KEY_ID });
+		const zstd = engine.zstd();
+		const built = await engine
+			.frameBuilder(BODY)
+			.withCompressor(zstd)
+			.withEncryptor(cipher)
+			.build();
+
+		const opened = built.open(engine.opaque, {
+			opener: cipher,
+			inflator: zstd,
+		});
+		await expect(opened).resolves.toEqual(BODY);
+	});
+
+	it("refuses compactness the inflator does not admit before any decryption", async () => {
+		const cipher = engine.aes256Gcm({ key: AES_KEY, keyId: KEY_ID });
+		const opener = engine.aes256Gcm({ key: WRONG_KEY, keyId: KEY_ID });
+		const built = await engine
+			.frameBuilder(BODY)
+			.withCompressor(ZLIB_LABEL)
+			.withEncryptor(cipher)
+			.build();
+
+		const opened = built.open(engine.opaque, {
+			opener,
+			inflator: engine.zstd(),
+		});
+		await expect(opened).rejects.toMatchObject({
+			code: "COMPACTNESS_REFUSED",
+		});
+	});
+
+	it("refuses a sealed body without an opener", async () => {
+		const cipher = engine.aes256Gcm({ key: AES_KEY, keyId: KEY_ID });
+		const built = await engine
+			.frameBuilder(BODY)
+			.withEncryptor(cipher)
+			.build();
+
+		await expect(built.open(engine.opaque)).rejects.toMatchObject({
+			code: "MISSING_OPENER",
+		});
 	});
 });
 
@@ -523,18 +834,21 @@ describe("bring-your-own encryption across the wasm boundary", () => {
 	/**
 	 * A {@link BodyEncryptor} / {@link BodyDecryptor} outside the wasm
 	 * profile classes. It hands the codec a finished envelope and records
-	 * the content type the codec names.
+	 * the content type the codec names. It is a user implementation of the
+	 * public `BodyEncryptor` port, and it records what crossed the boundary,
+	 * because no public accessor of a frame shows the content type a seal
+	 * authenticates.
 	 */
 	class RecordingEncryptor implements BodyEncryptor, BodyDecryptor {
-		readonly contentOids: (string | undefined)[] = [];
+		readonly contentOids: string[] = [];
 
 		constructor(private readonly cipher: Aes256Gcm) {}
 
 		encrypt(
 			bodyDer: Uint8Array,
-			contentOid?: string,
+			contentOid: OidName,
 		): Promise<EncryptedBody> {
-			this.contentOids.push(contentOid);
+			this.contentOids.push(contentOid.toString());
 			return this.cipher.encrypt(bodyDer, contentOid);
 		}
 
@@ -545,48 +859,51 @@ describe("bring-your-own encryption across the wasm boundary", () => {
 
 	it("installs the envelope a caller-supplied encryptor returns", async () => {
 		const encryptor = new RecordingEncryptor(
-			Aes256Gcm.fromKey(AES_KEY, KEY_ID),
+			engine.aes256Gcm({ key: AES_KEY, keyId: KEY_ID }),
 		);
-		const built = await frame(BODY).withEncryptor(encryptor).build();
-		expect(built.confidentialityInfo?.algorithmOid).toBe(
-			PROFILE_OIDS.aes256Gcm,
+		const built = await engine
+			.frameBuilder(BODY)
+			.withEncryptor(encryptor)
+			.build();
+		expect(built.confidentialityInfo?.algorithmOid.toString()).toBe(
+			engine.profile.aes256Gcm.toString(),
 		);
-		expect(encryptor.contentOids).toEqual([undefined]);
+		expect(encryptor.contentOids).toEqual([engine.profile.data.toString()]);
 
-		const decryptor = Aes256Gcm.fromKey(AES_KEY, KEY_ID);
-		await expect(built.decryptMessage(decryptor, Opaque)).resolves.toEqual(
-			BODY,
-		);
+		const decryptor = engine.aes256Gcm({ key: AES_KEY, keyId: KEY_ID });
+		await expect(
+			built.decryptMessage(decryptor, engine.opaque),
+		).resolves.toEqual(BODY);
 	});
 
-	it("names the content type to the encryptor, which the envelope authenticates", async () => {
+	it("hands the encryptor the content type the builder names", async () => {
 		const contentOid = "1.2.840.113549.1.7.2";
 		const encryptor = new RecordingEncryptor(
-			Aes256Gcm.fromKey(AES_KEY, KEY_ID),
+			engine.aes256Gcm({ key: AES_KEY, keyId: KEY_ID }),
 		);
-		const built = await frame(BODY)
-			.withContentOid(contentOid)
+		const built = await engine
+			.frameBuilder(BODY)
+			.withContentOid(engine.oid(contentOid))
 			.withEncryptor(encryptor)
 			.build();
 		expect(encryptor.contentOids).toEqual([contentOid]);
 
-		await expect(built.decryptMessage(encryptor, Opaque)).resolves.toEqual(
-			BODY,
-		);
+		await expect(
+			built.decryptMessage(encryptor, engine.opaque),
+		).resolves.toEqual(BODY);
 	});
 
 	it("refuses bytes that are no envelope", async () => {
 		const forged: BodyEncryptor = {
 			encrypt: (bodyDer: Uint8Array): Promise<EncryptedBody> =>
 				Promise.resolve({
-					algorithmOid: PROFILE_OIDS.aes256Gcm,
 					envelopeDer: new Uint8Array([0x30, 0x00]),
 					ciphertext: bodyDer,
 				}),
 		};
 
 		await expect(
-			frame(BODY).withEncryptor(forged).build(),
+			engine.frameBuilder(BODY).withEncryptor(forged).build(),
 		).rejects.toThrow();
 	});
 });
@@ -613,26 +930,25 @@ describe("bring-your-own compression", () => {
 	 * bring-your-own compression library.
 	 */
 	class ZlibCompression implements BodyCompressor, BodyInflator {
+		readonly algorithmOid = engine.profile.zlib;
+
 		async compress(bodyDer: Uint8Array): Promise<CompressedBody> {
 			const data = await pump(new CompressionStream("deflate"), bodyDer);
-			const compressed = { algorithmOid: PROFILE_OIDS.zlib, data };
+			const compressed = { data };
 			return compressed;
 		}
 
-		async decompress(compressed: CompressedBody): Promise<Uint8Array> {
-			if (compressed.algorithmOid !== PROFILE_OIDS.zlib) {
-				throw new ValidationError("COMPRESSION_ALGORITHM", [
-					{
-						path: "compactness.algorithmOid",
-						message: `Expected zlib, got ${compressed.algorithmOid}`,
-					},
-				]);
-			}
+		/**
+		 * zlib defines no parameters, so only their absence is admitted.
+		 */
+		admitsParameters(parametersDer?: Uint8Array): boolean {
+			const admitted = parametersDer === undefined;
+			return admitted;
+		}
 
-			const bodyDer = await pump(
-				new DecompressionStream("deflate"),
-				compressed.data,
-			);
+		async decompress(data: Uint8Array): Promise<Uint8Array> {
+			const inflate = new DecompressionStream("deflate");
+			const bodyDer = await pump(inflate, data);
 			return bodyDer;
 		}
 	}
@@ -640,20 +956,29 @@ describe("bring-your-own compression", () => {
 	const zlib = new ZlibCompression();
 
 	it("round-trips a compressed cleartext body", async () => {
-		const uncompressedBodyDer = bodyPreimage(BODY);
+		const uncompressedBodyDer = engine.opaque.encode(BODY);
 
-		const built = await frame(BODY).withCompressor(zlib).build();
+		const built = await engine
+			.frameBuilder(BODY)
+			.withCompressor(zlib)
+			.build();
 		expect(built.compressed).toBe(true);
-		expect(built.compactnessInfo?.algorithmOid).toBe(PROFILE_OIDS.zlib);
-		expect(built.compactnessInfo?.contentOid).toBe(PROFILE_OIDS.data);
+		expect(built.compactnessInfo?.algorithmOid.toString()).toBe(
+			engine.profile.zlib.toString(),
+		);
+		expect(built.compactnessInfo?.contentOid.toString()).toBe(
+			engine.profile.data.toString(),
+		);
 		expect(built.bodyDer).not.toEqual(uncompressedBodyDer);
 
-		await expect(built.inflateMessage(zlib, Opaque)).resolves.toEqual(BODY);
+		const opened = built.open(engine.opaque, { inflator: zlib });
+		await expect(opened).resolves.toEqual(BODY);
 	});
 
 	it("round-trips a compressed-then-sealed body", async () => {
-		const cipher = Aes256Gcm.fromKey(AES_KEY, KEY_ID);
-		const built = await frame(BODY)
+		const cipher = engine.aes256Gcm({ key: AES_KEY, keyId: KEY_ID });
+		const built = await engine
+			.frameBuilder(BODY)
 			.withCompressor(zlib)
 			.withEncryptor(cipher)
 			.build();
@@ -661,85 +986,60 @@ describe("bring-your-own compression", () => {
 		expect(built.compressed).toBe(true);
 		expect(built.confidential).toBe(true);
 		await expect(
-			built.decryptMessage(cipher, Opaque, zlib),
+			built.decryptMessage(cipher, engine.opaque, zlib),
 		).resolves.toEqual(BODY);
 	});
 
 	it("rejects decryption of a compressed body without an inflator", async () => {
-		const cipher = Aes256Gcm.fromKey(AES_KEY, KEY_ID);
-		const built = await frame(BODY)
+		const cipher = engine.aes256Gcm({ key: AES_KEY, keyId: KEY_ID });
+		const built = await engine
+			.frameBuilder(BODY)
 			.withCompressor(zlib)
 			.withEncryptor(cipher)
 			.build();
 
-		await expect(built.decryptMessage(cipher, Opaque)).rejects.toThrow(
-			ValidationError,
-		);
+		await expect(
+			built.decryptMessage(cipher, engine.opaque),
+		).rejects.toThrow(ValidationError);
 	});
 
 	it("rejects a plain read of a compressed body", async () => {
-		const built = await frame(BODY).withCompressor(zlib).build();
-		expect(() => built.message(Opaque)).toThrow(ValidationError);
+		const built = await engine
+			.frameBuilder(BODY)
+			.withCompressor(zlib)
+			.build();
+		expect(() => built.message(engine.opaque)).toThrow(ValidationError);
 	});
 
-	it("rejects inflation of an uncompressed frame", async () => {
-		const bare = await frame(BODY).build();
-		await expect(bare.inflateMessage(zlib, Opaque)).rejects.toThrow(
-			ValidationError,
-		);
-	});
-
-	it("commits to the uncompressed body, so the carried digest only checks out after inflation", async () => {
-		const built = await frame(BODY)
-			.withMessageHasher(new Sha3_256())
+	it("refuses a body that names another algorithm than the inflator", async () => {
+		const built = await engine
+			.frameBuilder(BODY)
 			.withCompressor(zlib)
 			.build();
 
-		await expect(built.messageCommitmentVerdict(EMPTY_SALT)).resolves.toBe(
-			"mismatch",
-		);
+		const opened = built.open(engine.opaque, { inflator: engine.zstd() });
+		await expect(opened).rejects.toMatchObject({
+			code: "COMPACTNESS_REFUSED",
+		});
+	});
 
-		const bodyDer = await built.inflateMessage(zlib, Opaque);
+	it("commits to the uncompressed body, so a compressed frame refuses the check until inflated", async () => {
+		const built = await engine
+			.frameBuilder(BODY)
+			.withMessageHasher(engine.sha3_256)
+			.withCompressor(zlib)
+			.build();
+
+		await expect(
+			built.messageCommitmentVerdict(EMPTY_SALT),
+		).rejects.toMatchObject({ code: "FRAME_COMPRESSED" });
+
+		const bodyDer = await built.open(engine.opaque, { inflator: zlib });
 		expect(bodyDer).toEqual(BODY);
 	});
 });
 
 describe("typed message codecs", () => {
-	interface ChatMessage {
-		author: string;
-		text: string;
-	}
-
-	/**
-	 * A wrapped payload codec: JSON inside the profile opaque body, with
-	 * caller-side runtime validation on decode.
-	 */
-	const Chat: MessageCodec<ChatMessage> = wrapped({
-		encode(message: ChatMessage): Uint8Array {
-			const payload = new TextEncoder().encode(JSON.stringify(message));
-			return payload;
-		},
-		decode(payload: Uint8Array): ChatMessage {
-			const text = new TextDecoder().decode(payload);
-			const parsed: unknown = JSON.parse(text);
-			if (
-				typeof parsed !== "object" ||
-				parsed === null ||
-				!("author" in parsed) ||
-				!("text" in parsed) ||
-				typeof parsed.author !== "string" ||
-				typeof parsed.text !== "string"
-			) {
-				throw new ValidationError("CHAT_MESSAGE", [
-					{ path: "body", message: "Not a chat message" },
-				]);
-			}
-
-			const message = { author: parsed.author, text: parsed.text };
-			return message;
-		},
-	});
-
 	/**
 	 * A full-DER codec for `SEQUENCE { title UTF8String }`, the schema of
 	 * the Rust `Doc` interop test: no opaque wrapper, so a typed Rust peer
@@ -764,9 +1064,7 @@ describe("typed message codecs", () => {
 				bodyDer[2] !== 0x0c ||
 				bodyDer.length !== length + 4
 			) {
-				throw new ValidationError("DOC", [
-					{ path: "body", message: "Not a Doc body" },
-				]);
+				throw new TypeError("Not a Doc body");
 			}
 
 			const title = new TextDecoder().decode(bodyDer.slice(4));
@@ -774,40 +1072,47 @@ describe("typed message codecs", () => {
 		},
 	};
 
-	const CHAT: ChatMessage = { author: "ada", text: "hello" };
+	const NOTE: Note = { author: "ada", text: "hello" };
 
 	it("round-trips a wrapped typed message", async () => {
-		const built = await frame().withMessage(Chat, CHAT).build();
-		expect(built.message(Chat)).toEqual(CHAT);
+		const built = await engine
+			.frameBuilder()
+			.withMessage(Notes, NOTE)
+			.build();
+		expect(built.message(Notes)).toEqual(NOTE);
 	});
 
 	it("round-trips a wrapped typed message through encryption", async () => {
-		const cipher = Aes256Gcm.fromKey(AES_KEY, KEY_ID);
-		const built = await frame()
-			.withMessage(Chat, CHAT)
+		const cipher = engine.aes256Gcm({ key: AES_KEY, keyId: KEY_ID });
+		const built = await engine
+			.frameBuilder()
+			.withMessage(Notes, NOTE)
 			.withEncryptor(cipher)
 			.build();
 
-		await expect(built.decryptMessage(cipher, Chat)).resolves.toEqual(CHAT);
+		const decrypted = built.decryptMessage(cipher, Notes);
+		await expect(decrypted).resolves.toEqual(NOTE);
 	});
 
 	it("rejects decoding under a codec the body does not satisfy", async () => {
-		const built = await frame(BODY).build();
-		expect(() => built.message(Chat)).toThrow();
+		const built = await engine.frameBuilder(BODY).build();
+		expect(() => built.message(Notes)).toThrow();
 	});
 
 	it("rejects typed decode of an encrypted frame", async () => {
-		const cipher = Aes256Gcm.fromKey(AES_KEY, KEY_ID);
-		const built = await frame()
-			.withMessage(Chat, CHAT)
+		const cipher = engine.aes256Gcm({ key: AES_KEY, keyId: KEY_ID });
+		const built = await engine
+			.frameBuilder()
+			.withMessage(Notes, NOTE)
 			.withEncryptor(cipher)
 			.build();
 
-		expect(() => built.message(Chat)).toThrow(ValidationError);
+		expect(() => built.message(Notes)).toThrow(ValidationError);
 	});
 
 	it("installs a full-DER body, matching the Rust Doc schema", async () => {
-		const built = await frame()
+		const built = await engine
+			.frameBuilder()
 			.withMessage(Doc, { title: "typed-body" })
 			.build();
 
@@ -824,9 +1129,10 @@ describe("typed message codecs", () => {
 	});
 
 	it("commits to the typed body DER, not the payload", async () => {
-		const built = await frame()
+		const built = await engine
+			.frameBuilder()
 			.withMessage(Doc, { title: "committed" })
-			.withMessageHasher(new Sha3_256())
+			.withMessageHasher(engine.sha3_256)
 			.build();
 
 		await expect(built.messageCommitmentVerdict(EMPTY_SALT)).resolves.toBe(

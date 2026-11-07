@@ -4,22 +4,26 @@
 //! the demo server, and the client side drives the wire commands a
 //! TypeScript subscriber would send.
 
+use core::num::NonZeroUsize;
 use std::sync::Arc;
 
 use der::{Decode, Encode};
-use tightbeam::policy::TransitStatus;
+use tightbeam::policy::{SessionContext, TransitStatus};
+use tightbeam::transport::envelopes::GoAwayReason;
 use tightbeam::transport::error::{TransportError, TransportFailure};
-use tightbeam::transport::multiplex::MuxHandle;
+use tightbeam::transport::handshake::negotiation::MuxSettings;
+use tightbeam::transport::multiplex::{MuxHandle, MuxTransport};
 use tightbeam::transport::ResponsePackage;
-use tightbeam::Frame;
-use tightbeam_pubsub::testing::{command_frame, memory_mux_pair};
+use tightbeam::{Frame, Opaque};
+use tightbeam_pubsub::testing::{MemoryLink, MemorySink, MemorySource, OpaqueFrame};
 use tightbeam_pubsub::{
-	opaque_payload, serve_connection, unrouted, AccessVerdict, AllowAll, Backplane, DropOldest, Local, PublishError,
-	PubsubCommands, RegistryOptions, SubscribePolicy, Topic, TopicRegistry,
+	AccessVerdict, AllowAll, Backplane, DeliveryPolicy, DeliveryVerdict, DropOldest, Local, PublishError,
+	PubsubCommands, RegistryOptions, RegistryView, SubscribePolicy, Topic, TopicRegistry, Unrouted,
 };
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 use tokio::sync::Semaphore;
-use tokio::time::{timeout, Duration};
+use tokio::task::{yield_now, JoinHandle};
+use tokio::time::{sleep, timeout, Duration};
 
 /// Symmetric stream cap for the in-memory pair.
 const CAP: u32 = 4;
@@ -31,7 +35,7 @@ const DEADLINE: Duration = Duration::from_secs(5);
 struct DenyForbidden;
 
 impl SubscribePolicy for DenyForbidden {
-	fn authorize(&self, _identity: Option<&[u8]>, topic: &Topic) -> AccessVerdict {
+	fn authorize(&self, _registry: RegistryView<'_>, _session: &SessionContext, topic: &Topic) -> AccessVerdict {
 		if topic.as_str().starts_with("forbidden/") {
 			return AccessVerdict::Forbid;
 		}
@@ -40,15 +44,54 @@ impl SubscribePolicy for DenyForbidden {
 }
 
 /// One in-process client wired to a registry-backed server: the handle
-/// sends commands, the receiver observes server-initiated updates, and
-/// the semaphore gates update acknowledgments.
+/// sends commands, the receiver observes server-initiated updates, the
+/// semaphore gates update acknowledgments, and the task serves the server
+/// side.
 struct Peer {
 	handle: MuxHandle,
 	updates: UnboundedReceiver<Arc<Frame>>,
 	ack_gate: Arc<Semaphore>,
+	serving: JoinHandle<()>,
 }
 
 impl Peer {
+	/// Drive the client half `client` against the server that `serving`
+	/// serves. Its responder hands each update to the receiver and acks
+	/// through a gate that starts with `ack_permits`.
+	fn wired(client: MuxTransport<MemorySource, MemorySink>, ack_permits: usize, serving: JoinHandle<()>) -> Self {
+		let (client_handle, client_reader, client_writer, client_responder) = client.into_parts();
+		tokio::spawn(client_reader.drive());
+		tokio::spawn(client_writer.drive());
+
+		let (sender, updates) = unbounded_channel();
+		let ack_gate = Arc::new(Semaphore::new(ack_permits));
+		let serve_gate = Arc::clone(&ack_gate);
+		tokio::spawn(async move {
+			let _ = client_responder
+				.serve(move |frame| {
+					let sender = sender.clone();
+					let gate = Arc::clone(&serve_gate);
+					async move {
+						let _ = sender.send(Arc::clone(&frame));
+						let permit = gate.acquire().await.expect("the ack gate should stay open");
+						drop(permit);
+
+						ResponsePackage::new(TransitStatus::Ok, None)
+					}
+				})
+				.await;
+		});
+
+		Self { handle: client_handle, updates, ack_gate, serving }
+	}
+
+	/// Drop the server's serve future, as an accept loop that aborts its
+	/// handlers does, and wait until the future is gone.
+	async fn drop_serve(&mut self) {
+		self.serving.abort();
+		let _ = (&mut self.serving).await;
+	}
+
 	/// Emit one command stream and return its outcome.
 	async fn request(&self, id: &str) -> Result<Option<Frame>, TransportError> {
 		self.request_with(id, &[]).await
@@ -56,7 +99,8 @@ impl Peer {
 
 	/// Emit one command stream carrying `payload` and return its outcome.
 	async fn request_with(&self, id: &str, payload: &[u8]) -> Result<Option<Frame>, TransportError> {
-		let command = command_frame(id, 1, payload).expect("command frames build from valid input");
+		let frame = OpaqueFrame { id, order: 1, payload };
+		let command = frame.build().expect("command frames build from valid input");
 		self.handle.emit_on_stream(&command).await
 	}
 
@@ -87,41 +131,37 @@ async fn connect<P>(registry: &TopicRegistry, policy: P, ack_permits: usize) -> 
 where
 	P: SubscribePolicy + 'static,
 {
-	let (client, server) = memory_mux_pair(CAP);
-
-	let commands = PubsubCommands::new(registry.clone(), policy).with_publish(AllowAll);
-	tokio::spawn(async move {
-		let _ = serve_connection(server, commands, unrouted).await;
-	});
-
-	let (client_handle, client_reader, client_writer, client_responder) = client.into_parts();
-	tokio::spawn(client_reader.drive());
-	tokio::spawn(client_writer.drive());
-
-	let (sender, updates) = unbounded_channel();
-	let ack_gate = Arc::new(Semaphore::new(ack_permits));
-	let serve_gate = Arc::clone(&ack_gate);
-	tokio::spawn(async move {
-		let _ = client_responder
-			.serve(move |frame| {
-				let sender = sender.clone();
-				let gate = Arc::clone(&serve_gate);
-				async move {
-					let _ = sender.send(Arc::clone(&frame));
-					let permit = gate.acquire().await.expect("the ack gate should stay open");
-					drop(permit);
-
-					ResponsePackage::new(TransitStatus::Ok, None)
-				}
-			})
-			.await;
-	});
-
-	Peer { handle: client_handle, updates, ack_gate }
+	connect_over(registry, policy, MuxSettings::symmetric(CAP), ack_permits).await
 }
 
-fn topic(name: &str) -> Topic {
-	name.parse().expect("test topics are valid")
+/// As [`connect`], over a link under `settings`.
+async fn connect_over<P>(registry: &TopicRegistry, policy: P, settings: MuxSettings, ack_permits: usize) -> Peer
+where
+	P: SubscribePolicy + 'static,
+{
+	let linked = MemoryLink::default().served(settings);
+	let (client, server) = linked.expect("a link on the system clock races on a tokio thread");
+
+	let commands = PubsubCommands::new(registry.clone(), policy).with_publish(AllowAll);
+	let serving = tokio::spawn(async move {
+		let _ = commands.serve(server, Unrouted).await;
+	});
+
+	Peer::wired(client, ack_permits, serving)
+}
+
+/// A delivery policy that returns one fixed verdict.
+struct FixedVerdict(DeliveryVerdict);
+
+impl DeliveryPolicy for FixedVerdict {
+	fn on_full(&self, _registry: RegistryView<'_>, _topic: &Topic, _dropped_so_far: u64) -> DeliveryVerdict {
+		self.0
+	}
+}
+
+/// A queue capacity of `updates`.
+fn capacity(updates: usize) -> NonZeroUsize {
+	NonZeroUsize::new(updates).expect("test capacities are above zero")
 }
 
 /// A default registry with one peer granted the `sub/` command in `name`.
@@ -134,19 +174,21 @@ async fn subscribed(name: &str) -> (TopicRegistry, Peer) {
 
 /// Publish `payload` to `name` through `registry`, expecting acceptance.
 fn published(registry: &TopicRegistry, name: &str, payload: &[u8]) {
-	registry.publish(&topic(name), payload).expect("the publish should be accepted");
+	let topic = Topic::fixture(name);
+	registry.publish(&topic, payload).expect("the publish should be accepted");
 }
 
 /// Publish a full frame to `name` through `registry`, expecting acceptance.
 fn published_frame(registry: &TopicRegistry, name: &str, inner: &Frame) {
 	registry
-		.publish_frame(&topic(name), inner)
+		.publish_frame(&Topic::fixture(name), inner)
 		.expect("the frame publish should be accepted");
 }
 
 /// Build an application frame to carry as a topic payload.
 fn inner_frame(id: &str, order: u64, payload: &[u8]) -> Frame {
-	command_frame(id, order, payload).expect("the inner frame should build")
+	let frame = OpaqueFrame { id, order, payload };
+	frame.build().expect("the inner frame should build")
 }
 
 /// Encode a frame, expecting well-formed DER.
@@ -166,7 +208,8 @@ fn quiesced(registry: &TopicRegistry) -> usize {
 
 /// Decode the opaque body, expecting a well-formed update.
 fn payload_of(update: &Frame) -> Vec<u8> {
-	opaque_payload(update).expect("update bodies should decode")
+	let body = update.decode_message::<Opaque>().expect("update bodies should decode");
+	body.into_bytes()
 }
 
 /// Assert one update's wrapper stamps and payload.
@@ -207,7 +250,7 @@ async fn subscribe_publish_unsubscribe_round_trip() {
 	published(&registry, "prices", b"four");
 
 	assert_eq!(
-		registry.subscriber_count(&topic("prices")),
+		registry.view().subscriber_count(&Topic::fixture("prices")),
 		0,
 		"a publish after unsubscribe should reach nobody"
 	);
@@ -317,15 +360,15 @@ async fn quiescing_one_node_leaves_the_backplane_live() {
 		b"end/prices",
 		"the quiesced node should complete its topics"
 	);
-	assert_eq!(end.metadata().order(), 2, "quiesce claims the next dense stamp for end/");
+	assert_eq!(end.metadata().order(), 1, "end/ carries the last committed order");
 
 	published(&node_b, "prices", b"tock");
 
 	let update = on_b.next_update().await;
 	assert_eq!(
 		update.metadata().order(),
-		3,
-		"the live node should continue after the end/ stamp"
+		2,
+		"the live node should see dense orders across the sibling's quiesce"
 	);
 }
 
@@ -366,15 +409,20 @@ async fn quiesce_completes_topics_and_refuses_new_work() {
 		TransportFailure::Unavailable,
 		"a draining registry should answer Unavailable"
 	);
+	let late = registry.publish(&Topic::fixture("prices"), b"late");
 	assert!(
-		matches!(registry.publish(&topic("prices"), b"late"), Err(PublishError::Draining)),
+		matches!(late, Err(PublishError::Draining)),
 		"a draining registry should refuse publishes"
 	);
 }
 
 #[tokio::test]
 async fn slow_consumer_drops_oldest_and_continues() {
-	let options = RegistryOptions { queue_capacity: 2, delivery: Arc::new(DropOldest), ..RegistryOptions::default() };
+	let options = RegistryOptions {
+		queue_capacity: capacity(2),
+		delivery: Arc::new(DropOldest),
+		..RegistryOptions::default()
+	};
 	let registry = TopicRegistry::new(options);
 
 	// Zero permits: the client receives updates but stalls every ack.
@@ -402,4 +450,82 @@ async fn slow_consumer_drops_oldest_and_continues() {
 		[3, 4],
 		"the oldest queued update should be dropped, revealing a gap"
 	);
+}
+
+#[tokio::test]
+async fn a_dropped_serve_leaves_no_registration_and_ends_its_link() {
+	let (registry, mut peer) = subscribed("sub/prices").await;
+
+	peer.drop_serve().await;
+
+	let after = timeout(DEADLINE, peer.request("sub/chat")).await;
+	assert_eq!(
+		registry.view().subscriber_count(&Topic::fixture("prices")),
+		0,
+		"the dropped serve should leave the registry"
+	);
+	assert!(
+		matches!(after, Ok(Err(TransportError::ConnectionClosed))),
+		"the link should end with the serve: {after:?}"
+	);
+}
+
+#[tokio::test]
+async fn an_update_waits_for_the_stream_slot_another_topic_holds() {
+	let registry = TopicRegistry::default();
+	let mut peer = connect_over(&registry, AllowAll, MuxSettings::symmetric(1), 0).await;
+	peer.granted("sub/prices").await;
+	peer.granted("sub/chat").await;
+	published(&registry, "prices", b"tick");
+	let holding = peer.next_update().await;
+
+	published(&registry, "chat", b"hello");
+	yield_now().await;
+	peer.ack_gate.add_permits(2);
+
+	let waited = peer.next_update().await;
+	expect_update(&holding, b"prices", 1, b"tick");
+	expect_update(&waited, b"chat", 1, b"hello");
+}
+
+/// Poll until the peer observes a GoAway, or give up.
+async fn goaway_of(handle: &MuxHandle) -> Option<GoAwayReason> {
+	for _ in 0..100 {
+		if let Some(reason) = handle.goaway_reason() {
+			return Some(reason);
+		}
+
+		sleep(Duration::from_millis(10)).await;
+	}
+
+	None
+}
+
+#[tokio::test]
+async fn an_expelled_connection_goes_away_with_enhance_your_calm() {
+	let options = RegistryOptions {
+		queue_capacity: capacity(1),
+		delivery: Arc::new(FixedVerdict(DeliveryVerdict::Disconnect)),
+		..RegistryOptions::default()
+	};
+
+	let registry = TopicRegistry::new(options);
+	let mut peer = connect(&registry, AllowAll, 0).await;
+	peer.granted("sub/prices").await;
+
+	/*
+	 * The peer stalls every ack, so the first update stays in flight, the
+	 * second fills the queue of one, and the third makes the delivery
+	 * policy vote the connection off.
+	 */
+	published(&registry, "prices", b"one");
+
+	peer.next_update().await;
+
+	published(&registry, "prices", b"two");
+	published(&registry, "prices", b"three");
+
+	let reason = goaway_of(&peer.handle).await;
+	assert_eq!(reason, Some(GoAwayReason::EnhanceYourCalm));
+	assert_eq!(registry.view().subscriber_count(&Topic::fixture("prices")), 0);
 }
