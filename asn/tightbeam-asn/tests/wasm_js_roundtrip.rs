@@ -1,14 +1,18 @@
 //! wasm32 AsnCodec JS value encode/decode round-trips for fixture types.
-#![cfg(all(target_arch = "wasm32", feature = "wasm"))]
+#![cfg(target_arch = "wasm32")]
 
-use der::asn1::{OctetString, PrintableString, SetOfVec};
+use der::asn1::{OctetString, PrintableString, SequenceOf, SetOfVec};
 use der::{Decode, Encode};
-use js_sys::{Array, BigInt, Object, Reflect, Uint8Array};
-use wasm_bindgen::JsValue;
+use js_sys::{Array, BigInt, Object, Reflect, TypeError, Uint8Array};
+use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_test::wasm_bindgen_test;
 
-use tightbeam_asn::AsnCodec;
-use tightbeam_asn_fixtures::{
+use tightbeam_asn::{AsnCodec, FieldError};
+
+#[allow(dead_code)]
+mod fixtures;
+
+use fixtures::{
 	sample_leaf_bundle, sample_nest_bundle, Ack, Doc, Envelope, LeafBundle, ListPad, ListResult, NestBundle, Record,
 	RegisterBody, Request, Status,
 };
@@ -343,36 +347,177 @@ fn bitstring_preserves_unused_bits() {
 	assert_eq!(unused.as_f64(), Some(3.0), "unusedBits projected");
 }
 
-#[wasm_bindgen_test]
-fn sequence_of_rejects_wrong_length() {
+/// A JS `Array` of the integers from 1 to `length`.
+fn integers(length: u8) -> JsValue {
+	let array = Array::new();
+	for number in 1..=length {
+		array.push(&JsValue::from(f64::from(number)));
+	}
+
+	array.into()
+}
+
+/// A `NestBundle` whose `field` holds the integers from 1 to `length`.
+fn bundle_with(field: &str, length: u8) -> Result<NestBundle, FieldError> {
 	let Ok(js) = sample_nest_bundle().to_js() else {
 		panic!("to_js");
 	};
 
-	let short = Array::new();
-	short.push(&JsValue::from(1.0));
-	short.push(&JsValue::from(2.0));
+	set_field(&js, field, &integers(length));
+	NestBundle::from_js(&js)
+}
 
-	set_field(&js, "triple", &short.into());
-
-	let Err(_) = NestBundle::from_js(&js) else {
-		panic!("SequenceOf length 2 must fail for N=3");
+/// `field` takes `length` elements and round-trips them.
+fn assert_holds(field: &str, length: u8) {
+	let Ok(bundle) = bundle_with(field, length) else {
+		panic!("{field} of {length} elements is within its bound");
 	};
+
+	assert_js_round_trip(&bundle);
+}
+
+/// `field` refuses `length` elements and names itself.
+fn assert_overflows(field: &str, length: u8) {
+	let Err(error) = bundle_with(field, length) else {
+		panic!("{field} of {length} elements is over its bound");
+	};
+
+	assert!(error.to_string().starts_with(field), "{error}");
 }
 
 #[wasm_bindgen_test]
-fn set_of_rejects_wrong_length() {
-	let Ok(js) = sample_nest_bundle().to_js() else {
+fn a_sequence_of_three_takes_none() {
+	assert_holds("triple", 0);
+}
+
+#[wasm_bindgen_test]
+fn a_sequence_of_three_takes_two() {
+	assert_holds("triple", 2);
+}
+
+#[wasm_bindgen_test]
+fn a_sequence_of_three_takes_three() {
+	assert_holds("triple", 3);
+}
+
+#[wasm_bindgen_test]
+fn a_sequence_of_three_refuses_four() {
+	assert_overflows("triple", 4);
+}
+
+#[wasm_bindgen_test]
+fn a_set_of_two_takes_none() {
+	assert_holds("pair", 0);
+}
+
+#[wasm_bindgen_test]
+fn a_set_of_two_takes_one() {
+	assert_holds("pair", 1);
+}
+
+#[wasm_bindgen_test]
+fn a_set_of_two_takes_two() {
+	assert_holds("pair", 2);
+}
+
+#[wasm_bindgen_test]
+fn a_set_of_two_refuses_three() {
+	assert_overflows("pair", 3);
+}
+
+#[wasm_bindgen_test]
+fn a_short_wire_collection_decodes_and_encodes_again() {
+	let short = NestBundle { triple: SequenceOf::new(), ..sample_nest_bundle() };
+	let Ok(der) = short.to_der() else {
+		panic!("to_der");
+	};
+	let Ok(decoded) = NestBundle::from_der(&der) else {
+		panic!("from_der");
+	};
+
+	assert_js_round_trip(&decoded);
+}
+
+#[wasm_bindgen_test]
+fn a_failure_names_its_field() {
+	let result = ListResult { records: vec![Record { subject: "a".into() }, Record { subject: "b".into() }] };
+	let Ok(js) = result.to_js() else {
 		panic!("to_js");
 	};
 
-	let one = Array::new();
-	one.push(&JsValue::from(1.0));
-	set_field(&js, "pair", &one.into());
+	let records = Array::from(&Reflect::get(&js, &"records".into()).unwrap_or(JsValue::UNDEFINED));
+	set_field(&records.get(1), "subject", &JsValue::from(7.0));
 
-	let Err(_) = NestBundle::from_js(&js) else {
-		panic!("SetOf length 1 must fail for N=2");
+	let Err(error) = ListResult::from_js(&js) else {
+		panic!("a number is not a subject");
 	};
+	assert_eq!(error.to_string(), "records[1].subject: expected a string");
+}
+
+#[wasm_bindgen_test]
+fn a_missing_field_is_named() {
+	let Err(error) = Doc::from_js(&Object::new().into()) else {
+		panic!("a Doc needs a title");
+	};
+
+	assert_eq!(error.to_string(), "title: expected a string");
+}
+
+#[wasm_bindgen_test]
+fn a_value_that_is_no_object_fails_at_the_value() {
+	let Err(error) = Doc::from_js(&JsValue::from(5.0)) else {
+		panic!("a number is not a Doc");
+	};
+
+	assert_eq!(error.to_string(), "expected an object");
+}
+
+#[wasm_bindgen_test]
+fn a_bit_string_that_is_no_object_fails_at_its_field() {
+	let Ok(js) = sample_leaf_bundle().to_js() else {
+		panic!("to_js");
+	};
+
+	set_field(&js, "bits", &JsValue::from(5.0));
+
+	let Err(error) = LeafBundle::from_js(&js) else {
+		panic!("a number is not a BIT STRING");
+	};
+	assert_eq!(error.to_string(), "bits: expected an object");
+}
+
+#[wasm_bindgen_test]
+fn an_object_without_a_prototype_is_an_object() {
+	let null = JsValue::NULL;
+	let prototype: &Object = null.unchecked_ref();
+	let bare = Object::create(prototype);
+	set_field(&bare, "title", &JsValue::from_str("bare"));
+
+	let Ok(doc) = Doc::from_js(&bare) else {
+		panic!("a null-prototype object carries fields");
+	};
+	assert_eq!(doc.title, "bare");
+}
+
+#[wasm_bindgen_test]
+fn a_shape_failure_throws_a_type_error() {
+	let Err(error) = Doc::from_js(&Object::new().into()) else {
+		panic!("a Doc needs a title");
+	};
+
+	assert!(JsValue::from(error).has_type::<TypeError>());
+}
+
+#[wasm_bindgen_test]
+fn a_choice_failure_names_its_variant() {
+	let register = Object::new();
+	set_field(&register, "Register", &Object::new());
+
+	let Err(error) = Request::from_js(&register) else {
+		panic!("Register needs a doc");
+	};
+
+	assert!(error.to_string().starts_with("Register.doc"), "{error}");
 }
 
 #[wasm_bindgen_test]

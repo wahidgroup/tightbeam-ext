@@ -1,6 +1,6 @@
 # tightbeam-asn-derive
 
-Proc-macro crate for [`tightbeam-asn`](../tightbeam-asn). Depend on `tightbeam-asn`, which re-exports `AsnCodec` for Sequence, Enumerated, and Choice wire types.
+Proc-macro crate for [`tightbeam-asn`](../tightbeam-asn). Depend on `tightbeam-asn`, which re-exports `AsnCodec` for Sequence, Enumerated, and Choice wire types. Implementation: [docs/asn.md](../../docs/asn.md#derive).
 
 ## License
 

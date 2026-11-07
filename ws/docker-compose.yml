@@ -2,15 +2,17 @@
 # (encrypted, cleartext, and mutual-auth encrypted) sharing one image.
 #
 # The image is built by scripts/stack.sh. Identity fixtures are generated on
-# the host (gen_certs) and bind-mounted read-only under /certs.
+# the host (gen_certs) and bind-mounted read-only under /certs. The demo
+# stream cap and paywall facts come from scripts/stack-env.sh, and a missing
+# one refuses to start the stack.
 
 services:
   echo-server-mux:
     image: ${ECHO_IMAGE:-tightbeam-ws-echo:dev}
     environment:
       ECHO_WS_PORT: "9100"
+      MUX_STREAMS: "${MUX_STREAMS:?}"
       TBWS_SERVER_CERT: /certs/server.cert.der
-      TBWS_SERVER_KEY: /certs/server.key
     volumes:
       - ${CERT_DIR:?}:/certs:ro
     ports:
@@ -21,6 +23,7 @@ services:
     command: ["echo-server-mux-clear"]
     environment:
       ECHO_WS_PORT: "9101"
+      MUX_STREAMS: "${MUX_STREAMS:?}"
     ports:
       - "${ECHO_WS_MUX_CLEAR_HOST_PORT:-9101}:9101"
 
@@ -28,12 +31,14 @@ services:
     image: ${ECHO_IMAGE:-tightbeam-ws-echo:dev}
     environment:
       ECHO_WS_PORT: "9102"
+      MUX_STREAMS: "${MUX_STREAMS:?}"
       TBWS_SERVER_CERT: /certs/server.cert.der
-      TBWS_SERVER_KEY: /certs/server.key
       TBWS_CLIENT_CERT: /certs/client.cert.der
-      TBWS_PAYWALL: "1"
-      TBWS_MUX_BUDGET_C2S: "4096"
-      TBWS_MUX_BUDGET_S2C: "4096"
+      TBWS_PAYWALL: "${TBWS_PAYWALL:?}"
+      TBWS_DEMO_INVOICE: "${TBWS_DEMO_INVOICE:?}"
+      TBWS_DEMO_PAYMENT: "${TBWS_DEMO_PAYMENT:?}"
+      TBWS_MUX_BUDGET_C2S: "${TBWS_MUX_BUDGET_C2S:?}"
+      TBWS_MUX_BUDGET_S2C: "${TBWS_MUX_BUDGET_S2C:?}"
     volumes:
       - ${CERT_DIR:?}:/certs:ro
     ports:
@@ -45,6 +50,7 @@ services:
     command: ["echo-server-mux-clear"]
     environment:
       ECHO_WS_PORT: "9103"
+      MUX_STREAMS: "${MUX_STREAMS:?}"
       TBWS_ECHO_BODY: duplex
     ports:
       - "${ECHO_WS_MUX_DUPLEX_HOST_PORT:-9103}:9103"
@@ -58,9 +64,7 @@ services:
     environment:
       ECHO_WS_PORT: "9104"
       TBWS_SERVER_CERT: /certs/server.cert.der
-      TBWS_SERVER_KEY: /certs/server.key
       TBWS_WORK_CERT: /certs/client.cert.der
-      TBWS_WORK_KEY: /certs/client.key
     volumes:
       - ${CERT_DIR:?}:/certs:ro
     ports:

@@ -7,14 +7,17 @@
 import { secp256k1 } from "@noble/curves/secp256k1.js";
 
 import type { FrameVerifier, Signatory, VerifiableFrame } from "../crypto.js";
-import { PROFILE_OIDS, Secp256k1VerifyingKey } from "../crypto.js";
+import type { Engine } from "../engine.js";
 
 /**
  * Verify a frame from its signature prehash + carried signature bytes with
  * noble secp256k1. Stands in for any non-wasm verifier (wallet SDK, …).
  */
 export class NobleFrameVerifier implements FrameVerifier {
-	constructor(private readonly publicKey: Uint8Array) {}
+	constructor(
+		private readonly engine: Engine,
+		private readonly publicKey: Uint8Array,
+	) {}
 
 	verifyFrame(frame: VerifiableFrame): void {
 		const info = frame.signatureInfo;
@@ -22,7 +25,8 @@ export class NobleFrameVerifier implements FrameVerifier {
 			throw new Error("frame is unsigned");
 		}
 
-		if (info.algorithmOid !== PROFILE_OIDS.ecdsaWithSha3_256) {
+		const profile = this.engine.profile.ecdsaWithSha3_256;
+		if (!info.algorithmOid.equals(profile)) {
 			throw new Error("unexpected signature algorithm");
 		}
 
@@ -39,19 +43,17 @@ export class NobleFrameVerifier implements FrameVerifier {
 }
 
 /**
- * A {@link Signatory} whose secret never enters wasm. Optional prehash
- * capture for boundary-order assertions.
+ * A {@link Signatory} whose secret never enters wasm.
  */
 export class NobleSignatory implements Signatory {
-	readonly signatureAlgorithmOid = PROFILE_OIDS.ecdsaWithSha3_256;
-	readonly digestAlgorithmOid = PROFILE_OIDS.sha3_256;
 	readonly verifier: FrameVerifier;
-	readonly seen: Uint8Array[] = [];
 
-	constructor(private readonly secret: Uint8Array) {
-		this.verifier = new NobleFrameVerifier(
-			secp256k1.getPublicKey(secret, true),
-		);
+	constructor(
+		private readonly engine: Engine,
+		private readonly secret: Uint8Array,
+	) {
+		const publicKey = secp256k1.getPublicKey(secret, true);
+		this.verifier = new NobleFrameVerifier(engine, publicKey);
 	}
 
 	/**
@@ -63,15 +65,13 @@ export class NobleSignatory implements Signatory {
 	}
 
 	signerId(): Uint8Array {
-		const id = Secp256k1VerifyingKey.fromSec1Bytes(
-			this.publicKey(),
-		).signerId();
+		const key = this.engine.verifyingKey(this.publicKey());
+		const id = key.signerId();
+		key[Symbol.dispose]();
 		return id;
 	}
 
 	signPrehash(prehash: Uint8Array): Promise<Uint8Array> {
-		this.seen.push(prehash);
-
 		const signature = secp256k1.sign(prehash, this.secret, {
 			format: "der",
 			prehash: false,

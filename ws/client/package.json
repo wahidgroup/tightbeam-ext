@@ -14,9 +14,12 @@
 	},
 	"imports": {
 		"#wasm": {
-			"types": "./wasm/tightbeam_ws_wasm.d.ts",
-			"node": "./wasm-node/tightbeam_ws_wasm.js",
-			"default": "./wasm/tightbeam_ws_wasm.js"
+			"types": "./wasm/tightbeam_ws_wasm.d.ts"
+		},
+		"#engine": {
+			"types": "./dist/engine/web.d.ts",
+			"node": "./dist/engine/node.js",
+			"default": "./dist/engine/web.js"
 		}
 	},
 	"files": [
@@ -34,7 +37,7 @@
 	"scripts": {
 		"build:wasm": "wasm-pack build ../tightbeam-ws-wasm --target web --out-dir ../client/wasm --out-name tightbeam_ws_wasm $WASM_PACK_FLAGS && rm -f wasm/.gitignore",
 		"build:wasm:node": "wasm-pack build ../tightbeam-ws-wasm --target nodejs --out-dir ../client/wasm-node --out-name tightbeam_ws_wasm $WASM_PACK_FLAGS && rm -f wasm-node/.gitignore",
-		"build": "npm run build:wasm && npm run build:wasm:node && tsc -p tsconfig.build.json",
+		"build": "npm run build:wasm && npm run build:wasm:node && rm -rf dist && tsc -p tsconfig.build.json",
 		"typecheck": "tsc --noEmit && tsc --noEmit -p scripts/tsconfig.json",
 		"test": "vitest run",
 		"test:watch": "vitest",
@@ -44,9 +47,6 @@
 		"pack:check": "node --experimental-strip-types ./scripts/check-pack.ts",
 		"prepublishOnly": "cd ../.. && make client sbom",
 		"clean": "rm -rf dist wasm wasm-node sbom.json"
-	},
-	"dependencies": {
-		"@bokuweb/zstd-wasm": "0.0.27"
 	},
 	"devDependencies": {
 		"@cyclonedx/cyclonedx-npm": "6.0.0",

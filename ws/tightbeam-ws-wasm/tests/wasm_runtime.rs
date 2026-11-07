@@ -1,18 +1,18 @@
-//! Headless-browser runtime proof that tightbeam's two target-specific
-//! handshake hazards work on `wasm32-unknown-unknown`:
+//! Runtime proof that tightbeam's two target-specific handshake hazards work
+//! on `wasm32-unknown-unknown` under a JavaScript host:
 //!
 //! 1. Clock: `OffsetDateTime::now_utc()`
-//! 2. RNG: `OsRng` (browser `getrandom/js`)
+//! 2. RNG: `OsRng` (`getrandom/js`)
 //!
 //! Both panic on wasm without the `wasm` (getrandom/js) and `time/wasm-bindgen`
-//! feature wiring; passing here proves that wiring at runtime.
+//! feature wiring. A pass here therefore proves that wiring at runtime. The
+//! suite runs under Node, and the Playwright e2e lane proves the same
+//! handshake in a browser.
 #![cfg(target_arch = "wasm32")]
 
 use tightbeam::time::OffsetDateTime;
 use tightbeam_ws_wasm::build::HpkeSecp256k1Encryptor;
-use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
-
-wasm_bindgen_test_configure!(run_in_browser);
+use wasm_bindgen_test::wasm_bindgen_test;
 
 /// SEC1-compressed encoding of the secp256k1 generator point `G`, used as a
 /// valid recipient public key so the encryptor reaches its RNG-backed path.
@@ -22,11 +22,11 @@ const G_COMPRESSED: [u8; 33] = [
 ];
 
 #[wasm_bindgen_test]
-fn now_utc_resolves_browser_clock() {
+fn now_utc_resolves_the_host_clock() {
 	let timestamp = OffsetDateTime::now_utc().unix_timestamp();
 	assert!(
 		timestamp > 1_700_000_000,
-		"browser clock must yield a current unix timestamp, got {timestamp}"
+		"the host clock must yield a current unix timestamp, got {timestamp}"
 	);
 }
 
@@ -38,11 +38,11 @@ fn generator_ciphertext(content: &[u8]) -> Vec<u8> {
 		.seal(content, None)
 		.expect("HPKE seal should drive OsRng without panicking");
 
-	sealed.ciphertext
+	sealed.ciphertext().to_vec()
 }
 
 #[wasm_bindgen_test]
-fn hpke_seal_resolves_browser_rng() {
+fn hpke_seal_resolves_the_host_rng() {
 	let ciphertext = generator_ciphertext(b"wasm-rng-proof");
 	assert!(!ciphertext.is_empty(), "HPKE ciphertext must be non-empty");
 }

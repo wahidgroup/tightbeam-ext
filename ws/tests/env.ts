@@ -1,19 +1,24 @@
 /**
- * Endpoint and identity-fixture resolution shared by the Playwright specs
- * and the Node vitest lane. All values come from the environment rendered
- * by `scripts/test-e2e.sh`.
+ * Environment and identity-fixture resolution shared by the ws and pubsub
+ * suites. The ws suites import this module by its relative path, and the
+ * pubsub suites as `#ws-env`. All values come from the environment that
+ * `scripts/test-e2e.sh` exports from the stack env file, under the names the
+ * stack writes them.
  */
 
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
-import type { ConnectOptions } from "@wahidgroup/tightbeam-ws-client";
+import type {
+	MutualIdentity,
+	TransportSigner,
+} from "@wahidgroup/tightbeam-ws-client";
 
 /**
  * Read a required stack variable, failing fast when the suite is run
  * without the stack environment.
  */
-function requireEnv(name: string): string {
+export function requireEnv(name: string): string {
 	const value = process.env[name];
 	if (value === undefined) {
 		throw new Error(
@@ -25,73 +30,32 @@ function requireEnv(name: string): string {
 }
 
 /**
- * The multiplexed encrypted echo server: serves concurrent streams,
- * calls the client back when a frame id starts with `call-me`, accepts
- * without a response frame on a `sink` id, and drains the session on a
- * `drain-calm` id.
- */
-export const muxEndpoint = requireEnv("E2E_ECHO_WS_MUX_ENDPOINT");
-
-/**
- * The multiplexed cleartext echo server: same behavior as the encrypted
- * one, with a symmetric stream cap of 8 in place of negotiation.
- */
-export const muxClearEndpoint = requireEnv("E2E_ECHO_WS_MUX_CLEAR_ENDPOINT");
-
-/**
- * The mutually-authenticated multiplexed encrypted echo server: as the
- * encrypted one, additionally requiring the pinned client certificate
- * and the demo session-budget paywall.
- */
-export const muxMutualEndpoint = requireEnv("E2E_ECHO_WS_MUX_MUTUAL_ENDPOINT");
-
-/**
- * Cleartext duplex body echo (`TBWS_ECHO_BODY=duplex`) for `openDuplex`.
- */
-export const muxDuplexEndpoint = requireEnv("E2E_ECHO_WS_MUX_DUPLEX_ENDPOINT");
-
-/**
- * The cluster work-plane gateway: a real gateway, hive, and `work-probe`
- * servlet in one container, admitting browser work submissions.
- */
-export const workGatewayEndpoint = requireEnv("E2E_WORK_GATEWAY_WS_ENDPOINT");
-
-/**
- * Demo settlement payment bytes matching `tightbeam_ws::testing::DEMO_PAYMENT`.
- */
-export const DEMO_PAYMENT = new TextEncoder().encode("tbws-demo-payment-v1");
-
-/**
- * Mutual dial options for the compose stack: request the demo budget
- * ceiling and pay the fixed invoice. `payments` caps how many invoices
- * the wallet will settle (handshake + renewals).
- */
-export function mutualSessionOptions(payments = 1024): ConnectOptions {
-	let left = payments;
-	return {
-		budgets: { clientToServer: 4096, serverToClient: 4096 },
-		approveReceipt: () => {
-			if (left <= 0) {
-				return undefined;
-			}
-			left -= 1;
-			return DEMO_PAYMENT;
-		},
-	};
-}
-
-/**
  * Read an identity fixture as raw bytes.
  */
 export function certBytes(name: string): Uint8Array {
-	return readFileSync(join(requireEnv("E2E_CERT_DIR"), name));
+	return readFileSync(join(requireEnv("CERT_DIR"), name));
 }
 
 /**
- * Read an identity fixture as base64 for the `page.evaluate` boundary.
+ * Read an identity fixture as base64 for the `page.evaluate` boundary or a
+ * page's query parameter.
  */
 export function certBase64(name: string): string {
-	return readFileSync(join(requireEnv("E2E_CERT_DIR"), name)).toString(
-		"base64",
-	);
+	return readFileSync(join(requireEnv("CERT_DIR"), name)).toString("base64");
+}
+
+/**
+ * The demo client identity: the pinned server certificate, the client
+ * certificate, and the proof of its key, the raw fixture scalar unless a
+ * signer stands in for it.
+ */
+export function demoIdentity(
+	clientKey: Uint8Array | TransportSigner = certBytes("client.key"),
+): MutualIdentity {
+	const identity = {
+		serverCertDer: certBytes("server.cert.der"),
+		clientCertDer: certBytes("client.cert.der"),
+		clientKey,
+	};
+	return identity;
 }

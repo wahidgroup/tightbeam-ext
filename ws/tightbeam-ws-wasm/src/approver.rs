@@ -6,10 +6,8 @@
 
 use std::sync::Arc;
 
-use js_sys::{Function, Promise, Reflect, Uint8Array};
+use js_sys::{Function, Reflect, Uint8Array};
 use wasm_bindgen::prelude::*;
-use wasm_bindgen::JsCast;
-use wasm_bindgen_futures::JsFuture;
 
 use tightbeam::der::asn1::OctetString;
 use tightbeam::der::Encode;
@@ -17,7 +15,8 @@ use tightbeam::marker::MaybeSendFuture;
 use tightbeam::transport::handshake::negotiation::MuxBudgets;
 use tightbeam::transport::handshake::receipt::{ApprovalRefusal, ReceiptApprover, SessionReceipt};
 
-use crate::fault::validation;
+use crate::fault::{JsFault, RefusalCode};
+use crate::promise::{JsBytes, Record, Returned, WholeNumber};
 
 /// Application refusal when the JS approver rejects or returns a bad shape.
 const APPROVER_REFUSAL: u32 = 0x7462_7761;
@@ -65,25 +64,19 @@ impl ReceiptApprover for JsReceiptApprover {
 			let invoked = self
 				.callback
 				.call1(&JsValue::UNDEFINED, &input)
+				.map(Returned::from)
 				.map_err(|_| ApprovalRefusal { code: APPROVER_REFUSAL })?;
 
-			let resolved = if invoked.has_type::<Promise>() {
-				let promise: Promise = invoked.unchecked_into();
-				JsFuture::from(promise)
-					.await
-					.map_err(|_| ApprovalRefusal { code: APPROVER_REFUSAL })?
-			} else {
-				invoked
+			let resolved = invoked.settle().await.map_err(|_| ApprovalRefusal { code: APPROVER_REFUSAL })?;
+			let Some(resolved) = Record::present(resolved) else {
+				return Ok(None);
 			};
 
-			if resolved.is_undefined() || resolved.is_null() {
-				return Ok(None);
-			}
-
-			let bytes = Uint8Array::new(&resolved).to_vec();
+			let bytes = JsBytes::recognize(&resolved).ok_or(ApprovalRefusal { code: APPROVER_REFUSAL })?;
 			if bytes.len() > MAX_SETTLEMENT_ANSWER {
 				return Err(ApprovalRefusal { code: APPROVER_REFUSAL });
 			}
+
 			let answer = OctetString::new(bytes).map_err(|_| ApprovalRefusal { code: APPROVER_REFUSAL })?;
 			Ok(Some(answer))
 		})
@@ -96,50 +89,110 @@ impl core::fmt::Debug for JsReceiptApprover {
 	}
 }
 
-/// Parse an optional JS approveReceipt function.
-pub fn approver_from_js(value: &JsValue) -> Result<Option<Arc<dyn ReceiptApprover>>, JsValue> {
-	if value.is_undefined() || value.is_null() {
-		return Ok(None);
-	}
+impl TryFrom<&JsValue> for JsReceiptApprover {
+	type Error = JsFault;
 
-	let function = value
-		.dyn_ref::<Function>()
-		.ok_or_else(|| validation("InvalidApproveReceipt", "approveReceipt must be a function"))?;
-	let approver = JsReceiptApprover::new(function.clone()).into_approver();
-	Ok(Some(approver))
+	/// Read an `approveReceipt` callback.
+	///
+	/// # Errors
+	///
+	/// - `InvalidApproveReceipt` -- `value` is not a function.
+	fn try_from(value: &JsValue) -> Result<Self, Self::Error> {
+		let function = value.dyn_ref::<Function>();
+		let refusal = || {
+			RefusalCode::InvalidApproveReceipt
+				.because("must be a function")
+				.at("approveReceipt")
+		};
+
+		let function = function.ok_or_else(refusal)?;
+		Ok(Self::new(function.clone()))
+	}
 }
 
-/// Parse optional budget pair `{ clientToServer, serverToClient }`.
-pub fn budgets_from_js(value: &JsValue) -> Result<Option<MuxBudgets>, JsValue> {
-	if value.is_undefined() || value.is_null() {
-		return Ok(None);
+/// The session budgets a mutual-auth dial offers, as JavaScript hands them
+/// over: `{ clientToServer, serverToClient }` in whole credits.
+pub(crate) struct OfferedBudgets(pub(crate) MuxBudgets);
+
+impl TryFrom<&JsValue> for OfferedBudgets {
+	type Error = JsFault;
+
+	/// Read the two budgets of the object `value`.
+	///
+	/// # Errors
+	///
+	/// - `InvalidBudgets` -- a budget is no whole, non-negative number.
+	fn try_from(value: &JsValue) -> Result<Self, Self::Error> {
+		let client = Record::member(value, "budgets.clientToServer");
+		let server = Record::member(value, "budgets.serverToClient");
+		let refusal = || RefusalCode::InvalidBudgets.because("budget credits must be non-negative integers");
+
+		let client_to_server = WholeNumber::read(&client).ok_or_else(refusal)?;
+		let server_to_client = WholeNumber::read(&server).ok_or_else(refusal)?;
+		Ok(Self(MuxBudgets { client_to_server, server_to_client }))
 	}
-
-	let client = Reflect::get(value, &JsValue::from_str("clientToServer"))?
-		.as_f64()
-		.ok_or_else(|| validation("InvalidBudgets", "budgets.clientToServer must be a number"))?;
-	let server = Reflect::get(value, &JsValue::from_str("serverToClient"))?
-		.as_f64()
-		.ok_or_else(|| validation("InvalidBudgets", "budgets.serverToClient must be a number"))?;
-
-	if client.fract() != 0.0 || server.fract() != 0.0 || client < 0.0 || server < 0.0 {
-		return Err(validation("InvalidBudgets", "budget credits must be non-negative integers"));
-	}
-
-	Ok(Some(MuxBudgets {
-		client_to_server: client as u64,
-		server_to_client: server as u64,
-	}))
 }
 
-/// Parse optional authorization token bytes.
-pub fn authorization_from_js(value: &JsValue) -> Result<Option<OctetString>, JsValue> {
-	if value.is_undefined() || value.is_null() {
-		return Ok(None);
+/// The authorization token a mutual-auth dial offers, as JavaScript hands it
+/// over.
+pub(crate) struct OfferedAuthorization(pub(crate) OctetString);
+
+impl TryFrom<&JsValue> for OfferedAuthorization {
+	type Error = JsFault;
+
+	/// Read the token octets of `value`.
+	///
+	/// # Errors
+	///
+	/// - `InvalidBytes` -- `value` is not a `Uint8Array`.
+	/// - `InvalidAuthorization` -- the octets do not fit an `OCTET STRING`.
+	fn try_from(value: &JsValue) -> Result<Self, Self::Error> {
+		let bytes = JsBytes::read_value(value, "options.authorization")?;
+		let token = OctetString::new(bytes);
+
+		let malformed = "options.authorization is not a valid OCTET STRING";
+		let token = token.map_err(|_| RefusalCode::InvalidAuthorization.because(malformed))?;
+		Ok(Self(token))
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use js_sys::Function;
+	use tightbeam::asn1::{AlgorithmIdentifierOwned, DigestInfo};
+	use tightbeam::der::asn1::OctetString;
+	use tightbeam::oids::HASH_SHA3_256;
+	use tightbeam::transport::handshake::negotiation::MuxBudgets;
+	use tightbeam::transport::handshake::receipt::{ApprovalRefusal, ReceiptApprover, SessionReceipt};
+	use wasm_bindgen::JsValue;
+	use wasm_bindgen_test::wasm_bindgen_test;
+
+	use super::{JsReceiptApprover, OfferedAuthorization, APPROVER_REFUSAL};
+	use crate::fault::Refused;
+
+	/// A receipt over a fixed transcript that carries no settlement challenge.
+	fn receipt() -> SessionReceipt {
+		let algorithm = AlgorithmIdentifierOwned { oid: HASH_SHA3_256, parameters: None };
+		let digest = OctetString::new([0x07; 32]).expect("32 octets fit an OCTET STRING");
+
+		let transcript_hash = DigestInfo { algorithm, digest };
+		let budgets = MuxBudgets { client_to_server: 1, server_to_client: 1 };
+		SessionReceipt { transcript_hash, budgets, credit_unit: 1024, ancillary: None }
 	}
 
-	let bytes = Uint8Array::new(value).to_vec();
-	let token = OctetString::new(bytes)
-		.map_err(|_| validation("InvalidAuthorization", "authorization token is not a valid OCTET STRING"))?;
-	Ok(Some(token))
+	#[wasm_bindgen_test]
+	async fn a_number_from_the_approver_is_no_settlement_answer() {
+		let approver = JsReceiptApprover::new(Function::new_no_args("return 7"));
+		let receipt = receipt();
+
+		let approved = approver.approve(&receipt).await;
+		assert_eq!(approved, Err(ApprovalRefusal { code: APPROVER_REFUSAL }));
+	}
+
+	#[wasm_bindgen_test]
+	fn a_number_is_no_authorization_token() {
+		let number = JsValue::from_f64(7.0);
+		let authorization = OfferedAuthorization::try_from(&number);
+		assert_eq!(authorization.code().as_deref(), Some("InvalidBytes"));
+	}
 }

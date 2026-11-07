@@ -4,6 +4,15 @@ use tightbeam::Errorizable;
 pub type Result<T> = core::result::Result<T, Error>;
 
 /// Errors produced by the WebSocket transport.
+///
+/// # Examples
+///
+/// ```
+/// use tightbeam_ws::Error;
+///
+/// let error = Error::from(std::io::Error::other("refused"));
+/// assert!(matches!(error, Error::Io(_)));
+/// ```
 #[derive(Debug, Errorizable)]
 #[non_exhaustive]
 pub enum Error {
@@ -23,6 +32,11 @@ pub enum Error {
 	#[error("transport error: {0}")]
 	#[from]
 	Transport(tightbeam::transport::error::TransportError),
+	/// A demo environment variable gave no value.
+	#[cfg(feature = "testing")]
+	#[error("environment error: {0}")]
+	#[from]
+	Env(crate::testing::EnvError),
 }
 
 impl From<tokio_tungstenite::tungstenite::Error> for Error {

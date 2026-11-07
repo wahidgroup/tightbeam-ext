@@ -1,34 +1,61 @@
 /**
  * Minimal, headless example app for the generic tightbeam-ws client.
  *
- * Builds frames with the fluent {@link frame} builder, ships them over the
+ * Builds frames with the fluent builder of its engine, ships them over the
  * socket, and surfaces the decoded response so the Playwright spec can assert
  * the body and metadata survived the round-trip.
+ *
+ * The query string carries the dial facts of the stack under their own
+ * names, which {@link readDialFacts} parses once at load. The page loads the
+ * engine once, before it reports ready.
  */
 
-import type { Frame, MessageCodec } from "@wahidgroup/tightbeam-ws-client";
-import {
-	Aes256Gcm,
-	Opaque,
+import type {
+	Frame,
+	MutualIdentity,
 	Secp256k1SigningKey,
-	Sha3_256,
+} from "@wahidgroup/tightbeam-ws-client";
+import {
 	StreamRefusal,
 	TightbeamWsClient,
-	ZstdCompression,
-	frame,
-	initClient,
-	isTransportError,
-	wrapped,
 } from "@wahidgroup/tightbeam-ws-client";
 
+import type { EmitClient, Note } from "../fixtures.js";
+import {
+	NotePayload,
+	SEAL_SECRET,
+	base64ToBytes,
+	bytesToHex,
+	emitOrFail,
+	hexToBytes,
+	mutualSessionOptions,
+	queryFacts,
+	readDialFacts,
+	withClient,
+} from "../fixtures.js";
 import { NobleTransportSigner } from "../signer.js";
 
 const TEXT = new TextDecoder();
 
 /**
- * The identifier that names the shared key of the sealed round trips.
+ * The stack facts in the query string that the spec opened the page with.
  */
-const E2E_KEY_ID = new TextEncoder().encode("tbws/e2e/kek/v1");
+const PAGE_FACTS = queryFacts(window.location.search);
+
+/**
+ * The stream cap and the demo paywall of the stack.
+ */
+const DIAL = readDialFacts(PAGE_FACTS);
+
+/**
+ * The engine every round-trip of the page builds, parses, and dials with.
+ */
+const ENGINE = await TightbeamWsClient.init();
+
+/**
+ * The typed body codec for a note: JSON in the profile opaque wrapper.
+ */
+const NOTES = ENGINE.wrapping(NotePayload);
 
 /**
  * The decoded outcome of a single round-trip, in a structured-clone-safe shape
@@ -44,57 +71,9 @@ export interface RoundTripResult {
 	readonly frameIntegrity: boolean;
 }
 
-function hexToBytes(hex: string): Uint8Array {
-	const bytes = new Uint8Array(hex.length / 2);
-	for (let i = 0; i < bytes.length; i += 1) {
-		bytes[i] = Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16);
-	}
-
-	return bytes;
-}
-
-function bytesToHex(bytes: Uint8Array): string {
-	let hex = "";
-	for (const byte of bytes) {
-		hex += byte.toString(16).padStart(2, "0");
-	}
-
-	return hex;
-}
-
-function base64ToBytes(base64: string): Uint8Array {
-	const binary = atob(base64);
-	const bytes = new Uint8Array(binary.length);
-	for (let i = 0; i < binary.length; i += 1) {
-		bytes[i] = binary.charCodeAt(i);
-	}
-
-	return bytes;
-}
-
-/**
- * The emit surface of the multiplexed client, cleartext or encrypted.
- */
-interface EmitClient {
-	emit(frame: Frame): Promise<Frame | undefined>;
-	close(): void;
-}
-
-/**
- * Emit `frame` and return the response frame.
- */
-async function emitFrame(client: EmitClient, built: Frame): Promise<Frame> {
-	const response = await client.emit(built);
-	if (response === undefined) {
-		throw new Error("the peer returned no response frame");
-	}
-
-	return response;
-}
-
 function toResult(response: Frame): RoundTripResult {
 	return {
-		bodyHex: bytesToHex(response.message(Opaque)),
+		bodyHex: bytesToHex(response.message(ENGINE.opaque)),
 		version: response.version,
 		idText: TEXT.decode(response.id),
 		order: response.order.toString(),
@@ -104,87 +83,111 @@ function toResult(response: Frame): RoundTripResult {
 	};
 }
 
-async function emitAndDecode(
-	client: EmitClient,
-	payloadHex: string,
-	idText: string,
-	order: number,
-): Promise<RoundTripResult> {
-	try {
-		const built = await frame(hexToBytes(payloadHex))
-			.withId(idText)
-			.withOrder(order)
-			.build();
+/**
+ * How a page dials the stack: in cleartext when absent, pinning a base64
+ * server certificate, or presenting a mutual identity as well.
+ */
+type PageCredentials = string | MutualIdentity | undefined;
 
-		return toResult(await emitFrame(client, built));
-	} finally {
-		client.close();
-	}
+/**
+ * The one opaque frame a round-trip emits.
+ */
+interface EchoFields {
+	readonly payloadHex: string;
+	readonly idText: string;
+	readonly order: number;
 }
 
 /**
- * Open a cleartext multiplexed client to `url`, run the round-trip body,
- * and always release the socket.
+ * Dial `url` with `credentials`. A cleartext dial passes the stream cap of
+ * the stack, and a mutual dial requests the ceiling of its paywall and pays
+ * its invoice.
  */
-async function withEchoClient<T>(
+function dial(
 	url: string,
-	run: (client: EmitClient) => Promise<T>,
-): Promise<T> {
-	const client = await TightbeamWsClient.connectCleartext(url);
-	try {
-		return await run(client);
-	} finally {
-		client.close();
+	credentials: PageCredentials,
+): Promise<TightbeamWsClient> {
+	if (credentials === undefined) {
+		const options = { streams: DIAL.streams };
+		const cleartext = ENGINE.connectCleartext(url, options);
+		return cleartext;
 	}
+	if (typeof credentials === "string") {
+		const serverCert = base64ToBytes(credentials);
+		const pinned = ENGINE.connect(url, serverCert);
+		return pinned;
+	}
+
+	const options = mutualSessionOptions(DIAL.paywall);
+	const mutual = ENGINE.connectMutual(url, credentials, options);
+	return mutual;
 }
 
-async function roundTrip(
+/**
+ * Open a multiplexed client to `url` under `credentials`, run the exchange
+ * body, and always release the socket.
+ */
+async function withMuxClient<T>(
+	url: string,
+	credentials: PageCredentials,
+	run: (client: TightbeamWsClient) => Promise<T>,
+): Promise<T> {
+	const connect = (): Promise<TightbeamWsClient> => dial(url, credentials);
+
+	const result = await withClient(connect, run);
+	return result;
+}
+
+/**
+ * Open a client to `url` under `credentials`, emit the one opaque frame
+ * `echo` names, release the socket, and decode the echo.
+ */
+async function emitAndDecode(
+	url: string,
+	credentials: PageCredentials,
+	echo: EchoFields,
+): Promise<RoundTripResult> {
+	const exchange = async (client: EmitClient): Promise<Frame> => {
+		const built = await ENGINE.frameBuilder(hexToBytes(echo.payloadHex))
+			.withId(echo.idText)
+			.withOrder(echo.order)
+			.build();
+
+		const reply = await emitOrFail(client, built);
+		return reply;
+	};
+
+	const response = await withMuxClient(url, credentials, exchange);
+	const result = toResult(response);
+	return result;
+}
+
+export async function roundTrip(
 	url: string,
 	payloadHex: string,
 	idText: string,
 	order: number,
 ): Promise<RoundTripResult> {
-	const client = await TightbeamWsClient.connectCleartext(url);
-	const result = await emitAndDecode(client, payloadHex, idText, order);
+	const echo = { payloadHex, idText, order };
+
+	const result = await emitAndDecode(url, undefined, echo);
 	return result;
 }
 
-async function secureRoundTrip(
+export async function secureRoundTrip(
 	url: string,
 	serverCertB64: string,
 	payloadHex: string,
 	idText: string,
 	order: number,
 ): Promise<RoundTripResult> {
-	const client = await TightbeamWsClient.connect(
-		url,
-		base64ToBytes(serverCertB64),
-	);
+	const echo = { payloadHex, idText, order };
 
-	const result = await emitAndDecode(client, payloadHex, idText, order);
+	const result = await emitAndDecode(url, serverCertB64, echo);
 	return result;
 }
 
-/**
- * Demo settlement payment matching `tightbeam_ws::testing::DEMO_PAYMENT`.
- * Mutual echo always runs the demo paywall in compose.
- */
-const DEMO_PAYMENT = new TextEncoder().encode("tbws-demo-payment-v1");
-
-/**
- * Mutual dial options for the compose stack's demo budget ceiling.
- */
-function mutualSessionOffer(): {
-	budgets: { clientToServer: number; serverToClient: number };
-	approveReceipt: () => Uint8Array;
-} {
-	return {
-		budgets: { clientToServer: 4096, serverToClient: 4096 },
-		approveReceipt: (): Uint8Array => DEMO_PAYMENT,
-	};
-}
-
-async function mutualRoundTrip(
+export async function mutualRoundTrip(
 	url: string,
 	serverCertB64: string,
 	clientCertB64: string,
@@ -193,15 +196,14 @@ async function mutualRoundTrip(
 	idText: string,
 	order: number,
 ): Promise<RoundTripResult> {
-	const client = await TightbeamWsClient.connectMutual(
-		url,
-		base64ToBytes(serverCertB64),
-		base64ToBytes(clientCertB64),
-		base64ToBytes(clientKeyB64),
-		mutualSessionOffer(),
-	);
+	const identity = {
+		serverCertDer: base64ToBytes(serverCertB64),
+		clientCertDer: base64ToBytes(clientCertB64),
+		clientKey: base64ToBytes(clientKeyB64),
+	};
 
-	const result = await emitAndDecode(client, payloadHex, idText, order);
+	const echo = { payloadHex, idText, order };
+	const result = await emitAndDecode(url, identity, echo);
 	return result;
 }
 
@@ -213,7 +215,7 @@ export interface SignerRoundTripResult extends RoundTripResult {
 	readonly signatures: number;
 }
 
-async function mutualSignerRoundTrip(
+export async function mutualSignerRoundTrip(
 	url: string,
 	serverCertB64: string,
 	clientCertB64: string,
@@ -222,17 +224,17 @@ async function mutualSignerRoundTrip(
 	idText: string,
 	order: number,
 ): Promise<SignerRoundTripResult> {
-	const signer = new NobleTransportSigner(base64ToBytes(clientKeyB64));
+	const clientKey = base64ToBytes(clientKeyB64);
+	const signer = new NobleTransportSigner(ENGINE, clientKey);
+	const identity = {
+		serverCertDer: base64ToBytes(serverCertB64),
+		clientCertDer: base64ToBytes(clientCertB64),
+		clientKey: signer,
+	};
 
-	const client = await TightbeamWsClient.connectMutual(
-		url,
-		base64ToBytes(serverCertB64),
-		base64ToBytes(clientCertB64),
-		signer,
-		mutualSessionOffer(),
-	);
+	const echo = { payloadHex, idText, order };
 
-	const decoded = await emitAndDecode(client, payloadHex, idText, order);
+	const decoded = await emitAndDecode(url, identity, echo);
 	const result = { ...decoded, signatures: signer.signatures };
 	return result;
 }
@@ -248,7 +250,7 @@ export interface SignedRoundTripResult extends RoundTripResult {
 	readonly wrongSaltVerdict: string;
 }
 
-async function signedRoundTrip(
+export async function signedRoundTrip(
 	url: string,
 	payloadHex: string,
 	idText: string,
@@ -256,20 +258,23 @@ async function signedRoundTrip(
 	signingKeyHex: string,
 	saltHex: string,
 ): Promise<SignedRoundTripResult> {
-	await initClient();
+	const signingKey = ENGINE.signingKey(hexToBytes(signingKeyHex));
+	const committed = ENGINE.salt(hexToBytes(saltHex));
+	const salt = ENGINE.salt(hexToBytes(saltHex));
+	const wrongSalt = ENGINE.salt(hexToBytes("deadbeef".repeat(4)));
 
-	const signingKey = Secp256k1SigningKey.fromBytes(hexToBytes(signingKeyHex));
-	const salt = hexToBytes(saltHex);
-
-	const response = await withEchoClient(url, async (client) => {
-		const built = await frame(hexToBytes(payloadHex))
+	const response = await withMuxClient(url, undefined, async (client) => {
+		const built = await ENGINE.frameBuilder(hexToBytes(payloadHex))
 			.withId(idText)
 			.withOrder(order)
-			.withMessageHasher(new Sha3_256(), salt)
-			.withWitnessHasher(new Sha3_256())
+			.withMessageHasher(ENGINE.sha3_256)
+			.withCommitment(committed)
+			.withWitnessHasher(ENGINE.sha3_256)
 			.withSigner(signingKey)
 			.build();
-		return emitFrame(client, built);
+
+		const reply = await emitOrFail(client, built);
+		return reply;
 	});
 
 	let signatureValid = false;
@@ -285,9 +290,7 @@ async function signedRoundTrip(
 		signatureValid,
 		frameVerdict: await response.frameIntegrityVerdict(),
 		messageVerdict: await response.messageCommitmentVerdict(salt),
-		wrongSaltVerdict: await response.messageCommitmentVerdict(
-			hexToBytes("deadbeef".repeat(4)),
-		),
+		wrongSaltVerdict: await response.messageCommitmentVerdict(wrongSalt),
 	};
 }
 
@@ -302,33 +305,33 @@ export interface SealedRoundTripResult {
 	readonly decryptedHex: string;
 }
 
-async function sealedRoundTrip(
+export async function sealedRoundTrip(
 	url: string,
 	payloadHex: string,
 	idText: string,
 	order: number,
-	keyHex: string,
 ): Promise<SealedRoundTripResult> {
-	await initClient();
-
 	const payload = hexToBytes(payloadHex);
-	const cipher = Aes256Gcm.fromKey(hexToBytes(keyHex), E2E_KEY_ID);
+	const cipher = ENGINE.aes256Gcm(SEAL_SECRET);
 
-	const response = await withEchoClient(url, async (client) => {
-		const built = await frame(payload)
+	const response = await withMuxClient(url, undefined, async (client) => {
+		const built = await ENGINE.frameBuilder(payload)
 			.withId(idText)
 			.withOrder(order)
 			.withEncryptor(cipher)
 			.build();
 
-		return emitFrame(client, built);
+		const reply = await emitOrFail(client, built);
+		return reply;
 	});
 
+	const algorithm = response.confidentialityInfo?.algorithmOid;
+	const decrypted = await response.decryptMessage(cipher, ENGINE.opaque);
 	return {
 		confidential: response.confidential,
-		confidentialityOid: response.confidentialityInfo?.algorithmOid ?? "",
+		confidentialityOid: algorithm?.toString() ?? "",
 		ciphertextDiffers: bytesToHex(response.bodyDer) !== payloadHex,
-		decryptedHex: bytesToHex(await response.decryptMessage(cipher, Opaque)),
+		decryptedHex: bytesToHex(decrypted),
 	};
 }
 
@@ -342,143 +345,88 @@ export interface CompressedRoundTripResult {
 	readonly inflatedHex: string;
 }
 
-async function compressedRoundTrip(
+export async function compressedRoundTrip(
 	url: string,
 	payloadHex: string,
 	idText: string,
 	order: number,
 ): Promise<CompressedRoundTripResult> {
-	const zstd = new ZstdCompression();
+	const zstd = ENGINE.zstd();
 
-	const response = await withEchoClient(url, async (client) => {
-		const built = await frame(hexToBytes(payloadHex))
+	const response = await withMuxClient(url, undefined, async (client) => {
+		const built = await ENGINE.frameBuilder(hexToBytes(payloadHex))
 			.withId(idText)
 			.withOrder(order)
 			.withCompressor(zstd)
 			.build();
 
-		return emitFrame(client, built);
+		const reply = await emitOrFail(client, built);
+		return reply;
 	});
 
-	const inflated = await response.inflateMessage(zstd, Opaque);
+	const inflated = await response.inflateMessage(zstd, ENGINE.opaque);
 	return {
 		compressed: response.compressed,
-		compactnessOid: response.compactnessInfo?.algorithmOid ?? "",
+		compactnessOid: response.compactnessInfo?.algorithmOid.toString() ?? "",
 		inflatedHex: bytesToHex(inflated),
 	};
 }
 
-async function compressedSealedRoundTrip(
+export async function compressedSealedRoundTrip(
 	url: string,
 	payloadHex: string,
 	idText: string,
 	order: number,
-	keyHex: string,
 ): Promise<CompressedRoundTripResult> {
-	await initClient();
+	const zstd = ENGINE.zstd();
+	const cipher = ENGINE.aes256Gcm(SEAL_SECRET);
 
-	const zstd = new ZstdCompression();
-	const cipher = Aes256Gcm.fromKey(hexToBytes(keyHex), E2E_KEY_ID);
-
-	const response = await withEchoClient(url, async (client) => {
-		const built = await frame(hexToBytes(payloadHex))
+	const response = await withMuxClient(url, undefined, async (client) => {
+		const built = await ENGINE.frameBuilder(hexToBytes(payloadHex))
 			.withId(idText)
 			.withOrder(order)
 			.withCompressor(zstd)
 			.withEncryptor(cipher)
 			.build();
 
-		return emitFrame(client, built);
+		const reply = await emitOrFail(client, built);
+		return reply;
 	});
 
-	const inflated = await response.decryptMessage(cipher, Opaque, zstd);
+	const inflated = await response.decryptMessage(cipher, ENGINE.opaque, zstd);
 	return {
 		compressed: response.compressed,
-		compactnessOid: response.compactnessInfo?.algorithmOid ?? "",
+		compactnessOid: response.compactnessInfo?.algorithmOid.toString() ?? "",
 		inflatedHex: bytesToHex(inflated),
 	};
 }
 
 /**
- * A chat message round-tripped as a typed body: JSON under a wrapped
- * payload codec, decoded and runtime-validated in the browser.
+ * A note round-tripped as a typed body: JSON under a wrapped payload codec,
+ * decoded and runtime-validated in the browser.
  */
-export interface TypedRoundTripResult {
-	readonly author: string;
-	readonly text: string;
-}
+export type TypedRoundTripResult = Note;
 
-const Chat: MessageCodec<TypedRoundTripResult> = wrapped({
-	encode(message: TypedRoundTripResult): Uint8Array {
-		const payload = new TextEncoder().encode(JSON.stringify(message));
-		return payload;
-	},
-	decode(payload: Uint8Array): TypedRoundTripResult {
-		const parsed: unknown = JSON.parse(TEXT.decode(payload));
-		if (
-			typeof parsed !== "object" ||
-			parsed === null ||
-			!("author" in parsed) ||
-			!("text" in parsed)
-		) {
-			throw new Error("not a chat message");
-		}
-
-		const { author, text } = parsed;
-		if (typeof author !== "string" || typeof text !== "string") {
-			throw new Error("not a chat message");
-		}
-
-		const message = { author, text };
-		return message;
-	},
-});
-
-async function typedRoundTrip(
+export async function typedRoundTrip(
 	url: string,
 	idText: string,
 	order: number,
 	author: string,
 	text: string,
 ): Promise<TypedRoundTripResult> {
-	const response = await withEchoClient(url, async (client) => {
-		const built = await frame()
+	const response = await withMuxClient(url, undefined, async (client) => {
+		const built = await ENGINE.frameBuilder()
 			.withId(idText)
 			.withOrder(order)
-			.withMessage(Chat, { author, text })
+			.withMessage(NOTES, { author, text })
 			.build();
 
-		return emitFrame(client, built);
+		const reply = await emitOrFail(client, built);
+		return reply;
 	});
 
-	const message = response.message(Chat);
+	const message = response.message(NOTES);
 	return message;
-}
-
-/**
- * Open a multiplexed client to `url`, run the exchange body, and always
- * release the socket.
- */
-async function withMuxClient<T>(
-	url: string,
-	serverCertB64: string | undefined,
-	run: (client: TightbeamWsClient) => Promise<T>,
-): Promise<T> {
-	let client: TightbeamWsClient;
-	if (serverCertB64 === undefined) {
-		client = await TightbeamWsClient.connectCleartext(url);
-	} else {
-		client = await TightbeamWsClient.connect(
-			url,
-			base64ToBytes(serverCertB64),
-		);
-	}
-
-	try {
-		return await run(client);
-	} finally {
-		client.close();
-	}
 }
 
 /**
@@ -501,7 +449,7 @@ function indexedBody(payload: Uint8Array, index: number): Uint8Array {
 	return body;
 }
 
-async function muxConcurrentRoundTrip(
+export async function muxConcurrentRoundTrip(
 	url: string,
 	serverCertB64: string | undefined,
 	payloadHex: string,
@@ -509,14 +457,14 @@ async function muxConcurrentRoundTrip(
 	const payload = hexToBytes(payloadHex);
 	const labels = ["mux-browser-1", "mux-browser-2", "mux-browser-3"];
 
-	return withMuxClient(url, serverCertB64, async (client) => {
+	const result = await withMuxClient(url, serverCertB64, async (client) => {
 		const emits = labels.map(async (label, index) => {
-			const built = await frame(indexedBody(payload, index))
+			const built = await ENGINE.frameBuilder(indexedBody(payload, index))
 				.withId(label)
 				.withOrder(index + 1)
 				.build();
 
-			const response = await emitFrame(client, built);
+			const response = await emitOrFail(client, built);
 			return response;
 		});
 
@@ -524,11 +472,12 @@ async function muxConcurrentRoundTrip(
 		const result = {
 			echoedIds: echoed.map((response) => TEXT.decode(response.id)),
 			echoedBodiesHex: echoed.map((response) =>
-				bytesToHex(response.message(Opaque)),
+				bytesToHex(response.message(ENGINE.opaque)),
 			),
 		};
 		return result;
 	});
+	return result;
 }
 
 /**
@@ -542,18 +491,18 @@ export interface MuxCallbackResult {
 	readonly relayedBodyHex: string;
 }
 
-async function muxCallbackRoundTrip(
+export async function muxCallbackRoundTrip(
 	url: string,
 	serverCertB64: string,
 	payloadHex: string,
 	replyHex: string,
 ): Promise<MuxCallbackResult> {
-	return withMuxClient(url, serverCertB64, async (client) => {
+	const result = await withMuxClient(url, serverCertB64, async (client) => {
 		const servedIds: string[] = [];
 		client.serve(async (request) => {
 			servedIds.push(TEXT.decode(request.id));
 
-			const reply = await frame(hexToBytes(replyHex))
+			const reply = await ENGINE.frameBuilder(hexToBytes(replyHex))
 				.withId("browser-reply")
 				.withOrder(9)
 				.build();
@@ -564,19 +513,20 @@ async function muxCallbackRoundTrip(
 		 * The `call-me` id makes the server open its own stream back to
 		 * this page. The handler's reply follows the original stream.
 		 */
-		const callMe = await frame(hexToBytes(payloadHex))
+		const callMe = await ENGINE.frameBuilder(hexToBytes(payloadHex))
 			.withId("call-me-browser")
 			.withOrder(4)
 			.build();
 
-		const relayed = await emitFrame(client, callMe);
+		const relayed = await emitOrFail(client, callMe);
 		const result = {
 			servedIds,
 			relayedIdText: TEXT.decode(relayed.id),
-			relayedBodyHex: bytesToHex(relayed.message(Opaque)),
+			relayedBodyHex: bytesToHex(relayed.message(ENGINE.opaque)),
 		};
 		return result;
 	});
+	return result;
 }
 
 /**
@@ -594,11 +544,11 @@ export interface MuxLifecycleResult {
 	readonly localReasonEmpty: boolean;
 }
 
-async function muxLifecycleProbe(
+export async function muxLifecycleProbe(
 	url: string,
 	serverCertB64: string,
 ): Promise<MuxLifecycleResult> {
-	return withMuxClient(url, serverCertB64, async (client) => {
+	const result = await withMuxClient(url, serverCertB64, async (client) => {
 		await client.ping();
 		await client.waitForStreamSlot();
 
@@ -618,17 +568,19 @@ async function muxLifecycleProbe(
 			}
 		}
 
-		await client.shutdownWith("EnhanceYourCalm");
+		await client.shutdownWith("enhance-your-calm");
 
 		let drainCode = "";
 		try {
-			const after = await frame(new Uint8Array([0xb0, 0x1f]))
+			const after = await ENGINE.frameBuilder(
+				new Uint8Array([0xb0, 0x1f]),
+			)
 				.withId("browser-after-calm")
 				.withOrder(1)
 				.build();
 			await client.emit(after);
 		} catch (error) {
-			if (isTransportError(error)) {
+			if (ENGINE.isTransportError(error)) {
 				drainCode = error.code;
 			}
 		}
@@ -644,6 +596,7 @@ async function muxLifecycleProbe(
 		};
 		return result;
 	});
+	return result;
 }
 
 /**
@@ -656,18 +609,18 @@ export interface MuxDrainResult {
 	readonly emitRejection: string;
 }
 
-async function muxDrainReason(
+export async function muxDrainReason(
 	url: string,
 	serverCertB64: string,
 ): Promise<MuxDrainResult> {
-	return withMuxClient(url, serverCertB64, async (client) => {
+	const result = await withMuxClient(url, serverCertB64, async (client) => {
 		/*
 		 * The `drain-calm` id makes the server drain the session with an
 		 * EnhanceYourCalm GoAway instead of echoing. The drain stops the
 		 * server's writer before the response, so the emit never settles
 		 * on its own and is aborted once the reason surfaces.
 		 */
-		const drain = await frame(new Uint8Array([0xb0, 0x1d]))
+		const drain = await ENGINE.frameBuilder(new Uint8Array([0xb0, 0x1d]))
 			.withId("drain-calm-browser")
 			.withOrder(1)
 			.build();
@@ -698,6 +651,7 @@ async function muxDrainReason(
 		};
 		return result;
 	});
+	return result;
 }
 
 /**
@@ -705,24 +659,24 @@ async function muxDrainReason(
  * before any handler registers, proving early server streams wait for
  * `serve` instead of being dropped.
  */
-async function muxParkedCallbackRoundTrip(
+export async function muxParkedCallbackRoundTrip(
 	url: string,
 	serverCertB64: string,
 	payloadHex: string,
 	replyHex: string,
 ): Promise<MuxCallbackResult> {
-	return withMuxClient(url, serverCertB64, async (client) => {
+	const result = await withMuxClient(url, serverCertB64, async (client) => {
 		/*
 		 * Fire the call-back with no handler, then wait until the local
 		 * emit occupies a stream slot so serve registers only after the
 		 * request left the client.
 		 */
-		const callMe = await frame(hexToBytes(payloadHex))
+		const callMe = await ENGINE.frameBuilder(hexToBytes(payloadHex))
 			.withId("call-me-parked-browser")
 			.withOrder(4)
 			.build();
 
-		const pending = emitFrame(client, callMe);
+		const pending = emitOrFail(client, callMe);
 		const deadline = Date.now() + 10_000;
 		while (!client.hasPendingStreams) {
 			if (Date.now() > deadline) {
@@ -738,7 +692,7 @@ async function muxParkedCallbackRoundTrip(
 		client.serve(async (request) => {
 			servedIds.push(TEXT.decode(request.id));
 
-			const reply = await frame(hexToBytes(replyHex))
+			const reply = await ENGINE.frameBuilder(hexToBytes(replyHex))
 				.withId("late-browser-reply")
 				.withOrder(9)
 				.build();
@@ -749,10 +703,11 @@ async function muxParkedCallbackRoundTrip(
 		const result = {
 			servedIds,
 			relayedIdText: TEXT.decode(relayed.id),
-			relayedBodyHex: bytesToHex(relayed.message(Opaque)),
+			relayedBodyHex: bytesToHex(relayed.message(ENGINE.opaque)),
 		};
 		return result;
 	});
+	return result;
 }
 
 /**
@@ -769,25 +724,25 @@ export interface MuxRefusalResult {
  * stream with a chosen gRPC status, and the echo server relays that
  * failure as the answer on the original stream.
  */
-async function muxRefusalRoundTrip(
+export async function muxRefusalRoundTrip(
 	url: string,
 	serverCertB64: string,
 	payloadHex: string,
 ): Promise<MuxRefusalResult> {
-	return withMuxClient(url, serverCertB64, async (client) => {
+	const result = await withMuxClient(url, serverCertB64, async (client) => {
 		client.serve(() => {
 			throw new StreamRefusal("NotFound", "nothing here");
 		});
 
-		const callMe = await frame(hexToBytes(payloadHex))
+		const callMe = await ENGINE.frameBuilder(hexToBytes(payloadHex))
 			.withId("call-me-refused-browser")
 			.withOrder(4)
 			.build();
 
 		try {
-			await emitFrame(client, callMe);
+			await emitOrFail(client, callMe);
 		} catch (error) {
-			if (isTransportError(error)) {
+			if (ENGINE.isTransportError(error)) {
 				return { rejectionName: error.name, rejectionCode: error.code };
 			}
 
@@ -796,6 +751,7 @@ async function muxRefusalRoundTrip(
 
 		return { rejectionName: "", rejectionCode: "" };
 	});
+	return result;
 }
 
 /**
@@ -820,20 +776,6 @@ export interface WorkRefusalResult {
 }
 
 /**
- * The `status` property a work refusal carries, when present.
- */
-function refusalStatus(error: unknown): string {
-	if (typeof error === "object" && error !== null && "status" in error) {
-		const status: unknown = Reflect.get(error, "status");
-		if (typeof status === "string") {
-			return status;
-		}
-	}
-
-	return "";
-}
-
-/**
  * Build and sign the end-to-end work frame the gateway must forward to
  * the servlet byte-for-byte.
  */
@@ -843,7 +785,7 @@ async function signedWorkFrame(
 	order: number,
 	workKey: Secp256k1SigningKey,
 ): Promise<Frame> {
-	const built = await frame(hexToBytes(payloadHex))
+	const built = await ENGINE.frameBuilder(hexToBytes(payloadHex))
 		.withId(idText)
 		.withOrder(order)
 		.withSigner(workKey)
@@ -866,20 +808,14 @@ export interface WorkRoundTripOptions {
 	readonly workKeyB64: string;
 }
 
-async function workRoundTrip(
+export async function workRoundTrip(
 	options: WorkRoundTripOptions,
 ): Promise<WorkRoundTripResult> {
-	await initClient();
+	const { url, serverCertB64, workKeyB64 } = options;
+	const workKeyBytes = base64ToBytes(workKeyB64);
+	const workKey = ENGINE.signingKey(workKeyBytes);
 
-	const workKey = Secp256k1SigningKey.fromBytes(
-		base64ToBytes(options.workKeyB64),
-	);
-	const client = await TightbeamWsClient.connect(
-		options.url,
-		base64ToBytes(options.serverCertB64),
-	);
-
-	try {
+	const result = await withMuxClient(url, serverCertB64, async (client) => {
 		const built = await signedWorkFrame(
 			options.payloadHex,
 			options.idText,
@@ -897,57 +833,52 @@ async function workRoundTrip(
 		}
 
 		return {
-			bodyText: TEXT.decode(response.message(Opaque)),
+			bodyText: TEXT.decode(response.message(ENGINE.opaque)),
 			idText: TEXT.decode(response.id),
 			signatureValid,
 		};
-	} finally {
-		client.close();
-	}
+	});
+	return result;
 }
 
-async function workRefusal(
+export async function workRefusal(
 	url: string,
 	serverCertB64: string,
 	target: string,
 	payloadHex: string,
 	workKeyB64: string,
 ): Promise<WorkRefusalResult> {
-	await initClient();
+	const workKey = ENGINE.signingKey(base64ToBytes(workKeyB64));
 
-	const workKey = Secp256k1SigningKey.fromBytes(base64ToBytes(workKeyB64));
-	const client = await TightbeamWsClient.connect(
-		url,
-		base64ToBytes(serverCertB64),
-	);
-
-	try {
+	const result = await withMuxClient(url, serverCertB64, async (client) => {
 		const built = await signedWorkFrame(
 			payloadHex,
 			"e2e-work-refused",
 			1,
 			workKey,
 		);
-		await client.submitWork(target, built);
-	} catch (error) {
-		if (isTransportError(error)) {
+
+		try {
+			await client.submitWork(target, built);
+		} catch (error) {
+			if (ENGINE.isTransportError(error)) {
+				return {
+					rejectionName: error.name,
+					rejectionCode: error.code,
+					rejectionStatus: error.status ?? "",
+				};
+			}
+
 			return {
-				rejectionName: error.name,
-				rejectionCode: error.code,
-				rejectionStatus: refusalStatus(error),
+				rejectionName: String(error),
+				rejectionCode: "",
+				rejectionStatus: "",
 			};
 		}
 
-		return {
-			rejectionName: String(error),
-			rejectionCode: "",
-			rejectionStatus: "",
-		};
-	} finally {
-		client.close();
-	}
-
-	return { rejectionName: "", rejectionCode: "", rejectionStatus: "" };
+		return { rejectionName: "", rejectionCode: "", rejectionStatus: "" };
+	});
+	return result;
 }
 
 window.tbRoundTrip = roundTrip;
@@ -963,7 +894,7 @@ window.tbTypedRoundTrip = typedRoundTrip;
  * The concurrent round-trip over the cleartext mux lane: no certificate,
  * symmetric stream cap in place of negotiation.
  */
-async function muxClearConcurrentRoundTrip(
+export async function muxClearConcurrentRoundTrip(
 	url: string,
 	payloadHex: string,
 ): Promise<MuxConcurrentResult> {
@@ -974,18 +905,14 @@ async function muxClearConcurrentRoundTrip(
 /**
  * Progressive openStream round-trip: split the Frame DER, push, close.
  */
-async function streamingRoundTrip(
+export async function streamingRoundTrip(
 	url: string,
 	serverCertB64: string,
 	payloadHex: string,
 	idText: string,
 ): Promise<RoundTripResult> {
-	const client = await TightbeamWsClient.connect(
-		url,
-		base64ToBytes(serverCertB64),
-	);
-	try {
-		const built = await frame(hexToBytes(payloadHex))
+	const result = await withMuxClient(url, serverCertB64, async (client) => {
+		const built = await ENGINE.frameBuilder(hexToBytes(payloadHex))
 			.withId(idText)
 			.withOrder(1)
 			.build();
@@ -1002,10 +929,10 @@ async function streamingRoundTrip(
 			throw new Error("streaming peer returned no response frame");
 		}
 
-		return toResult(response);
-	} finally {
-		client.close();
-	}
+		const outcome = toResult(response);
+		return outcome;
+	});
+	return result;
 }
 
 window.tbMuxConcurrentRoundTrip = muxConcurrentRoundTrip;

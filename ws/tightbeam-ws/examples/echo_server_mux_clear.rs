@@ -1,8 +1,8 @@
 //! Multiplexed cleartext echo server for the tightbeam WebSocket transport.
 //!
-//! The server serves each client stream with the handler that `TBWS_ECHO_BODY`
-//! selects. In the `streaming` and `unary` modes, a frame id can select a
-//! command in place of the echo, as [`echo_stream`] lists.
+//! The server serves each client stream with the [`EchoBody`] that
+//! `TBWS_ECHO_BODY` names. In the `streaming` and `unary` bodies, a frame id
+//! can select an [`EchoCommand`] in place of the echo.
 //!
 //! Both endpoints MUST configure the same concurrency cap, because no handshake
 //! negotiates it. The connection carries NO confidentiality or integrity
@@ -10,16 +10,16 @@
 //!
 //! Environment:
 //!   - `ECHO_WS_PORT`     listen port (default `9101`)
-//!   - `MUX_STREAMS`      symmetric concurrency cap (default `8`)
-//!   - `TBWS_ECHO_BODY`   `streaming` (default) | `duplex` | `unary`
-
-use std::env;
+//!   - `TBWS_ECHO_BODY`   the [`EchoBody`] to serve (default `streaming`)
+//!   - `MUX_STREAMS`      the symmetric concurrency cap, which [`DemoConfig`] reads
+//!
+//! [`EchoCommand`]: tightbeam_ws::testing::EchoCommand
 
 use tightbeam::transport::handshake::negotiation::MuxSettings;
-use tightbeam::transport::multiplex::{MuxRole, MuxTransport};
 use tightbeam_ws::io::WsTransport;
 use tightbeam_ws::protocol::WsListener;
-use tightbeam_ws::testing::{echo_duplex, echo_stream, env_u32, EchoFrames};
+use tightbeam_ws::serve::AcceptedLink;
+use tightbeam_ws::testing::{DemoConfig, EchoBody, EnvVar};
 use tokio::net::TcpStream;
 use tokio_tungstenite::MaybeTlsStream;
 
@@ -28,41 +28,37 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 /// The transport an accepted WebSocket connection follows.
 type ServerTransport = WsTransport<MaybeTlsStream<TcpStream>>;
 
-/// Serve one multiplexed cleartext connection until it ends.
-async fn serve_connection(transport: ServerTransport, cap: u32) -> Result<(), BoxError> {
-	let (reader, writer) = transport.into_split()?;
+/// The variable that sets the listen port.
+const PORT: EnvVar = EnvVar::new("ECHO_WS_PORT");
 
-	let mux = MuxTransport::new(reader, writer, MuxRole::Server, MuxSettings::symmetric(cap));
-	let (handle, reader_driver, writer_driver, responder) = mux.into_parts();
+/// One accepted cleartext connection of the echo server.
+struct EchoConnection(ServerTransport);
 
-	let reader_task = tokio::spawn(reader_driver.drive());
-	let writer_task = tokio::spawn(writer_driver.drive());
-
-	let body_mode = env::var("TBWS_ECHO_BODY").unwrap_or_else(|_| "streaming".into());
-	let outcome = match body_mode.as_str() {
-		"unary" => responder.serve(move |frame| echo_stream(handle.clone(), frame)).await,
-		"duplex" => responder.serve_duplex(echo_duplex).await,
-		_ => responder.serve_with(EchoFrames::new(handle)).await,
-	};
-
-	reader_task.abort();
-	writer_task.abort();
-	outcome?;
-	Ok(())
+impl EchoConnection {
+	/// Serve the connection with `body` until it ends, under `cap` streams
+	/// each way.
+	async fn serve(self, cap: u32, body: EchoBody) -> Result<(), BoxError> {
+		let settings = MuxSettings::symmetric(cap);
+		let link = AcceptedLink::cleartext(self.0, settings)?;
+		body.serve(link.spawn()).await?;
+		Ok(())
+	}
 }
 
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
-	let port = env_u32("ECHO_WS_PORT", 9101);
-	let cap = env_u32("MUX_STREAMS", 8);
+	let port = PORT.parsed_or(9101u32)?;
+	let demo = DemoConfig::from_env()?;
+	let cap = demo.streams();
+	let body = EchoBody::from_env()?;
 	let addr = format!("0.0.0.0:{port}");
 
 	let listener = WsListener::bind_cleartext(&addr).await?;
 	println!("[echo-mux-clear] multiplexed cleartext tightbeam-ws echo server listening on ws://{addr}");
 
 	loop {
-		// A failed WebSocket upgrade is a per-connection fault (bad
-		// handshake, probe, abrupt teardown), never server-fatal.
+		// A failed accept is the listener's own fault, such as a descriptor
+		// shortage, and it clears on retry.
 		let (transport, peer) = match listener.accept().await {
 			Ok(accepted) => accepted,
 			Err(error) => {
@@ -72,7 +68,8 @@ async fn main() -> Result<(), BoxError> {
 		};
 
 		tokio::spawn(async move {
-			if let Err(error) = serve_connection(transport, cap).await {
+			let connection = EchoConnection(transport);
+			if let Err(error) = connection.serve(cap, body).await {
 				eprintln!("[echo-mux-clear] connection from {peer} ended: {error}");
 			}
 		});

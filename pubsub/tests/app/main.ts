@@ -12,80 +12,34 @@
  * - `topic`: the topic to subscribe to and publish on.
  * - `cert`: the server certificate to pin, in base64.
  * - `clientCert`, `clientKey`: the client identity to present, in base64.
- * - `seal=1`: seal notes under {@link TOPIC_KEY}.
+ * - The dial facts and the topic seal of the stack, under the names the stack
+ *   writes them, which {@link readDialFacts} and {@link readTopicSecret}
+ *   parse.
+ * - `seal=1`: seal notes under the topic seal.
  * - `processed=1`: receive the frames that the backend servlet rebuilds.
  */
 
 import type {
+	Aes256Gcm,
 	Envelope,
 	Frame,
-	MessageCodec,
-} from "@wahidgroup/tightbeam-ws-client";
-import {
-	Aes256Gcm,
 	Secp256k1SigningKey,
-	TightbeamWsClient,
-	envelope,
-	initClient,
-	wrapped,
 } from "@wahidgroup/tightbeam-ws-client";
-import { SubscriptionManager } from "@wahidgroup/tightbeam-pubsub-client";
+import { TightbeamWsClient } from "@wahidgroup/tightbeam-ws-client";
+import {
+	ClientPorts,
+	SubscriptionManager,
+} from "@wahidgroup/tightbeam-pubsub-client";
 
-const ENCODER = new TextEncoder();
-
-const DECODER = new TextDecoder();
-
-/**
- * The pre-shared AES-256-GCM key: the topic seal on sealed boards
- * (`seal=1`), and the key the processor servlet seals rebuilt frames
- * under (`processed=1`).
- */
-const TOPIC_KEY = new Uint8Array(32).fill(7);
-
-/**
- * The identifier that names {@link TOPIC_KEY} in each sealed envelope,
- * matching the demo processor's `PROCESSED_TOPIC_KEY_ID`.
- */
-const TOPIC_KEY_ID = new TextEncoder().encode("pubsub-demo-processed");
-
-/**
- * The typed message every note board publishes.
- */
-interface Note {
-	author: string;
-	text: string;
-}
-
-/**
- * Runtime-validate a decoded note.
- */
-function asNote(value: unknown): Note {
-	if (typeof value !== "object" || value === null) {
-		throw new Error("a note must be a JSON object");
-	}
-	if (!("author" in value) || !("text" in value)) {
-		throw new Error("a note needs author and text");
-	}
-
-	const { author, text } = value;
-	if (typeof author !== "string" || typeof text !== "string") {
-		throw new Error("a note needs string author and text");
-	}
-
-	return { author, text };
-}
-
-/**
- * The typed body codec: JSON in the profile opaque wrapper.
- */
-const Notes: MessageCodec<Note> = wrapped({
-	encode(note: Note): Uint8Array {
-		return ENCODER.encode(JSON.stringify(note));
-	},
-	decode(payload: Uint8Array): Note {
-		return asNote(JSON.parse(DECODER.decode(payload)));
-	},
-});
+import type { Note } from "#ws-fixtures";
+import {
+	NotePayload,
+	base64ToBytes,
+	mutualSessionOptions,
+	queryFacts,
+	readDialFacts,
+} from "#ws-fixtures";
+import { readTopicSecret } from "../fixtures.js";
 
 function element<T extends HTMLElement>(id: string): T {
 	const found = document.querySelector<T>(`#${id}`);
@@ -104,34 +58,19 @@ const publishForm = element<HTMLFormElement>("publish-form");
 const payloadInput = element<HTMLInputElement>("payload");
 
 /**
- * Decode a base64 DER / key query parameter.
- */
-function bytesFromParam(encoded: string): Uint8Array {
-	const binary = atob(encoded);
-	const bytes = new Uint8Array(binary.length);
-	for (let index = 0; index < binary.length; index += 1) {
-		bytes[index] = binary.charCodeAt(index);
-	}
-
-	return bytes;
-}
-
-/**
- * Demo settlement payment matching `tightbeam_ws::testing::DEMO_PAYMENT`.
- */
-const DEMO_PAYMENT = new TextEncoder().encode("tbws-demo-payment-v1");
-
-/**
- * The envelope this page publishes under: always signed, sealed when
- * the board runs sealed.
+ * The envelope this page publishes under: `notes` signed, and sealed under
+ * the topic `cipher` when the board runs sealed.
  */
 function publishEnvelope(
 	seal: boolean,
+	notes: Envelope<Note>,
+	cipher: Aes256Gcm,
 	publisherKey: Secp256k1SigningKey,
 ): Envelope<Note> {
-	const signed = envelope(Notes).signed(publisherKey);
+	const signed = notes.signed(publisherKey);
 	if (seal) {
-		return signed.sealed(Aes256Gcm.fromKey(TOPIC_KEY, TOPIC_KEY_ID));
+		const sealed = signed.sealed(cipher);
+		return sealed;
 	}
 
 	return signed;
@@ -140,20 +79,22 @@ function publishEnvelope(
 /**
  * The envelope this page receives under. The plain board expects its
  * own publishes back untouched. The processed board expects the
- * servlet's rebuild: sealed under the pre-shared key and unsigned.
+ * servlet's rebuild: sealed under the pre-shared topic `cipher` and unsigned.
  */
 function receiveEnvelope(
 	seal: boolean,
 	processed: boolean,
+	notes: Envelope<Note>,
+	cipher: Aes256Gcm,
 	publisherKey: Secp256k1SigningKey,
 ): Envelope<Note> {
 	if (processed) {
-		return envelope(Notes).sealed(
-			Aes256Gcm.fromKey(TOPIC_KEY, TOPIC_KEY_ID),
-		);
+		const sealed = notes.sealed(cipher);
+		return sealed;
 	}
 
-	return publishEnvelope(seal, publisherKey);
+	const published = publishEnvelope(seal, notes, cipher, publisherKey);
+	return published;
 }
 
 /**
@@ -187,7 +128,12 @@ async function publish(
 	const published = Number(publishedCount.textContent);
 	const sequence = published + 1;
 
-	await manager.publish(topic, { author: "board", text }, publishing);
+	await manager.publish(
+		topic,
+		{ author: "board", text },
+		{ envelope: publishing },
+	);
+
 	publishedCount.textContent = String(sequence);
 }
 
@@ -212,28 +158,35 @@ async function main(): Promise<void> {
 
 	const seal = params.get("seal") === "1";
 	const processed = params.get("processed") === "1";
+	const facts = queryFacts(window.location.search);
+	const dial = readDialFacts(facts);
+	const secret = readTopicSecret(facts);
 
-	// Key construction needs the wasm module
-	await initClient();
+	const engine = await TightbeamWsClient.init();
+	const publisherKey = engine.signingKey(new Uint8Array(32).fill(1));
+	const cipher = engine.aes256Gcm(secret);
+	const codec = engine.wrapping(NotePayload);
+	const notes = engine.envelope(codec);
 
-	const publisherKey = Secp256k1SigningKey.fromBytes(
-		new Uint8Array(32).fill(1),
-	);
-	const publishing = publishEnvelope(seal, publisherKey);
-	const receiving = receiveEnvelope(seal, processed, publisherKey);
-
-	const client = await TightbeamWsClient.connectMutual(
-		endpoint,
-		bytesFromParam(cert),
-		bytesFromParam(clientCert),
-		bytesFromParam(clientKey),
-		{
-			budgets: { clientToServer: 4096, serverToClient: 4096 },
-			approveReceipt: (): Uint8Array => DEMO_PAYMENT,
-		},
+	const publishing = publishEnvelope(seal, notes, cipher, publisherKey);
+	const receiving = receiveEnvelope(
+		seal,
+		processed,
+		notes,
+		cipher,
+		publisherKey,
 	);
 
-	const manager = new SubscriptionManager(client);
+	const identity = {
+		serverCertDer: base64ToBytes(cert),
+		clientCertDer: base64ToBytes(clientCert),
+		clientKey: base64ToBytes(clientKey),
+	};
+
+	const options = mutualSessionOptions(dial.paywall);
+	const client = await engine.connectMutual(endpoint, identity, options);
+	const ports = ClientPorts.split(client);
+	const manager = new SubscriptionManager(ports);
 	await manager.subscribe(topic, {
 		envelope: receiving,
 		onUpdate: (note, wrapper) => {

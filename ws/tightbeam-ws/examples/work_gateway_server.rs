@@ -10,10 +10,8 @@
 //! type with a typed transit status.
 //!
 //! Environment:
-//!   - `TBWS_SERVER_CERT`  path to the gateway certificate DER
-//!   - `TBWS_SERVER_KEY`   path to the raw 32-byte gateway signing key
-//!   - `TBWS_WORK_CERT`    path to the shared work certificate DER
-//!   - `TBWS_WORK_KEY`     path to the raw 32-byte shared work signing key
+//!   - `TBWS_SERVER_CERT`  path to the gateway certificate DER, beside its key
+//!   - `TBWS_WORK_CERT`    path to the shared work certificate DER, beside its key
 //!   - `ECHO_WS_PORT`      listen port (default `9104`)
 
 // The colony runtime macros expand `cfg(feature = ...)` probes against the
@@ -23,27 +21,21 @@
 
 use core::fmt::Write;
 use core::future::pending;
-use std::env;
-use std::fs;
 use std::sync::{Arc, OnceLock};
 
 use der::asn1::OctetString;
 use der::Sequence;
-use tightbeam::colony::cluster::{Cluster, ClusterConfig, ClusterTlsConfig};
-use tightbeam::colony::hive::{Hive, HiveConfig, HiveTlsConfig};
+use tightbeam::colony::cluster::Cluster;
+use tightbeam::colony::hive::Hive;
 use tightbeam::colony::servlet::ServletConfig;
 use tightbeam::colony::urn::ColonyNamespace;
-use tightbeam::crypto::profiles::DefaultCryptoProvider;
-use tightbeam::crypto::x509::{KeyPurposes, PeerCertificate, Signing};
 use tightbeam::policy::TransitStatus;
 use tightbeam::trace::TraceCollector;
-use tightbeam::transport::handshake::negotiation::TransportOffer;
-use tightbeam::transport::handshake::PeerAuthentication;
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::urn::Urn;
-use tightbeam::{cluster, compose, hive, servlet, Beamable, Frame, TightBeamError};
+use tightbeam::{cluster, compose, hive, servlet, Beamable, TightBeamError};
 use tightbeam_ws::protocol::WsListener;
-use tightbeam_ws::testing::{env_u32, Identity, SIGNING_KEY_LEN};
+use tightbeam_ws::testing::{EnvVar, Identity, IdentityFiles};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -58,13 +50,12 @@ struct WorkBody {
 /// so the handler never observes an empty slot.
 static WORK_IDENTITY: OnceLock<Identity> = OnceLock::new();
 
-/// Whether `frame` carries a signature that `identity`'s certificate verifies
-/// over the bytes this end received.
-fn signature_verifies(identity: &Identity, frame: &Frame) -> bool {
-	let certificate = identity.certificate().clone();
-	let signer = PeerCertificate::<Signing<DefaultCryptoProvider>>::parse(certificate, KeyPurposes::HOUSE.signer);
-	signer.is_ok_and(|signer| frame.verify(&signer).is_ok())
-}
+/// The variable that sets the listen port of the edge.
+const PORT: EnvVar = EnvVar::new("ECHO_WS_PORT");
+
+/// The variable naming the end-to-end work certificate DER file, which sits
+/// beside its signing key.
+const WORK_CERT: EnvVar = EnvVar::new("TBWS_WORK_CERT");
 
 servlet! {
 	/// Answers the opaque work payload with a signed
@@ -81,7 +72,7 @@ servlet! {
 			return Err(TightBeamError::MissingConfiguration);
 		};
 
-		let signature_valid = signature_verifies(identity, &frame);
+		let signature_valid = identity.verifies(&frame);
 		let payload_hex = hex_string(req.body.as_bytes());
 		let reply = WorkBody {
 			body: OctetString::new(format!("pong:{payload_hex}:{signature_valid}").into_bytes())?,
@@ -105,7 +96,7 @@ hive! {
 
 cluster! {
 	/// TCP colony gateway with a WebSocket edge accept plane. Hives
-	/// register over TCP; the browser submits work over WebSocket.
+	/// register over TCP, and the browser submits work over WebSocket.
 	pub WorkPlaneGateway,
 	protocol: TokioListener,
 	edge: WsListener
@@ -128,82 +119,22 @@ fn servlet_urn(name: &str) -> Result<Urn<'static>, BoxError> {
 	Ok(ColonyNamespace::default().servlet(name)?)
 }
 
-// The four config builders below have a twin in tests/work_plane.rs. The
-// colony feature is dev-only, so no shared module can host these
-// colony-typed helpers. Mirror any edit here in the test twin.
-
-/// Gateway config: the provisioned identity for TLS, the same identity as
-/// the hive-plane trust anchor, a loopback TCP colony bind, the public
-/// WebSocket edge on the fixed port, and an eight-stream mux offer shared
-/// with every accepted connection (including the browser).
-fn cluster_conf(identity: &Identity, port: u32) -> Result<ClusterConfig, BoxError> {
-	let tls = ClusterTlsConfig::from_identity(identity.signing_identity()?, KeyPurposes::HOUSE)?;
-	let tls = tls.with_hive_trust(Some(identity.trust_anchor()?));
-
-	let mut conf = ClusterConfig::new(tls);
-	conf.bind_addr = Some("127.0.0.1:0".into());
-	conf.edge_bind_addr = Some(format!("0.0.0.0:{port}"));
-	conf.pool_config.mux_offer = Some(Arc::new(TransportOffer::mux(8)));
-	Ok(conf)
-}
-
-/// Hive config: control-plane TLS from the provisioned identity plus the
-/// trust anchor for dialing the gateway and the servlet.
-fn hive_conf(identity: &Identity) -> Result<HiveConfig, BoxError> {
-	let authentication = PeerAuthentication::Anonymous;
-	let hive_tls = HiveTlsConfig::from_identity(identity.signing_identity()?, authentication, KeyPurposes::HOUSE)?;
-
-	let mut conf = HiveConfig {
-		trust_store: Some(identity.trust_anchor()?),
-		hive_tls: Some(Arc::new(hive_tls)),
-		..Default::default()
-	};
-	conf.pool.mux_offer = Some(Arc::new(TransportOffer::mux(8)));
-	Ok(conf)
-}
-
-/// Servlet config: encrypted TCP listener under the provisioned identity
-/// with a mux offer matching the hive pool.
-fn servlet_conf(
-	identity: &Identity,
-) -> Result<ServletConfig<TokioListener, WorkBody, DefaultCryptoProvider>, BoxError> {
-	Ok(ServletConfig::<TokioListener, WorkBody, DefaultCryptoProvider>::builder()
-		.with_identity(identity.signing_identity()?, vec![])
-		.with_mux_offer(Some(TransportOffer::mux(8)))
-		.with_config(Arc::new(()))
-		.build())
-}
-
-/// Load the end-to-end work identity named by `TBWS_WORK_CERT` and
-/// `TBWS_WORK_KEY`.
-fn load_work_identity() -> Result<Identity, BoxError> {
-	let cert_path = env::var("TBWS_WORK_CERT").map_err(|_| "TBWS_WORK_CERT is not set")?;
-	let key_path = env::var("TBWS_WORK_KEY").map_err(|_| "TBWS_WORK_KEY is not set")?;
-
-	let certificate = fs::read(&cert_path)?;
-	let bytes = fs::read(&key_path)?;
-	let scalar: [u8; SIGNING_KEY_LEN] = bytes
-		.as_slice()
-		.try_into()
-		.map_err(|_| "work key file must hold exactly 32 bytes")?;
-
-	Ok(Identity::from_der(&certificate, &scalar)?)
-}
-
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
-	let port = env_u32("ECHO_WS_PORT", 9104);
+	let port = PORT.parsed_or(9104u32)?;
 	let identity = Identity::from_env()?;
 
 	// The handler reads the slot on every work item, so it must be full
 	// before the topology starts serving.
-	let _ = WORK_IDENTITY.set(load_work_identity()?);
+	let work_identity = IdentityFiles::from_env(WORK_CERT)?.load()?;
+	let _ = WORK_IDENTITY.set(work_identity);
 
 	let trace = TraceCollector::default();
-	let gateway = WorkPlaneGateway::start(Arc::new(trace.share()), cluster_conf(&identity, port)?).await?;
+	let cluster_config = identity.cluster_config(format!("0.0.0.0:{port}"))?;
+	let gateway = WorkPlaneGateway::start(Arc::new(trace.share()), cluster_config).await?;
 
-	let servlet = WorkProbeServlet::start(Arc::new(trace.share()), servlet_conf(&identity)?).await?;
-	let mut hive = WorkProbeHive::new(Some(hive_conf(&identity)?))?;
+	let servlet = WorkProbeServlet::start(Arc::new(trace.share()), identity.servlet_config()?).await?;
+	let mut hive = WorkProbeHive::new(Some(identity.hive_config()?))?;
 	hive.register(servlet_urn("work-probe")?, servlet, |t| {
 		WorkProbeServlet::start(t, ServletConfig::cleartext())
 	})?;

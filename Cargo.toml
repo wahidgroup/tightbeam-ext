@@ -6,7 +6,7 @@ members = [
 	"pubsub/tightbeam-pubsub",
 	"asn/tightbeam-asn",
 	"asn/tightbeam-asn-derive",
-	"asn/tightbeam-asn-fixtures",
+	"asn/tightbeam-asn-names",
 ]
 
 [workspace.package]
@@ -21,7 +21,7 @@ keywords = ["websocket", "transport", "messaging", "protocol", "tightbeam"]
 categories = ["network-programming", "asynchronous"]
 
 [workspace.dependencies]
-tightbeam-rs = { version = "0.17.0", default-features = false }
+tightbeam-rs = { version = "0.18.0", default-features = false }
 tokio = { version = "1.53.1", default-features = false }
 tokio-tungstenite = { version = "0.30.0", default-features = false }
 futures-util = { version = "0.3.33", default-features = false }

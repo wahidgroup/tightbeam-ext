@@ -1,599 +1,431 @@
-//! JavaScript value helpers for `AsnCodec` wasm expansions.
+//! JavaScript value conversions behind the `AsnCodec` expansion.
 
-use alloc::string::String;
-use alloc::string::ToString;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::str::FromStr;
 
 use der::asn1::{
-	Any, BitString, BmpString, GeneralizedTime, Ia5String, Null, ObjectIdentifier, PrintableString, TeletexString,
-	UtcTime,
+	Any, BitString, BmpString, GeneralizedTime, Ia5String, Null, ObjectIdentifier, OctetString, PrintableString,
+	TeletexString, UtcTime,
 };
-use der::{DateTime, Decode, Encode, Error, ErrorKind, Result};
-use js_sys::{Array, BigInt, Object, Reflect, Uint8Array};
-use wasm_bindgen::JsCast;
-use wasm_bindgen::JsValue;
+use der::{DateTime, Decode, Encode};
+use js_sys::{Array, BigInt, Object, Reflect, TypeError, Uint8Array};
+use wasm_bindgen::{JsCast, JsValue};
 
-/// Read a UTF-8 string field from a plain object.
-pub fn string_field(value: &JsValue, name: impl AsRef<str>) -> Result<String> {
-	as_string(&object_field(value, name)?)
+use crate::FieldError;
+
+/// A JavaScript value that the `AsnCodec` expansion reads one field from.
+#[derive(Clone, Copy)]
+pub struct JsField<'a>(&'a JsValue);
+
+impl<'a> From<&'a JsValue> for JsField<'a> {
+	fn from(value: &'a JsValue) -> Self {
+		Self(value)
+	}
 }
 
-/// Read an octet field from a plain object as a `Uint8Array`.
-pub fn octet_field(value: &JsValue, name: impl AsRef<str>) -> Result<Vec<u8>> {
-	as_octets(&object_field(value, name)?)
-}
+impl<'a> JsField<'a> {
+	/// Interpret a JavaScript value as an object, whatever its prototype.
+	pub fn object(self) -> Result<JsObject<'a>, FieldError> {
+		if self.0.is_object() {
+			return Ok(JsObject(self.0.unchecked_ref()));
+		}
 
-/// Read a nested value field for another `AsnCodec` type.
-pub fn object_field(value: &JsValue, name: impl AsRef<str>) -> Result<JsValue> {
-	let field = Reflect::get(value, &JsValue::from_str(name.as_ref())).map_err(|_| Error::from(ErrorKind::Failed))?;
-	if field.is_undefined() || field.is_null() {
-		return Err(Error::from(ErrorKind::Failed));
+		Err(FieldError::new("an object"))
 	}
 
-	Ok(field)
-}
+	/// The single own key and value of an externally tagged Choice object.
+	pub fn single_entry(self) -> Result<(String, JsValue), FieldError> {
+		const EXPECTED: &str = "an object with one variant key";
 
-/// Read an OPTIONAL field. Missing, `null`, and `undefined` map to `None`.
-pub fn optional_field(value: &JsValue, name: impl AsRef<str>) -> Result<Option<JsValue>> {
-	let field = Reflect::get(value, &JsValue::from_str(name.as_ref())).map_err(|_| Error::from(ErrorKind::Failed))?;
-	if field.is_undefined() || field.is_null() {
-		return Ok(None);
+		let object = self.object().map_err(|_| FieldError::new(EXPECTED))?;
+		let keys = Object::keys(object.0);
+		if keys.length() != 1 {
+			return Err(FieldError::new(EXPECTED));
+		}
+
+		let key = keys.get(0).as_string().ok_or_else(|| FieldError::new(EXPECTED))?;
+		let entry = object.get(&key)?;
+		Ok((key, entry))
 	}
 
-	Ok(Some(field))
-}
-
-/// Read a SEQUENCE OF / SET OF field as a JavaScript `Array`.
-pub fn array_field(value: &JsValue, name: impl AsRef<str>) -> Result<Array> {
-	as_array(&object_field(value, name)?)
-}
-
-/// Read a finite JavaScript number field from a plain object.
-pub fn number_field(value: &JsValue, name: impl AsRef<str>) -> Result<f64> {
-	as_number(&object_field(value, name)?)
-}
-
-/// Read a `u8` INTEGER field from a plain object.
-pub fn u8_field(value: &JsValue, name: impl AsRef<str>) -> Result<u8> {
-	as_u8(&object_field(value, name)?)
-}
-
-/// Read a `bool` BOOLEAN field from a plain object.
-pub fn bool_field(value: &JsValue, name: impl AsRef<str>) -> Result<bool> {
-	as_bool(&object_field(value, name)?)
-}
-
-/// Read a NULL field that must be JS `null`.
-pub fn null_field(value: &JsValue, name: impl AsRef<str>) -> Result<Null> {
-	let field = Reflect::get(value, &JsValue::from_str(name.as_ref())).map_err(|_| Error::from(ErrorKind::Failed))?;
-	as_null(&field)
-}
-
-/// Read a range-checked signed or unsigned INTEGER number field.
-pub fn i8_field(value: &JsValue, name: impl AsRef<str>) -> Result<i8> {
-	as_i8(&object_field(value, name)?)
-}
-
-/// Read a range-checked `u16` INTEGER field.
-pub fn u16_field(value: &JsValue, name: impl AsRef<str>) -> Result<u16> {
-	as_u16(&object_field(value, name)?)
-}
-
-/// Read a range-checked `i16` INTEGER field.
-pub fn i16_field(value: &JsValue, name: impl AsRef<str>) -> Result<i16> {
-	as_i16(&object_field(value, name)?)
-}
-
-/// Read a range-checked `u32` INTEGER field.
-pub fn u32_field(value: &JsValue, name: impl AsRef<str>) -> Result<u32> {
-	as_u32(&object_field(value, name)?)
-}
-
-/// Read a range-checked `i32` INTEGER field.
-pub fn i32_field(value: &JsValue, name: impl AsRef<str>) -> Result<i32> {
-	as_i32(&object_field(value, name)?)
-}
-
-/// Read a `u64` INTEGER field that must be a JS bigint.
-pub fn u64_field(value: &JsValue, name: impl AsRef<str>) -> Result<u64> {
-	as_u64(&object_field(value, name)?)
-}
-
-/// Read an `i64` INTEGER field that must be a JS bigint.
-pub fn i64_field(value: &JsValue, name: impl AsRef<str>) -> Result<i64> {
-	as_i64(&object_field(value, name)?)
-}
-
-/// Read an OBJECT IDENTIFIER field as a dotted string.
-pub fn oid_field(value: &JsValue, name: impl AsRef<str>) -> Result<ObjectIdentifier> {
-	as_oid(&object_field(value, name)?)
-}
-
-/// Read an ANY field as opaque DER bytes.
-pub fn any_field(value: &JsValue, name: impl AsRef<str>) -> Result<Any> {
-	as_any(&object_field(value, name)?)
-}
-
-/// Read a BIT STRING field as `{ unusedBits, bytes }`.
-pub fn bitstring_field(value: &JsValue, name: impl AsRef<str>) -> Result<BitString> {
-	as_bitstring(&object_field(value, name)?)
-}
-
-/// Read a UTCTime field as an RFC 3339 string.
-pub fn utc_time_field(value: &JsValue, name: impl AsRef<str>) -> Result<UtcTime> {
-	as_utc_time(&object_field(value, name)?)
-}
-
-/// Read a GeneralizedTime field as an RFC 3339 string.
-pub fn generalized_time_field(value: &JsValue, name: impl AsRef<str>) -> Result<GeneralizedTime> {
-	as_generalized_time(&object_field(value, name)?)
-}
-
-/// Read an IA5String field validated by the der constructor.
-pub fn ia5_string_field(value: &JsValue, name: impl AsRef<str>) -> Result<Ia5String> {
-	as_ia5_string(&object_field(value, name)?)
-}
-
-/// Read a PrintableString field validated by the der constructor.
-pub fn printable_string_field(value: &JsValue, name: impl AsRef<str>) -> Result<PrintableString> {
-	as_printable_string(&object_field(value, name)?)
-}
-
-/// Read a TeletexString field validated by the der constructor.
-pub fn teletex_string_field(value: &JsValue, name: impl AsRef<str>) -> Result<TeletexString> {
-	as_teletex_string(&object_field(value, name)?)
-}
-
-/// Read a BmpString field validated by the der constructor.
-pub fn bmp_string_field(value: &JsValue, name: impl AsRef<str>) -> Result<BmpString> {
-	as_bmp_string(&object_field(value, name)?)
-}
-
-/// Interpret a JavaScript value as a UTF-8 string.
-pub fn as_string(value: &JsValue) -> Result<String> {
-	value.as_string().ok_or_else(|| Error::from(ErrorKind::Failed))
-}
-
-/// Interpret a JavaScript value as octet bytes from a `Uint8Array`.
-pub fn as_octets(value: &JsValue) -> Result<Vec<u8>> {
-	let array = value.dyn_ref::<Uint8Array>().ok_or_else(|| Error::from(ErrorKind::Failed))?;
-	Ok(array.to_vec())
-}
-
-/// Interpret a JavaScript value as a finite number.
-pub fn as_number(value: &JsValue) -> Result<f64> {
-	value.as_f64().ok_or_else(|| Error::from(ErrorKind::Failed))
-}
-
-/// Interpret a JavaScript value as a `u8` discriminant or INTEGER.
-pub fn as_u8(value: &JsValue) -> Result<u8> {
-	f64_as_unsigned(as_number(value)?, u8::MAX as f64).map(|n| n as u8)
-}
-
-/// Interpret a JavaScript value as a BOOLEAN.
-pub fn as_bool(value: &JsValue) -> Result<bool> {
-	value.as_bool().ok_or_else(|| Error::from(ErrorKind::Failed))
-}
-
-/// Interpret a JavaScript `null` as ASN.1 NULL.
-pub fn as_null(value: &JsValue) -> Result<Null> {
-	if value.is_null() {
-		return Ok(Null);
-	}
-	Err(Error::from(ErrorKind::Failed))
-}
-
-/// Interpret a JavaScript number as an `i8` INTEGER.
-pub fn as_i8(value: &JsValue) -> Result<i8> {
-	f64_as_signed(as_number(value)?, i8::MIN as f64, i8::MAX as f64).map(|n| n as i8)
-}
-
-/// Interpret a JavaScript number as a `u16` INTEGER.
-pub fn as_u16(value: &JsValue) -> Result<u16> {
-	f64_as_unsigned(as_number(value)?, u16::MAX as f64).map(|n| n as u16)
-}
-
-/// Interpret a JavaScript number as an `i16` INTEGER.
-pub fn as_i16(value: &JsValue) -> Result<i16> {
-	f64_as_signed(as_number(value)?, i16::MIN as f64, i16::MAX as f64).map(|n| n as i16)
-}
-
-/// Interpret a JavaScript number as a `u32` INTEGER.
-pub fn as_u32(value: &JsValue) -> Result<u32> {
-	f64_as_unsigned(as_number(value)?, u32::MAX as f64).map(|n| n as u32)
-}
-
-/// Interpret a JavaScript number as an `i32` INTEGER.
-pub fn as_i32(value: &JsValue) -> Result<i32> {
-	f64_as_signed(as_number(value)?, i32::MIN as f64, i32::MAX as f64).map(|n| n as i32)
-}
-
-/// Interpret a JavaScript bigint as a `u64` INTEGER. JS numbers are rejected.
-pub fn as_u64(value: &JsValue) -> Result<u64> {
-	let bigint = as_bigint(value)?;
-	u64::try_from(bigint).map_err(|_| Error::from(ErrorKind::Failed))
-}
-
-/// Interpret a JavaScript bigint as an `i64` INTEGER. JS numbers are rejected.
-pub fn as_i64(value: &JsValue) -> Result<i64> {
-	let bigint = as_bigint(value)?;
-	i64::try_from(bigint).map_err(|_| Error::from(ErrorKind::Failed))
-}
-
-/// Interpret a dotted string as an OBJECT IDENTIFIER.
-pub fn as_oid(value: &JsValue) -> Result<ObjectIdentifier> {
-	let text = as_string(value)?;
-	ObjectIdentifier::new(&text).map_err(Error::from)
-}
-
-/// Interpret opaque DER bytes as an ANY value.
-pub fn as_any(value: &JsValue) -> Result<Any> {
-	let bytes = as_octets(value)?;
-	Any::from_der(&bytes)
-}
-
-/// Interpret `{ unusedBits, bytes }` as a BIT STRING.
-pub fn as_bitstring(value: &JsValue) -> Result<BitString> {
-	let unused_bits = u8_field(value, "unusedBits")?;
-	let bytes = octet_field(value, "bytes")?;
-	BitString::new(unused_bits, bytes)
-}
-
-/// Interpret an RFC 3339 string as UTCTime.
-pub fn as_utc_time(value: &JsValue) -> Result<UtcTime> {
-	let text = as_string(value)?;
-	let datetime = DateTime::from_str(&text)?;
-	UtcTime::from_date_time(datetime)
-}
-
-/// Interpret an RFC 3339 string as GeneralizedTime.
-pub fn as_generalized_time(value: &JsValue) -> Result<GeneralizedTime> {
-	let text = as_string(value)?;
-	let datetime = DateTime::from_str(&text)?;
-	Ok(GeneralizedTime::from_date_time(datetime))
-}
-
-/// Interpret a string as IA5String through the der constructor.
-pub fn as_ia5_string(value: &JsValue) -> Result<Ia5String> {
-	Ia5String::new(&as_string(value)?)
-}
-
-/// Interpret a string as PrintableString through the der constructor.
-pub fn as_printable_string(value: &JsValue) -> Result<PrintableString> {
-	PrintableString::new(&as_string(value)?)
-}
-
-/// Interpret a string as TeletexString through the der constructor.
-pub fn as_teletex_string(value: &JsValue) -> Result<TeletexString> {
-	TeletexString::new(&as_string(value)?)
-}
-
-/// Interpret a string as BmpString through the der constructor.
-pub fn as_bmp_string(value: &JsValue) -> Result<BmpString> {
-	BmpString::from_utf8(&as_string(value)?)
-}
-
-/// Interpret a JavaScript value as an `Array`.
-pub fn as_array(value: &JsValue) -> Result<Array> {
-	value.dyn_ref::<Array>().cloned().ok_or_else(|| Error::from(ErrorKind::Failed))
-}
-
-/// Interpret a JavaScript value as an `Array` with an exact length.
-pub fn as_array_len(value: &JsValue, expected: usize) -> Result<Array> {
-	let array = as_array(value)?;
-	if (array.length() as usize) != expected {
-		return Err(Error::from(ErrorKind::Failed));
-	}
-	Ok(array)
-}
-
-/// Project a `u8` as a JavaScript number.
-pub fn from_u8(value: u8) -> JsValue {
-	JsValue::from(f64::from(value))
-}
-
-/// Project a bool as a JavaScript boolean.
-pub fn from_bool(value: bool) -> JsValue {
-	JsValue::from(value)
-}
-
-/// Project ASN.1 NULL as JavaScript `null`.
-pub fn from_null(_value: Null) -> JsValue {
-	JsValue::NULL
-}
-
-/// Project a `u16` as a JavaScript number.
-pub fn from_u16(value: u16) -> JsValue {
-	JsValue::from(f64::from(value))
-}
-
-/// Project an `i8` as a JavaScript number.
-pub fn from_i8(value: i8) -> JsValue {
-	JsValue::from(f64::from(value))
-}
-
-/// Project an `i16` as a JavaScript number.
-pub fn from_i16(value: i16) -> JsValue {
-	JsValue::from(f64::from(value))
-}
-
-/// Project a `u32` as a JavaScript number.
-pub fn from_u32(value: u32) -> JsValue {
-	JsValue::from(f64::from(value))
-}
-
-/// Project an `i32` as a JavaScript number.
-pub fn from_i32(value: i32) -> JsValue {
-	JsValue::from(f64::from(value))
-}
-
-/// Project a `u64` as a JavaScript bigint.
-pub fn from_u64(value: u64) -> JsValue {
-	JsValue::from(BigInt::from(value))
-}
-
-/// Project an `i64` as a JavaScript bigint.
-pub fn from_i64(value: i64) -> JsValue {
-	JsValue::from(BigInt::from(value))
-}
-
-/// Project an OBJECT IDENTIFIER as a dotted string.
-pub fn from_oid(value: &ObjectIdentifier) -> JsValue {
-	JsValue::from_str(&value.to_string())
-}
-
-/// Project an ANY value as its full DER encoding.
-pub fn from_any(value: &Any) -> Result<JsValue> {
-	Ok(from_octets(value.to_der()?))
-}
-
-/// Project a BIT STRING as `{ unusedBits, bytes }`.
-pub fn from_bitstring(value: &BitString) -> Result<JsValue> {
-	let object = object()?;
-	set_u8(&object, "unusedBits", value.unused_bits())?;
-	set_octets(&object, "bytes", value.raw_bytes())?;
-	Ok(object)
-}
-
-/// Project UTCTime as an RFC 3339 string.
-pub fn from_utc_time(value: &UtcTime) -> JsValue {
-	JsValue::from_str(&value.to_date_time().to_string())
-}
-
-/// Project GeneralizedTime as an RFC 3339 string.
-pub fn from_generalized_time(value: &GeneralizedTime) -> JsValue {
-	JsValue::from_str(&value.to_date_time().to_string())
-}
-
-/// Project an IA5String as a JS string.
-pub fn from_ia5_string(value: &Ia5String) -> JsValue {
-	JsValue::from_str(value.as_str())
-}
-
-/// Project a PrintableString as a JS string.
-pub fn from_printable_string(value: &PrintableString) -> JsValue {
-	JsValue::from_str(value.as_str())
-}
-
-/// Project a TeletexString as a JS string.
-pub fn from_teletex_string(value: &TeletexString) -> JsValue {
-	JsValue::from_str(value.as_str())
-}
-
-/// Project a BmpString as a JS string.
-pub fn from_bmp_string(value: &BmpString) -> JsValue {
-	JsValue::from_str(&value.to_string())
-}
-
-/// Project octet bytes as a `Uint8Array` JavaScript value.
-pub fn from_octets(value: impl AsRef<[u8]>) -> JsValue {
-	JsValue::from(Uint8Array::from(value.as_ref()))
-}
-
-/// Empty JavaScript `Array` used when projecting SEQUENCE OF / SET OF fields.
-pub fn array() -> Array {
-	Array::new()
-}
-
-/// Single own enumerable string key and value for Choice tag objects.
-pub fn single_entry(value: &JsValue) -> Result<(String, JsValue)> {
-	let object = value.dyn_ref::<Object>().ok_or_else(|| Error::from(ErrorKind::Failed))?;
-	let keys = Object::keys(object);
-	if keys.length() != 1 {
-		return Err(Error::from(ErrorKind::Failed));
+	/// Interpret a JavaScript value as a UTF-8 string.
+	pub fn string(self) -> Result<String, FieldError> {
+		self.0.as_string().ok_or_else(|| FieldError::new("a string"))
 	}
 
-	let key_value = keys.get(0);
-	let key = key_value.as_string().ok_or_else(|| Error::from(ErrorKind::Failed))?;
-	let entry = Reflect::get(value, &key_value).map_err(|_| Error::from(ErrorKind::Failed))?;
-	if entry.is_undefined() || entry.is_null() {
-		return Err(Error::from(ErrorKind::Failed));
+	/// Interpret a JavaScript value as a BOOLEAN.
+	pub fn bool(self) -> Result<bool, FieldError> {
+		self.0.as_bool().ok_or_else(|| FieldError::new("a boolean"))
 	}
 
-	Ok((key, entry))
-}
+	/// Interpret JavaScript `null` as ASN.1 NULL.
+	pub fn null(self) -> Result<Null, FieldError> {
+		if self.0.is_null() {
+			return Ok(Null);
+		}
 
-/// Empty plain object used when projecting Sequence and Choice values.
-pub fn object() -> Result<JsValue> {
-	Ok(JsValue::from(Object::new()))
-}
-
-/// Set a UTF-8 string field on a plain object.
-pub fn set_string(object: &JsValue, name: impl AsRef<str>, value: impl AsRef<str>) -> Result<()> {
-	Reflect::set(object, &JsValue::from_str(name.as_ref()), &JsValue::from_str(value.as_ref()))
-		.map_err(|_| Error::from(ErrorKind::Failed))?;
-	Ok(())
-}
-
-/// Set an octet field on a plain object as a `Uint8Array`.
-pub fn set_octets(object: &JsValue, name: impl AsRef<str>, value: impl AsRef<[u8]>) -> Result<()> {
-	Reflect::set(object, &JsValue::from_str(name.as_ref()), &from_octets(value))
-		.map_err(|_| Error::from(ErrorKind::Failed))?;
-	Ok(())
-}
-
-/// Set a nested value field from another `AsnCodec` value.
-pub fn set_object(object: &JsValue, name: impl AsRef<str>, value: &JsValue) -> Result<()> {
-	Reflect::set(object, &JsValue::from_str(name.as_ref()), value).map_err(|_| Error::from(ErrorKind::Failed))?;
-	Ok(())
-}
-
-/// Set a SEQUENCE OF / SET OF field from a JavaScript `Array`.
-pub fn set_array(object: &JsValue, name: impl AsRef<str>, value: &Array) -> Result<()> {
-	Reflect::set(object, &JsValue::from_str(name.as_ref()), value).map_err(|_| Error::from(ErrorKind::Failed))?;
-	Ok(())
-}
-
-/// Set a JavaScript number field on a plain object.
-pub fn set_number(object: &JsValue, name: impl AsRef<str>, value: f64) -> Result<()> {
-	Reflect::set(object, &JsValue::from_str(name.as_ref()), &JsValue::from(value))
-		.map_err(|_| Error::from(ErrorKind::Failed))?;
-	Ok(())
-}
-
-/// Set a `u8` INTEGER field on a plain object.
-pub fn set_u8(object: &JsValue, name: impl AsRef<str>, value: u8) -> Result<()> {
-	set_number(object, name, f64::from(value))
-}
-
-/// Set a BOOLEAN field on a plain object.
-pub fn set_bool(object: &JsValue, name: impl AsRef<str>, value: bool) -> Result<()> {
-	Reflect::set(object, &JsValue::from_str(name.as_ref()), &from_bool(value))
-		.map_err(|_| Error::from(ErrorKind::Failed))?;
-	Ok(())
-}
-
-/// Set a NULL field on a plain object as JS `null`.
-pub fn set_null(object: &JsValue, name: impl AsRef<str>, value: Null) -> Result<()> {
-	Reflect::set(object, &JsValue::from_str(name.as_ref()), &from_null(value))
-		.map_err(|_| Error::from(ErrorKind::Failed))?;
-	Ok(())
-}
-
-/// Set an `i8` INTEGER field on a plain object.
-pub fn set_i8(object: &JsValue, name: impl AsRef<str>, value: i8) -> Result<()> {
-	set_number(object, name, f64::from(value))
-}
-
-/// Set a `u16` INTEGER field on a plain object.
-pub fn set_u16(object: &JsValue, name: impl AsRef<str>, value: u16) -> Result<()> {
-	set_number(object, name, f64::from(value))
-}
-
-/// Set an `i16` INTEGER field on a plain object.
-pub fn set_i16(object: &JsValue, name: impl AsRef<str>, value: i16) -> Result<()> {
-	set_number(object, name, f64::from(value))
-}
-
-/// Set a `u32` INTEGER field on a plain object.
-pub fn set_u32(object: &JsValue, name: impl AsRef<str>, value: u32) -> Result<()> {
-	set_number(object, name, f64::from(value))
-}
-
-/// Set an `i32` INTEGER field on a plain object.
-pub fn set_i32(object: &JsValue, name: impl AsRef<str>, value: i32) -> Result<()> {
-	set_number(object, name, f64::from(value))
-}
-
-/// Set a `u64` INTEGER field on a plain object as a bigint.
-pub fn set_u64(object: &JsValue, name: impl AsRef<str>, value: u64) -> Result<()> {
-	Reflect::set(object, &JsValue::from_str(name.as_ref()), &from_u64(value))
-		.map_err(|_| Error::from(ErrorKind::Failed))?;
-	Ok(())
-}
-
-/// Set an `i64` INTEGER field on a plain object as a bigint.
-pub fn set_i64(object: &JsValue, name: impl AsRef<str>, value: i64) -> Result<()> {
-	Reflect::set(object, &JsValue::from_str(name.as_ref()), &from_i64(value))
-		.map_err(|_| Error::from(ErrorKind::Failed))?;
-	Ok(())
-}
-
-/// Set an OBJECT IDENTIFIER field from its dotted string form.
-pub fn set_oid(object: &JsValue, name: impl AsRef<str>, value: &ObjectIdentifier) -> Result<()> {
-	set_string(object, name, value.to_string())
-}
-
-/// Set an ANY field from its full DER encoding.
-pub fn set_any(object: &JsValue, name: impl AsRef<str>, value: &Any) -> Result<()> {
-	let encoded = from_any(value)?;
-	set_object(object, name, &encoded)
-}
-
-/// Set a BIT STRING field as `{ unusedBits, bytes }`.
-pub fn set_bitstring(object: &JsValue, name: impl AsRef<str>, value: &BitString) -> Result<()> {
-	let encoded = from_bitstring(value)?;
-	set_object(object, name, &encoded)
-}
-
-/// Set a UTCTime field from its RFC 3339 string form.
-pub fn set_utc_time(object: &JsValue, name: impl AsRef<str>, value: &UtcTime) -> Result<()> {
-	set_string(object, name, value.to_date_time().to_string())
-}
-
-/// Set a GeneralizedTime field from its RFC 3339 string form.
-pub fn set_generalized_time(object: &JsValue, name: impl AsRef<str>, value: &GeneralizedTime) -> Result<()> {
-	set_string(object, name, value.to_date_time().to_string())
-}
-
-/// Set an IA5String field.
-pub fn set_ia5_string(object: &JsValue, name: impl AsRef<str>, value: &Ia5String) -> Result<()> {
-	set_string(object, name, value.as_str())
-}
-
-/// Set a PrintableString field.
-pub fn set_printable_string(object: &JsValue, name: impl AsRef<str>, value: &PrintableString) -> Result<()> {
-	set_string(object, name, value.as_str())
-}
-
-/// Set a TeletexString field.
-pub fn set_teletex_string(object: &JsValue, name: impl AsRef<str>, value: &TeletexString) -> Result<()> {
-	set_string(object, name, value.as_str())
-}
-
-/// Set a BmpString field.
-pub fn set_bmp_string(object: &JsValue, name: impl AsRef<str>, value: &BmpString) -> Result<()> {
-	set_string(object, name, value.to_string())
-}
-
-/// Convert a `der::Error` into a JavaScript exception value.
-pub fn to_js_error(error: Error) -> JsValue {
-	JsValue::from_str(&alloc::format!("{error}"))
-}
-
-fn as_bigint(value: &JsValue) -> Result<BigInt> {
-	if !value.is_bigint() {
-		return Err(Error::from(ErrorKind::Failed));
+		Err(FieldError::new("null"))
 	}
 
-	value.clone().dyn_into::<BigInt>().map_err(|_| Error::from(ErrorKind::Failed))
+	/// Interpret a JavaScript number as a `u8` INTEGER.
+	pub fn u8(self) -> Result<u8, FieldError> {
+		let number = self.integer(0.0, f64::from(u8::MAX), "an integer in the u8 range")?;
+		Ok(number as u8)
+	}
+
+	/// Interpret a JavaScript number as a `u16` INTEGER.
+	pub fn u16(self) -> Result<u16, FieldError> {
+		let number = self.integer(0.0, f64::from(u16::MAX), "an integer in the u16 range")?;
+		Ok(number as u16)
+	}
+
+	/// Interpret a JavaScript number as a `u32` INTEGER.
+	pub fn u32(self) -> Result<u32, FieldError> {
+		let number = self.integer(0.0, f64::from(u32::MAX), "an integer in the u32 range")?;
+		Ok(number as u32)
+	}
+
+	/// Interpret a JavaScript number as an `i8` INTEGER.
+	pub fn i8(self) -> Result<i8, FieldError> {
+		let number = self.integer(f64::from(i8::MIN), f64::from(i8::MAX), "an integer in the i8 range")?;
+		Ok(number as i8)
+	}
+
+	/// Interpret a JavaScript number as an `i16` INTEGER.
+	pub fn i16(self) -> Result<i16, FieldError> {
+		let number = self.integer(f64::from(i16::MIN), f64::from(i16::MAX), "an integer in the i16 range")?;
+		Ok(number as i16)
+	}
+
+	/// Interpret a JavaScript number as an `i32` INTEGER.
+	pub fn i32(self) -> Result<i32, FieldError> {
+		let number = self.integer(f64::from(i32::MIN), f64::from(i32::MAX), "an integer in the i32 range")?;
+		Ok(number as i32)
+	}
+
+	/// Interpret a JavaScript bigint as a `u64` INTEGER. A JS number is
+	/// refused.
+	pub fn u64(self) -> Result<u64, FieldError> {
+		const EXPECTED: &str = "a bigint in the u64 range";
+
+		let bigint = self.bigint(EXPECTED)?;
+		u64::try_from(bigint).map_err(|_| FieldError::new(EXPECTED))
+	}
+
+	/// Interpret a JavaScript bigint as an `i64` INTEGER. A JS number is
+	/// refused.
+	pub fn i64(self) -> Result<i64, FieldError> {
+		const EXPECTED: &str = "a bigint in the i64 range";
+
+		let bigint = self.bigint(EXPECTED)?;
+		i64::try_from(bigint).map_err(|_| FieldError::new(EXPECTED))
+	}
+
+	/// Interpret a `Uint8Array` as an OCTET STRING.
+	pub fn octet_string(self) -> Result<OctetString, FieldError> {
+		const EXPECTED: &str = "a Uint8Array within the der length limit";
+
+		let octets = self.octets()?;
+		OctetString::new(octets).map_err(|cause| FieldError::refused(EXPECTED, cause))
+	}
+
+	/// Interpret `{ unusedBits, bytes }` as a BIT STRING.
+	pub fn bitstring(self) -> Result<BitString, FieldError> {
+		let object = self.object()?;
+
+		let unused_bits = object.get("unusedBits")?;
+		let unused_bits = JsField(&unused_bits).u8().map_err(|error| error.within("unusedBits"))?;
+		let bytes = object.get("bytes")?;
+		let bytes = JsField(&bytes).octets().map_err(|error| error.within("bytes"))?;
+		BitString::new(unused_bits, bytes).map_err(|cause| FieldError::refused("a BIT STRING", cause))
+	}
+
+	/// Interpret a dotted string as an OBJECT IDENTIFIER.
+	pub fn oid(self) -> Result<ObjectIdentifier, FieldError> {
+		const EXPECTED: &str = "a dotted OBJECT IDENTIFIER";
+
+		let text = self.string().map_err(|_| FieldError::new(EXPECTED))?;
+		ObjectIdentifier::new(&text).map_err(|cause| FieldError::refused(EXPECTED, cause.into()))
+	}
+
+	/// Interpret opaque DER bytes as an ANY self.0.
+	pub fn any(self) -> Result<Any, FieldError> {
+		const EXPECTED: &str = "a Uint8Array holding one DER value";
+
+		let bytes = self.octets().map_err(|_| FieldError::new(EXPECTED))?;
+		Any::from_der(&bytes).map_err(|cause| FieldError::refused(EXPECTED, cause))
+	}
+
+	/// Interpret a `YYYY-MM-DDTHH:MM:SSZ` string as UTCTime.
+	pub fn utc_time(self) -> Result<UtcTime, FieldError> {
+		const EXPECTED: &str = "a YYYY-MM-DDTHH:MM:SSZ time from 1970 to 2049";
+
+		let datetime = self.date_time(EXPECTED)?;
+		UtcTime::from_date_time(datetime).map_err(|cause| FieldError::refused(EXPECTED, cause))
+	}
+
+	/// Interpret a `YYYY-MM-DDTHH:MM:SSZ` string as GeneralizedTime.
+	pub fn generalized_time(self) -> Result<GeneralizedTime, FieldError> {
+		let datetime = self.date_time("a YYYY-MM-DDTHH:MM:SSZ time from 1970 to 9999")?;
+		Ok(GeneralizedTime::from_date_time(datetime))
+	}
+
+	/// Interpret a string as IA5String through the der constructor.
+	pub fn ia5_string(self) -> Result<Ia5String, FieldError> {
+		const EXPECTED: &str = "an IA5String";
+
+		let text = self.string().map_err(|_| FieldError::new(EXPECTED))?;
+		Ia5String::new(&text).map_err(|cause| FieldError::refused(EXPECTED, cause))
+	}
+
+	/// Interpret a string as PrintableString through the der constructor.
+	pub fn printable_string(self) -> Result<PrintableString, FieldError> {
+		const EXPECTED: &str = "a PrintableString";
+
+		let text = self.string().map_err(|_| FieldError::new(EXPECTED))?;
+		PrintableString::new(&text).map_err(|cause| FieldError::refused(EXPECTED, cause))
+	}
+
+	/// Interpret a string as TeletexString through the der constructor.
+	pub fn teletex_string(self) -> Result<TeletexString, FieldError> {
+		const EXPECTED: &str = "a TeletexString";
+
+		let text = self.string().map_err(|_| FieldError::new(EXPECTED))?;
+		TeletexString::new(&text).map_err(|cause| FieldError::refused(EXPECTED, cause))
+	}
+
+	/// Interpret a string as BmpString through the der constructor.
+	pub fn bmp_string(self) -> Result<BmpString, FieldError> {
+		const EXPECTED: &str = "a BmpString";
+
+		let text = self.string().map_err(|_| FieldError::new(EXPECTED))?;
+		BmpString::from_utf8(&text).map_err(|cause| FieldError::refused(EXPECTED, cause))
+	}
+
+	/// Interpret a JavaScript value as an `Array`.
+	pub fn array(self) -> Result<Array, FieldError> {
+		self.0.dyn_ref::<Array>().cloned().ok_or_else(|| FieldError::new("an Array"))
+	}
+
+	fn octets(self) -> Result<Vec<u8>, FieldError> {
+		let array = self.0.dyn_ref::<Uint8Array>().ok_or_else(|| FieldError::new("a Uint8Array"))?;
+		Ok(array.to_vec())
+	}
+
+	fn date_time(self, expected: &'static str) -> Result<DateTime, FieldError> {
+		let text = self.string().map_err(|_| FieldError::new(expected))?;
+		DateTime::from_str(&text).map_err(|cause| FieldError::refused(expected, cause))
+	}
+
+	fn bigint(self, expected: &'static str) -> Result<BigInt, FieldError> {
+		if !self.0.is_bigint() {
+			return Err(FieldError::new(expected));
+		}
+
+		self.0.clone().dyn_into::<BigInt>().map_err(|_| FieldError::new(expected))
+	}
+
+	fn integer(self, min: f64, max: f64, expected: &'static str) -> Result<f64, FieldError> {
+		let number = self.0.as_f64().ok_or_else(|| FieldError::new(expected))?;
+		if !number.is_finite() || number.fract() != 0.0 || number < min || number > max {
+			return Err(FieldError::new(expected));
+		}
+
+		Ok(number)
+	}
 }
 
-fn f64_as_unsigned(number: f64, max: f64) -> Result<f64> {
-	if !number.is_finite() {
-		return Err(Error::from(ErrorKind::Failed));
-	}
-	if number.fract() != 0.0 {
-		return Err(Error::from(ErrorKind::Failed));
-	}
-	if number < 0.0 || number > max {
-		return Err(Error::from(ErrorKind::Failed));
-	}
+/// An object that the expansion reads its fields from.
+#[derive(Clone, Copy)]
+pub struct JsObject<'a>(&'a Object);
 
-	Ok(number)
+impl JsObject<'_> {
+	/// Read the property `key`. A missing key reads as `undefined`, which every
+	/// conversion refuses except an absent OPTIONAL.
+	pub fn get(self, key: &str) -> Result<JsValue, FieldError> {
+		Reflect::get(self.0, &JsValue::from_str(key)).map_err(|_| FieldError::new("a readable object").within(key))
+	}
 }
 
-fn f64_as_signed(number: f64, min: f64, max: f64) -> Result<f64> {
-	if !number.is_finite() {
-		return Err(Error::from(ErrorKind::Failed));
-	}
-	if number.fract() != 0.0 {
-		return Err(Error::from(ErrorKind::Failed));
-	}
-	if number < min || number > max {
-		return Err(Error::from(ErrorKind::Failed));
-	}
+/// A plain object that the expansion writes its fields onto.
+pub struct JsRecord(JsValue);
 
-	Ok(number)
+impl Default for JsRecord {
+	/// An empty plain object.
+	fn default() -> Self {
+		Self(JsValue::from(Object::new()))
+	}
+}
+
+impl JsRecord {
+	/// Write the property `key`.
+	pub fn set(&self, key: &str, value: &JsValue) -> Result<(), FieldError> {
+		let written = Reflect::set(&self.0, &JsValue::from_str(key), value);
+		written.map(|_| ()).map_err(|_| FieldError::new("a writable object"))
+	}
+}
+
+impl From<JsRecord> for JsValue {
+	fn from(record: JsRecord) -> Self {
+		record.0
+	}
+}
+
+/// An `Array` that the expansion pushes the items of a collection onto.
+pub struct JsList(Array);
+
+impl Default for JsList {
+	/// An empty `Array`.
+	fn default() -> Self {
+		Self(Array::new())
+	}
+}
+
+impl JsList {
+	/// Push one item.
+	pub fn push(&self, item: &JsValue) {
+		self.0.push(item);
+	}
+}
+
+impl From<JsList> for JsValue {
+	fn from(list: JsList) -> Self {
+		JsValue::from(list.0)
+	}
+}
+
+impl From<FieldError> for JsValue {
+	/// A shape failure as a JavaScript `TypeError`.
+	fn from(error: FieldError) -> Self {
+		TypeError::new(&error.to_string()).into()
+	}
+}
+
+/// A DER failure, as the JavaScript `Error` the expansion throws.
+pub struct WireError(pub der::Error);
+
+impl From<WireError> for JsValue {
+	fn from(error: WireError) -> Self {
+		js_sys::Error::new(&error.0.to_string()).into()
+	}
+}
+
+/// A Rust value that the expansion projects onto a JavaScript value.
+pub trait JsProjection {
+	/// This value as JavaScript.
+	///
+	/// # Errors
+	///
+	/// - [`FieldError`]: the value does not project, as an ANY that fails to
+	///   encode.
+	fn project(&self) -> Result<JsValue, FieldError>;
+}
+
+/// Projects each integer type of at most 32 bits as a JavaScript number.
+macro_rules! project_number {
+	($($number:ty),*) => {
+		$(
+			impl JsProjection for $number {
+				fn project(&self) -> Result<JsValue, FieldError> {
+					Ok(JsValue::from(f64::from(*self)))
+				}
+			}
+		)*
+	};
+}
+
+project_number!(u8, u16, u32, i8, i16, i32);
+
+impl JsProjection for bool {
+	fn project(&self) -> Result<JsValue, FieldError> {
+		Ok(JsValue::from(*self))
+	}
+}
+
+impl JsProjection for u64 {
+	/// A `u64` as a JavaScript bigint.
+	fn project(&self) -> Result<JsValue, FieldError> {
+		Ok(JsValue::from(BigInt::from(*self)))
+	}
+}
+
+impl JsProjection for i64 {
+	/// An `i64` as a JavaScript bigint.
+	fn project(&self) -> Result<JsValue, FieldError> {
+		Ok(JsValue::from(BigInt::from(*self)))
+	}
+}
+
+impl JsProjection for OctetString {
+	/// An OCTET STRING as a `Uint8Array`.
+	fn project(&self) -> Result<JsValue, FieldError> {
+		Ok(JsValue::from(Uint8Array::from(self.as_bytes())))
+	}
+}
+
+impl JsProjection for BitString {
+	/// A BIT STRING as `{ unusedBits, bytes }`.
+	fn project(&self) -> Result<JsValue, FieldError> {
+		let record = JsRecord::default();
+		let unused_bits = self.unused_bits().project()?;
+		let bytes = JsValue::from(Uint8Array::from(self.raw_bytes()));
+		record.set("unusedBits", &unused_bits)?;
+		record.set("bytes", &bytes)?;
+
+		Ok(record.into())
+	}
+}
+
+impl JsProjection for ObjectIdentifier {
+	/// An OBJECT IDENTIFIER as a dotted string.
+	fn project(&self) -> Result<JsValue, FieldError> {
+		Ok(JsValue::from_str(&self.to_string()))
+	}
+}
+
+impl JsProjection for Any {
+	/// An ANY value as its full DER encoding.
+	fn project(&self) -> Result<JsValue, FieldError> {
+		let encoded = self.to_der()?;
+		Ok(JsValue::from(Uint8Array::from(encoded.as_slice())))
+	}
+}
+
+impl JsProjection for UtcTime {
+	/// UTCTime as a `YYYY-MM-DDTHH:MM:SSZ` string.
+	fn project(&self) -> Result<JsValue, FieldError> {
+		Ok(JsValue::from_str(&self.to_date_time().to_string()))
+	}
+}
+
+impl JsProjection for GeneralizedTime {
+	/// GeneralizedTime as a `YYYY-MM-DDTHH:MM:SSZ` string.
+	fn project(&self) -> Result<JsValue, FieldError> {
+		Ok(JsValue::from_str(&self.to_date_time().to_string()))
+	}
+}
+
+impl JsProjection for Ia5String {
+	fn project(&self) -> Result<JsValue, FieldError> {
+		Ok(JsValue::from_str(self.as_str()))
+	}
+}
+
+impl JsProjection for PrintableString {
+	fn project(&self) -> Result<JsValue, FieldError> {
+		Ok(JsValue::from_str(self.as_str()))
+	}
+}
+
+impl JsProjection for TeletexString {
+	fn project(&self) -> Result<JsValue, FieldError> {
+		Ok(JsValue::from_str(self.as_str()))
+	}
+}
+
+impl JsProjection for BmpString {
+	fn project(&self) -> Result<JsValue, FieldError> {
+		Ok(JsValue::from_str(&self.to_string()))
+	}
 }

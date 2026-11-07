@@ -27,8 +27,13 @@ tightbeam-rs = { workspace = true, features = [
 	"wasm",
 	"time",
 	"aead",
+	"colony-wire",
+	"compress",
+	"router",
 ] }
+tightbeam-ws = { path = "../tightbeam-ws", default-features = false, features = ["wire"] }
 der = { workspace = true, features = ["alloc", "derive", "oid"] }
+ruzstd = { version = "=0.9.0", default-features = false, features = ["std", "hash"] }
 gloo-net = { workspace = true, features = ["websocket"] }
 futures-util = { workspace = true, features = ["std", "sink"] }
 js-sys = { workspace = true }
@@ -43,12 +48,11 @@ web-sys = { workspace = true, features = [
 	"WebSocket",
 ] }
 
-# The zstd feature is host-only (std I/O): it backs the compression interop
-# tests, which run natively, and never enters the wasm32 lib build.
 [dev-dependencies]
-tightbeam-rs = { workspace = true, features = ["testing", "zstd"] }
+tightbeam-rs = { workspace = true, features = ["testing"] }
 wasm-bindgen-test = "0.3"
+web-sys = { workspace = true, features = ["AbortController"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
-tightbeam-rs = { workspace = true, features = ["colony"] }
+tightbeam-rs = { workspace = true, features = ["testing", "zstd"] }
 tokio = { workspace = true, features = ["macros", "rt"] }

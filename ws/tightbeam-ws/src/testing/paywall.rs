@@ -1,12 +1,12 @@
 //! Demo session-budget paywall for encrypted mux examples and e2e.
 //!
-//! Env-gated: when [`paywall_enabled`] is true, servers install
-//! [`DemoPaywall`] and advertise a budget ceiling. Clients pay the
-//! fixed invoice through [`FixedWallet`] (or a JS `approveReceipt`).
+//! A paywalled [`Security`](super::Security) installs [`DemoPaywall`] on each
+//! accepted transport and advertises its ceiling. Clients pay its invoice
+//! through [`FixedWallet`] (or a JS `approveReceipt`). The invoice, the
+//! payment, and the ceiling are stack facts, which
+//! [`DemoConfig::from_env`](super::DemoConfig::from_env) reads.
 
 use core::sync::atomic::{AtomicUsize, Ordering};
-use std::env;
-use std::sync::Arc;
 
 use tightbeam::der::asn1::OctetString;
 use tightbeam::marker::MaybeSendFuture;
@@ -17,49 +17,12 @@ use tightbeam::transport::handshake::receipt::{ApprovalRefusal, ReceiptApprover,
 use tightbeam::x509::Certificate;
 use tightbeam::TightBeamError;
 
-/// Invoice bytes embedded in every grant and renewal challenge.
-pub const DEMO_INVOICE: &[u8] = b"tbws-demo-invoice-v1";
-/// Payment bytes [`FixedWallet`] and e2e clients return for a paid invoice.
-pub const DEMO_PAYMENT: &[u8] = b"tbws-demo-payment-v1";
 /// Application refusal when settlement payment does not match.
 pub const DEMO_INVOICE_REFUSAL: u32 = 0x7462_7731;
 /// Application refusal when [`FixedWallet`] has no remaining payments.
 pub const DEMO_WALLET_EMPTY: u32 = 0x7462_7732;
-
-/// True when `TBWS_PAYWALL=1` (or any non-empty value other than `0`/`false`).
-pub fn paywall_enabled() -> bool {
-	match env::var("TBWS_PAYWALL") {
-		Ok(value) => {
-			let trimmed = value.trim();
-			trimmed != "0" && !trimmed.eq_ignore_ascii_case("false") && !trimmed.is_empty()
-		}
-		Err(_) => false,
-	}
-}
-
-/// Default per-direction grant for the demo paywall.
-///
-/// Must clear the mux drain reserve
-/// (`2 * (local_cap + peer_cap) + 1` records × `ceil(chunk / credit_unit)`
-/// credits). With the default 8/8 caps, 16 KiB chunks, and 1 KiB credit
-/// unit that reserve is 528 credits. A grant of 64 leaves zero usable budget.
-pub const DEMO_BUDGET_CREDITS: u64 = 4096;
-
-/// Per-direction budget ceiling from `TBWS_MUX_BUDGET_C2S` /
-/// `TBWS_MUX_BUDGET_S2C` (defaults: [`DEMO_BUDGET_CREDITS`]).
-pub fn budget_ceiling() -> MuxBudgets {
-	MuxBudgets {
-		client_to_server: env_u64("TBWS_MUX_BUDGET_C2S", DEMO_BUDGET_CREDITS),
-		server_to_client: env_u64("TBWS_MUX_BUDGET_S2C", DEMO_BUDGET_CREDITS),
-	}
-}
-
-fn env_u64(name: &str, default: u64) -> u64 {
-	env::var(name)
-		.ok()
-		.and_then(|value| value.parse::<u64>().ok())
-		.unwrap_or(default)
-}
+/// Application refusal when a client requests no budgets.
+const DEMO_BUDGETS_REQUIRED: u32 = 0x7462_7733;
 
 /// Demo authorizer that invoices every session and renewal.
 ///
@@ -67,6 +30,22 @@ fn env_u64(name: &str, default: u64) -> u64 {
 /// paywall's ceiling. Upstream `authorize_transport` replaces the local
 /// offer clamp with the authorizer verdict, so the ceiling MUST be applied
 /// here or an oversized request would be granted.
+///
+/// The invoice rides in the session receipt, and only a session with budgets
+/// has a receipt. A client that requests no budgets is refused, because
+/// upstream aborts a challenge that has no budgets to carry it.
+///
+/// # Examples
+///
+/// ```
+/// use tightbeam::transport::handshake::negotiation::MuxBudgets;
+/// use tightbeam_ws::testing::DemoPaywall;
+///
+/// let ceiling = MuxBudgets { client_to_server: 600, server_to_client: 700 };
+/// let paywall = DemoPaywall::new(b"invoice", b"payment", ceiling)?;
+/// assert_eq!(paywall.ceiling(), ceiling);
+/// # Ok::<(), tightbeam::TightBeamError>(())
+/// ```
 pub struct DemoPaywall {
 	invoice: OctetString,
 	expected_payment: OctetString,
@@ -74,19 +53,34 @@ pub struct DemoPaywall {
 }
 
 impl DemoPaywall {
-	/// Build the demo authorizer with the fixed invoice/payment pair and
-	/// the env-derived [`budget_ceiling`].
-	pub fn open() -> Result<Self, TightBeamError> {
-		let invoice = OctetString::new(DEMO_INVOICE)?;
-		let expected_payment = OctetString::new(DEMO_PAYMENT)?;
-		let ceiling = budget_ceiling();
+	/// The paywall that challenges each session with `invoice`, settles on
+	/// `payment`, and grants at most `ceiling` in each direction.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError`]: the invoice or the payment does not encode as an
+	///   octet string.
+	pub fn new(
+		invoice: impl AsRef<[u8]>,
+		payment: impl AsRef<[u8]>,
+		ceiling: MuxBudgets,
+	) -> Result<Self, TightBeamError> {
+		let invoice = OctetString::new(invoice.as_ref())?;
+		let expected_payment = OctetString::new(payment.as_ref())?;
 		Ok(Self { invoice, expected_payment, ceiling })
 	}
 
-	/// Shared authorizer for server transport configuration.
-	pub fn shared() -> Result<Arc<dyn TransportAuthorizer>, TightBeamError> {
-		let paywall = Self::open()?;
-		Ok(Arc::new(paywall))
+	/// The per-direction budget ceiling that this paywall grants and that a
+	/// metered offer advertises.
+	#[must_use]
+	pub fn ceiling(&self) -> MuxBudgets {
+		self.ceiling
+	}
+
+	/// A wallet that pays the invoice of this paywall `payments` times.
+	pub(super) fn wallet(&self, payments: usize) -> FixedWallet {
+		let payment = self.expected_payment.clone();
+		FixedWallet { payment, remaining: AtomicUsize::new(payments) }
 	}
 }
 
@@ -96,8 +90,12 @@ impl TransportAuthorizer for DemoPaywall {
 		offer: &'a TransportOffer,
 	) -> MaybeSendFuture<'a, Result<AuthorizationGrant, AuthorizationRefusal>> {
 		Box::pin(async move {
-			let budgets = offer.requested_budgets.map(|requested| requested.min(self.ceiling));
-			let grant = AuthorizationGrant { budgets, challenge: Some(self.invoice.to_owned()) };
+			let Some(requested) = offer.requested_budgets else {
+				return Err(AuthorizationRefusal { code: DEMO_BUDGETS_REQUIRED });
+			};
+
+			let budgets = requested.min(self.ceiling);
+			let grant = AuthorizationGrant { budgets: Some(budgets), challenge: Some(self.invoice.to_owned()) };
 			Ok(grant)
 		})
 	}
@@ -126,22 +124,30 @@ impl TransportAuthorizer for DemoPaywall {
 }
 
 /// Pays the first `payments` invoices, then refuses with [`DEMO_WALLET_EMPTY`].
+///
+/// # Examples
+///
+/// ```
+/// use tightbeam_ws::testing::FixedWallet;
+///
+/// let _approver = FixedWallet::new(b"payment", 2)?;
+/// # Ok::<(), tightbeam::TightBeamError>(())
+/// ```
 pub struct FixedWallet {
 	payment: OctetString,
 	remaining: AtomicUsize,
 }
 
 impl FixedWallet {
-	/// Wallet that can settle `payments` invoices (handshake + renewals).
-	pub fn with_payments(payments: usize) -> Result<Self, TightBeamError> {
-		let payment = OctetString::new(DEMO_PAYMENT)?;
+	/// Wallet that answers `payments` invoices (handshake + renewals) with
+	/// `payment`.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError`]: the payment does not encode as an octet string.
+	pub fn new(payment: impl AsRef<[u8]>, payments: usize) -> Result<Self, TightBeamError> {
+		let payment = OctetString::new(payment.as_ref())?;
 		Ok(Self { payment, remaining: AtomicUsize::new(payments) })
-	}
-
-	/// Shared approver for client transport configuration.
-	pub fn shared(payments: usize) -> Result<Arc<dyn ReceiptApprover>, TightBeamError> {
-		let wallet = Self::with_payments(payments)?;
-		Ok(Arc::new(wallet))
 	}
 }
 
@@ -177,29 +183,41 @@ mod tests {
 	use tightbeam::testing::{TestCertificate, TestKey};
 	use tightbeam::transport::handshake::negotiation::TransportOffer;
 
-	#[tokio::test]
-	async fn authorize_clamps_request_to_ceiling() {
-		let paywall = DemoPaywall {
-			invoice: OctetString::new(DEMO_INVOICE).expect("invoice"),
-			expected_payment: OctetString::new(DEMO_PAYMENT).expect("payment"),
-			ceiling: MuxBudgets { client_to_server: 100, server_to_client: 200 },
-		};
+	/// A paywall that settles on `payment` under a 100 and 200 credit
+	/// ceiling.
+	fn paywall() -> DemoPaywall {
+		let ceiling = MuxBudgets { client_to_server: 100, server_to_client: 200 };
+		DemoPaywall::new(b"invoice", b"payment", ceiling).expect("the invoice and the payment encode")
+	}
 
+	#[tokio::test]
+	async fn authorize_clamps_request_to_ceiling() -> Result<(), Box<dyn core::error::Error>> {
 		let offer = TransportOffer::mux(8).with_budgets(MuxBudgets { client_to_server: 10_000, server_to_client: 50 });
-		let grant = paywall.authorize(&offer).await.expect("grant");
-		assert_eq!(grant.budgets, Some(MuxBudgets { client_to_server: 100, server_to_client: 50 }));
+		let grant = paywall().authorize(&offer).await;
+
+		let budgets = Some(MuxBudgets { client_to_server: 100, server_to_client: 50 });
+		let challenge = Some(OctetString::new(b"invoice")?);
+		assert_eq!(grant, Ok(AuthorizationGrant { budgets, challenge }));
+		Ok(())
+	}
+
+	#[tokio::test]
+	async fn authorize_refuses_an_offer_without_budgets() {
+		let offer = TransportOffer::mux(8);
+		let verdict = paywall().authorize(&offer).await;
+		assert_eq!(verdict, Err(AuthorizationRefusal { code: DEMO_BUDGETS_REQUIRED }));
 	}
 
 	#[tokio::test]
 	async fn settle_accepts_only_demo_payment() {
-		let paywall = DemoPaywall::open().expect("paywall");
+		let paywall = paywall();
 		let receipt = stub_receipt();
 		let client = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
 
-		paywall.settle(&receipt, Some(DEMO_PAYMENT), &client).await.expect("paid");
-
+		let paid = paywall.settle(&receipt, Some(b"payment"), &client).await;
 		let refused = paywall.settle(&receipt, Some(b"wrong"), &client).await;
-		assert!(matches!(refused, Err(AuthorizationRefusal { code: DEMO_INVOICE_REFUSAL })));
+		assert_eq!(paid, Ok(()));
+		assert_eq!(refused, Err(AuthorizationRefusal { code: DEMO_INVOICE_REFUSAL }));
 	}
 
 	fn stub_receipt() -> SessionReceipt {

@@ -1,8 +1,8 @@
 //! Cluster work-plane round trips through the WebSocket edge plane.
 //!
 //! The colony (gateway, hive, servlet) runs its internal traffic over
-//! TCP. The gateway additionally binds a WebSocket edge accept plane for
-//! external clients. Proves the upstream `SubmitWork` blanket impl
+//! TCP. The gateway also binds a WebSocket edge accept plane for external
+//! clients. Proves the upstream `SubmitWork` blanket impl
 //! reaches `GenericClient<WsListener>` with zero library changes in this
 //! crate. A signed end-to-end work frame travels from the WebSocket edge
 //! through the TCP colony to a hive-registered servlet, and the
@@ -12,31 +12,27 @@
 //!
 //! [`SubmitWork`]: tightbeam::colony::SubmitWork
 
-#![cfg(feature = "testing")]
+#![cfg(feature = "colony")]
 // The colony runtime macros expand `cfg(feature = ...)` probes against the
 // invoking crate's feature namespace. Those upstream feature names do not
 // exist in this crate, so the leaked cfg warnings carry no signal here.
 #![allow(unexpected_cfgs)]
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use tightbeam::builder::TypeBuilder;
 use tightbeam::clock::UnixMillis;
-use tightbeam::colony::cluster::{Cluster, ClusterConfig, ClusterTlsConfig};
-use tightbeam::colony::hive::{Hive, HiveConfig, HiveTlsConfig};
+use tightbeam::colony::cluster::Cluster;
+use tightbeam::colony::hive::Hive;
 use tightbeam::colony::servlet::ServletConfig;
 use tightbeam::colony::urn::ColonyNamespace;
 use tightbeam::colony::SubmitWork;
-use tightbeam::crypto::profiles::DefaultCryptoProvider;
 use tightbeam::crypto::sign::ecdsa::Secp256k1SigningKey;
-use tightbeam::crypto::x509::{KeyPurposes, PeerCertificate, Signing};
 use tightbeam::policy::TransitStatus;
 use tightbeam::prelude::TightBeamSocketAddr;
-use tightbeam::testing::{TestCertificate, TestIdentity, TestKey, TestMessage};
+use tightbeam::testing::{TestIdentity, TestKey, TestMessage};
 use tightbeam::trace::TraceCollector;
-use tightbeam::transport::handshake::negotiation::TransportOffer;
-use tightbeam::transport::handshake::PeerAuthentication;
 use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::transport::{ClientBuilder, ConnectionBuilder};
 use tightbeam::urn::Urn;
@@ -54,7 +50,7 @@ servlet! {
 	pub WorkProbeServlet<TestMessage, EnvConfig = ()>,
 	protocol: TokioListener,
 	handle: |req, frame, _ctx| async move {
-		let signature_valid = signature_verifies(&frame);
+		let signature_valid = PROBE.verifies(&frame);
 
 		let mut reply = compose! {
 			V1: id: frame.metadata().id(),
@@ -73,7 +69,7 @@ hive! {
 
 cluster! {
 	/// TCP colony gateway with a WebSocket edge accept plane. Hives
-	/// register over TCP; external clients submit work over WebSocket.
+	/// register over TCP, and external clients submit work over WebSocket.
 	pub WorkPlaneGateway,
 	protocol: TokioListener,
 	edge: WsListener
@@ -86,14 +82,17 @@ fn probe_signing_key() -> Secp256k1SigningKey {
 	TestKey::insecure_fixed_signing()
 }
 
-/// Whether `frame` carries a signature that the probe key's self-signed
-/// certificate verifies over the bytes this end received.
-fn signature_verifies(frame: &Frame) -> bool {
-	let certificate = TestCertificate::self_signed(&probe_signing_key());
-	let signer = PeerCertificate::<Signing<DefaultCryptoProvider>>::parse(certificate, KeyPurposes::HOUSE.signer);
-
-	signer.is_ok_and(|signer| frame.verify(&signer).is_ok())
-}
+/// The identity of the probe key, which verifies the end-to-end signature of
+/// each frame either side signs with that key.
+static PROBE: LazyLock<Identity> = LazyLock::new(|| {
+	let probe = Identity::from_key(
+		probe_signing_key(),
+		"CN=work probe,O=tightbeam-ws,C=US",
+		2,
+		Duration::from_secs(3600),
+	);
+	probe.expect("the probe identity issues over the fixed test key")
+});
 
 /// Servlet type URN under the default colony namespace.
 fn servlet_urn(name: &str) -> Urn<'static> {
@@ -111,50 +110,6 @@ fn stack_identity() -> Result<Identity, BoxError> {
 		1,
 		Duration::from_secs(3600),
 	)?)
-}
-
-// The four config builders below have a twin in
-// examples/work_gateway_server.rs. The colony feature is dev-only, so no
-// shared module can host these colony-typed helpers. Mirror any edit here
-// in the example twin.
-
-/// Gateway config: the shared identity for TLS, the shared trust anchor
-/// on the hive plane, and an eight-stream mux offer for pooled dials.
-fn cluster_conf(identity: &Identity) -> Result<ClusterConfig, BoxError> {
-	let tls = ClusterTlsConfig::from_identity(identity.signing_identity()?, KeyPurposes::HOUSE)?;
-	let tls = tls.with_hive_trust(Some(identity.trust_anchor()?));
-
-	let mut conf = ClusterConfig::new(tls);
-	conf.pool_config.mux_offer = Some(Arc::new(TransportOffer::mux(8)));
-	conf.edge_bind_addr = Some("127.0.0.1:0".into());
-	Ok(conf)
-}
-
-/// Hive config: control-plane TLS from the shared identity plus the trust
-/// anchor for dialing the gateway and the servlet.
-fn hive_conf(identity: &Identity) -> Result<HiveConfig, BoxError> {
-	let authentication = PeerAuthentication::Anonymous;
-	let hive_tls = HiveTlsConfig::from_identity(identity.signing_identity()?, authentication, KeyPurposes::HOUSE)?;
-
-	let mut conf = HiveConfig {
-		trust_store: Some(identity.trust_anchor()?),
-		hive_tls: Some(Arc::new(hive_tls)),
-		..Default::default()
-	};
-	conf.pool.mux_offer = Some(Arc::new(TransportOffer::mux(8)));
-	Ok(conf)
-}
-
-/// Servlet config: encrypted TCP listener under the shared identity with
-/// a mux offer matching the hive pool.
-fn servlet_conf(
-	identity: &Identity,
-) -> Result<ServletConfig<TokioListener, TestMessage, DefaultCryptoProvider>, BoxError> {
-	Ok(ServletConfig::<TokioListener, TestMessage, DefaultCryptoProvider>::builder()
-		.with_identity(identity.signing_identity()?, vec![])
-		.with_mux_offer(Some(TransportOffer::mux(8)))
-		.with_config(Arc::new(()))
-		.build())
 }
 
 /// Compose and sign the end-to-end client work frame the gateway must
@@ -179,10 +134,11 @@ async fn start_stack(
 	identity: &Identity,
 	type_name: &str,
 ) -> Result<(WorkPlaneGateway, WorkProbeHive), BoxError> {
-	let gateway = WorkPlaneGateway::start(Arc::new(trace.share()), cluster_conf(identity)?).await?;
+	let cluster_config = identity.cluster_config("127.0.0.1:0")?;
+	let gateway = WorkPlaneGateway::start(Arc::new(trace.share()), cluster_config).await?;
 
-	let servlet = WorkProbeServlet::start(Arc::new(trace.share()), servlet_conf(identity)?).await?;
-	let mut hive = WorkProbeHive::new(Some(hive_conf(identity)?))?;
+	let servlet = WorkProbeServlet::start(Arc::new(trace.share()), identity.servlet_config()?).await?;
+	let mut hive = WorkProbeHive::new(Some(identity.hive_config()?))?;
 	hive.register(servlet_urn(type_name), servlet, |t| {
 		WorkProbeServlet::start(t, ServletConfig::cleartext())
 	})?;
@@ -218,7 +174,7 @@ async fn submit_work_round_trips_through_ws_gateway() -> Result<(), BoxError> {
 	let work = signed_work_frame(b"ws-work-1").await?;
 	let served = client.submit_work_to(servlet_urn("work-probe"), &work).await?;
 	assert!(
-		signature_verifies(&served),
+		PROBE.verifies(&served),
 		"servlet response signature must verify end to end at the client"
 	);
 

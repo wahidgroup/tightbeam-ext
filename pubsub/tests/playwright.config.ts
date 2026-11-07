@@ -8,8 +8,9 @@ if (process.env.E2E_PUBSUB_APP_PORT) {
 const baseURL = `http://localhost:${port}`;
 
 /**
- * The dockerized pubsub demo server is owned by scripts/stack.sh, which
- * exports its endpoint as E2E_PUBSUB_WS_ENDPOINT.
+ * The dockerized pubsub demo server is owned by scripts/stack.sh, and
+ * scripts/test-e2e.sh exports its endpoint as PUBSUB_WS_ENDPOINT, which the
+ * `STACK` of node/stack.ts reads.
  */
 export default defineConfig({
 	testDir: "./specs",

@@ -1,7 +1,7 @@
 import type { SealedRoundTripResult } from "../app/main.js";
 import { expect, test } from "@playwright/test";
 
-import { muxClearEndpoint } from "../env.js";
+import { STACK } from "../stack.js";
 import { openApp } from "./helpers.js";
 
 test("seals a body with AES-256-GCM, echoes it, and opens it with the key", async ({
@@ -11,14 +11,8 @@ test("seals a body with AES-256-GCM, echoes it, and opens it with the key", asyn
 
 	const result: SealedRoundTripResult = await page.evaluate(
 		({ url }) =>
-			window.tbSealedRoundTrip(
-				url,
-				"cafebabe0042",
-				"e2e-sealed",
-				14,
-				"0707070707070707070707070707070707070707070707070707070707070707",
-			),
-		{ url: muxClearEndpoint },
+			window.tbSealedRoundTrip(url, "cafebabe0042", "e2e-sealed", 14),
+		{ url: STACK.muxClearEndpoint },
 	);
 	expect(result.confidential).toBe(true);
 	expect(result.confidentialityOid).toBe("2.16.840.1.101.3.4.1.46");

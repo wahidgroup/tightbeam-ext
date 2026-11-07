@@ -4,8 +4,7 @@
 
 import { secp256k1 } from "@noble/curves/secp256k1.js";
 
-import type { TransportSigner } from "@wahidgroup/tightbeam-ws-client";
-import { Secp256k1SigningKey } from "@wahidgroup/tightbeam-ws-client";
+import type { Engine, TransportSigner } from "@wahidgroup/tightbeam-ws-client";
 
 /** ecdsa-with-SHA3-256 (NIST / TB profile). */
 const ECDSA_WITH_SHA3_256 = "2.16.840.1.101.3.4.3.10";
@@ -42,28 +41,24 @@ export class NobleTransportSigner implements TransportSigner {
 	 */
 	signatures = 0;
 
-	private readonly secret: Uint8Array;
-	private cachedPublicKeyDer: Uint8Array | undefined;
-
-	constructor(secret: Uint8Array) {
-		this.secret = copyBytes(secret);
-	}
-
 	/**
-	 * DER SubjectPublicKeyInfo for the signing key.
-	 *
-	 * Lazy so `connectMutual` can `initClient` before shape checks read
-	 * this field. Encoding comes from {@link Secp256k1SigningKey.toSpkiDer}
-	 * (profile EncodePublicKey / uncompressed SEC1).
+	 * DER SubjectPublicKeyInfo for the signing key, as the profile
+	 * `Secp256k1SigningKey.toSpkiDer` of `engine` encodes it (profile
+	 * `EncodePublicKey`, uncompressed SEC1).
 	 */
-	get publicKeyDer(): Uint8Array {
-		if (this.cachedPublicKeyDer === undefined) {
-			this.cachedPublicKeyDer = Secp256k1SigningKey.fromBytes(
-				this.secret,
-			).toSpkiDer();
-		}
+	readonly publicKeyDer: Uint8Array;
 
-		return this.cachedPublicKeyDer;
+	private readonly secret: Uint8Array;
+
+	constructor(engine: Engine, secret: Uint8Array) {
+		this.secret = copyBytes(secret);
+
+		const key = engine.signingKey(this.secret);
+		try {
+			this.publicKeyDer = key.toSpkiDer();
+		} finally {
+			key[Symbol.dispose]();
+		}
 	}
 
 	signPrehash(prehash: Uint8Array): Promise<Uint8Array> {
