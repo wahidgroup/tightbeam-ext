@@ -18,8 +18,9 @@ name = "tightbeam_pubsub"
 
 [features]
 # Test-support code builds frames a client would (including sealed
-# bodies), so it needs tightbeam's AEAD surface.
-testing = ["tightbeam-rs/aead"]
+# bodies), so it needs tightbeam's AEAD surface. Its in-memory link runs no
+# handshake, so it builds the served link from its parts.
+testing = ["tightbeam-rs/aead", "tightbeam-ws/link-parts"]
 
 [[example]]
 name = "pubsub_demo_server"
@@ -39,11 +40,15 @@ tightbeam-rs = { workspace = true, features = [
 ] }
 der = { workspace = true, features = ["alloc", "derive", "oid"] }
 tokio = { workspace = true, features = ["rt", "sync", "macros", "time"] }
+# The owner of one served connection, with no socket crate.
+tightbeam-ws = { version = "0.4.0", path = "../../ws/tightbeam-ws", default-features = false, features = ["serve"] }
 
 [dev-dependencies]
 # Self dev-dependency: turns the `testing` feature on for every test
 # and example build, so integration tests need no feature gate.
 tightbeam-pubsub = { path = ".", features = ["testing"] }
+# The manual clock that drives a link in the deadline tests.
+tightbeam-rs = { workspace = true, features = ["testing"] }
 husky-rs = { workspace = true }
 tightbeam-ws = { path = "../../ws/tightbeam-ws", features = ["testing"] }
 tokio-tungstenite = { workspace = true, features = ["connect", "handshake"] }
@@ -53,4 +58,5 @@ tokio = { workspace = true, features = [
 	"macros",
 	"sync",
 	"time",
+	"test-util",
 ] }

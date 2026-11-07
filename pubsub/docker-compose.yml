@@ -5,28 +5,35 @@
 # HPKE encrypted: browser to demo server, and the processed demo server's
 # relay dial to the processor.
 
+# The demo stream cap and paywall facts of ws/scripts/stack-env.sh, shared by
+# every service. The processor and the processed demo server read the same
+# values, so the relay dial meets the cap and pays the paywall it dials. A
+# missing fact refuses to start the stack.
+x-demo-config: &demo-config
+  MUX_STREAMS: "${MUX_STREAMS:?}"
+  TBWS_PAYWALL: "${TBWS_PAYWALL:?}"
+  TBWS_DEMO_INVOICE: "${TBWS_DEMO_INVOICE:?}"
+  TBWS_DEMO_PAYMENT: "${TBWS_DEMO_PAYMENT:?}"
+  TBWS_MUX_BUDGET_C2S: "${TBWS_MUX_BUDGET_C2S:?}"
+  TBWS_MUX_BUDGET_S2C: "${TBWS_MUX_BUDGET_S2C:?}"
+
 services:
   pubsub-demo:
     image: ${ECHO_IMAGE:-tightbeam-ws-echo:dev}
     command: ["pubsub-demo-server"]
     environment:
       PUBSUB_WS_PORT: "9110"
-      PUBSUB_QUEUE_CAPACITY: "${PUBSUB_QUEUE_CAPACITY:-32}"
+      PUBSUB_QUEUE_CAPACITY: "${PUBSUB_QUEUE_CAPACITY:?}"
       TBWS_SERVER_CERT: /certs/server.cert.der
-      TBWS_SERVER_KEY: /certs/server.key
       TBWS_CLIENT_CERT: /certs/client.cert.der
-      TBWS_CLIENT_KEY: /certs/client.key
-      TBWS_PAYWALL: "1"
-      TBWS_MUX_BUDGET_C2S: "4096"
-      TBWS_MUX_BUDGET_S2C: "4096"
+      <<: *demo-config
     volumes:
       - ${CERT_DIR:?}:/certs:ro
     ports:
       - "${PUBSUB_WS_HOST_PORT:-9110}:9110"
     # The image healthcheck probes the echo port.
     healthcheck:
-      test:
-        ["CMD-SHELL", "ss -ltn 'sport = :9110' | grep -q LISTEN || exit 1"]
+      test: ["CMD-SHELL", "ss -ltn 'sport = :9110' | grep -q LISTEN || exit 1"]
       interval: 3s
       timeout: 2s
       start_period: 3s
@@ -39,18 +46,15 @@ services:
     command: ["pubsub-processor-server"]
     environment:
       PUBSUB_PROCESSOR_PORT: "9111"
+      PUBSUB_TOPIC_KEY: "${PUBSUB_TOPIC_KEY:?}"
+      PUBSUB_TOPIC_KEY_ID: "${PUBSUB_TOPIC_KEY_ID:?}"
       TBWS_SERVER_CERT: /certs/server.cert.der
-      TBWS_SERVER_KEY: /certs/server.key
       TBWS_CLIENT_CERT: /certs/client.cert.der
-      TBWS_CLIENT_KEY: /certs/client.key
-      TBWS_PAYWALL: "1"
-      TBWS_MUX_BUDGET_C2S: "4096"
-      TBWS_MUX_BUDGET_S2C: "4096"
+      <<: *demo-config
     volumes:
       - ${CERT_DIR:?}:/certs:ro
     healthcheck:
-      test:
-        ["CMD-SHELL", "ss -ltn 'sport = :9111' | grep -q LISTEN || exit 1"]
+      test: ["CMD-SHELL", "ss -ltn 'sport = :9111' | grep -q LISTEN || exit 1"]
       interval: 3s
       timeout: 2s
       start_period: 3s
@@ -64,16 +68,12 @@ services:
     command: ["pubsub-demo-server"]
     environment:
       PUBSUB_WS_PORT: "9110"
-      PUBSUB_QUEUE_CAPACITY: "${PUBSUB_QUEUE_CAPACITY:-32}"
+      PUBSUB_QUEUE_CAPACITY: "${PUBSUB_QUEUE_CAPACITY:?}"
       PUBSUB_PROCESSOR_ENDPOINT: "ws://pubsub-processor:9111"
       PUBSUB_PROCESSOR_CERT: /certs/server.cert.der
       TBWS_SERVER_CERT: /certs/server.cert.der
-      TBWS_SERVER_KEY: /certs/server.key
       TBWS_CLIENT_CERT: /certs/client.cert.der
-      TBWS_CLIENT_KEY: /certs/client.key
-      TBWS_PAYWALL: "1"
-      TBWS_MUX_BUDGET_C2S: "4096"
-      TBWS_MUX_BUDGET_S2C: "4096"
+      <<: *demo-config
     volumes:
       - ${CERT_DIR:?}:/certs:ro
     depends_on:
@@ -82,8 +82,7 @@ services:
     ports:
       - "${PUBSUB_PROCESSED_WS_HOST_PORT:-9112}:9110"
     healthcheck:
-      test:
-        ["CMD-SHELL", "ss -ltn 'sport = :9110' | grep -q LISTEN || exit 1"]
+      test: ["CMD-SHELL", "ss -ltn 'sport = :9110' | grep -q LISTEN || exit 1"]
       interval: 3s
       timeout: 2s
       start_period: 3s

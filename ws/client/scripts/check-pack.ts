@@ -1,8 +1,13 @@
 /**
- * Assert npm pack matches `package.json` `files` (plus always-included
- * `package.json`).
+ * Assert that `npm pack` holds what `package.json` names:
+ *
+ * - Every packed path sits under a `files` entry, or is `package.json`.
+ * - Every `files` entry appears in the pack.
+ * - Every packed output under the build's `outDir` is one that
+ *   tsconfig.build.json compiles from a source it includes.
  */
 
+import type { SpawnSyncOptionsWithStringEncoding } from "node:child_process";
 import { spawnSync } from "node:child_process";
 import { access, readFile } from "node:fs/promises";
 import path from "node:path";
@@ -118,6 +123,56 @@ function isPresent(entry: string): boolean {
 	return false;
 }
 
+/**
+ * The build outputs `tsc` writes for tsconfig.build.json, as `tsc` itself
+ * resolves the config: one `.js` and one `.d.ts` per source it compiles,
+ * and a copy of each JSON source under its own name, under its `outDir`. The
+ * config's own excludes decide which sources those are, so test sources and
+ * fixtures stay out of the set.
+ */
+const showArgs = ["tsc", "-p", "tsconfig.build.json", "--showConfig"];
+const showOptions: SpawnSyncOptionsWithStringEncoding = {
+	cwd: root,
+	encoding: "utf8",
+};
+const showConfig = spawnSync("npx", showArgs, showOptions);
+if (showConfig.status !== 0) {
+	console.error(showConfig.stderr || "tsc --showConfig failed");
+	process.exit(1);
+}
+
+const parsed: unknown = JSON.parse(showConfig.stdout);
+const resolved: object = Object(parsed);
+const compilerField: unknown = Reflect.get(resolved, "compilerOptions");
+const compilerOptions: object = Object(compilerField);
+const outDirOption: unknown = Reflect.get(compilerOptions, "outDir");
+const rootDirOption: unknown = Reflect.get(compilerOptions, "rootDir");
+const sources: unknown = Reflect.get(resolved, "files");
+
+const namesOutDir = typeof outDirOption === "string";
+const namesRootDir = typeof rootDirOption === "string";
+const listsSources = Array.isArray(sources);
+if (!namesOutDir || !namesRootDir || !listsSources) {
+	console.error("tsconfig.build.json resolves no outDir, rootDir, or files");
+	process.exit(1);
+}
+
+const outDir = path.normalize(outDirOption);
+const rootDir = path.normalize(rootDirOption);
+const built = new Set<string>();
+for (const source of sources) {
+	const sourcePath = String(source);
+	const relative = path.relative(rootDir, sourcePath);
+	if (relative.endsWith(".json")) {
+		built.add(path.join(outDir, relative));
+		continue;
+	}
+
+	const stem = relative.replace(/\.ts$/, "");
+	built.add(path.join(outDir, `${stem}.js`));
+	built.add(path.join(outDir, `${stem}.d.ts`));
+}
+
 let failed = false;
 for (const file of packed) {
 	if (isAllowed(file)) {
@@ -125,6 +180,17 @@ for (const file of packed) {
 	}
 
 	console.error(`unexpected pack path: ${file}`);
+	failed = true;
+}
+
+for (const file of packed) {
+	const output = file.startsWith(`${outDir}/`);
+	if (!output || built.has(file)) {
+		continue;
+	}
+
+	const stray = `packed output that tsconfig.build.json does not build: ${file}`;
+	console.error(stray);
 	failed = true;
 }
 

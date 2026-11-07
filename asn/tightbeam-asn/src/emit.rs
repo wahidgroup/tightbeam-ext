@@ -1,11 +1,21 @@
 //! Discover AsnCodec wasm encode/decode pairs and emit MessageCodec TypeScript.
+//!
+//! [`CodecPairs`] reads the type names a wasm `.d.ts` exports, and
+//! [`EmitOptions`] shapes and writes the TypeScript module for them. The
+//! module exports an `AsnCodecs` class, which an application builds from its
+//! initialized wasm module.
 
+use core::str::FromStr;
 use std::collections::BTreeSet;
 use std::fs;
 use std::io;
 use std::path::Path;
 
 use tightbeam::Errorizable;
+use tightbeam_asn_names::TypeName;
+
+/// The package that exports the `MessageCodec` type by default.
+const MESSAGE_CODEC_FROM: &str = "@wahidgroup/tightbeam-ws-client";
 
 /// Failure while discovering pairs or writing façades.
 #[derive(Debug, Errorizable)]
@@ -17,185 +27,215 @@ pub enum EmitError {
 	/// No matching `encode{Name}` / `decode{Name}` pairs in the `.d.ts`.
 	#[error("no encode/decode codec pairs found in .d.ts")]
 	NoCodecPairs,
+	/// The `.d.ts` exports a codec function whose name holds no TypeScript
+	/// type name, so the module cannot bind it.
+	#[error("the .d.ts exports {0}, which holds no TypeScript type name to bind")]
+	UnboundExport(String),
 }
 
 /// Options that shape the generated TypeScript module.
+///
+/// # Examples
+///
+/// ```
+/// use tightbeam_asn::emit::{CodecPairs, EmitOptions};
+///
+/// let dts = "export function encodeDoc(value: Doc): Uint8Array;\n\
+///            export function decodeDoc(bytes: Uint8Array): Doc;\n";
+/// let pairs: CodecPairs = dts.parse()?;
+///
+/// let options = EmitOptions::new("#asn-wasm").with_message_codec_from("./message.js");
+/// let module = pairs.render(&options);
+/// assert!(module.contains("export class AsnCodecs {"));
+/// # Ok::<(), tightbeam_asn::emit::EmitError>(())
+/// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EmitOptions {
-	/// Module specifier for wasm encode/decode imports and type namespace.
-	pub import: String,
-	/// Specifier for `ensureAsnInit` when `encodeAsn` / `decodeAsn` are emitted.
-	pub init_import: Option<String>,
-	/// Package that exports the `MessageCodec` type.
-	pub message_codec_from: String,
+	import: String,
+	message_codec_from: String,
 }
 
-impl Default for EmitOptions {
-	fn default() -> Self {
-		Self {
-			import: String::from("#apollyon-asn"),
-			init_import: None,
-			message_codec_from: String::from("@wahidgroup/tightbeam-ws-client"),
+impl EmitOptions {
+	/// Options that read the wasm types from the module specifier `import`,
+	/// and `MessageCodec` from `@wahidgroup/tightbeam-ws-client`.
+	#[must_use]
+	pub fn new(import: impl Into<String>) -> Self {
+		Self { import: import.into(), message_codec_from: String::from(MESSAGE_CODEC_FROM) }
+	}
+
+	/// These options, with `MessageCodec` read from the package
+	/// `message_codec_from`.
+	#[must_use]
+	pub fn with_message_codec_from(self, message_codec_from: impl Into<String>) -> Self {
+		Self { message_codec_from: message_codec_from.into(), ..self }
+	}
+
+	/// Read the `.d.ts` at `from_dts`, and write the MessageCodec module of its
+	/// [`CodecPairs`] to `out`, creating the parent directory.
+	///
+	/// # Errors
+	///
+	/// - [`EmitError::Io`]: the read or a write failed.
+	/// - [`EmitError::UnboundExport`]: a codec export of the `.d.ts` holds no TypeScript type name.
+	/// - [`EmitError::NoCodecPairs`]: the `.d.ts` exports no codec pair.
+	pub fn emit(&self, from_dts: impl AsRef<Path>, out: impl AsRef<Path>) -> Result<CodecPairs, EmitError> {
+		let dts = fs::read_to_string(from_dts)?;
+		let pairs: CodecPairs = dts.parse()?;
+		let source = pairs.render(self);
+
+		let out = out.as_ref();
+		if let Some(parent) = out.parent() {
+			if !parent.as_os_str().is_empty() {
+				fs::create_dir_all(parent)?;
+			}
 		}
+
+		fs::write(out, source)?;
+		Ok(pairs)
 	}
 }
 
-/// Collect type names that have both `encode{Name}` and `decode{Name}` exports.
-pub fn discover_pairs(dts: impl AsRef<str>) -> Result<Vec<String>, EmitError> {
-	let dts = dts.as_ref();
-	let encodes = collect_export_names(dts, "encode");
-	let decodes = collect_export_names(dts, "decode");
-	let names: Vec<String> = encodes.intersection(&decodes).cloned().collect();
-	if names.is_empty() {
-		return Err(EmitError::NoCodecPairs);
-	}
+/// The type names a wasm `.d.ts` exports both an `encode{Name}` and a
+/// `decode{Name}` function for, sorted, at least one.
+///
+/// # Examples
+///
+/// ```
+/// use tightbeam_asn::emit::CodecPairs;
+///
+/// let dts = "export function encodeDoc(value: any): Uint8Array;\n\
+///            export function decodeDoc(bytes: Uint8Array): any;\n";
+/// let pairs: CodecPairs = dts.parse()?;
+/// assert_eq!(pairs.names(), ["Doc"]);
+/// # Ok::<(), tightbeam_asn::emit::EmitError>(())
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodecPairs(Vec<String>);
 
-	Ok(names)
-}
+impl FromStr for CodecPairs {
+	type Err = EmitError;
 
-/// Render a MessageCodec TypeScript module for the given type names.
-pub fn emit_codecs_ts(names: &[impl AsRef<str>], opts: &EmitOptions) -> String {
-	let mut out = String::new();
-	out.push_str("// Generated by tightbeam-asn-emit. DO NOT EDIT.\n");
-	out.push_str("// Regenerate after wasm-pack via the consumer asn-wasm script.\n");
-	out.push('\n');
-	out.push_str("import type { MessageCodec } from \"");
-	out.push_str(&opts.message_codec_from);
-	out.push_str("\";\n\n");
-	out.push_str("import type * as Asn from \"");
-	out.push_str(&opts.import);
-	out.push_str("\";\n");
+	/// Collect the type names of `dts` that have both exports. A name with
+	/// one export alone names no pair.
+	///
+	/// # Errors
+	///
+	/// - [`EmitError::UnboundExport`]: a codec export name holds no [`TypeName`].
+	/// - [`EmitError::NoCodecPairs`]: no type name has both exports.
+	fn from_str(dts: &str) -> Result<Self, Self::Err> {
+		let encodes = Self::export_names(dts, "encode")?;
+		let decodes = Self::export_names(dts, "decode")?;
 
-	if let Some(init_import) = opts.init_import.as_deref() {
-		out.push_str("import { ensureAsnInit } from \"");
-		out.push_str(init_import);
-		out.push_str("\";\n");
-	}
-
-	out.push_str("import {\n");
-
-	for name in names {
-		let name = name.as_ref();
-		out.push('\t');
-		out.push_str("decode");
-		out.push_str(name);
-		out.push_str(",\n");
-	}
-	for (index, name) in names.iter().enumerate() {
-		let name = name.as_ref();
-		out.push('\t');
-		out.push_str("encode");
-		out.push_str(name);
-		if index + 1 < names.len() {
-			out.push_str(",\n");
-		} else {
-			out.push('\n');
+		let names: Vec<String> = encodes.intersection(&decodes).cloned().collect();
+		if names.is_empty() {
+			return Err(EmitError::NoCodecPairs);
 		}
+
+		Ok(Self(names))
+	}
+}
+
+impl CodecPairs {
+	/// The type names, sorted.
+	#[must_use]
+	pub fn names(&self) -> &[String] {
+		&self.0
 	}
 
-	out.push_str("} from \"");
-	out.push_str(&opts.import);
-	out.push_str("\";\n\n");
-
-	for name in names {
-		let name = name.as_ref();
-		out.push_str("export type ");
-		out.push_str(name);
-		out.push_str(" = Asn.");
-		out.push_str(name);
-		out.push_str(";\n");
-	}
-
-	out.push('\n');
-
-	out.push_str("function asCodec<T>(\n");
-	out.push_str("\tencode: (value: T) => Uint8Array,\n");
-	out.push_str("\tdecode: (bodyDer: Uint8Array) => T,\n");
-	out.push_str("): MessageCodec<T> {\n");
-	out.push_str("\treturn { encode, decode };\n");
-	out.push_str("}\n");
-
-	if opts.init_import.is_some() {
+	/// The MessageCodec TypeScript module of these pairs, shaped by `opts`.
+	#[must_use]
+	pub fn render(&self, opts: &EmitOptions) -> String {
+		let names = &self.0;
+		let mut out = String::new();
+		out.push_str("// Generated by tightbeam-asn-emit. DO NOT EDIT.\n");
+		out.push_str("// Regenerate after wasm-pack.\n");
 		out.push('\n');
-		out.push_str("export async function encodeAsn<T>(\n");
-		out.push_str("\tcodec: MessageCodec<T>,\n");
-		out.push_str("\tvalue: T,\n");
-		out.push_str("): Promise<Uint8Array> {\n");
-		out.push_str("\tawait ensureAsnInit();\n");
-		out.push_str("\treturn codec.encode(value);\n");
-		out.push_str("}\n\n");
-		out.push_str("export async function decodeAsn<T>(\n");
-		out.push_str("\tcodec: MessageCodec<T>,\n");
-		out.push_str("\tbodyDer: Uint8Array,\n");
-		out.push_str("): Promise<T> {\n");
-		out.push_str("\tawait ensureAsnInit();\n");
-		out.push_str("\treturn codec.decode(bodyDer);\n");
+		out.push_str("import type { MessageCodec } from \"");
+		out.push_str(&opts.message_codec_from);
+		out.push_str("\";\n\n");
+		out.push_str("import type * as Asn from \"");
+		out.push_str(&opts.import);
+		out.push_str("\";\n\n");
+
+		for name in names {
+			out.push_str("export type ");
+			out.push_str(name);
+			out.push_str(" = Asn.");
+			out.push_str(name);
+			out.push_str(";\n");
+		}
+
+		out.push('\n');
+		out.push_str("/**\n");
+		out.push_str(" * The MessageCodec of each wire type, bound to the exports of one\n");
+		out.push_str(" * initialized wasm module. Build it once the init of the module resolves.\n");
+		out.push_str(" */\n");
+		out.push_str("export class AsnCodecs {\n");
+
+		for name in names {
+			out.push_str("\treadonly ");
+			out.push_str(name);
+			out.push_str(": MessageCodec<");
+			out.push_str(name);
+			out.push_str(">;\n");
+		}
+
+		let mut exports = Vec::with_capacity(names.len() * 2);
+		for name in names {
+			exports.push(format!("\"decode{name}\""));
+			exports.push(format!("\"encode{name}\""));
+		}
+
+		out.push('\n');
+		out.push_str("\tconstructor(asn: Pick<typeof Asn, ");
+		out.push_str(&exports.join(" | "));
+		out.push_str(">) {\n");
+
+		for name in names {
+			out.push_str("\t\tthis.");
+			out.push_str(name);
+			out.push_str(" = { encode: asn.encode");
+			out.push_str(name);
+			out.push_str(", decode: asn.decode");
+			out.push_str(name);
+			out.push_str(" };\n");
+		}
+
+		out.push_str("\t}\n");
 		out.push_str("}\n");
+		out
 	}
 
-	for name in names {
-		let name = name.as_ref();
-		out.push('\n');
-		out.push_str("export const ");
-		out.push_str(name);
-		out.push_str(": MessageCodec<");
-		out.push_str(name);
-		out.push_str("> = asCodec(\n");
-		out.push_str("\tencode");
-		out.push_str(name);
-		out.push_str(",\n");
-		out.push_str("\tdecode");
-		out.push_str(name);
-		out.push_str(",\n");
-		out.push_str(");\n");
-	}
+	/// The names that follow `prefix` in the `export function` lines of `dts`.
+	///
+	/// # Errors
+	///
+	/// - [`EmitError::UnboundExport`]: a name holds no [`TypeName`].
+	fn export_names(dts: &str, prefix: &str) -> Result<BTreeSet<String>, EmitError> {
+		let mut names = BTreeSet::new();
+		let marker = format!("export function {prefix}");
+		for line in dts.lines() {
+			let trimmed = line.trim_start();
+			let Some(rest) = trimmed.strip_prefix(&marker) else {
+				continue;
+			};
+			let Some(end) = rest.find('(') else {
+				continue;
+			};
 
-	out
-}
+			// A bare `encode` or `decode` export names no codec.
+			let name = &rest[..end];
+			if name.is_empty() {
+				continue;
+			}
+			let parsed = name.parse::<TypeName>();
+			let name = parsed.map_err(|_| EmitError::UnboundExport(format!("{prefix}{name}")))?;
 
-/// Read `--from-dts`, discover pairs, and write `--out`.
-pub fn emit_from_paths(
-	from_dts: impl AsRef<Path>,
-	out: impl AsRef<Path>,
-	opts: &EmitOptions,
-) -> Result<Vec<String>, EmitError> {
-	let dts = fs::read_to_string(from_dts)?;
-	let names = discover_pairs(&dts)?;
-	let source = emit_codecs_ts(&names, opts);
-	if let Some(parent) = out.as_ref().parent() {
-		if !parent.as_os_str().is_empty() {
-			fs::create_dir_all(parent)?;
-		}
-	}
-
-	fs::write(out, source)?;
-	Ok(names)
-}
-
-fn collect_export_names(dts: &str, prefix: &str) -> BTreeSet<String> {
-	let mut names = BTreeSet::new();
-	let marker = format!("export function {prefix}");
-	for line in dts.lines() {
-		let trimmed = line.trim_start();
-		let Some(rest) = trimmed.strip_prefix(&marker) else {
-			continue;
-		};
-		let Some(end) = rest.find('(') else {
-			continue;
-		};
-
-		let name = &rest[..end];
-		if name.is_empty() {
-			continue;
-		}
-		if !name.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_') {
-			continue;
+			names.insert(name.as_str().to_owned());
 		}
 
-		names.insert(name.to_owned());
+		Ok(names)
 	}
-
-	names
 }
 
 #[cfg(test)]
@@ -203,7 +243,7 @@ mod tests {
 	use super::*;
 
 	#[test]
-	fn discover_pairs_intersection_sorted() {
+	fn codec_pairs_intersect_and_sort() {
 		let dts = concat!(
 			"export function decodeZed(bytes: Uint8Array): any;\n",
 			"export function encodeZed(value: any): Uint8Array;\n",
@@ -212,34 +252,38 @@ mod tests {
 			"export function encodeAlpha(value: any): Uint8Array;\n",
 		);
 
-		let names = discover_pairs(dts);
+		let pairs: Result<CodecPairs, EmitError> = dts.parse();
 		assert!(matches!(
-			names.as_deref(),
+			pairs.as_ref().map(CodecPairs::names),
 			Ok([a, b]) if a == "Alpha" && b == "Zed"
 		));
 	}
 
 	#[test]
-	fn discover_pairs_empty_is_error() {
-		assert!(matches!(discover_pairs("export const x = 1;"), Err(EmitError::NoCodecPairs)));
+	fn a_dts_with_no_pair_is_refused() {
+		let pairs: Result<CodecPairs, EmitError> = "export const x = 1;".parse();
+		assert!(matches!(pairs, Err(EmitError::NoCodecPairs)));
 	}
 
 	#[test]
-	fn emit_codecs_ts_hard_tabs_no_ternary() {
-		let names = vec![String::from("Doc")];
-		let opts = EmitOptions {
-			import: concat!("#", "apollyon-asn").to_owned(),
-			init_import: Some(concat!("./asnInit", ".js").to_owned()),
-			message_codec_from: concat!("@wahidgroup/tightbeam-ws-", "client").to_owned(),
-		};
+	fn an_export_name_the_emitter_cannot_bind_is_refused() {
+		let dts = concat!(
+			"export function decodeDoc(bytes: Uint8Array): any;\n",
+			"export function encodeDoc<T>(value: T): Uint8Array;\n",
+		);
 
-		let source = emit_codecs_ts(&names, &opts);
-		assert!(source.contains('\t'));
-		assert!(!source.contains(" ? "));
-		assert!(source.contains("export type Doc = Asn.Doc;"));
-		assert!(source.contains("export const Doc: MessageCodec<Doc> = asCodec("));
-		assert!(source.contains("export async function encodeAsn"));
-		assert!(source.contains("await ensureAsnInit();"));
-		assert!(source.contains(concat!("from \"./asnInit", ".js\"")));
+		let pairs: Result<CodecPairs, EmitError> = dts.parse();
+		assert!(matches!(pairs, Err(EmitError::UnboundExport(name)) if name == "encodeDoc<T>"));
+	}
+
+	#[test]
+	fn an_export_named_by_a_reserved_word_is_refused() {
+		let dts = concat!(
+			"export function decodestring(bytes: Uint8Array): any;\n",
+			"export function encodestring(value: any): Uint8Array;\n",
+		);
+
+		let pairs: Result<CodecPairs, EmitError> = dts.parse();
+		assert!(matches!(pairs, Err(EmitError::UnboundExport(name)) if name == "encodestring"));
 	}
 }

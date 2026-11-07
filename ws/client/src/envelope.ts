@@ -10,18 +10,22 @@ import type {
 	FrameVerifier,
 	Signatory,
 } from "./crypto.js";
-import type { FrameCodec } from "./builder/codec.js";
+import type { ValidationCode } from "./builder/errors.js";
 import type { BodyCompressor, BodyInflator } from "./compress.js";
+import type { EngineParts } from "./engine.js";
 import type { Frame } from "./frame.js";
 import type { MessageCodec } from "./message.js";
 import { FrameBuilder } from "./builder/builder.js";
 import { ValidationError } from "./builder/errors.js";
+import { HeldCompressor, HeldInflator } from "./compress.js";
+import { HeldCodec } from "./message.js";
 
 /**
  * The declared layers. Each direction is optional so one-sided parties
  * compose only their half: a subscriber holds a verifying key and a
  * decryptor, a publisher a signatory and an encryptor. Symmetric
- * implementations (`Aes256Gcm`, `ZstdCompression`) declare both at once.
+ * implementations (`Aes256Gcm`, the engine `ZstdCompression`) declare both at
+ * once.
  */
 interface Layers {
 	readonly signer?: Signatory;
@@ -33,48 +37,58 @@ interface Layers {
 }
 
 /**
- * A layer-enforcement failure.
- */
-function envelopeError(code: string, message: string): ValidationError {
-	const error = new ValidationError(code, [{ path: "envelope", message }]);
-	return error;
-}
-
-/**
  * A typed message envelope: the codec plus the declared security and
  * transport layers, immutable and reusable across every frame of a
  * conversation.
  *
  * ```ts
- * const notes = envelope(Notes)
+ * const notes = engine
+ *     .envelope(Notes)
  *     .signed(publisherKey)
- *     .sealed(Aes256Gcm.fromKey(topicKey, topicKeyId));
+ *     .sealed(engine.aes256Gcm({ key: topicKey, keyId: topicKeyId }));
  *
  * const sent = await notes.frame(note).withId("note-1").build();
  * const received = await notes.unwrap(relayed); // Note
  * ```
  */
 export class Envelope<T> {
+	readonly #parts: EngineParts;
+
 	private constructor(
-		private readonly frameCodec: FrameCodec,
+		parts: EngineParts,
 		private readonly codec: MessageCodec<T>,
 		private readonly layers: Layers,
-	) {}
+	) {
+		this.#parts = parts;
+	}
 
 	/**
-	 * Begin an envelope over `codec` against an explicit {@link FrameCodec}.
-	 * The `envelope()` entry point injects the shared wasm codec.
+	 * The refusal of a frame that breaks a declared layer, with the code
+	 * `code`.
 	 */
-	static over<T>(
-		frameCodec: FrameCodec,
-		codec: MessageCodec<T>,
-	): Envelope<T> {
-		const begun = new Envelope(frameCodec, codec, {});
+	private static refusal(
+		code: ValidationCode,
+		message: string,
+	): ValidationError {
+		const issues = [{ path: "envelope", message }];
+		const refused = new ValidationError(code, issues);
+		return refused;
+	}
+
+	/**
+	 * Begin a typed message envelope over `codec` through the engine `parts`,
+	 * with no layers declared: declare the layers once (`signed`, `sealed`,
+	 * `compressed`), then build with `frame(message)` and receive with
+	 * `unwrap(frame)`. `unwrap` enforces the declared layers.
+	 */
+	static over<T>(parts: EngineParts, codec: MessageCodec<T>): Envelope<T> {
+		const held = HeldCodec.of(codec);
+		const begun = new Envelope(parts, held, {});
 		return begun;
 	}
 
 	private with(patch: Partial<Layers>): Envelope<T> {
-		const next = new Envelope(this.frameCodec, this.codec, {
+		const next = new Envelope(this.#parts, this.codec, {
 			...this.layers,
 			...patch,
 		});
@@ -131,10 +145,12 @@ export class Envelope<T> {
 	compressed(compression: BodyCompressor | BodyInflator): Envelope<T> {
 		let patch: Partial<Layers> = {};
 		if ("compress" in compression) {
-			patch = { ...patch, compressor: compression };
+			const compressor = new HeldCompressor(compression);
+			patch = { ...patch, compressor };
 		}
 		if ("decompress" in compression) {
-			patch = { ...patch, inflator: compression };
+			const inflator = new HeldInflator(compression);
+			patch = { ...patch, inflator };
 		}
 
 		const next = this.with(patch);
@@ -151,24 +167,22 @@ export class Envelope<T> {
 	 */
 	frame(message: T): FrameBuilder {
 		if (this.authenticityDeclared() && this.layers.signer === undefined) {
-			throw envelopeError(
+			throw Envelope.refusal(
 				"ENVELOPE_SIGNER",
 				"The envelope declares authenticity but has no signatory: " +
 					"declare signed(signatory) to build frames",
 			);
 		}
 		if (this.sealedDeclared() && this.layers.sealer === undefined) {
-			throw envelopeError(
+			throw Envelope.refusal(
 				"ENVELOPE_SEALER",
 				"The envelope declares confidentiality but has no encryptor: " +
 					"declare sealed(encryptor) to build frames",
 			);
 		}
 
-		let builder = new FrameBuilder(this.frameCodec).withMessage(
-			this.codec,
-			message,
-		);
+		const begun = FrameBuilder.of(this.#parts);
+		let builder = begun.withMessage(this.codec, message);
 		if (this.layers.compressor !== undefined) {
 			builder = builder.withCompressor(this.layers.compressor);
 		}
@@ -186,61 +200,35 @@ export class Envelope<T> {
 	 * Reverse the declared layers on a received frame: verify, open,
 	 * inflate, decode - and enforce them.
 	 *
-	 * @throws ValidationError when a declared signature or seal is
-	 * absent (downgrade), when a declared layer is missing its
-	 * unwrap-side capability, or when the frame carries a layer the
-	 * envelope cannot reverse.
+	 * - The envelope decides policy: a declared signature MUST verify, and a
+	 *   declared seal MUST be present.
+	 * - The frame decides how its body opens, through {@link Frame.open}.
+	 *
+	 * @throws ValidationError in each of these cases:
+	 *
+	 * - A declared signature or seal is absent (a downgrade).
+	 * - A declared layer is missing its unwrap-side capability.
+	 * - The frame carries a layer the envelope cannot reverse.
+	 *
 	 * @throws when the signature does not verify, the opener rejects the
-	 * ciphertext, the inflator rejects the body, or the codec rejects
-	 * the decoded bytes.
+	 * ciphertext, the inflator rejects the body, or the codec rejects the
+	 * decoded bytes.
 	 */
 	async unwrap(received: Frame): Promise<T> {
 		this.checkAuthenticity(received);
 
-		if (received.confidential) {
-			const opener = this.layers.opener;
-			if (opener === undefined) {
-				throw envelopeError(
-					"ENVELOPE_OPENER",
-					"The frame is sealed but the envelope has no decryptor: " +
-						"declare sealed(decryptor) to unwrap it",
-				);
-			}
-
-			const opened = await received.decryptMessage(
-				opener,
-				this.codec,
-				this.layers.inflator,
-			);
-			return opened;
-		}
-
-		if (this.sealedDeclared()) {
-			throw envelopeError(
+		if (this.sealedDeclared() && !received.confidential) {
+			throw Envelope.refusal(
 				"ENVELOPE_CLEARTEXT",
 				"The envelope declares confidentiality but the frame body " +
 					"is cleartext: refusing the downgrade",
 			);
 		}
 
-		if (received.compressed) {
-			const inflator = this.layers.inflator;
-			if (inflator === undefined) {
-				throw envelopeError(
-					"ENVELOPE_INFLATOR",
-					"The frame is compressed but the envelope has no " +
-						"inflator: declare compressed(inflator) to unwrap it",
-				);
-			}
-
-			const inflated = await received.inflateMessage(
-				inflator,
-				this.codec,
-			);
-			return inflated;
-		}
-
-		const message = received.message(this.codec);
+		const message = await received.open(this.codec, {
+			opener: this.layers.opener,
+			inflator: this.layers.inflator,
+		});
 		return message;
 	}
 
@@ -266,9 +254,8 @@ export class Envelope<T> {
 	 * Authenticity is declared by either half.
 	 */
 	private authenticityDeclared(): boolean {
-		const declared =
-			this.layers.signer !== undefined ||
-			this.layers.verifier !== undefined;
+		const { signer, verifier } = this.layers;
+		const declared = signer !== undefined || verifier !== undefined;
 		return declared;
 	}
 
@@ -276,16 +263,14 @@ export class Envelope<T> {
 	 * Confidentiality is declared by either half.
 	 */
 	private sealedDeclared(): boolean {
-		const declared =
-			this.layers.sealer !== undefined ||
-			this.layers.opener !== undefined;
+		const { sealer, opener } = this.layers;
+		const declared = sealer !== undefined || opener !== undefined;
 		return declared;
 	}
 
 	/**
 	 * The verifier for `unwrap()`: the explicit declaration, or the
-	 * signatory's own verify half. Resolved lazily so envelopes can
-	 * compose before the wasm module initializes.
+	 * signatory's own verify half, resolved at the unwrap.
 	 */
 	private resolveVerifier(): FrameVerifier | undefined {
 		if (this.layers.verifier !== undefined) {
@@ -306,7 +291,7 @@ export class Envelope<T> {
 
 		const verifier = this.resolveVerifier();
 		if (verifier === undefined) {
-			throw envelopeError(
+			throw Envelope.refusal(
 				"ENVELOPE_VERIFIER",
 				"The envelope declares authenticity but its signatory " +
 					"exposes no verifier: declare verified(verifier) to " +
@@ -315,7 +300,7 @@ export class Envelope<T> {
 		}
 
 		if (!received.signed) {
-			throw envelopeError(
+			throw Envelope.refusal(
 				"ENVELOPE_UNSIGNED",
 				"The envelope declares authenticity but the frame is " +
 					"unsigned: refusing the downgrade",

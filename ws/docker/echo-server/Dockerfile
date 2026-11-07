@@ -12,7 +12,7 @@ COPY . .
 WORKDIR /src/tightbeam-ext
 RUN cargo build --example echo_server_mux -p tightbeam-ws --features testing \
 	&& cargo build --example echo_server_mux_clear -p tightbeam-ws --features testing \
-	&& cargo build --example work_gateway_server -p tightbeam-ws --features testing \
+	&& cargo build --example work_gateway_server -p tightbeam-ws --features colony \
 	&& cargo build --example pubsub_demo_server -p tightbeam-pubsub --features testing \
 	&& cargo build --example pubsub_processor_server -p tightbeam-pubsub --features testing
 

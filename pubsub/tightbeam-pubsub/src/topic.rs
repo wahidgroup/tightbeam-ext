@@ -1,7 +1,8 @@
 //! Topic names and their validation.
 //!
-//! A topic is a non-empty UTF-8 string with an optional `/`-separated
-//! hierarchy. Matching is exact: no wildcards, no shared subscriptions.
+//! A topic is a non-empty UTF-8 string of at most [`Topic::MAX_LEN`] octets,
+//! with an optional `/`-separated hierarchy. Matching is exact: no wildcards,
+//! no shared subscriptions.
 //! The wire command prefixes are reserved so a topic can never be mistaken
 //! for a command.
 //!
@@ -31,8 +32,9 @@ pub const END_PREFIX: &str = "end/";
 /// Every reserved command prefix, in dispatch order.
 const RESERVED_PREFIXES: [&str; 4] = [SUB_PREFIX, UNSUB_PREFIX, PUB_PREFIX, END_PREFIX];
 
-/// A validated topic name: non-empty UTF-8, exact-match semantics,
-/// never starting with a reserved command prefix.
+/// A validated topic name: non-empty UTF-8 of at most [`Topic::MAX_LEN`]
+/// octets, exact-match semantics, never starting with a reserved command
+/// prefix.
 ///
 /// Clone-cheap (`Arc` inner) so registries and managers key maps with it
 /// without copying the name.
@@ -40,6 +42,13 @@ const RESERVED_PREFIXES: [&str; 4] = [SUB_PREFIX, UNSUB_PREFIX, PUB_PREFIX, END_
 pub struct Topic(Arc<str>);
 
 impl Topic {
+	/// The longest topic name, in octets of UTF-8.
+	///
+	/// The registry keeps each subscribed name, and the backplane keeps a
+	/// counter for each published name, so this ceiling bounds the memory
+	/// one name can hold.
+	pub const MAX_LEN: usize = 256;
+
 	/// The topic name as a string slice.
 	pub fn as_str(&self) -> &str {
 		&self.0
@@ -66,10 +75,14 @@ impl FromStr for Topic {
 	/// # Errors
 	///
 	/// - [`TopicError::Empty`]: the name has zero length.
+	/// - [`TopicError::TooLong`]: the name holds more than [`Topic::MAX_LEN`] octets.
 	/// - [`TopicError::ReservedPrefix`]: the name starts with a wire command prefix.
 	fn from_str(name: &str) -> Result<Self, Self::Err> {
 		if name.is_empty() {
 			return Err(TopicError::Empty);
+		}
+		if name.len() > Self::MAX_LEN {
+			return Err(TopicError::TooLong(name.len()));
 		}
 
 		for prefix in RESERVED_PREFIXES {
@@ -98,7 +111,8 @@ impl TryFrom<&[u8]> for Topic {
 	/// # Errors
 	///
 	/// - [`TopicError::NotUtf8`]: the octets are not valid UTF-8.
-	/// - [`TopicError::Empty`] / [`TopicError::ReservedPrefix`]: same as [`FromStr`].
+	/// - [`TopicError::Empty`], [`TopicError::TooLong`], or
+	///   [`TopicError::ReservedPrefix`]: as for [`FromStr`].
 	fn try_from(name: &[u8]) -> Result<Self, Self::Error> {
 		let text = from_utf8(name)?;
 		text.parse()
@@ -116,6 +130,9 @@ impl From<Utf8Error> for TopicError {
 pub enum TopicError {
 	/// The name is empty.
 	Empty,
+	/// The name holds more than [`Topic::MAX_LEN`] octets. The field is its
+	/// length in octets.
+	TooLong(usize),
 	/// The name starts with a reserved wire command prefix.
 	ReservedPrefix(&'static str),
 	/// The name bytes are not valid UTF-8.
@@ -126,6 +143,10 @@ impl fmt::Display for TopicError {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::Empty => f.write_str("a topic name must be non-empty"),
+			Self::TooLong(len) => {
+				let max = Topic::MAX_LEN;
+				write!(f, "a topic name must fit in {max} octets, and this one holds {len}")
+			}
 			Self::NotUtf8(cause) => write!(f, "a topic name must be UTF-8: {cause}"),
 			Self::ReservedPrefix(prefix) => {
 				write!(f, "a topic name must not start with the reserved prefix {prefix}")
@@ -183,6 +204,20 @@ mod tests {
 	fn rejects_non_utf8_bytes() {
 		let outcome = Topic::try_from([0xff, 0xfe].as_slice());
 		assert!(matches!(outcome, Err(TopicError::NotUtf8(_))));
+	}
+
+	#[test]
+	fn accepts_a_name_at_the_length_ceiling() {
+		let name = "x".repeat(Topic::MAX_LEN);
+		let outcome: Result<Topic, TopicError> = name.parse();
+		assert!(outcome.is_ok());
+	}
+
+	#[test]
+	fn rejects_a_name_past_the_length_ceiling() {
+		let name = "x".repeat(Topic::MAX_LEN + 1);
+		let outcome: Result<Topic, TopicError> = name.parse();
+		assert!(matches!(outcome, Err(TopicError::TooLong(_))));
 	}
 
 	#[test]

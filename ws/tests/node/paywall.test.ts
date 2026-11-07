@@ -1,20 +1,21 @@
 import { describe, expect, it } from "vitest";
 
-import { TightbeamWsClient, frame } from "@wahidgroup/tightbeam-ws-client";
+import { TightbeamWsClient } from "@wahidgroup/tightbeam-ws-client";
 
-import { certBytes, muxMutualEndpoint, mutualSessionOptions } from "../env.js";
-import { emitOrFail, withClient } from "./harness.js";
+import { demoIdentity } from "../env.js";
+import { emitOrFail, mutualSessionOptions, withClient } from "../fixtures.js";
+import { STACK } from "../stack.js";
+
+const ENGINE = await TightbeamWsClient.init();
 
 describe("Node mutual paywall", () => {
 	it("exposes usableSendBudget after a paid handshake", async () => {
 		await withClient(
 			() =>
-				TightbeamWsClient.connectMutual(
-					muxMutualEndpoint,
-					certBytes("server.cert.der"),
-					certBytes("client.cert.der"),
-					certBytes("client.key"),
-					mutualSessionOptions(),
+				ENGINE.connectMutual(
+					STACK.muxMutualEndpoint,
+					demoIdentity(),
+					mutualSessionOptions(STACK.paywall),
 				),
 			async (client) => {
 				expect(client.usableSendBudget).toBeTypeOf("number");
@@ -30,15 +31,10 @@ describe("Node mutual paywall", () => {
 		 * countersigned receipt. An unpaid challenge still aborts the
 		 * server side. The client observes that as `closed`.
 		 */
-		const client = await TightbeamWsClient.connectMutual(
-			muxMutualEndpoint,
-			certBytes("server.cert.der"),
-			certBytes("client.cert.der"),
-			certBytes("client.key"),
-			{
-				budgets: { clientToServer: 4096, serverToClient: 4096 },
-				approveReceipt: () => undefined,
-			},
+		const client = await ENGINE.connectMutual(
+			STACK.muxMutualEndpoint,
+			demoIdentity(),
+			mutualSessionOptions(STACK.paywall, 0),
 		);
 
 		await expect(client.closed).resolves.toBeTruthy();
@@ -47,18 +43,19 @@ describe("Node mutual paywall", () => {
 	it("pays and emits under session budgets", async () => {
 		await withClient(
 			() =>
-				TightbeamWsClient.connectMutual(
-					muxMutualEndpoint,
-					certBytes("server.cert.der"),
-					certBytes("client.cert.der"),
-					certBytes("client.key"),
-					mutualSessionOptions(),
+				ENGINE.connectMutual(
+					STACK.muxMutualEndpoint,
+					demoIdentity(),
+					mutualSessionOptions(STACK.paywall),
 				),
 			async (client) => {
-				const built = await frame(new Uint8Array([0xb0, 0xee]))
+				const built = await ENGINE.frameBuilder(
+					new Uint8Array([0xb0, 0xee]),
+				)
 					.withId("paywall-emit")
 					.withOrder(1)
 					.build();
+
 				const response = await emitOrFail(client, built);
 				expect(response.id).toEqual(built.id);
 			},
@@ -68,15 +65,15 @@ describe("Node mutual paywall", () => {
 	it("openStream multi-push works under the paywall", async () => {
 		await withClient(
 			() =>
-				TightbeamWsClient.connectMutual(
-					muxMutualEndpoint,
-					certBytes("server.cert.der"),
-					certBytes("client.cert.der"),
-					certBytes("client.key"),
-					mutualSessionOptions(),
+				ENGINE.connectMutual(
+					STACK.muxMutualEndpoint,
+					demoIdentity(),
+					mutualSessionOptions(STACK.paywall),
 				),
 			async (client) => {
-				const built = await frame(new Uint8Array([0xb0, 0x51]))
+				const built = await ENGINE.frameBuilder(
+					new Uint8Array([0xb0, 0x51]),
+				)
 					.withId("paywall-stream")
 					.withOrder(1)
 					.build();

@@ -1,5 +1,6 @@
-import { resolve } from "node:path";
 import { defineConfig } from "vitest/config";
+
+import { SOURCE_ALIASES } from "./aliases.js";
 
 export default defineConfig({
 	test: {
@@ -7,21 +8,12 @@ export default defineConfig({
 		include: ["node/**/*.test.ts"],
 		exclude: ["node_modules"],
 		root: ".",
+		setupFiles: ["../../scripts/vitest/byte-equality.mjs"],
 	},
 	resolve: {
-		alias: {
-			/*
-			 * The node-lane harness is shared with the ws extension at the
-			 * source level: one file, no copies.
-			 */
-			"#ws-harness": resolve(
-				import.meta.dirname,
-				"../../ws/tests/node/harness.ts",
-			),
-			"#ws-signer": resolve(
-				import.meta.dirname,
-				"../../ws/tests/signer.ts",
-			),
-		},
+		// The e2e fixtures, environment readers, and signer are shared with
+		// the ws extension, and the wire contract with the pubsub client, at
+		// the source level: one file each, no copies.
+		alias: SOURCE_ALIASES,
 	},
 });

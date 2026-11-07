@@ -912,6 +912,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
+name = "ruzstd"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a252f5e20f038fe7b4ea53e073e65398d652c864cc162fc77c56c2f13717b888"
+dependencies = [
+ "twox-hash",
+]
+
+[[package]]
 name = "same-file"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1118,7 +1127,7 @@ dependencies = [
  "der",
  "js-sys",
  "tightbeam-asn-derive",
- "tightbeam-asn-fixtures",
+ "tightbeam-asn-names",
  "tightbeam-rs",
  "wasm-bindgen",
  "wasm-bindgen-test",
@@ -1131,16 +1140,12 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.3",
+ "tightbeam-asn-names",
 ]
 
 [[package]]
-name = "tightbeam-asn-fixtures"
+name = "tightbeam-asn-names"
 version = "0.1.0"
-dependencies = [
- "der",
- "tightbeam-asn",
- "wasm-bindgen",
-]
 
 [[package]]
 name = "tightbeam-derive"
@@ -1169,9 +1174,9 @@ dependencies = [
 
 [[package]]
 name = "tightbeam-rs"
-version = "0.17.0"
+version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43d403a55bae2d128de6840418f3ea616b9f24c86d9aa37bf946edd67f67fe2d"
+checksum = "1ec345b6db00d936ecf5e84e2b4053604e6cc893de5755189b193ee07a225517"
 dependencies = [
  "aead",
  "aes",
@@ -1227,7 +1232,9 @@ dependencies = [
  "futures-util",
  "gloo-net",
  "js-sys",
+ "ruzstd",
  "tightbeam-rs",
+ "tightbeam-ws",
  "tokio",
  "wasm-bindgen",
  "wasm-bindgen-futures",
@@ -1329,6 +1336,12 @@ dependencies = [
  "sha1 0.11.0",
  "thiserror",
 ]
+
+[[package]]
+name = "twox-hash"
+version = "2.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "86a801b3cea342a06d468c8710662aa29e5e05e4f5c0d62f00bbb7f2ad7941c2"
 
 [[package]]
 name = "typenum"

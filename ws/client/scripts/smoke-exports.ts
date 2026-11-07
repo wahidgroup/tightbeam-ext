@@ -1,9 +1,12 @@
 /**
  * Smoke: load every `package.json` export and scan dist for Node coupling.
  *
- * Only `dist/` is scanned for isomorphism: the `wasm-node/` tree is the
- * Node-target wasm-pack output and is Node-bound by design, selected via
- * the `#wasm` imports map's `node` condition.
+ * - Only `dist/` is scanned for isomorphism. The `wasm-node/` tree is the
+ *   Node-target wasm-pack output and is Node-bound by design. The `node`
+ *   condition of the `#engine` imports map selects its loader, which imports
+ *   that glue only inside `load`.
+ * - An export loads without the glue, because `TightbeamWsClient.init` is
+ *   the one call that loads it.
  */
 
 import { access, readFile, readdir } from "node:fs/promises";

@@ -2,12 +2,17 @@
 
 DER-backed ASN.1 codec bridge for TypeScript `MessageCodec` façades over [tightbeam](https://crates.io/crates/tightbeam-rs) wire types.
 
+## Status
+
+This project is under active development. Public APIs MAY change without notice. No security audit has been conducted. Use this software at your own risk.
+
 ## Contents
 
-- **[tightbeam-asn](tightbeam-asn)** - published package: `AsnCodec` trait, JS helpers, derive entry, and the `tightbeam-asn-emit` binary that writes consumer MessageCodec TypeScript modules
-- **[tightbeam-asn-derive](tightbeam-asn-derive)** - `#[derive(AsnCodec)]`
+- [tightbeam-asn](tightbeam-asn): the published package, with the `AsnCodec` trait and derive and the `tightbeam-asn-emit` binary.
+- [tightbeam-asn-derive](tightbeam-asn-derive): the `#[derive(AsnCodec)]` proc macro.
+- [tightbeam-asn-names](tightbeam-asn-names): the TypeScript type-name rule that the derive and the emitter share.
 
-See [tightbeam-asn/README.md](tightbeam-asn/README.md) for emit usage and the field map.
+The [tightbeam-asn README](tightbeam-asn/README.md) holds the quick start. Implementation: [docs/asn.md](../docs/asn.md).
 
 ## Development
 
@@ -16,6 +21,8 @@ make setup asn
 make test asn
 make lint asn
 ```
+
+Implementation: [docs/development.md](../docs/development.md).
 
 ## License
 

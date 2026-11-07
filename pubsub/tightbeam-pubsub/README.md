@@ -2,21 +2,26 @@
 
 Topic pub/sub extension for the [tightbeam](https://crates.io/crates/tightbeam-rs) messaging protocol.
 
-This crate adds topic membership and publish fan-out on the existing tightbeam mux. Subscriptions are ordinary client-initiated command streams, and updates are server-initiated pushes. Any process that holds a `MuxHandle` can fan out. There is no new wire protocol and no broker, so the design stays carrier-agnostic (WebSocket or raw TCP mux alike).
+## Status
 
-## Surface
+This project is under active development. Public APIs MAY change without notice. No security audit has been conducted. Use this software at your own risk.
 
-- `Topic` validates names as a `/`-separated hierarchy with exact match semantics. Command prefixes are reserved.
-- `TopicRegistry` owns membership and publishing. The registry builds every update frame itself, so stamps never depend on callers. `RegistryOptions::max_subscriptions_per_connection` (default 64) caps live subscriptions per connection.
-- `PubsubCommands` answers the wire commands inside an existing serve handler. Everything else falls through to the application's routes.
-- `serve_connection` performs the per-connection ceremony in one call: drivers, keepalive, registration, dispatch, and cleanup. `keep_alive` pings a peer on any other link that must outlive the read deadline of a quiet session. `serve_connection_as` attaches an identity. `unrouted` serves command-only.
-- `SubscribePolicy` and `PublishPolicy` expose `authorize(identity, &Topic)` and own the `PermissionDenied` decision. Default is `AllowAll`.
-- `DeliveryPolicy` defines what a full subscriber queue does: `DropOldest` (default, counted), `DropNew`, or `Disconnect`. A slow client never stalls the topic fan-out.
-- `Backplane` provides sequencing and cross-node distribution. `Local` (in-process, the default) covers one node. See [Scaling out](#scaling-out).
+## Abstract
 
-## Publish
+This crate adds topic membership and publish fan-out to the tightbeam mux. A subscription is an ordinary command stream that the client opens, and an update is a push that the server initiates. The crate therefore adds no wire protocol and no broker, and any carrier of the mux carries it, WebSocket or raw TCP. Topic names follow the exact-match model of [MQTT 5.0](https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html) § 4.7, with no wildcards.
+
+## Install
+
+```sh
+cargo add tightbeam-pubsub
+```
+
+## Quick start
 
 ```rust
+# use tightbeam::Frame;
+# use tightbeam_pubsub::{Topic, TopicRegistry};
+# fn publish(registry: &TopicRegistry, payload: &[u8], signed_frame: Frame) -> Result<(), Box<dyn std::error::Error>> {
 let topic: Topic = "prices/spot".parse()?;
 
 // Bytes: the registry wraps them in an update frame, stamping the topic
@@ -28,106 +33,37 @@ registry.publish(&topic, payload)?;
 // compression survive end to end (the TS client decodes with `Framed`),
 // and the registry never reads the inner frame.
 registry.publish_frame(&topic, &signed_frame)?;
+# Ok(())
+# }
 ```
 
-## Authorize
+## Topics and delivery
 
-Identity is whatever the application attaches at connection registration. Mutual-auth certificates are the expected source.
+`TopicRegistry` owns membership, stamps each update with a dense sequence for its topic, and bounds what each connection queues. A delivery policy decides what a full queue drops, so a slow client never stalls the fan-out. Implementation: [docs/pubsub.md](../../docs/pubsub.md#registry).
 
-```rust
-struct DenySecrets;
+## Authorization
 
-impl SubscribePolicy for DenySecrets {
-	fn authorize(&self, _identity: Option<&[u8]>, topic: &Topic) -> AccessVerdict {
-		if topic.as_str().starts_with("secrets/") {
-			return AccessVerdict::Forbid;
-		}
+A subscribe policy and an optional publish policy decide each topic against the peer that the handshake proved. Client publish stays off until a publish policy is installed. Implementation: [docs/pubsub.md](../../docs/pubsub.md#access-policies).
 
-		AccessVerdict::Allow
-	}
-}
+## Serving connections
 
-// Client publish is opt-in. Without `with_publish`, `pub/` frames fall
-// through to the application like any other stream.
-let commands = PubsubCommands::new(registry, DenySecrets).with_publish(AllowAll);
-```
+`PubsubCommands::serve` runs the whole life of one accepted connection, and it hands every stream that no command claims to the routes of the application. Implementation: [docs/pubsub.md](../../docs/pubsub.md#connection-serve).
 
 ## Drain
 
-Quiesce refuses new work, pushes `end/<topic>` to every subscriber, then waits for those pushes to leave before connection shutdown.
-
-```rust
-registry.quiesce()?; // push end/<topic> everywhere, refuse new work
-registry.flushed().await; // wait for the pushes to leave
-handle.shutdown_with(GoAwayReason::Shutdown).await?; // per connection
-```
+A quiesce completes every subscription before the connections shut down, and it keeps each sequence dense. Implementation: [docs/pubsub.md](../../docs/pubsub.md#drain).
 
 ## Scaling out
 
-```rust
-let backplane: Arc<dyn Backplane> = Arc::new(Local::default());
-
-// Every node hands the same backplane to its registry: a publish on any
-// node reaches subscribers on all of them with one dense stamp.
-let registry = TopicRegistry::new(RegistryOptions {
-	backplane: Arc::clone(&backplane),
-	..RegistryOptions::default()
-});
-```
-
-Sharing one `Local` spans registries in one process. An implementation over Redis/Postgres/NATS spans machines under the same contract: orders stay dense per topic and deliveries never run concurrently for one topic. Egress to other channels (web push, email, SNS) attaches as additional consumers of the same bus, beside the registry rather than through it.
+A backplane assigns the sequence of each topic and carries a publish to every node. The in-process `Local` backplane is the default, and an implementation over Redis, Postgres, or NATS meets the same contract. Implementation: [docs/pubsub.md](../../docs/pubsub.md#backplane).
 
 ## Wire convention
 
-Topic names travel in `Frame.metadata.id` as UTF-8 bytes. Refusals use tightbeam's gRPC-canonical `TransitStatus`.
-
-| Direction        | Frame id        | Meaning                                      | Answer                                                                                |
-| ---------------- | --------------- | -------------------------------------------- | ------------------------------------------------------------------------------------- |
-| client to server | `sub/<topic>`   | subscribe                                    | `Ok`, or `PermissionDenied` / `Unavailable` / `ResourceExhausted` / `InvalidArgument` |
-| client to server | `unsub/<topic>` | unsubscribe (idempotent)                     | `Ok`                                                                                  |
-| client to server | `pub/<topic>`   | publish the body payload (opt-in)            | `Ok`, or `PermissionDenied` / `Unavailable` / `InvalidArgument`                       |
-| server to client | `<topic>`       | update: payload in body, sequence in `order` | `Ok`, or `ResourceExhausted` / `Unimplemented` (drop-and-count)                       |
-| server to client | `end/<topic>`   | completion (quiesce)                         | `Ok`                                                                                  |
-
-Both sides dispatch on the same prefixes. The Rust server, per accepted connection:
-
-```rust
-let commands = PubsubCommands::new(registry, policy).with_publish(AllowAll);
-
-// Drivers, registration, command dispatch, cleanup: one call. The
-// application handler receives everything the commands leave alone.
-serve_connection(mux, commands, move |context, frame| {
-	application_routes(context, frame)
-})
-.await?;
-```
-
-The TypeScript client answers the same rows, one route each:
-
-```ts
-const manager = new SubscriptionManager(client, {
-  // Non-topic server pushes. Unmatched ids answer Unimplemented.
-  fallback: async (update) => handleAppStream(update),
-});
-
-// Registers the topic route, then emits `sub/prices`.
-const prices = await manager.subscribe("prices", { codec: Opaque });
-for await (const { message, frame } of prices) {
-  render(message, frame.order);
-}
-
-await manager.publish("prices", payload, Opaque); // emits `pub/prices`
-await manager.unsubscribe("prices"); // emits `unsub/prices`
-```
+Topic names travel in the frame id behind the command prefixes `sub/`, `unsub/`, `pub/`, and `end/`, and every answer is a gRPC canonical status. Implementation: [docs/pubsub.md](../../docs/pubsub.md#wire-convention).
 
 ## Features
 
-- `testing` - in-memory mux fixtures (`memory_mux_pair`) and command-frame helpers for integration tests without sockets.
-
-## Sources
-
-- MQTT 5.0 § 4.7, Topic names and filters:
-  <https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html>
+`testing` adds in-memory links and frame builders for integration tests without sockets. Implementation: [docs/pubsub.md](../../docs/pubsub.md#testing).
 
 ## Related
 

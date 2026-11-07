@@ -26,21 +26,26 @@ name = "emit"
 path = "tests/emit.rs"
 required-features = ["emit"]
 
+[[example]]
+name = "fixture_package"
+crate-type = ["cdylib"]
+
 [features]
 default = []
-wasm = ["dep:wasm-bindgen", "dep:js-sys"]
-emit = ["dep:tightbeam-rs"]
+emit = ["dep:tightbeam-rs", "dep:tightbeam-asn-names"]
 
 [dependencies]
 tightbeam-asn-derive = { version = "0.1.0", path = "../tightbeam-asn-derive" }
+tightbeam-asn-names = { version = "0.1.0", path = "../tightbeam-asn-names", optional = true }
 tightbeam-rs = { workspace = true, optional = true }
 der = { workspace = true, features = ["alloc", "derive", "oid"] }
-js-sys = { workspace = true, optional = true }
-wasm-bindgen = { workspace = true, optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys = { workspace = true }
+wasm-bindgen = { workspace = true }
 
 [dev-dependencies]
 tightbeam-asn-derive = { path = "../tightbeam-asn-derive" }
-tightbeam-asn-fixtures = { path = "../tightbeam-asn-fixtures", features = ["wasm"] }
-js-sys = { workspace = true }
-wasm-bindgen = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 wasm-bindgen-test = "0.3"

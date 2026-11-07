@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { copyFile, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -10,8 +10,24 @@ const execFileAsync = promisify(execFile);
 
 const testsDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(testsDir, "../..");
-const rustFixtures = join(testsDir, "../tightbeam-asn/tests/fixtures");
-const localFixtures = join(testsDir, "fixtures");
+const messageCodecSource = join(repoRoot, "ws/client/src/message.ts");
+const tsc = join(testsDir, "../node_modules/.bin/tsc");
+
+/**
+ * The wasm package of the fixture wire types, which `make -C asn test` builds
+ * before this suite: the declarations the emitter reads, and the exports the
+ * generated codecs bind.
+ */
+const fixturePackage = join(repoRoot, "target/asn-fixture-package");
+const fixtureDts = join(fixturePackage, "asn_fixtures.d.ts");
+const fixtureGlue = join(fixturePackage, "asn_fixtures.js");
+const fixtureBinary = join(fixturePackage, "asn_fixtures_bg.wasm");
+
+/**
+ * The declarations of the ws engine build, which `message.ts` reads as
+ * `#wasm`. `make -C asn test` builds the ws client before this suite.
+ */
+const engineDts = join(repoRoot, "ws/client/wasm/tightbeam_ws_wasm.d.ts");
 
 interface MessageCodec<T> {
 	encode(value: T): Uint8Array;
@@ -20,45 +36,88 @@ interface MessageCodec<T> {
 
 interface GeneratedCodecs {
 	Doc: MessageCodec<{ title: string }>;
-	StatusReport: MessageCodec<{ status: number }>;
-	encodeAsn<T>(codec: MessageCodec<T>, value: T): Promise<Uint8Array>;
-	decodeAsn<T>(codec: MessageCodec<T>, bodyDer: Uint8Array): Promise<T>;
-	Orphan?: MessageCodec<unknown>;
+	StatusReport: MessageCodec<{ title: string; status: number }>;
 }
 
+/**
+ * The exports of an initialized wasm module, as the codecs read them.
+ */
+type AsnModule = Record<string, unknown>;
+
+/**
+ * The `AsnCodecs` class of a generated module.
+ */
+type CodecsClass = new (asn: AsnModule) => GeneratedCodecs;
+
 async function writePackageJson(work: string): Promise<void> {
-	const source = {
-		type: "module",
-		imports: {
-			"#apollyon-asn": "./stub_apollyon_asn.ts",
-			"@wahidgroup/tightbeam-ws-client": "./stub_ws_client.ts",
-		},
-	};
+	const source = { type: "module" };
 	await writeFile(
 		join(work, "package.json"),
 		`${JSON.stringify(source, null, "\t")}\n`,
 	);
 }
 
-async function seedWorkDir(work: string): Promise<void> {
-	await writePackageJson(work);
-	await copyFile(
-		join(rustFixtures, "sample.d.ts"),
-		join(work, "sample.d.ts"),
-	);
-	await copyFile(
-		join(localFixtures, "stub_apollyon_asn.ts"),
-		join(work, "stub_apollyon_asn.ts"),
-	);
-	await copyFile(join(localFixtures, "asnInit.ts"), join(work, "asnInit.ts"));
-	await copyFile(
-		join(localFixtures, "stub_ws_client.ts"),
-		join(work, "stub_ws_client.ts"),
+async function writeTsconfig(work: string): Promise<void> {
+	const source = {
+		compilerOptions: {
+			noEmit: true,
+			strict: true,
+			target: "ES2022",
+			lib: ["ES2022", "ESNext.Disposable", "DOM"],
+			module: "ESNext",
+			moduleResolution: "Bundler",
+			skipLibCheck: true,
+			types: [],
+			paths: {
+				"#asn-wasm": [fixtureDts],
+				"#wasm": [engineDts],
+				"#your-asn-alias": [fixtureDts],
+				"@wahidgroup/tightbeam-ws-client": [messageCodecSource],
+			},
+		},
+		files: ["codecs.ts"],
+	};
+	await writeFile(
+		join(work, "tsconfig.json"),
+		`${JSON.stringify(source, null, "\t")}\n`,
 	);
 }
 
+/**
+ * The TypeScript sample of the `tightbeam-asn` README quick start, verbatim.
+ * Its alias names the web build of the fixture package, whose default export
+ * is the `init` of a `wasm-pack` web build.
+ */
+const README_QUICK_START = `import init, * as asn from "#your-asn-alias";
+import { AsnCodecs } from "./codecs.js";
+
+await init();
+const codecs = new AsnCodecs(asn);
+const bodyDer = codecs.Doc.encode({ title: "hello" });
+`;
+
+/**
+ * Write the quick start and the project that compiles it against the emitted
+ * `codecs.ts`.
+ */
+async function writeQuickStart(work: string): Promise<void> {
+	const project = {
+		extends: "./tsconfig.json",
+		files: ["quick_start.ts"],
+	};
+	await writeFile(join(work, "quick_start.ts"), README_QUICK_START);
+	await writeFile(
+		join(work, "tsconfig.quick-start.json"),
+		`${JSON.stringify(project, null, "\t")}\n`,
+	);
+}
+
+async function seedWorkDir(work: string): Promise<void> {
+	await writePackageJson(work);
+	await writeTsconfig(work);
+}
+
 async function runEmit(work: string): Promise<void> {
-	const fromDts = join(work, "sample.d.ts");
 	const out = join(work, "codecs.ts");
 	await execFileAsync(
 		"cargo",
@@ -72,13 +131,11 @@ async function runEmit(work: string): Promise<void> {
 			"tightbeam-asn-emit",
 			"--",
 			"--from-dts",
-			fromDts,
+			fixtureDts,
 			"--out",
 			out,
 			"--import",
-			"#apollyon-asn",
-			"--init-import",
-			"./asnInit.js",
+			"#asn-wasm",
 			"--message-codec-from",
 			"@wahidgroup/tightbeam-ws-client",
 		],
@@ -110,46 +167,57 @@ function isGeneratedCodecs(value: unknown): value is GeneratedCodecs {
 	if (!isMessageCodec(value.StatusReport)) {
 		return false;
 	}
-	if (typeof value.encodeAsn !== "function") {
-		return false;
-	}
-	if (typeof value.decodeAsn !== "function") {
-		return false;
-	}
 
 	return true;
 }
 
-function isAsnInitModule(value: unknown): value is {
-	resetInit: () => void;
-	wasInitialized: () => boolean;
-} {
-	if (!isRecord(value)) {
-		return false;
-	}
-
-	return (
-		typeof value.resetInit === "function" &&
-		typeof value.wasInitialized === "function"
-	);
+function isCodecsClass(value: unknown): value is CodecsClass {
+	return typeof value === "function";
 }
 
-async function loadGeneratedCodecs(work: string): Promise<GeneratedCodecs> {
-	const mod: unknown = await import(
-		pathToFileURL(join(work, "codecs.ts")).href
-	);
-	if (!isGeneratedCodecs(mod)) {
-		throw new Error("generated codecs module has unexpected exports");
+/**
+ * The module the test imports from `path`.
+ */
+async function importFrom(path: string): Promise<AsnModule> {
+	const url = pathToFileURL(path).href;
+	const mod: unknown = await import(url);
+	if (!isRecord(mod)) {
+		throw new Error(`${path} exports no module namespace`);
 	}
 
 	return mod;
 }
 
+/**
+ * The web build of the fixture package, started from its binary.
+ */
+async function startedFixturePackage(): Promise<AsnModule> {
+	const glue = await importFrom(fixtureGlue);
+	const start = glue.initSync;
+	if (typeof start !== "function") {
+		throw new Error("the fixture package exports no initSync");
+	}
+
+	const binary = await readFile(fixtureBinary);
+	start({ module: binary });
+	return glue;
+}
+
+/**
+ * The codecs of the generated module, bound to `asn`.
+ */
+function bind(AsnCodecs: CodecsClass, asn: AsnModule): GeneratedCodecs {
+	const codecs: unknown = new AsnCodecs(asn);
+	if (!isGeneratedCodecs(codecs)) {
+		throw new Error("AsnCodecs binds unexpected codecs");
+	}
+
+	return codecs;
+}
+
 describe("tightbeam-asn-emit", () => {
 	let work = "";
 	let codecs: GeneratedCodecs;
-	let resetInit: () => void;
-	let wasInitialized: () => boolean;
 
 	beforeAll(async () => {
 		work = await mkdtemp(join(tmpdir(), "tightbeam-asn-emit-"));
@@ -157,16 +225,13 @@ describe("tightbeam-asn-emit", () => {
 		await seedWorkDir(work);
 		await runEmit(work);
 
-		codecs = await loadGeneratedCodecs(work);
-		const init: unknown = await import(
-			pathToFileURL(join(work, "asnInit.ts")).href
-		);
-		if (!isAsnInitModule(init)) {
-			throw new Error("asnInit module has unexpected exports");
+		const generated = await importFrom(join(work, "codecs.ts"));
+		if (!isCodecsClass(generated.AsnCodecs)) {
+			throw new Error("the generated module exports no AsnCodecs class");
 		}
 
-		resetInit = init.resetInit;
-		wasInitialized = init.wasInitialized;
+		const asn = await startedFixturePackage();
+		codecs = bind(generated.AsnCodecs, asn);
 	});
 
 	afterAll(async () => {
@@ -183,34 +248,20 @@ describe("tightbeam-asn-emit", () => {
 	});
 
 	it("round-trips StatusReport through MessageCodec.encode/decode", () => {
-		const status = { status: 42 };
-		const der = codecs.StatusReport.encode(status);
+		const report = { title: "emit-test", status: 2 };
+		const der = codecs.StatusReport.encode(report);
 		const round = codecs.StatusReport.decode(der);
-		expect(round).toEqual(status);
+		expect(round).toEqual(report);
 	});
 
-	it("calls ensureAsnInit from encodeAsn and decodeAsn", async () => {
-		resetInit();
-		const doc = { title: "init-gate" };
+	it("typechecks against the real MessageCodec", async () => {
+		await execFileAsync(tsc, ["-p", work]);
+	}, 60_000);
 
-		if (wasInitialized()) {
-			throw new Error("ensureAsnInit must not run before encodeAsn");
-		}
+	it("README quick start compiles against the emitted module", async () => {
+		await writeQuickStart(work);
 
-		const der = await codecs.encodeAsn(codecs.Doc, doc);
-		if (!wasInitialized()) {
-			throw new Error("encodeAsn must call ensureAsnInit");
-		}
-
-		const round = await codecs.decodeAsn(codecs.Doc, der);
-		if (!wasInitialized()) {
-			throw new Error("decodeAsn must call ensureAsnInit");
-		}
-
-		expect(round).toEqual(doc);
-	});
-
-	it("does not export codecs for unpaired wasm encode functions", () => {
-		expect(codecs.Orphan).toBeUndefined();
-	});
+		const project = join(work, "tsconfig.quick-start.json");
+		await execFileAsync(tsc, ["-p", project]);
+	}, 60_000);
 });

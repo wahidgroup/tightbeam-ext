@@ -1,141 +1,54 @@
-// Bridge the in-page round-trip helpers installed by `app/main.ts` so both the
-// app and the Playwright spec (via `page.evaluate`) share one typed interface.
+// Bridge the in-page helpers installed by `app/main.ts` and `app/engine.ts` so
+// both the pages and the Playwright specs (via `page.evaluate`) share one typed
+// interface.
+// Each entry takes the type of the function the app installs.
 import type {
-	CompressedRoundTripResult,
-	MuxCallbackResult,
-	MuxConcurrentResult,
-	MuxDrainResult,
-	MuxLifecycleResult,
-	MuxRefusalResult,
-	RoundTripResult,
-	SealedRoundTripResult,
-	SignedRoundTripResult,
-	SignerRoundTripResult,
-	TypedRoundTripResult,
-	WorkRefusalResult,
-	WorkRoundTripOptions,
-	WorkRoundTripResult,
+	compressedRoundTrip,
+	compressedSealedRoundTrip,
+	muxCallbackRoundTrip,
+	muxClearConcurrentRoundTrip,
+	muxConcurrentRoundTrip,
+	muxDrainReason,
+	muxLifecycleProbe,
+	muxParkedCallbackRoundTrip,
+	muxRefusalRoundTrip,
+	mutualRoundTrip,
+	mutualSignerRoundTrip,
+	roundTrip,
+	sealedRoundTrip,
+	secureRoundTrip,
+	signedRoundTrip,
+	streamingRoundTrip,
+	typedRoundTrip,
+	workRefusal,
+	workRoundTrip,
 } from "./app/main.js";
+import type { initRefusal, initWithInput } from "./app/engine.js";
 
 export {};
 
 declare global {
 	interface Window {
-		tbRoundTrip: (
-			url: string,
-			payloadHex: string,
-			idText: string,
-			order: number,
-		) => Promise<RoundTripResult>;
-		tbSecureRoundTrip: (
-			url: string,
-			serverCertB64: string,
-			payloadHex: string,
-			idText: string,
-			order: number,
-		) => Promise<RoundTripResult>;
-		tbMutualRoundTrip: (
-			url: string,
-			serverCertB64: string,
-			clientCertB64: string,
-			clientKeyB64: string,
-			payloadHex: string,
-			idText: string,
-			order: number,
-		) => Promise<RoundTripResult>;
-		tbMutualSignerRoundTrip: (
-			url: string,
-			serverCertB64: string,
-			clientCertB64: string,
-			clientKeyB64: string,
-			payloadHex: string,
-			idText: string,
-			order: number,
-		) => Promise<SignerRoundTripResult>;
-		tbStreamingRoundTrip: (
-			url: string,
-			serverCertB64: string,
-			payloadHex: string,
-			idText: string,
-		) => Promise<RoundTripResult>;
-		tbSignedRoundTrip: (
-			url: string,
-			payloadHex: string,
-			idText: string,
-			order: number,
-			signingKeyHex: string,
-			saltHex: string,
-		) => Promise<SignedRoundTripResult>;
-		tbSealedRoundTrip: (
-			url: string,
-			payloadHex: string,
-			idText: string,
-			order: number,
-			keyHex: string,
-		) => Promise<SealedRoundTripResult>;
-		tbCompressedRoundTrip: (
-			url: string,
-			payloadHex: string,
-			idText: string,
-			order: number,
-		) => Promise<CompressedRoundTripResult>;
-		tbCompressedSealedRoundTrip: (
-			url: string,
-			payloadHex: string,
-			idText: string,
-			order: number,
-			keyHex: string,
-		) => Promise<CompressedRoundTripResult>;
-		tbTypedRoundTrip: (
-			url: string,
-			idText: string,
-			order: number,
-			author: string,
-			text: string,
-		) => Promise<TypedRoundTripResult>;
-		tbMuxConcurrentRoundTrip: (
-			url: string,
-			serverCertB64: string,
-			payloadHex: string,
-		) => Promise<MuxConcurrentResult>;
-		tbMuxCallbackRoundTrip: (
-			url: string,
-			serverCertB64: string,
-			payloadHex: string,
-			replyHex: string,
-		) => Promise<MuxCallbackResult>;
-		tbMuxClearConcurrentRoundTrip: (
-			url: string,
-			payloadHex: string,
-		) => Promise<MuxConcurrentResult>;
-		tbMuxLifecycleProbe: (
-			url: string,
-			serverCertB64: string,
-		) => Promise<MuxLifecycleResult>;
-		tbMuxDrainReason: (
-			url: string,
-			serverCertB64: string,
-		) => Promise<MuxDrainResult>;
-		tbMuxParkedCallbackRoundTrip: (
-			url: string,
-			serverCertB64: string,
-			payloadHex: string,
-			replyHex: string,
-		) => Promise<MuxCallbackResult>;
-		tbMuxRefusalRoundTrip: (
-			url: string,
-			serverCertB64: string,
-			payloadHex: string,
-		) => Promise<MuxRefusalResult>;
-		tbWorkRoundTrip: (
-			options: WorkRoundTripOptions,
-		) => Promise<WorkRoundTripResult>;
-		tbWorkRefusal: (
-			url: string,
-			serverCertB64: string,
-			target: string,
-			payloadHex: string,
-			workKeyB64: string,
-		) => Promise<WorkRefusalResult>;
+		tbRoundTrip: typeof roundTrip;
+		tbSecureRoundTrip: typeof secureRoundTrip;
+		tbMutualRoundTrip: typeof mutualRoundTrip;
+		tbMutualSignerRoundTrip: typeof mutualSignerRoundTrip;
+		tbStreamingRoundTrip: typeof streamingRoundTrip;
+		tbSignedRoundTrip: typeof signedRoundTrip;
+		tbSealedRoundTrip: typeof sealedRoundTrip;
+		tbCompressedRoundTrip: typeof compressedRoundTrip;
+		tbCompressedSealedRoundTrip: typeof compressedSealedRoundTrip;
+		tbTypedRoundTrip: typeof typedRoundTrip;
+		tbMuxConcurrentRoundTrip: typeof muxConcurrentRoundTrip;
+		tbMuxCallbackRoundTrip: typeof muxCallbackRoundTrip;
+		tbMuxClearConcurrentRoundTrip: typeof muxClearConcurrentRoundTrip;
+		tbMuxLifecycleProbe: typeof muxLifecycleProbe;
+		tbMuxDrainReason: typeof muxDrainReason;
+		tbMuxParkedCallbackRoundTrip: typeof muxParkedCallbackRoundTrip;
+		tbMuxRefusalRoundTrip: typeof muxRefusalRoundTrip;
+		tbWorkRoundTrip: typeof workRoundTrip;
+		tbWorkRefusal: typeof workRefusal;
+		tbInitWithInput: typeof initWithInput;
+		tbInitRefusal: typeof initRefusal;
 	}
 }

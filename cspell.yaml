@@ -11,6 +11,7 @@ words:
   - websockets
   - tungstenite
   - tokio
+  - oneshot
   - rustfmt
   - clippy
   - cargo
@@ -94,6 +95,8 @@ words:
   - monomorphization
   - handshaken
   - rlib
+  - cdylib
+  - doctest
   - thenables
   - bivariant
   - unsub
@@ -111,8 +114,29 @@ words:
   - uppercases
   - baselined
   - unmetered
+  - unconfigured
   - subarray
   - teletex
+  - microtasks
+  - checksummed
+  - zeroizing
+  - usize
+  - absolutemin
+  - targetlength
+  - windowlog
+  - ssot
+  - rsplit
+  - unhex
+  - paywalled
+  - encodestring
+  - decodestring
+  - hexdigit
+  - ruzstd
+  - blocksize
+  - clevel
+  - clevels
+  - upto
+  - seekable
 ignorePaths:
   - node_modules/**
   - "**/sbom.json"

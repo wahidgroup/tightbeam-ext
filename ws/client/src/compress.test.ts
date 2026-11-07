@@ -1,126 +1,210 @@
 import { describe, expect, it } from "vitest";
 
-import { PROFILE_OIDS } from "./crypto.js";
-import { ZstdCompression } from "./compress.js";
-import { Opaque, ValidationError, frame, initClient } from "./index.js";
+import { TightbeamWsClient } from "./index.js";
 
 /**
- * The profile zstd compression: one zstd frame that must interoperate with
- * tightbeam-rs `ZstdCompression`.
+ * The engine zstd compression: one frame, with the refusals the engine names,
+ * on its own and on the inflate path of a frame.
  */
 
-await initClient();
+const engine = await TightbeamWsClient.init();
 
 const BODY = new Uint8Array([1, 2, 3, 4]);
 
 /**
- * The shared payload of the TypeScript/Rust zstd interop fixtures.
+ * A payload that compresses well, so its frame is short.
  */
-const INTEROP_PAYLOAD = new TextEncoder().encode(
-	"tightbeam zstd interop fixture body ".repeat(8),
-);
+const PAYLOAD = new Uint8Array(4096).fill(0x61);
 
 /**
- * One zstd frame over {@link INTEROP_PAYLOAD} that declares no content size,
- * as a streaming encoder writes: the profile inflator must open it within
- * its ceiling.
+ * A ceiling below the 128 KiB window ruzstd 0.9.0 declares, which refuses
+ * every body the engine compressed.
  */
-const UNSIZED_FRAME_HEX =
-	"28b52ffd00586d0100440274696768746265616d207a73746420696e7465726f7020" +
-	"6669787475726520626f6479200100cc1f4a3d01";
+const SMALL_CEILING = 64;
 
 /**
- * The seek table a seekable-format writer appends after a frame. tightbeam-rs
- * refuses it, so the profile writes none.
+ * A ceiling whose rounded window holds the 128 KiB window ruzstd declares,
+ * and which {@link LARGE_PAYLOAD} outgrows.
  */
-const SEEK_TABLE_HEX =
-	"5e2a4d1811000000360000002001000001000000" + "00b1ea928f";
+const WINDOW_CEILING = 200 * 1024;
 
-function bytesFromHex(hex: string): Uint8Array {
-	const bytes = new Uint8Array(hex.length / 2);
-	for (let index = 0; index < bytes.length; index += 1) {
-		const pair = hex.slice(index * 2, index * 2 + 2);
-		bytes[index] = Number.parseInt(pair, 16);
-	}
+/**
+ * A payload past {@link WINDOW_CEILING}.
+ */
+const LARGE_PAYLOAD = new Uint8Array(300 * 1024).fill(0x62);
 
-	return bytes;
-}
+/**
+ * A ceiling that holds {@link LARGE_PAYLOAD}.
+ */
+const HOLDING_CEILING = 400 * 1024;
+
+/**
+ * Octets that open no zstd frame.
+ */
+const NO_FRAME = new Uint8Array(32).fill(0xff);
+
+/**
+ * The profile zstd at the default ceiling.
+ */
+const zstd = engine.zstd();
+
+/**
+ * The compressed octets of {@link PAYLOAD}.
+ */
+const PACKED = zstd.compress(PAYLOAD).data;
+
+/**
+ * {@link PACKED} with its last octet cut.
+ */
+const TRUNCATED = PACKED.slice(0, -1);
+
+/**
+ * {@link PACKED} with one octet after the frame.
+ */
+const TRAILING = new Uint8Array([...PACKED, 0]);
 
 describe("ZstdCompression", () => {
-	const zstd = new ZstdCompression();
+	it("two views over one handle each enforce their own ceiling", () => {
+		const lower = engine.zstd(WINDOW_CEILING);
+		const higher = engine.zstd(HOLDING_CEILING);
 
-	it("round-trips a body under the profile zstd OID", async () => {
-		const compressed = await zstd.compress(INTEROP_PAYLOAD);
-		expect(compressed.algorithmOid).toBe(PROFILE_OIDS.zstd);
-
-		await expect(zstd.decompress(compressed)).resolves.toEqual(
-			INTEROP_PAYLOAD,
+		const compressed = zstd.compress(LARGE_PAYLOAD);
+		expect(() => lower.decompress(compressed.data)).toThrow(
+			expect.objectContaining({ code: "OutputLimitExceeded" }),
 		);
+		expect(higher.decompress(compressed.data)).toEqual(LARGE_PAYLOAD);
 	});
 
-	it("opens a frame that declares no content size", async () => {
-		const compressed = {
-			algorithmOid: PROFILE_OIDS.zstd,
-			data: bytesFromHex(UNSIZED_FRAME_HEX),
-		};
-
-		await expect(zstd.decompress(compressed)).resolves.toEqual(
-			INTEROP_PAYLOAD,
-		);
+	it("round-trips a body", () => {
+		const compressed = zstd.compress(PAYLOAD);
+		expect(zstd.decompress(compressed.data)).toEqual(PAYLOAD);
 	});
 
-	it("writes one frame with no seek table", async () => {
-		const compressed = await zstd.compress(INTEROP_PAYLOAD);
-		const hex = Array.from(compressed.data, (octet) =>
-			octet.toString(16).padStart(2, "0"),
-		).join("");
-		expect(hex.startsWith("28b52ffd")).toBe(true);
-		expect(hex.includes(SEEK_TABLE_HEX.slice(0, 8))).toBe(false);
+	it("names the profile zstd OID as the algorithm it reverses", () => {
+		expect(zstd.algorithmOid.equals(engine.profile.zstd)).toBe(true);
 	});
 
-	it("round-trips a body past one megabyte", async () => {
+	it("round-trips a body past one megabyte", () => {
 		const large = new Uint8Array(2 * 1024 * 1024 + 1).fill(0x61);
-
-		const compressed = await zstd.compress(large);
-		await expect(zstd.decompress(compressed)).resolves.toEqual(large);
+		const compressed = zstd.compress(large);
+		expect(zstd.decompress(compressed.data)).toEqual(large);
 	}, 20_000);
 
-	it("rejects a body carried under another algorithm OID", async () => {
-		const compressed = await zstd.compress(INTEROP_PAYLOAD);
-		const relabeled = { ...compressed, algorithmOid: PROFILE_OIDS.zlib };
-
-		await expect(zstd.decompress(relabeled)).rejects.toThrow(
-			ValidationError,
+	it.each([
+		{ name: "bytes that open no frame", data: NO_FRAME, code: "Malformed" },
+		{ name: "a frame cut short", data: TRUNCATED, code: "Truncated" },
+		{
+			name: "an octet after the frame",
+			data: TRAILING,
+			code: "TrailingBytes",
+		},
+	])("refuses $name with $code", ({ data, code }) => {
+		expect(() => zstd.decompress(data)).toThrow(
+			expect.objectContaining({ code }),
 		);
 	});
 
-	it("rejects bytes that open no zstd frame", async () => {
-		const compressed = {
-			algorithmOid: PROFILE_OIDS.zstd,
-			data: new Uint8Array(32).fill(0xff),
-		};
-
-		await expect(zstd.decompress(compressed)).rejects.toThrow();
+	it("refuses a window past the ceiling with WindowTooLarge", () => {
+		const capped = engine.zstd(SMALL_CEILING);
+		expect(() => capped.decompress(PACKED)).toThrow(
+			expect.objectContaining({ code: "WindowTooLarge" }),
+		);
 	});
 
-	it("rejects a declared output size beyond the ceiling before decompressing", async () => {
-		const capped = new ZstdCompression(64);
-		const compressed = await zstd.compress(INTEROP_PAYLOAD);
+	it("refuses output past the ceiling with OutputLimitExceeded", () => {
+		const capped = engine.zstd(WINDOW_CEILING);
+		const compressed = zstd.compress(LARGE_PAYLOAD);
+		expect(() => capped.decompress(compressed.data)).toThrow(
+			expect.objectContaining({ code: "OutputLimitExceeded" }),
+		);
+	});
 
-		await expect(capped.decompress(compressed)).rejects.toThrow(
-			ValidationError,
+	it.each([
+		{ name: "NaN", maxOutput: Number.NaN },
+		{ name: "a negative ceiling", maxOutput: -1 },
+		{ name: "a fraction", maxOutput: 1.5 },
+	])("refuses $name as a ceiling with InvalidMaxOutput", ({ maxOutput }) => {
+		expect(() => engine.zstd(maxOutput)).toThrow(
+			expect.objectContaining({ code: "InvalidMaxOutput" }),
 		);
 	});
 });
 
+describe("ZstdCompression.admitsParameters", () => {
+	it.each([
+		{ name: "no parameters", parametersDer: undefined, admitted: true },
+		{
+			name: "the default level",
+			parametersDer: new Uint8Array([0x02, 0x01, 0x03]),
+			admitted: true,
+		},
+		{
+			name: "the highest level",
+			parametersDer: new Uint8Array([0x02, 0x01, 0x16]),
+			admitted: true,
+		},
+		{
+			name: "the lowest level",
+			parametersDer: new Uint8Array([0x02, 0x03, 0xfe, 0x00, 0x00]),
+			admitted: true,
+		},
+		{
+			name: "a level above the range",
+			parametersDer: new Uint8Array([0x02, 0x01, 0x17]),
+			admitted: false,
+		},
+		{
+			name: "a level below the range",
+			parametersDer: new Uint8Array([0x02, 0x03, 0xfd, 0xff, 0xff]),
+			admitted: false,
+		},
+		{
+			name: "a padded integer",
+			parametersDer: new Uint8Array([0x02, 0x02, 0x00, 0x03]),
+			admitted: false,
+		},
+		{
+			name: "a NULL",
+			parametersDer: new Uint8Array([0x05, 0x00]),
+			admitted: false,
+		},
+	])("reads $name as admitted: $admitted", ({ parametersDer, admitted }) => {
+		expect(zstd.admitsParameters(parametersDer)).toBe(admitted);
+	});
+});
+
 describe("profile zstd through the frame pipeline", () => {
-	const zstd = new ZstdCompression();
-
 	it("round-trips a compressed frame body", async () => {
-		const built = await frame(BODY).withCompressor(zstd).build();
-		expect(built.compressed).toBe(true);
-		expect(built.compactnessInfo?.algorithmOid).toBe(PROFILE_OIDS.zstd);
+		const builder = engine.frameBuilder(BODY).withCompressor(zstd);
+		const built = await builder.build();
+		const algorithm = built.compactnessInfo?.algorithmOid;
 
-		await expect(built.inflateMessage(zstd, Opaque)).resolves.toEqual(BODY);
+		expect(built.compressed).toBe(true);
+		expect(algorithm?.equals(engine.profile.zstd)).toBe(true);
+		await expect(
+			built.inflateMessage(zstd, engine.opaque),
+		).resolves.toEqual(BODY);
+	});
+
+	it("opens a compressed frame body through an inflator", async () => {
+		const builder = engine.frameBuilder(BODY).withCompressor(zstd);
+		const built = await builder.build();
+
+		const opened = built.open(engine.opaque, { inflator: zstd });
+		await expect(opened).resolves.toEqual(BODY);
+	});
+
+	it("a zstd refusal on the frame inflate path carries CompressionError", async () => {
+		const builder = engine.frameBuilder(PAYLOAD).withCompressor(zstd);
+		const built = await builder.build();
+		const capped = engine.zstd(SMALL_CEILING);
+
+		const inflated = built.inflateMessage(capped, engine.opaque);
+		await expect(inflated).rejects.toMatchObject({
+			code: "CompressionError",
+		});
+		expect(() => capped.decompress(built.bodyDer)).toThrow(
+			expect.objectContaining({ code: "WindowTooLarge" }),
+		);
 	});
 });

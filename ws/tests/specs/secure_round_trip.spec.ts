@@ -1,7 +1,8 @@
 import type { RoundTripResult, SignerRoundTripResult } from "../app/main.js";
 import { expect, test } from "@playwright/test";
 
-import { certBase64, muxEndpoint, muxMutualEndpoint } from "../env.js";
+import { certBase64 } from "../env.js";
+import { STACK } from "../stack.js";
 import { openApp } from "./helpers.js";
 
 const serverCert = certBase64("server.cert.der");
@@ -40,7 +41,7 @@ for (const testCase of cases) {
 			({ url, cert, payload, id, order }) =>
 				window.tbSecureRoundTrip(url, cert, payload, id, order),
 			{
-				url: muxEndpoint,
+				url: STACK.muxEndpoint,
 				cert: serverCert,
 				payload: testCase.payloadHex,
 				id: testCase.id,
@@ -71,7 +72,7 @@ test("round-trips over a mutually-authenticated encrypted session", async ({
 				7,
 			),
 		{
-			url: muxMutualEndpoint,
+			url: STACK.muxMutualEndpoint,
 			cert: serverCert,
 			clientCertB64: clientCert,
 			clientKeyB64: clientKey,
@@ -99,7 +100,7 @@ test("authenticates mutually through an external signer in the browser", async (
 				8,
 			),
 		{
-			url: muxMutualEndpoint,
+			url: STACK.muxMutualEndpoint,
 			cert: serverCert,
 			clientCertB64: clientCert,
 			clientKeyB64: clientKey,

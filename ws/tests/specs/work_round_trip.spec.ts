@@ -1,7 +1,8 @@
 import type { WorkRefusalResult, WorkRoundTripResult } from "../app/main.js";
 import { expect, test } from "@playwright/test";
 
-import { certBase64, workGatewayEndpoint } from "../env.js";
+import { certBase64 } from "../env.js";
+import { STACK } from "../stack.js";
 import { openApp } from "./helpers.js";
 
 /**
@@ -22,7 +23,7 @@ test("submits a signed work frame and verifies the served response frame", async
 	const result: WorkRoundTripResult = await page.evaluate(
 		(options) => window.tbWorkRoundTrip(options),
 		{
-			url: workGatewayEndpoint,
+			url: STACK.workGatewayEndpoint,
 			serverCertB64: certBase64("server.cert.der"),
 			target: SERVED_TARGET,
 			payloadHex: "cafef00d",
@@ -31,7 +32,6 @@ test("submits a signed work frame and verifies the served response frame", async
 			workKeyB64: certBase64("client.key"),
 		},
 	);
-
 	expect(result.bodyText).toBe("pong:cafef00d:true");
 	expect(result.idText).toBe("e2e-work-1");
 	expect(result.signatureValid).toBe(true);
@@ -46,13 +46,12 @@ test("refuses work for an unserved servlet type with a typed status", async ({
 		({ url, serverCert, workKey, target }) =>
 			window.tbWorkRefusal(url, serverCert, target, "0badf00d", workKey),
 		{
-			url: workGatewayEndpoint,
+			url: STACK.workGatewayEndpoint,
 			serverCert: certBase64("server.cert.der"),
 			workKey: certBase64("client.key"),
 			target: UNSERVED_TARGET,
 		},
 	);
-
 	expect(result.rejectionName).toBe("TightbeamTransportError");
 	expect(result.rejectionCode).toBe("WorkRefused");
 	expect(result.rejectionStatus).toBe("Unavailable");

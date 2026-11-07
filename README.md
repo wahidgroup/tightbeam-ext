@@ -1,26 +1,31 @@
 # tightbeam-ext
 
-Official, canonical extensions for the [tightbeam](https://crates.io/crates/tightbeam-rs) messaging protocol.
+Official extensions for the [tightbeam](https://crates.io/crates/tightbeam-rs) messaging protocol.
 
-This repository is the supported home for everything beyond the tightbeam core: additional transports, browser/WebAssembly clients, and the various packages that let non-Rust environments speak tightbeam.
+## Status
+
+This project is under active development. Public APIs MAY change without notice. No security audit has been conducted. Use this software at your own risk.
+
+## Abstract
+
+This repository holds the parts of tightbeam that sit beyond the core crate: a WebSocket transport, a browser client, topic pub/sub, and an ASN.1 bridge to TypeScript. Each extension lives in its own directory with its crates, its npm packages, and its end-to-end tests. The [documentation index](docs/README.md) lists the page that specifies each part.
 
 ## Extensions
 
-Each extension lives in its own directory carrying everything it needs: crates, browser packages, and end-to-end tests, plus a README with usage and design details.
+### [ws/](ws): WebSocket transport
 
-### [ws/](ws) - WebSocket transport
+- [tightbeam-ws](ws/tightbeam-ws): the native transport, which carries tightbeam envelopes as WebSocket binary messages ([RFC 6455](https://datatracker.ietf.org/doc/html/rfc6455)). Published to crates.io.
+- [tightbeam-ws-client](ws/client): `@wahidgroup/tightbeam-ws-client`, the TypeScript and wasm client for browsers and Node. It builds and verifies tightbeam frames and runs encrypted, multiplexed sessions.
+- [tightbeam-ws-wasm](ws/tightbeam-ws-wasm): the wasm engine that the client ships.
 
-- **[ws/tightbeam-ws](ws/tightbeam-ws)** - the host transport. Carries DER-encoded tightbeam envelopes as WebSocket binary frames ([RFC 6455](https://www.rfc-editor.org/rfc/rfc6455)), one envelope per message, with cleartext and HPKE-encrypted round-trips. Published to crates.io.
-- **[ws/client](ws/client)** - `@wahidgroup/tightbeam-ws-client`, the published hybrid TS/wasm package for browsers and Node. Fluent frame builder with algorithm selection, `Frame` with verification methods matching the Rust client, `Signatory` external signers, and HPKE sessions.
+### [pubsub/](pubsub): Topic pub/sub
 
-### [pubsub/](pubsub) - Topic pub/sub
+- [tightbeam-pubsub](pubsub/tightbeam-pubsub): the server-side topic registry over the tightbeam mux. It adds no wire protocol.
+- [tightbeam-pubsub-client](pubsub/client): `@wahidgroup/tightbeam-pubsub-client`, typed topic subscriptions over the ws client.
 
-- **[pubsub/tightbeam-pubsub](pubsub/tightbeam-pubsub)** - server-side topic registry over the core mux: publish fan-out with dense per-topic ordering, bounded per-subscriber queues with delivery policies, subscribe authorization, and orderly quiesce. Carrier-agnostic, no new wire protocol.
-- **[pubsub/client](pubsub/client)** - `@wahidgroup/tightbeam-pubsub-client`, typed subscribe/unsubscribe lifecycle over the ws client: exact-match dispatch, per-topic ordering gates with gap detection, completion callbacks, and reconnect replay.
+### [asn/](asn): ASN.1 bridge to TypeScript
 
-### [asn/](asn) - DER ASN.1 TypeScript bridge
-
-- **[asn/tightbeam-asn](asn/tightbeam-asn)** - RustCrypto `der` codec bridge: `AsnCodec` marker and runtime helpers for TypeScript façades.
+- [tightbeam-asn](asn/tightbeam-asn): `#[derive(AsnCodec)]` on `der` wire types, and the `tightbeam-asn-emit` binary that writes TypeScript `MessageCodec` modules.
 
 ## Development
 
@@ -34,31 +39,7 @@ make audit       # cargo audit + npm audit
 make ci          # full CI pipeline
 ```
 
-Each extension owns its targets in `<project>/Makefile` and its setup in
-`<project>/scripts/setup.sh`. The root composes them. Naming a project
-scopes a target to it:
-
-```sh
-make test ws     # ws only: cargo + vitest + its e2e lanes
-make lint pubsub # pubsub only
-make setup ws    # skips the pubsub install entirely
-```
-
-Run `make help` for the full target list.
-
-## Releasing
-
-```sh
-make release version=v0.1.0            # release the default extension (ws)
-make release version=v0.1.0 ext=ws     # release a named extension
-make release                           # prompt for the next version
-make release version=v0.1.0 dry-run=1  # preview without mutations
-make release yank=1                    # yank a published version
-```
-
-Extensions are released independently: each top-level extension directory (e.g. `ws/`) versions its crates on its own. A release bumps that extension's versions, opens a release pull request, and on merge creates a signed `releases/<ext>/v<version>` tag. Pushing that tag publishes that extension's publishable crates to crates.io (Cargo multi-package, dependency order - not the whole workspace) and creates the GitHub release.
-
-The deploy guard `check-yanked.sh` refuses yanked versions (`yanked/<ext>/v<version>`).
+A project name after a target scopes it, as in `make test ws`, and `make help` prints every target. Each extension releases on its own with `make release`. Implementation: [docs/development.md](docs/development.md).
 
 ## License
 

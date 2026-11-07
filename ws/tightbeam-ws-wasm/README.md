@@ -4,33 +4,35 @@ WebAssembly WebSocket client for the [tightbeam](https://crates.io/crates/tightb
 
 ## Status
 
-> Warning: This project is under active development. Public APIs MAY change without notice.
-
-**Security Disclaimer:** A SECURITY AUDIT HAS NOT BEEN CONDUCTED. USE AT YOUR OWN RISK.
+This project is under active development. Public APIs MAY change without notice. No security audit has been conducted. Use this software at your own risk.
 
 ## Abstract
 
-The wasm32 counterpart to [tightbeam-ws](../tightbeam-ws): a `gloo-net` WebSocket stream implementing the same tightbeam transport traits, plus `wasm-bindgen` frame-composer bindings for JavaScript callers.
+This crate is the browser counterpart of [tightbeam-ws](../tightbeam-ws). It runs the tightbeam transport over a browser WebSocket under the same envelope rules, and it exposes the frame composer of tightbeam to JavaScript through `wasm-bindgen`. It never reaches crates.io: it ships inside the npm package `@wahidgroup/tightbeam-ws-client` ([client](../client)).
 
-Not published to crates.io. It is compiled with `wasm-pack` and shipped inside the npm package `@wahidgroup/tightbeam-ws-client` ([client](../client)):
+## Build
 
 ```sh
 make client   # wasm-pack build + TS workspace build
 ```
 
-The Playwright suite under [tests/](../tests) exercises the compiled client end to end against a dockerized `tightbeam-ws` echo server (`make test`).
+The build writes a browser bundle and a Node bundle, and each has a loader of its own, which imports the bundle as `TightbeamWsClient.init` runs. Implementation: [docs/ws-wasm.md](../../docs/ws-wasm.md#build).
 
-## Custom transport profiles
+## Parse once
 
-The session profile (curve, AEAD, digests, certificate policy) is a compile-time `CryptoProvider` choice, exactly as with a native tightbeam-rs transport. The shipped `MuxWsClient` binding instantiates the tightbeam default profile. Frame-level cryptography stays caller-supplied at runtime in the TypeScript layer regardless.
+Each JavaScript value that the engine owns parses once, in Rust, into a handle such as `Oid` or `DigestInfo`, and every binding refuses a value it cannot read with a code in place of a coercion. Implementation: [docs/ws-wasm.md](../../docs/ws-wasm.md#parse-once).
 
-A deployment on a different provider builds its own wasm crate against this one (it compiles as an `rlib`) and reuses the transport layer with its own `#[wasm_bindgen]` bindings:
+## Compression
 
-1. For mutual authentication, adapt a JavaScript `TransportSigner` with `JsSigningKeyProvider::identity::<P>(signer, cert_der)`. Its signatures MUST verify under `P`.
-2. Call `build_transport_with::<P>(socket, trust_store, identity)` on an opened `gloo` WebSocket, with the identity from step 1 or `None`. The trust store MUST validate under `P`, as `profile_trust_store` does for the default profile.
-3. For multiplexed traffic, offer mux with `with_mux_offer`.
-4. Run `perform_client_handshake` on the transport.
-5. Call `emit` for single-flight traffic, or `split_mux(transport)` for multiplexed traffic. `split_mux` accepts the default provider only.
+The engine zstd runs on the pure-Rust `ruzstd` under the clauses of the zstd of `tightbeam-rs`, so the browser admits the compressed bodies a native peer admits, with no C compiler in the build. Implementation: [docs/ws-wasm.md](../../docs/ws-wasm.md#compression).
+
+## Session profiles
+
+The session profile is a compile-time `CryptoProvider` choice, as with a native tightbeam transport, and the shipped binding runs the default profile. A deployment on another provider builds its own wasm crate against this one. Implementation: [docs/ws-wasm.md](../../docs/ws-wasm.md#session-profiles).
+
+## Tests
+
+`wasm-pack test --node` runs the engine and its browser stream, `cargo test` checks the engine zstd against the zstd of `tightbeam-rs` on the host, and the Playwright suite runs the compiled client against a dockerized `tightbeam-ws` server. Implementation: [docs/ws-wasm.md](../../docs/ws-wasm.md#tests).
 
 ## Related
 

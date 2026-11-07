@@ -6,5 +6,6 @@ export default defineConfig({
 		include: ["src/**/*.test.ts"],
 		exclude: ["node_modules", "dist"],
 		root: ".",
+		setupFiles: ["../../scripts/vitest/byte-equality.mjs"],
 	},
 });

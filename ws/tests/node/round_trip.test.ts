@@ -1,29 +1,30 @@
 import { describe, expect, it } from "vitest";
 
-import type { MessageCodec } from "@wahidgroup/tightbeam-ws-client";
-import {
-	Aes256Gcm,
-	HpkeDecryptor,
-	HpkeEncryptor,
-	Opaque,
-	PROFILE_OIDS,
-	Secp256k1SigningKey,
-	Sha3_256,
-	TightbeamWsClient,
-	ZstdCompression,
-	frame,
-	wrapped,
-} from "@wahidgroup/tightbeam-ws-client";
+import { TightbeamWsClient } from "@wahidgroup/tightbeam-ws-client";
 
+import { certBytes, demoIdentity } from "../env.js";
 import {
-	certBytes,
-	muxClearEndpoint,
-	muxEndpoint,
-	muxMutualEndpoint,
+	NotePayload,
+	SEAL_SECRET,
+	emitOrFail,
 	mutualSessionOptions,
-} from "../env.js";
+	withClient,
+} from "../fixtures.js";
 import { NobleTransportSigner } from "../signer.js";
-import { emitOrFail, withClient } from "./harness.js";
+import { STACK } from "../stack.js";
+
+/**
+ * The options of every cleartext dial: the stream cap of the stack, which no
+ * handshake negotiates.
+ */
+const CLEARTEXT = { streams: STACK.streams };
+
+const ENGINE = await TightbeamWsClient.init();
+
+/**
+ * The typed body codec for a note: JSON in the profile opaque wrapper.
+ */
+const NOTES = ENGINE.wrapping(NotePayload);
 
 /**
  * Open a cleartext multiplexed client against the echo server. The frame
@@ -34,39 +35,46 @@ async function withEchoClient(
 	run: (client: TightbeamWsClient) => Promise<void>,
 ): Promise<void> {
 	await withClient(
-		() => TightbeamWsClient.connectCleartext(muxClearEndpoint),
+		() => ENGINE.connectCleartext(STACK.muxClearEndpoint, CLEARTEXT),
 		run,
 	);
 }
 
 const TEXT = new TextDecoder();
 const BODY = new Uint8Array([0xde, 0xad, 0xbe, 0xef]);
-const SIGNING_KEY = Secp256k1SigningKey.fromBytes(new Uint8Array(32).fill(3));
-const KEY_ID = new TextEncoder().encode("tbws/e2e/kek/v1");
-const SALT = new Uint8Array(16).fill(0x5a);
+const SIGNING_KEY = ENGINE.signingKey(new Uint8Array(32).fill(3));
+
+/**
+ * The octets of the salt that hides the message commitment.
+ */
+const SALT_OCTETS = new Uint8Array(16).fill(0x5a);
 
 describe("Node round-trips against the dockerized echo server", () => {
 	it("round-trips a frame over Node's global WebSocket", async () => {
 		await withEchoClient(async (client) => {
-			const built = await frame(BODY)
+			const built = await ENGINE.frameBuilder(BODY)
 				.withId("node-e2e")
 				.withOrder(3)
 				.build();
 
 			const response = await emitOrFail(client, built);
-			expect(response.message(Opaque)).toEqual(BODY);
+			expect(response.message(ENGINE.opaque)).toEqual(BODY);
 			expect(TEXT.decode(response.id)).toBe("node-e2e");
 			expect(response.order).toBe(3n);
 		});
 	});
 
 	it("verifies a signed, committed frame after the echo", async () => {
+		const committed = ENGINE.salt(SALT_OCTETS);
+		const salt = ENGINE.salt(SALT_OCTETS);
+
 		await withEchoClient(async (client) => {
-			const built = await frame(BODY)
+			const built = await ENGINE.frameBuilder(BODY)
 				.withId("node-signed")
 				.withOrder(4)
-				.withMessageHasher(new Sha3_256(), SALT)
-				.withWitnessHasher(new Sha3_256())
+				.withMessageHasher(ENGINE.sha3_256)
+				.withCommitment(committed)
+				.withWitnessHasher(ENGINE.sha3_256)
 				.withSigner(SIGNING_KEY)
 				.build();
 
@@ -78,17 +86,17 @@ describe("Node round-trips against the dockerized echo server", () => {
 			await expect(response.frameIntegrityVerdict()).resolves.toBe(
 				"verified",
 			);
-			await expect(response.messageCommitmentVerdict(SALT)).resolves.toBe(
+			await expect(response.messageCommitmentVerdict(salt)).resolves.toBe(
 				"verified",
 			);
 		});
 	});
 
 	it("round-trips an AES-256-GCM sealed body and opens it with the key", async () => {
-		const cipher = Aes256Gcm.fromKey(new Uint8Array(32).fill(7), KEY_ID);
+		const cipher = ENGINE.aes256Gcm(SEAL_SECRET);
 
 		await withEchoClient(async (client) => {
-			const built = await frame(BODY)
+			const built = await ENGINE.frameBuilder(BODY)
 				.withId("node-aead")
 				.withOrder(6)
 				.withEncryptor(cipher)
@@ -96,12 +104,12 @@ describe("Node round-trips against the dockerized echo server", () => {
 
 			const response = await emitOrFail(client, built);
 			expect(response.confidential).toBe(true);
-			expect(response.confidentialityInfo?.algorithmOid).toBe(
-				PROFILE_OIDS.aes256Gcm,
+			expect(response.confidentialityInfo?.algorithmOid.toString()).toBe(
+				ENGINE.profile.aes256Gcm.toString(),
 			);
 			expect(response.bodyDer).not.toEqual(BODY);
 			await expect(
-				response.decryptMessage(cipher, Opaque),
+				response.decryptMessage(cipher, ENGINE.opaque),
 			).resolves.toEqual(BODY);
 		});
 	});
@@ -111,29 +119,29 @@ describe("Node round-trips against the dockerized echo server", () => {
 		const recipientPublic = SIGNING_KEY.verifyingKey().toSec1Bytes();
 
 		await withEchoClient(async (client) => {
-			const built = await frame(BODY)
+			const built = await ENGINE.frameBuilder(BODY)
 				.withId("node-hpke")
 				.withOrder(8)
-				.withEncryptor(HpkeEncryptor.fromBytes(recipientPublic))
+				.withEncryptor(ENGINE.hpkeEncryptor(recipientPublic))
 				.build();
 
 			const response = await emitOrFail(client, built);
 			expect(response.confidential).toBe(true);
 			expect(response.bodyDer).not.toEqual(BODY);
 
-			const decryptor = HpkeDecryptor.fromBytes(recipientSecret);
+			const decryptor = ENGINE.hpkeDecryptor(recipientSecret);
 			await expect(
-				response.decryptMessage(decryptor, Opaque),
+				response.decryptMessage(decryptor, ENGINE.opaque),
 			).resolves.toEqual(BODY);
 		});
 	});
 
 	it("round-trips a compressed, sealed body and recovers it with the inflator", async () => {
-		const zstd = new ZstdCompression();
-		const cipher = Aes256Gcm.fromKey(new Uint8Array(32).fill(7), KEY_ID);
+		const zstd = ENGINE.zstd();
+		const cipher = ENGINE.aes256Gcm(SEAL_SECRET);
 
 		await withEchoClient(async (client) => {
-			const built = await frame(BODY)
+			const built = await ENGINE.frameBuilder(BODY)
 				.withId("node-packed")
 				.withOrder(7)
 				.withCompressor(zstd)
@@ -142,59 +150,35 @@ describe("Node round-trips against the dockerized echo server", () => {
 
 			const response = await emitOrFail(client, built);
 			expect(response.compressed).toBe(true);
-			expect(response.compactnessInfo?.algorithmOid).toBe(
-				PROFILE_OIDS.zstd,
+			expect(response.compactnessInfo?.algorithmOid.toString()).toBe(
+				ENGINE.profile.zstd.toString(),
 			);
 
 			await expect(
-				response.decryptMessage(cipher, Opaque, zstd),
+				response.decryptMessage(cipher, ENGINE.opaque, zstd),
 			).resolves.toEqual(BODY);
 		});
 	});
 
 	it("round-trips a typed message under a wrapped payload codec", async () => {
-		interface Ping {
-			seq: number;
-		}
-
-		const PingCodec: MessageCodec<Ping> = wrapped({
-			encode(message: Ping): Uint8Array {
-				const payload = new TextEncoder().encode(
-					JSON.stringify(message),
-				);
-				return payload;
-			},
-			decode(payload: Uint8Array): Ping {
-				const parsed: unknown = JSON.parse(TEXT.decode(payload));
-				if (
-					typeof parsed !== "object" ||
-					parsed === null ||
-					!("seq" in parsed) ||
-					typeof parsed.seq !== "number"
-				) {
-					throw new Error("not a Ping payload");
-				}
-
-				const ping = { seq: parsed.seq };
-				return ping;
-			},
-		});
-
 		await withEchoClient(async (client) => {
-			const built = await frame()
+			const built = await ENGINE.frameBuilder()
 				.withId("node-typed")
 				.withOrder(5)
-				.withMessage(PingCodec, { seq: 42 })
+				.withMessage(NOTES, { author: "ada", text: "hello" })
 				.build();
 
 			const response = await emitOrFail(client, built);
-			expect(response.message(PingCodec)).toEqual({ seq: 42 });
+			expect(response.message(NOTES)).toEqual({
+				author: "ada",
+				text: "hello",
+			});
 		});
 	});
 
 	it("resolves undefined when the server accepts without a response frame", async () => {
 		await withEchoClient(async (client) => {
-			const built = await frame(BODY)
+			const built = await ENGINE.frameBuilder(BODY)
 				.withId("sink-node")
 				.withOrder(10)
 				.build();
@@ -208,40 +192,41 @@ describe("Node round-trips against the dockerized echo server", () => {
 		const serverCert = certBytes("server.cert.der");
 
 		await withClient(
-			() => TightbeamWsClient.connect(muxEndpoint, serverCert),
+			() => ENGINE.connect(STACK.muxEndpoint, serverCert),
 			async (client) => {
-				const built = await frame(BODY)
+				const built = await ENGINE.frameBuilder(BODY)
 					.withId("node-secure")
 					.withOrder(9)
 					.build();
 
 				const response = await emitOrFail(client, built);
-				expect(response.message(Opaque)).toEqual(BODY);
+				expect(response.message(ENGINE.opaque)).toEqual(BODY);
 				expect(TEXT.decode(response.id)).toBe("node-secure");
 			},
 		);
 	});
 
 	it("authenticates mutually through an external transport signer", async () => {
-		const signer = new NobleTransportSigner(certBytes("client.key"));
+		const signer = new NobleTransportSigner(
+			ENGINE,
+			certBytes("client.key"),
+		);
 
 		await withClient(
 			() =>
-				TightbeamWsClient.connectMutual(
-					muxMutualEndpoint,
-					certBytes("server.cert.der"),
-					certBytes("client.cert.der"),
-					signer,
-					mutualSessionOptions(),
+				ENGINE.connectMutual(
+					STACK.muxMutualEndpoint,
+					demoIdentity(signer),
+					mutualSessionOptions(STACK.paywall),
 				),
 			async (client) => {
-				const built = await frame(BODY)
+				const built = await ENGINE.frameBuilder(BODY)
 					.withId("node-mutual-signer")
 					.withOrder(11)
 					.build();
 
 				const response = await emitOrFail(client, built);
-				expect(response.message(Opaque)).toEqual(BODY);
+				expect(response.message(ENGINE.opaque)).toEqual(BODY);
 				// Client-auth + receipt countersignature.
 				expect(signer.signatures).toBe(2);
 			},

@@ -8,8 +8,9 @@ if (process.env.E2E_APP_PORT) {
 const baseURL = `http://localhost:${port}`;
 
 /**
- * The dockerized echo server is owned by scripts/stack.sh, which exports its
- * endpoint as E2E_ECHO_WS_ENDPOINT.
+ * The dockerized echo servers are owned by scripts/stack.sh, and
+ * scripts/test-e2e.sh exports their endpoints from the stack env file, under
+ * the names that the `STACK` of stack.ts reads.
  */
 export default defineConfig({
 	testDir: "./specs",
