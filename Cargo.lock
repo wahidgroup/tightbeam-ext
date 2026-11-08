@@ -1122,7 +1122,7 @@ dependencies = [
 
 [[package]]
 name = "tightbeam-asn"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "der",
  "js-sys",
@@ -1135,7 +1135,7 @@ dependencies = [
 
 [[package]]
 name = "tightbeam-asn-derive"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1145,7 +1145,7 @@ dependencies = [
 
 [[package]]
 name = "tightbeam-asn-names"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "tightbeam-derive"
