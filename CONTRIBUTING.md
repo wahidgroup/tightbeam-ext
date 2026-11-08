@@ -72,7 +72,7 @@ The type MUST be lowercase and one of:
 
 The scope is OPTIONAL, MUST be lowercase (`[a-z0-9/-]+`), and identifies the affected area. Recommended scopes:
 
-- Crate: `ws`, `wasm`
+- Crate: `wire`, `ws`, `wasm`
 - Package: `client`, `tests`
 - Cross-cutting: `deps`, `docs`, `ci`, `scripts`
 

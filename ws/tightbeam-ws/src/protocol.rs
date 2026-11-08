@@ -8,7 +8,6 @@ use std::io;
 use std::net::SocketAddr;
 
 use tokio::net::TcpListener;
-use tokio_tungstenite::connect_async_with_config;
 
 use tightbeam::crypto::aead::{RecvCipher, SendCipher};
 use tightbeam::crypto::profiles::{CryptoProvider, DefaultCryptoProvider};
@@ -20,7 +19,6 @@ use tightbeam::transport::{
 
 use crate::acceptor::{Acceptor, WsInner};
 use crate::io::{WsStream, WsTransport};
-use crate::wire::WireFault;
 
 /// A tightbeam listener that speaks the protocol over WebSocket connections.
 ///
@@ -91,8 +89,8 @@ impl<P: CryptoProvider + Send + Sync + 'static> WsListener<P> {
 	/// - [`TransportError::IoError`] -- the listener failed to accept a TCP connection.
 	/// - [`TransportError::ConnectionClosed`] -- the accept task stopped.
 	pub async fn accept(&self) -> Result<(WsTransport<WsInner, P>, SocketAddr), TransportError> {
-		let (websocket, addr) = self.acceptor.next().await?;
-		let transport = TcpTransport::new(WsStream::from(websocket), self.config.clone());
+		let (stream, addr) = self.acceptor.next().await?;
+		let transport = TcpTransport::new(stream, self.config.clone());
 		Ok((transport, addr))
 	}
 }
@@ -126,14 +124,7 @@ impl<P: CryptoProvider + Send + Sync + 'static> Protocol for WsListener<P> {
 
 	async fn connect_within(addr: Self::Address, limits: &CheckedLimits) -> Result<Self::Stream, Self::Error> {
 		let url = format!("ws://{}/", addr.0);
-
-		// The socket admits the larger ceiling of the endpoint, and the
-		// transport narrows each read to the ceiling of its own phase.
-		let ceilings = WsStream::socket_config(limits);
-		let dialed = connect_async_with_config(url, Some(ceilings), false).await;
-
-		let (websocket, _response) = dialed.map_err(WireFault::from)?;
-		Ok(WsStream::from(websocket))
+		WsStream::dial(&url, limits).await
 	}
 
 	fn create_transport(stream: Self::Stream, config: EndpointConfig<P>) -> Self::Transport {

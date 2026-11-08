@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Audit the Rust workspace (cargo audit) and each selected project's npm
-# workspace (npm audit).
+# Audit the Rust workspace (cargo audit) and the npm workspace of each
+# selected project that has one (npm audit).
 #
 # Usage: audit.sh [project...]   (default: every project)
 # Mode: AUDIT_MODE=fix runs `npm audit fix`; cargo audit is check-only.
@@ -25,6 +25,11 @@ echo "Auditing Rust workspace (cargo audit)..."
 cargo audit
 
 for project in "${PROJECTS[@]}"; do
+	if [ ! -f "$ROOT/$project/package-lock.json" ]; then
+		echo "Skipping npm audit ($project has no npm workspace)."
+		continue
+	fi
+
 	echo "Auditing npm workspace ($project)..."
 	cd "$ROOT/$project"
 	if [ "$MODE" = "fix" ]; then

@@ -18,14 +18,9 @@ name = "tightbeam_ws"
 
 [features]
 default = ["socket"]
-# The envelope rules of a WebSocket half. They build on the tightbeam
-# transport alone, so the wasm32 browser client shares them. Upstream
-# refuses `async-transport` without a handshake protocol, so `wire` names
-# `transport-hpke`, the protocol both clients run.
-wire = ["tightbeam-rs/std", "tightbeam-rs/async-transport", "tightbeam-rs/transport-hpke"]
 # The tokio-tungstenite listener, dial, and stream.
 socket = [
-    "wire",
+    "dep:tightbeam-wire",
     "dep:tokio",
     "tokio/net",
     "tokio/rt",
@@ -35,6 +30,8 @@ socket = [
     "tokio/time",
     "dep:tokio-tungstenite",
     "dep:futures-util",
+    "tightbeam-rs/std",
+    "tightbeam-rs/async-transport",
     "tightbeam-rs/tcp",
     "tightbeam-rs/tokio",
     "tightbeam-rs/transport-hpke",
@@ -78,6 +75,7 @@ required-features = ["colony"]
 
 [dependencies]
 tightbeam-rs = { workspace = true }
+tightbeam-wire = { version = "0.1.0", path = "../../wire/tightbeam-wire", optional = true }
 tokio = { workspace = true, optional = true }
 tokio-tungstenite = { workspace = true, optional = true, features = ["connect", "handshake"] }
 futures-util = { workspace = true, optional = true, features = ["std", "sink"] }

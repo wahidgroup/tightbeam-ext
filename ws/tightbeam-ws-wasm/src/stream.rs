@@ -17,7 +17,7 @@ use gloo_net::websocket::{Message, WebSocketError};
 
 use tightbeam::crypto::profiles::DefaultCryptoProvider;
 use tightbeam::transport::{AsyncProtocolStream, SplittableStream, TcpTransport, TransportError};
-use tightbeam_ws::wire::{Wire, WireDuplex, WireFault, WireReader, WireSink, WireStream, WireWriter};
+use tightbeam_wire::{Wire, WireDuplex, WireFault, WireReader, WireSink, WireStream, WireWriter};
 
 /// A browser WebSocket carrying tightbeam frames, one DER envelope per message.
 ///

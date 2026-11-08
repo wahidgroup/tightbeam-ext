@@ -63,7 +63,7 @@ help:
 
 help-body:
 	@printf 'USAGE:\n'
-	@printf '    make <target> [ws] [pubsub] [fix=1] [debug=1] [features="<comma-separated>"]\n'
+	@printf '    make <target> [<project>...] [fix=1] [debug=1] [features="<comma-separated>"]\n'
 	@printf '                  [no-default=1] [version=vX.Y.Z] [ext=<name>] [dry-run=1]\n'
 	@printf '                  [allow-staged=1] [yank=1] [ui=1] [trace=1]\n\n'
 	@printf 'DESCRIPTION:\n'
@@ -93,7 +93,7 @@ help-body:
 	@printf '    release         Release an extension independently (see OPTIONS)\n'
 	@printf '    check-yanked    Check if the extension version has been yanked\n\n'
 	@printf 'OPTIONS / VARIABLES:\n'
-	@printf '    ws / pubsub     Scope the target to the named project(s)\n'
+	@printf '    <project>       Scope the target to the named project(s): %s\n' '$(PROJECTS)'
 	@printf '    fix             If set (e.g., fix=1), apply lint/audit fixes; rustdoc still denies warnings\n'
 	@printf '    debug           If set (e.g., debug=1), RUST_LOG=debug + verbose e2e reporter\n'
 	@printf '    features        Comma-separated Cargo feature list passed as --features\n'

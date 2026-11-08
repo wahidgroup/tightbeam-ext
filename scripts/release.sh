@@ -316,6 +316,18 @@ extension_crate_names() {
 	printf '%s' "$names"
 }
 
+# The crates of the extension that the release workflow publishes, one per
+# line. Cargo reads `publish = false` as an empty registry list.
+extension_publishable_crates() {
+	cargo metadata --no-deps --format-version 1 --offline \
+		| jq -r --arg root "$(pwd -P)/${EXTENSION}/" '
+			.packages[]
+			| select(.manifest_path | startswith($root))
+			| select(.publish != [])
+			| .name
+		'
+}
+
 # Tracked Cargo manifests that require an extension crate at a version.
 dependent_cargo_manifests() {
 	local names manifest
@@ -1164,18 +1176,38 @@ require_signing_key() {
 		return 0
 	fi
 	cat >&2 <<-SIGNING
-	
+
 	  ${RED}No signing key configured.${RESET}
-	
+
 	  Configure GPG signing:
 	    git config --global user.signingkey <GPG-KEY-ID>
-	
+
 	  Or configure SSH signing:
 	    git config --global gpg.format ssh
 	    git config --global user.signingkey ~/.ssh/id_ed25519.pub
-	
+
 	SIGNING
 	fail "Signing key is required for releases"
+}
+
+# The workflow publishes after the tag is pushed, so a requirement on a crate
+# that crates.io does not have yet fails here instead, before the tag exists.
+require_published_dependencies() {
+	local crate output
+	local packages=()
+	while IFS= read -r crate; do
+		packages+=(-p "$crate")
+	done < <(extension_publishable_crates)
+
+	if [[ ${#packages[@]} -eq 0 ]]; then
+		fail "No publishable crates found under ${EXTENSION}/"
+	fi
+
+	if ! output=$(cargo publish --dry-run --allow-dirty --no-verify "${packages[@]}" 2>&1); then
+		printf '%s\n' "$output" >&2
+		fail "A dependency of ${EXTENSION} is not on crates.io: release the extension that owns it first"
+	fi
+	ok "Every dependency of ${EXTENSION} resolves on crates.io"
 }
 
 require_jq() {
@@ -1560,6 +1592,8 @@ validate_preconditions() {
 			fail "${DEFAULT_BRANCH} is not up to date with origin/${DEFAULT_BRANCH} (pull or push first)"
 		fi
 	fi
+
+	require_published_dependencies
 
 	if [[ "$RELEASE_COMMIT_EXISTS" == false && "$DRY_RUN" != true \
 		&& "$RELEASE_MODE" == "forward" && -z "$REPO_DIR" && ${#SUBMODULES[@]} -gt 0 ]]; then

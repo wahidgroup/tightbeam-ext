@@ -20,7 +20,7 @@ It drills down from the [repository README](../README.md) for engineers who work
 
 ## Projects
 
-Every top-level directory that owns a `Makefile` is an extension project: `asn`, `pubsub`, and `ws`. Each project owns its targets in `<project>/Makefile` and its setup in `<project>/scripts/setup.sh`, and the root `Makefile` composes them. A project name after a target scopes the target to that project, and with no project name a target runs for every project.
+Every top-level directory that owns a `Makefile` is an extension project: `asn`, `pubsub`, `wire`, and `ws`. Each project owns its targets in `<project>/Makefile` and its setup in `<project>/scripts/setup.sh`, and the root `Makefile` composes them. A project name after a target scopes the target to that project, and with no project name a target runs for every project.
 
 ```sh
 make test ws     # ws only: cargo + vitest + its e2e lanes
@@ -93,6 +93,8 @@ make release yank=1                    # yank a published version
 2. Push the release branch and open the release pull request.
 3. Wait for the merge.
 4. Push the tag `releases/<ext>/v<version>`, signed with GPG or SSH.
+
+Before it prepares anything, the script resolves every crate the release publishes against crates.io. A crate that requires a release of another extension that crates.io does not have yet refuses the release, so `tightbeam-wire` releases before `tightbeam-ws`, and `tightbeam-ws` before `tightbeam-pubsub`.
 
 The script compiles the release notes from the titles and labels of the merged pull requests. The push of that tag publishes the publishable crates of that extension to crates.io, as one Cargo multi-package publish in dependency order, and creates the GitHub release. It publishes only the crates of that extension, and never the whole workspace.
 

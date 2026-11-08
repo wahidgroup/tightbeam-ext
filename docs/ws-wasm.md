@@ -43,7 +43,7 @@ make client
 
 ## Modules
 
-The engine depends on `tightbeam-ws` with default features off and `wire` on, so the browser stream runs the envelope rules of the native one ([The WebSocket Transport](ws.md#stream-and-envelope-rules)).
+The engine depends on `tightbeam-wire`, which names no socket, so the browser stream runs the envelope rules of the native one ([The Envelope Wire Rules](wire.md)).
 
 | Module      | Target        | Holds                                                                                                                |
 | ----------- | ------------- | -------------------------------------------------------------------------------------------------------------------- |
@@ -124,7 +124,7 @@ The frame inflate path returns the error type of `tightbeam-rs`, so the engine w
 
 ## Browser transport
 
-`GlooStream` adapts a `gloo-net` WebSocket to `AsyncProtocolStream`, and it splits into exclusive halves (`SplittableStream`) so a multiplexed connection reads and writes at once. Each read and write runs the envelope rules of `tightbeam_ws::wire`. `BrowserSocket<P>` is the protocol of a socket the page opened, so it adopts and never dials:
+`GlooStream` adapts a `gloo-net` WebSocket to `AsyncProtocolStream`, and it splits into exclusive halves (`SplittableStream`) so a multiplexed connection reads and writes at once. Each read and write runs the envelope rules of `tightbeam_wire`. `BrowserSocket<P>` is the protocol of a socket the page opened, so it adopts and never dials:
 
 - `Protocol::connect` and `Protocol::bind_cleartext` refuse with `TransportError::InvalidState`.
 - `BrowserSocket::<P>::pinned(stream, trust_store, identity)` adopts an opened socket into the transport of a client that pins `trust_store`. It presents `identity` when a server demands mutual authentication. The dialer rule or the key-purpose check refuses the provisioning with a `TransportError`.
@@ -151,7 +151,7 @@ A deployment on another provider builds its own wasm crate against this one, whi
 | Suite                                                                                 | Command                            | Runs                                                                                                                                                                                         |
 | ------------------------------------------------------------------------------------- | ---------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `tests/wasm_runtime.rs`                                                               | `wasm-pack test --node`            | The two target-specific hazards of a handshake: the host clock through `OffsetDateTime::now_utc`, and the RNG through an HPKE seal of `build::HpkeSecp256k1Encryptor`                        |
-| `tests/gloo_stream.rs`                                                                | `wasm-pack test --node`            | The envelope rules of `wire` against `GlooStream`, over a real `gloo` WebSocket to a peer that the `ws` server of the ws workspace serves                                                    |
+| `tests/gloo_stream.rs`                                                                | `wasm-pack test --node`            | The envelope rules of `tightbeam-wire` against `GlooStream`, over a real `gloo` WebSocket to a peer that the `ws` server of the ws workspace serves                                          |
 | `mod tests` of `src/bindings.rs`, `src/mux.rs`, `src/profile.rs`, and `src/signer.rs` | `wasm-pack test --node`            | The bindings and their parse-once refusals, and the JavaScript signer                                                                                                                        |
 | `mod tests` of `src/compress.rs`                                                      | `cargo test`                       | The engine zstd against the zstd of `tightbeam-rs` on the host: bodies that one side compresses inflate on the other, one case for each refusal test of `tightbeam-rs`, and each level bound |
 | Playwright, under `ws/tests`                                                          | `make test` at the repository root | The compiled client end to end, against a dockerized `tightbeam-ws` echo server                                                                                                              |
