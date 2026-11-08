@@ -16,8 +16,6 @@ pub mod io;
 pub mod protocol;
 #[cfg(feature = "serve")]
 pub mod serve;
-#[cfg(feature = "wire")]
-pub mod wire;
 
 #[cfg(feature = "socket")]
 mod acceptor;

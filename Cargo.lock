@@ -1213,6 +1213,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "tightbeam-wire"
+version = "0.1.0"
+dependencies = [
+ "tightbeam-rs",
+]
+
+[[package]]
 name = "tightbeam-ws"
 version = "0.5.0"
 dependencies = [
@@ -1220,6 +1227,7 @@ dependencies = [
  "futures-util",
  "husky-rs",
  "tightbeam-rs",
+ "tightbeam-wire",
  "tokio",
  "tokio-tungstenite",
 ]
@@ -1234,7 +1242,7 @@ dependencies = [
  "js-sys",
  "ruzstd",
  "tightbeam-rs",
- "tightbeam-ws",
+ "tightbeam-wire",
  "tokio",
  "wasm-bindgen",
  "wasm-bindgen-futures",

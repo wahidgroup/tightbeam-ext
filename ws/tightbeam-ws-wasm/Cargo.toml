@@ -31,7 +31,7 @@ tightbeam-rs = { workspace = true, features = [
 	"compress",
 	"router",
 ] }
-tightbeam-ws = { path = "../tightbeam-ws", default-features = false, features = ["wire"] }
+tightbeam-wire = { path = "../../wire/tightbeam-wire" }
 der = { workspace = true, features = ["alloc", "derive", "oid"] }
 ruzstd = { version = "=0.9.0", default-features = false, features = ["std", "hash"] }
 gloo-net = { workspace = true, features = ["websocket"] }

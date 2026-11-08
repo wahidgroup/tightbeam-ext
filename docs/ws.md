@@ -3,7 +3,7 @@
 This page specifies the types of `tightbeam-ws` that carry tightbeam envelopes over WebSocket:
 
 - the listener, its upgrade slots, and the dial
-- the stream and the envelope rules of `wire`
+- the stream, and how it runs the envelope rules over WebSocket
 - the accepted multiplexed link of `serve`
 - the cargo features
 - the cluster work plane at the WebSocket edge
@@ -26,12 +26,12 @@ It drills down from the [tightbeam-ws README](../ws/tightbeam-ws/README.md) for 
 
 `protocol::WsListener<P>` is the tightbeam listener over WebSocket. `P` is the `CryptoProvider` of the session, and `DefaultCryptoProvider` is the default. It implements these traits of `tightbeam::transport`:
 
-| Trait                  | What the listener supplies                                                                                     |
-| ---------------------- | -------------------------------------------------------------------------------------------------------------- |
-| `Protocol`             | `bind_cleartext`, `connect`, `connect_within`, and `create_transport`. The stream is `io::WsStream`           |
-| `EncryptedProtocol`    | `bind_with(addr, TransportEncryptionConfig)`, with `SendCipher` and `RecvCipher` as the record ciphers         |
-| `AsyncListenerTrait`   | `accept`, which yields the transport and its `TightBeamSocketAddr`                                             |
-| `PersistentConnection` | `is_connected`, so `ConnectionPool` and the colony stack reuse one WebSocket connection across leases          |
+| Trait                  | What the listener supplies                                                                             |
+| ---------------------- | ------------------------------------------------------------------------------------------------------ |
+| `Protocol`             | `bind_cleartext`, `connect`, `connect_within`, and `create_transport`. The stream is `io::WsStream`    |
+| `EncryptedProtocol`    | `bind_with(addr, TransportEncryptionConfig)`, with `SendCipher` and `RecvCipher` as the record ciphers |
+| `AsyncListenerTrait`   | `accept`, which yields the transport and its `TightBeamSocketAddr`                                     |
+| `PersistentConnection` | `is_connected`, so `ConnectionPool` and the colony stack reuse one WebSocket connection across leases  |
 
 Every accepted transport builds from the one `EndpointConfig` that the listener holds, so the provisioning and the ceilings of the listener reach each connection. The inherent `WsListener::bind_cleartext(addr)` binds a listener in the clear, and its accepted transports carry no confidentiality, integrity, or peer authentication (CWE-319). An encrypted listener binds through `EncryptedProtocol::bind_with`, and each connection then runs the tightbeam handshake unchanged. Authentication and confidentiality come from that handshake above the socket, and the listener runs no TLS.
 
@@ -57,31 +57,15 @@ assert!(listener.local_addr()?.ip().is_loopback());
 
 ## Stream and envelope rules
 
-`io::WsStream<S>` is the `wire::WireDuplex` of the two native halves, `io::WsReadHalf` and `io::WsWriteHalf`, over a `tokio-tungstenite` WebSocket. It implements `AsyncProtocolStream`, and it splits into exclusive halves (`SplittableStream`) so a multiplexed connection reads and writes at once. `io::WsTransport<S, P>` names `TcpTransport<WsStream<S>, P>`, the tightbeam transport over that stream.
+`io::WsStream<S>` holds the `tightbeam_wire::WireDuplex` of the two native halves, `io::WsReadHalf` and `io::WsWriteHalf`, over a `tokio-tungstenite` WebSocket. It implements `AsyncProtocolStream`, and it splits into exclusive halves (`SplittableStream`) so a multiplexed connection reads and writes at once. `io::WsTransport<S, P>` names `TcpTransport<WsStream<S>, P>`, the tightbeam transport over that stream. A stream comes only from a dial or an accept of `WsListener`, and each one opens its socket under the envelope ceiling of its endpoint.
 
-The `wire` module holds the envelope rules that every socket kind shares, the native one and the browser one:
+The halves are the native socket kind of the envelope rules that `tightbeam-wire` holds for every message-oriented socket ([The Envelope Wire Rules](wire.md)). Over WebSocket the rules read as follows:
 
 - A tightbeam envelope travels as one binary WebSocket message.
-- A read skips a text or control message, refuses an envelope past its cap, and ends at a close or at the end of the message stream.
-- A write sends one binary message per envelope.
-- A stream reads as dead after its first failure (`Liveness`).
-
-A socket kind implements two traits: `WireStream` classifies each received message as a `Wire` value, and `WireSink` sends each envelope. `EnvelopeReader` admits one envelope from a `WireStream`. Each socket failure maps to one transport error:
-
-| `WireFault` | Cause                                                                          | `TransportError`                   |
-| ----------- | ------------------------------------------------------------------------------ | ---------------------------------- |
-| `Closed`    | The connection closed before the operation finished                            | `ConnectionClosed`                 |
-| `Io`        | The byte stream under the socket failed                                        | `IoError`                          |
-| `Oversize`  | A message passed the frame ceiling of the socket, or the cap of a read         | `OperationFailed(SizeExceeded)`    |
-| `Invalid`   | The socket broke the WebSocket protocol, lost its connection, or refused a send | `InvalidMessage`                   |
-
-```rust
-use tightbeam::transport::{TransportError, TransportFailure};
-use tightbeam_ws::wire::WireFault;
-
-let error = TransportError::from(WireFault::Oversize);
-assert!(matches!(error, TransportError::OperationFailed(TransportFailure::SizeExceeded)));
-```
+- A text message skips. So do ping, pong, and raw frames, because tungstenite answers each ping itself.
+- A close frame, or the end of the message stream, ends a read.
+- Tungstenite refuses a message past the envelope ceiling of the endpoint by its declared length, before it sizes a buffer, and the stream reads that refusal as `WireFault::Oversize`.
+- A closed connection is `WireFault::Closed`, a failed byte stream is `WireFault::Io`, and every other tungstenite error, such as a protocol violation, is `WireFault::Invalid`.
 
 Cleartext and HPKE-encrypted round trips run the transport-agnostic handshake of tightbeam unchanged. `tests/round_trip.rs` drives both: the `server!` and `client!` macros over a cleartext listener, and the HPKE handshake over `bind_with`.
 
@@ -107,25 +91,29 @@ A link refuses a transport with a `LinkError`:
 - `Transport(TransportError)`: the transport refused to detach its rekey context or to split.
 
 ```rust
+# #[cfg(feature = "serve")]
+# fn main() {
 use tightbeam::transport::error::TransportError;
 use tightbeam_ws::serve::LinkError;
 
 let refused = LinkError::from(TransportError::InvalidState);
 assert_eq!(refused.to_string(), "the transport refused the split: Invalid state");
+# }
+# #[cfg(not(feature = "serve"))]
+# fn main() {}
 ```
 
 `tightbeam-pubsub` serves each connection through an `AcceptedLink` ([The Topic Registry](pubsub.md#connection-serve)).
 
 ## Features
 
-| Feature            | Enables                                                                                                                                  |
-| ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| `socket` (default) | The `tokio-tungstenite` listener, dial, and stream of `protocol` and `io`. It turns on `wire`                                            |
-| `wire`             | The envelope rules of `wire`. They build on the tightbeam transport alone, so the browser engine depends on this crate with `wire` only  |
-| `serve`            | The accepted link of `serve`. It names no socket, so `tightbeam-pubsub` depends on `serve` alone                                         |
-| `link-parts`       | `serve`, and `AcceptedLink::from_parts`, a link from the parts of an in-memory test link. The parts name any gate and any session        |
-| `testing`          | `socket` and `serve`, and the test-support module: X.509 identity fixtures and the shared multiplexed echo behavior                     |
-| `colony`           | `testing`, and the upstream `colony` runtime with the gateway, hive, and servlet configs that one identity derives                      |
+| Feature            | Enables                                                                                                                           |
+| ------------------ | --------------------------------------------------------------------------------------------------------------------------------- |
+| `socket` (default) | The `tokio-tungstenite` listener, dial, and stream of `protocol` and `io`, over the envelope rules of `tightbeam-wire`            |
+| `serve`            | The accepted link of `serve`. It names no socket, so `tightbeam-pubsub` depends on `serve` alone                                  |
+| `link-parts`       | `serve`, and `AcceptedLink::from_parts`, a link from the parts of an in-memory test link. The parts name any gate and any session |
+| `testing`          | `socket` and `serve`, and the test-support module: X.509 identity fixtures and the shared multiplexed echo behavior               |
+| `colony`           | `testing`, and the upstream `colony` runtime with the gateway, hive, and servlet configs that one identity derives                |
 
 Only test support enables `link-parts`. The examples `gen_certs`, `echo_server_mux`, and `echo_server_mux_clear` require `testing`, and `work_gateway_server` requires `colony`.
 

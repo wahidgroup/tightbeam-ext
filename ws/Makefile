@@ -7,10 +7,6 @@
 REPO := ..
 CRATES := -p tightbeam-ws -p tightbeam-ws-wasm
 
-# The socket-free build the browser client links: `wire` alone, on the host,
-# so a socket import into `wire` fails lint before it reaches `make wasm`.
-WIRE_ONLY := -p tightbeam-ws --no-default-features --features wire
-
 # Browser client target: only compiled for wasm32, so the host-target
 # lint/test steps never exercise it. `make wasm` guards it explicitly.
 WASM_TARGET := wasm32-unknown-unknown
@@ -64,12 +60,10 @@ lint: setup
 ifeq ($(LINT_MODE),fix)
 	cargo fmt $(CRATES)
 	cargo clippy $(CRATES) --all-targets --all-features
-	cargo clippy $(WIRE_ONLY) --all-targets
 	npm run lint:fix
 else
 	cargo fmt $(CRATES) --check
 	cargo clippy $(CRATES) --all-targets --all-features -- -D warnings
-	cargo clippy $(WIRE_ONLY) --all-targets -- -D warnings
 	npm run lint
 endif
 

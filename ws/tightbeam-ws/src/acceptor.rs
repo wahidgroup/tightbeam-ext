@@ -14,7 +14,6 @@
 //! - CWE-400, uncontrolled resource consumption: <https://cwe.mitre.org/data/definitions/400.html>
 //! - CWE-770, resource allocation without limits: <https://cwe.mitre.org/data/definitions/770.html>
 
-use core::time::Duration;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -24,8 +23,7 @@ use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio::task::{AbortHandle, JoinSet};
 use tokio::time::{sleep, timeout};
-use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
-use tokio_tungstenite::{accept_async_with_config, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::MaybeTlsStream;
 
 use tightbeam::constants::{DEFAULT_ACCEPT_RETRY_DELAY, DEFAULT_MAX_SERVER_CONNECTIONS};
 use tightbeam::transport::{TransportError, TransportLimits};
@@ -37,7 +35,7 @@ pub(crate) type WsInner = MaybeTlsStream<TcpStream>;
 
 /// One socket the upgrade plane holds for a caller.
 struct Upgraded {
-	stream: WebSocketStream<WsInner>,
+	stream: WsStream<WsInner>,
 	addr: SocketAddr,
 	/// Returns to the plane when a caller takes the socket.
 	_slot: OwnedSemaphorePermit,
@@ -46,34 +44,21 @@ struct Upgraded {
 /// What the upgrade plane hands to the accept loop.
 type Arrival = io::Result<Upgraded>;
 
-/// The ceilings and the deadline every upgrade runs under.
-#[derive(Clone, Copy)]
-struct UpgradeTerms {
-	ceilings: WebSocketConfig,
-	deadline: Duration,
-}
-
-impl From<&TransportLimits> for UpgradeTerms {
-	fn from(limits: &TransportLimits) -> Self {
-		Self { ceilings: WsStream::socket_config(limits), deadline: limits.handshake_timeout }
-	}
-}
-
 /// One accepted TCP socket on its way to a WebSocket.
 struct Upgrade {
 	tcp: TcpStream,
 	addr: SocketAddr,
 	slot: OwnedSemaphorePermit,
-	terms: UpgradeTerms,
+	/// The ceilings of the socket, and the deadline of its upgrade.
+	limits: TransportLimits,
 }
 
 impl Upgrade {
 	/// Upgrade the socket and queue it. A failed or late upgrade ends here, so
 	/// the peer's fault returns the slot and reaches no caller.
 	async fn run(self, arrivals: Sender<Arrival>) {
-		let socket = MaybeTlsStream::Plain(self.tcp);
-		let upgrading = accept_async_with_config(socket, Some(self.terms.ceilings));
-		let Ok(Ok(stream)) = timeout(self.terms.deadline, upgrading).await else {
+		let upgrading = WsStream::upgrade(self.tcp, &self.limits);
+		let Ok(Ok(stream)) = timeout(self.limits.handshake_timeout, upgrading).await else {
 			return;
 		};
 
@@ -102,21 +87,21 @@ impl Acceptor {
 	fn with_slots(listener: TcpListener, limits: &TransportLimits, capacity: usize) -> Self {
 		let (sender, receiver) = mpsc::channel(capacity);
 		let slots = Arc::new(Semaphore::new(capacity));
-		let task = tokio::spawn(Self::run(listener, UpgradeTerms::from(limits), slots, sender));
+		let task = tokio::spawn(Self::run(listener, *limits, slots, sender));
 
 		Self { arrivals: Mutex::new(receiver), task: task.abort_handle() }
 	}
 
 	/// Accept TCP while a slot is free, and upgrade each socket on a task the
 	/// plane owns, so an abort of this task ends every upgrade in flight.
-	async fn run(listener: TcpListener, terms: UpgradeTerms, slots: Arc<Semaphore>, arrivals: Sender<Arrival>) {
+	async fn run(listener: TcpListener, limits: TransportLimits, slots: Arc<Semaphore>, arrivals: Sender<Arrival>) {
 		let mut upgrades = JoinSet::new();
 		// The semaphore stays open for the life of the plane, so the wait ends
 		// only in a slot.
 		while let Ok(slot) = Arc::clone(&slots).acquire_owned().await {
 			match listener.accept().await {
 				Ok((tcp, addr)) => {
-					let upgrade = Upgrade { tcp, addr, slot, terms };
+					let upgrade = Upgrade { tcp, addr, slot, limits };
 					upgrades.spawn(upgrade.run(arrivals.clone()));
 				}
 				Err(error) => {
@@ -149,7 +134,7 @@ impl Acceptor {
 	///
 	/// - [`TransportError::IoError`] -- the listener failed to accept a TCP connection.
 	/// - [`TransportError::ConnectionClosed`] -- the plane stopped.
-	pub(crate) async fn next(&self) -> Result<(WebSocketStream<WsInner>, SocketAddr), TransportError> {
+	pub(crate) async fn next(&self) -> Result<(WsStream<WsInner>, SocketAddr), TransportError> {
 		let mut arrivals = self.arrivals.lock().await;
 		match arrivals.recv().await {
 			Some(Ok(upgraded)) => Ok((upgraded.stream, upgraded.addr)),
@@ -167,6 +152,8 @@ impl Drop for Acceptor {
 
 #[cfg(test)]
 mod tests {
+	use core::time::Duration;
+
 	use tokio::io::AsyncReadExt;
 	use tokio::task::yield_now;
 	use tokio_tungstenite::connect_async;

@@ -40,7 +40,7 @@ The listener serves in the clear here, and `bind_cleartext` says so: its connect
 
 ## Transport
 
-`WsListener` is a tightbeam protocol: it binds, accepts, and dials WebSocket connections, and its stream holds every read and write to the envelope rules of the wire. The browser engine shares those rules. Implementation: [docs/ws.md](../../docs/ws.md#listener).
+`WsListener` is a tightbeam protocol: it binds, accepts, and dials WebSocket connections, and its stream holds every read and write to the envelope rules of [tightbeam-wire](../../wire/tightbeam-wire). The browser engine shares those rules. Implementation: [docs/ws.md](../../docs/ws.md#listener).
 
 ## Security
 
@@ -56,7 +56,7 @@ A tightbeam cluster gateway binds a WebSocket edge that admits signed work frame
 
 ## Features
 
-`socket`, on by default, holds the listener and the dial. `wire`, `serve`, `link-parts`, `testing`, and `colony` select the other parts. Implementation: [docs/ws.md](../../docs/ws.md#features).
+`socket`, on by default, holds the listener and the dial. `serve`, `link-parts`, `testing`, and `colony` select the other parts. Implementation: [docs/ws.md](../../docs/ws.md#features).
 
 ## Related
 

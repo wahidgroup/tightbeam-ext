@@ -1,0 +1,22 @@
+[package]
+name = "tightbeam-wire"
+description = "The envelope rules that message-oriented socket transports of tightbeam share"
+authors.workspace = true
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/tightbeam-wire"
+readme = "README.md"
+keywords = ["transport", "messaging", "protocol", "tightbeam", "framing"]
+categories.workspace = true
+
+[lib]
+name = "tightbeam_wire"
+
+[dependencies]
+# Upstream refuses `async-transport` without a handshake protocol, so the
+# crate names `transport-hpke`, the protocol every socket kind runs.
+tightbeam-rs = { workspace = true, features = ["std", "async-transport", "transport-hpke"] }

@@ -1,4 +1,4 @@
-//! The envelope rules of `tightbeam_ws::wire`, run against the browser kind,
+//! The envelope rules of `tightbeam_wire`, run against the browser kind,
 //! [`GlooStream`], under a JavaScript host.
 //!
 //! Each case opens a real `gloo` WebSocket to a peer served by `ws`, the
