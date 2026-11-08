@@ -2,7 +2,7 @@
 name = "tightbeam-asn"
 description = "DER-backed ASN.1 codec bridge for TypeScript MessageCodec façades"
 authors.workspace = true
-version = "0.1.0"
+version = "0.2.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -35,8 +35,8 @@ default = []
 emit = ["dep:tightbeam-rs", "dep:tightbeam-asn-names"]
 
 [dependencies]
-tightbeam-asn-derive = { version = "0.1.0", path = "../tightbeam-asn-derive" }
-tightbeam-asn-names = { version = "0.1.0", path = "../tightbeam-asn-names", optional = true }
+tightbeam-asn-derive = { version = "0.2.0", path = "../tightbeam-asn-derive" }
+tightbeam-asn-names = { version = "0.2.0", path = "../tightbeam-asn-names", optional = true }
 tightbeam-rs = { workspace = true, optional = true }
 der = { workspace = true, features = ["alloc", "derive", "oid"] }
 
