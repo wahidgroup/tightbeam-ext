@@ -594,8 +594,10 @@ compile_changelog() {
 	local body=""
 	local merge_subjects
 	# Repo adaptation: only merges touching the extension belong in its notes.
-	merge_subjects=$(git log "${last_tag}..${ref}" --merges --format="%s" \
-		-- "${EXTENSION}/")
+	# --first-parent diffs each merge against the release line. Without it, a
+	# merge matching its PR branch under the path is simplified away.
+	merge_subjects=$(git log "${last_tag}..${ref}" --first-parent --merges \
+		--format="%s" -- "${EXTENSION}/")
 
 	local labels=""
 
