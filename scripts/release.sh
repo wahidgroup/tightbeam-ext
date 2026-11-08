@@ -273,6 +273,173 @@ cargo_write_version() {
 	fi
 }
 
+# Repo adaptation: other manifests require the extension at a version (pubsub
+# on ws, asn on its own crates). The bump moves each to the release version,
+# because one stale 0.x caret breaks the whole workspace.
+
+# Matches a versioned requirement on a crate in `names` in a dependency table.
+# With write=1, prints the manifest with it set to `version`.
+# shellcheck disable=SC2016 # awk fields, not shell expansions.
+CARGO_REQUIREMENT_AWK='
+	BEGIN {
+		count = split(names, list, " ")
+		for (i = 1; i <= count; i++) released[list[i]] = 1
+	}
+	/^\[/ { in_dependencies = ($0 ~ /dependencies\][[:space:]]*$/) }
+	in_dependencies {
+		key = $0
+		sub(/[[:space:]]*=.*/, "", key)
+		if (key in released) {
+			if ($0 ~ /version[[:space:]]*=[[:space:]]*"[^"]*"/) {
+				sub(/version[[:space:]]*=[[:space:]]*"[^"]*"/, "version = \"" version "\"")
+				found = 1
+			} else if ($0 ~ /=[[:space:]]*"[^"]*"[[:space:]]*$/) {
+				sub(/"[^"]*"[[:space:]]*$/, "\"" version "\"")
+				found = 1
+			}
+		}
+	}
+	write { print }
+	END { exit found ? 0 : 1 }
+'
+
+# The [package] names of the extension's crates, space-separated.
+extension_crate_names() {
+	local manifest names=""
+	while IFS= read -r manifest; do
+		names+="$(awk -F'"' '
+			/^\[package\]/ { in_package = 1; next }
+			in_package && /^\[/ { exit }
+			in_package && /^name[[:space:]]*=/ { print $2; exit }
+		' "$manifest") "
+	done < <(extension_crate_manifests)
+	printf '%s' "$names"
+}
+
+# Tracked Cargo manifests that require an extension crate at a version.
+dependent_cargo_manifests() {
+	local names manifest
+	names="$(extension_crate_names)"
+	while IFS= read -r manifest; do
+		if awk -v names="$names" -v write=0 "$CARGO_REQUIREMENT_AWK" "$manifest"; then
+			printf '%s\n' "$manifest"
+		fi
+	done < <(git ls-files -- '*Cargo.toml')
+}
+
+# Set every versioned requirement on a crate of the extension to $1.
+cargo_write_requirements() {
+	local version="$1"
+	local names manifest tmpfile
+	names="$(extension_crate_names)"
+	while IFS= read -r manifest; do
+		tmpfile=$(mktemp)
+		awk -v names="$names" -v write=1 -v version="$version" \
+			"$CARGO_REQUIREMENT_AWK" "$manifest" > "$tmpfile" \
+			|| fail "Could not set the requirements in ${manifest} to ${version}"
+		mv "$tmpfile" "$manifest"
+		git add "$manifest"
+	done < <(dependent_cargo_manifests)
+}
+
+# Re-lock the workspace packages. A stale requirement fails here, not at push.
+cargo_refresh_lock() {
+	local version="$1"
+	if [[ ! -f Cargo.lock ]]; then
+		return 0
+	fi
+
+	cargo update --workspace --offline --quiet 2>/dev/null \
+		|| cargo update --workspace --quiet \
+		|| fail "Cargo.lock does not resolve at ${version}: a manifest still requires an older version"
+	git add Cargo.lock
+}
+
+# The npm name of the extension's client, or nothing when it has none.
+extension_npm_name() {
+	local manifest="${EXTENSION}/client/package.json"
+	if [[ -f "$manifest" ]]; then
+		node -p "require('./${manifest}').name"
+	fi
+}
+
+# sed -E pattern of a versioned requirement on npm package $1.
+npm_requirement_pattern() {
+	printf '("%s"[[:space:]]*:[[:space:]]*")[~^]?[0-9]+\\.[0-9]+\\.[0-9]+(")' "$1"
+}
+
+# Tracked package.json files that require the client at a version.
+dependent_npm_manifests() {
+	local name pattern manifest
+	name="$(extension_npm_name)"
+	if [[ -z "$name" ]]; then
+		return 0
+	fi
+
+	pattern="$(npm_requirement_pattern "$name")"
+	while IFS= read -r manifest; do
+		if grep -qE "$pattern" "$manifest"; then
+			printf '%s\n' "$manifest"
+		fi
+	done < <(git ls-files -- '*package.json')
+}
+
+# Set every versioned requirement on the extension's client to ^$1.
+npm_write_requirements() {
+	local version="$1"
+	local name pattern manifest tmpfile
+	name="$(extension_npm_name)"
+	if [[ -z "$name" ]]; then
+		return 0
+	fi
+
+	pattern="$(npm_requirement_pattern "$name")"
+	while IFS= read -r manifest; do
+		tmpfile=$(mktemp)
+		sed -E "s#${pattern}#\\1^${version}\\2#g" "$manifest" > "$tmpfile" \
+			|| fail "Could not set the requirements in ${manifest} to ^${version}"
+		mv "$tmpfile" "$manifest"
+		git add "$manifest"
+	done < <(dependent_npm_manifests)
+}
+
+# Tracked npm lock files that record the client.
+released_npm_locks() {
+	local name lock
+	name="$(extension_npm_name)"
+	if [[ -z "$name" ]]; then
+		return 0
+	fi
+
+	while IFS= read -r lock; do
+		if grep -qF "\"${name}\"" "$lock"; then
+			printf '%s\n' "$lock"
+		fi
+	done < <(git ls-files -- '*package-lock.json')
+}
+
+# Refresh every lockfile that records the extension's client at $1.
+npm_refresh_locks() {
+	local version="$1"
+	local lock
+	while IFS= read -r lock; do
+		(cd "$(dirname "$lock")" && npm install --package-lock-only \
+			--ignore-scripts >/dev/null 2>&1) \
+			|| fail "Could not refresh ${lock} for ${version}"
+		git add "$lock"
+	done < <(released_npm_locks)
+}
+
+# Every file the Cargo version bump of the extension writes, one per line.
+release_written_files() {
+	extension_crate_manifests
+	dependent_cargo_manifests
+	printf 'Cargo.lock\n'
+	printf '%s/client/package.json\n' "$EXTENSION"
+	dependent_npm_manifests
+	released_npm_locks
+}
+
 detect_version_source() {
 	if [[ -f "$(extension_version_manifest)" ]]; then
 		printf "cargo"
@@ -298,12 +465,8 @@ bump_version() {
 	case "$source" in
 		cargo)
 			cargo_write_version "$version"
-			if [[ -f Cargo.lock ]]; then
-				cargo generate-lockfile --offline --quiet 2>/dev/null \
-					|| cargo generate-lockfile --quiet 2>/dev/null \
-					|| true
-				git add Cargo.lock
-			fi
+			cargo_write_requirements "$version"
+			cargo_refresh_lock "$version"
 			# Repo adaptation: an extension's crates and npm client share
 			# one version; the release workflow verifies both against the
 			# tag.
@@ -312,13 +475,9 @@ bump_version() {
 					--no-git-tag-version --allow-same-version >/dev/null) \
 					|| fail "Could not bump ${EXTENSION}/client/package.json to ${version}"
 				git add "${EXTENSION}/client/package.json"
-				if [[ -f "${EXTENSION}/package-lock.json" ]]; then
-					(cd "$EXTENSION" && npm install --package-lock-only \
-						--ignore-scripts >/dev/null 2>&1) \
-						|| fail "Could not refresh ${EXTENSION}/package-lock.json for ${version}"
-					git add "${EXTENSION}/package-lock.json"
-				fi
 			fi
+			npm_write_requirements "$version"
+			npm_refresh_locks "$version"
 			;;
 		npm)
 			npm version "$version" --no-git-tag-version --allow-same-version
@@ -1350,14 +1509,18 @@ validate_preconditions() {
 	fi
 
 	if ! git diff --cached --quiet --ignore-submodules; then
-		local staged_version_only=true f
+		local staged_version_only=true f written
+		written="$(release_written_files)"
 		while IFS= read -r f; do
 			case "$f" in
-				Cargo.toml|Cargo.lock|package.json|package-lock.json|npm-shrinkwrap.json|VERSION) ;;
-				"${EXTENSION}"/*/Cargo.toml) ;;
-				"${EXTENSION}"/client/package.json|"${EXTENSION}"/package-lock.json) ;;
-				*) staged_version_only=false; break ;;
+				Cargo.toml|Cargo.lock|package.json|package-lock.json|npm-shrinkwrap.json|VERSION)
+					continue
+					;;
 			esac
+			if ! grep -qxF -- "$f" <<< "$written"; then
+				staged_version_only=false
+				break
+			fi
 		done < <(git diff --cached --name-only --ignore-submodules)
 
 		if [[ "$staged_version_only" == true ]] \

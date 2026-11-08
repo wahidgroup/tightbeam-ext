@@ -2,7 +2,7 @@
 name = "tightbeam-ws"
 description = "WebSocket transport for the tightbeam messaging protocol"
 authors.workspace = true
-version = "0.4.0"
+version = "0.5.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
