@@ -41,7 +41,7 @@ tightbeam-rs = { workspace = true, features = [
 der = { workspace = true, features = ["alloc", "derive", "oid"] }
 tokio = { workspace = true, features = ["rt", "sync", "macros", "time"] }
 # The owner of one served connection, with no socket crate.
-tightbeam-ws = { version = "0.4.0", path = "../../ws/tightbeam-ws", default-features = false, features = ["serve"] }
+tightbeam-ws = { version = "0.5.0", path = "../../ws/tightbeam-ws", default-features = false, features = ["serve"] }
 
 [dev-dependencies]
 # Self dev-dependency: turns the `testing` feature on for every test
