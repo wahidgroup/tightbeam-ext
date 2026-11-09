@@ -15,7 +15,7 @@ use http::request::Parts;
 use http::HeaderValue;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::Semaphore;
-use tokio::time::{timeout_at, Instant};
+use tokio::time::Instant;
 
 use tightbeam::clock::UnixMillis;
 use tightbeam::colony::hive::ReplayGuard;
@@ -249,14 +249,16 @@ impl<P: HandshakeProvider + Send + Sync + 'static> LiveCoupler<P> {
 	}
 
 	/// Step 1: parse the head of a coupled call: its caller, which the TLS
-	/// handshake of its connection proved, then its route, its deadline, and
-	/// its claim. A call with no caller refuses before its method is looked
-	/// up, so an unauthenticated peer learns no route.
+	/// handshake of its connection proved, then its route, its grant, its
+	/// deadline, and its claim. A call with no caller refuses before its
+	/// method is looked up, so an unauthenticated peer learns no route, and a
+	/// call that no grant names refuses before it takes a lane.
 	///
 	/// # Errors
 	///
 	/// - [`CallFault::Unauthenticated`] -- the connection carries no caller.
 	/// - [`CallFault::Unrouted`] -- the edge routes no such method.
+	/// - [`CallFault::Denied`] -- no grant names the principal for the method.
 	/// - [`CallFault::Timeout`] -- the `grpc-timeout` does not parse.
 	/// - [`CallFault::ClaimRefused`] -- the claim does not decode.
 	pub(crate) fn head(&self, head: &Parts) -> Result<CoupledHead, CallFault> {
@@ -265,6 +267,10 @@ impl<P: HandshakeProvider + Send + Sync + 'static> LiveCoupler<P> {
 
 		let method = head.uri.path();
 		let route = self.config.routes.route(method).ok_or(CallFault::Unrouted)?.clone();
+		if !self.config.grants.permits(caller.principal(), method) {
+			return Err(CallFault::Denied);
+		}
+
 		let asked = head.headers.get("grpc-timeout").map(Self::timeout_of).transpose()?;
 		let deadline = asked.map_or(self.config.limits.timeout, |asked| asked.min(self.config.limits.timeout));
 		let expires = Instant::now() + deadline;
@@ -313,7 +319,7 @@ impl<P: HandshakeProvider + Send + Sync + 'static> LiveCoupler<P> {
 	/// Steps 3 to 9.
 	async fn carry(&self, opened: Opened, body: Vec<u8>) -> Result<VerifiedAnswer, CallFault> {
 		let presented = opened.present(body, self.config.callers.claims())?;
-		let permitted = presented.permit(&self.config.grants)?;
+		let permitted = presented.permit()?;
 		self.record_admission(&permitted);
 
 		let request_id = self.next_request_id();
@@ -411,6 +417,11 @@ pub(crate) struct CoupledHead {
 }
 
 impl CoupledHead {
+	/// When the deadline of the call passes, which bounds every later step.
+	pub(crate) fn expires(&self) -> Instant {
+		self.expires
+	}
+
 	/// Step 2: the head with the coupled slot of its lane.
 	pub(crate) fn opened(self, slot: CoupledSlot) -> Opened {
 		Opened { head: self, slot }
@@ -458,16 +469,13 @@ pub(crate) struct Presented {
 }
 
 impl Presented {
-	/// Step 4: the call, when a grant names its principal for its method and
-	/// its route accepts what it proves.
+	/// Step 4: the call, when its route accepts what it proves.
 	///
 	/// # Errors
 	///
-	/// - [`CallFault::Denied`] -- no grant names the principal, or the route requires more.
-	fn permit(self, grants: &Grants) -> Result<Permitted, CallFault> {
-		let head = &self.opened.head;
-		let granted = grants.permits(head.caller.principal(), &head.method);
-		if !granted || !head.route.accepts(self.assurance) {
+	/// - [`CallFault::Denied`] -- the route requires more assurance.
+	fn permit(self) -> Result<Permitted, CallFault> {
+		if !self.opened.head.route.accepts(self.assurance) {
 			return Err(CallFault::Denied);
 		}
 
@@ -527,15 +535,14 @@ pub(crate) struct Spent {
 }
 
 impl Spent {
-	/// Step 9, the pivot: send the work on `held` within the deadline of the
-	/// call, and resolve the reply of the gateway into the frame of the
-	/// servlet. A send that fails before it leaves the session forgets the
-	/// claim in `replay`, so the caller may retry it. A deadline that passes
-	/// during the send keeps the claim spent, because the frame may have left.
+	/// Step 9, the pivot: send the work on `held`, and resolve the reply of the
+	/// gateway into the frame of the servlet. A send that fails before it
+	/// leaves the session forgets the claim in `replay`, so the caller may
+	/// retry it. A deadline that ends the send keeps the claim spent, because
+	/// the frame may have left.
 	///
 	/// # Errors
 	///
-	/// - [`CallFault::Deadline`] -- the deadline passed.
 	/// - [`CallFault::Transit`] -- the gateway refused the work.
 	/// - [`CallFault::Unavailable`] -- the session failed.
 	/// - [`CallFault::Internal`] -- the reply does not decode.
@@ -545,10 +552,8 @@ impl Spent {
 		replay: &ReplayGuard,
 	) -> Result<Submitted, CallFault> {
 		let VouchedWork { opened, work, request_id, claim } = self.vouched;
-		let sent = timeout_at(opened.head.expires, held.send(work)).await;
-		let reply = match sent {
-			Err(_) => return Err(CallFault::Deadline),
-			Ok(Err(error)) => {
+		let reply = match held.send(work).await {
+			Err(error) => {
 				if Self::never_left(&error) {
 					if let Some(claim) = &claim {
 						replay.forget(claim.signature());
@@ -557,7 +562,7 @@ impl Spent {
 
 				return Err(CallFault::Unavailable);
 			}
-			Ok(Ok(reply)) => reply,
+			Ok(reply) => reply,
 		};
 
 		let served = ClusterWorkResponse::served_reply(reply);

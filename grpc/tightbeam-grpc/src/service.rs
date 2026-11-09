@@ -26,6 +26,8 @@ use crate::tunnel::{BoxFuture, Refusal, RefusalAudit, TunnelCall, TunnelCodec, T
 use crate::couple::{CallFault, LiveCoupler};
 #[cfg(feature = "couple")]
 use crate::incoming::GrpcConnectInfo;
+#[cfg(feature = "couple")]
+use tokio::time::timeout_at;
 
 /// The largest health check request an edge decodes: the request names a
 /// service, and the edge answers for the empty one alone.
@@ -121,7 +123,9 @@ impl<P: HandshakeProvider + Send + Sync + 'static> Served<P> {
 	}
 
 	/// Steps 1 and 2 of the coupler on `request`, then the unary call that
-	/// runs the rest of its saga once tonic decodes the body.
+	/// runs the rest of its saga once tonic decodes the body. The deadline of
+	/// the call bounds both, so a caller that withholds its body holds its
+	/// lane no longer than its deadline.
 	#[cfg(feature = "couple")]
 	async fn couple(coupler: Arc<LiveCoupler<P>>, request: HttpRequest<Body>) -> HttpResponse<Body> {
 		let (head, body) = request.into_parts();
@@ -135,13 +139,16 @@ impl<P: HandshakeProvider + Send + Sync + 'static> Served<P> {
 			return coupler.refused(CallFault::Unavailable).into_http();
 		};
 
+		let expires = parsed.expires();
 		let opened = parsed.opened(slot);
 		let request = HttpRequest::from_parts(head, body);
 		let ceiling = coupler.ceiling();
 
 		let grpc = Grpc::new(TunnelCodec).max_decoding_message_size(ceiling);
 		let mut grpc = grpc.max_encoding_message_size(ceiling);
-		grpc.unary(CoupledCall { coupler, opened: Some(opened) }, request).await
+		let call = CoupledCall { coupler: Arc::clone(&coupler), opened: Some(opened) };
+		let answered = timeout_at(expires, grpc.unary(call, request)).await;
+		answered.unwrap_or_else(|_| coupler.refused(CallFault::Deadline).into_http())
 	}
 }
 

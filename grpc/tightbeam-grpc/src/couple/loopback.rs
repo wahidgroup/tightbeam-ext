@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 use tokio::sync::mpsc::Sender;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use tokio::task::JoinHandle;
-use tokio::time::{sleep, timeout_at, Instant};
+use tokio::time::{sleep, Instant};
 
 use tightbeam::crypto::policy::Secp256k1Policy;
 use tightbeam::crypto::sign::SigningIdentity;
@@ -61,25 +61,26 @@ pub(crate) enum Ready<P: HandshakeProvider + Send + Sync + 'static> {
 }
 
 impl<P: HandshakeProvider + Send + Sync + 'static> Ready<P> {
-	/// Hold a live session for one send before `expires`: a free stream of a
-	/// multiplexed session, or the transport of a single session, which one
-	/// call holds at a time. A single session that a call left mid-exchange
-	/// carries no other call, because its stream position is lost (CWE-672).
+	/// Hold a live session for one send: a free stream of a multiplexed
+	/// session, or the transport of a single session, which one call holds at
+	/// a time. The deadline of the call bounds the wait, and a session held at
+	/// `expires` or later sends nothing. A single session that a call left
+	/// mid-exchange carries no other call, because its stream position is
+	/// lost (CWE-672).
 	///
 	/// # Errors
 	///
-	/// - [`CallFault::Deadline`] -- the deadline passed first.
+	/// - [`CallFault::Deadline`] -- the session came free at `expires` or later.
 	/// - [`CallFault::Unavailable`] -- the session ended, drains, or lost its position.
 	pub(crate) async fn hold(self, expires: Instant) -> Result<Held<P>, CallFault> {
 		let held = match self {
 			Self::Mux(handle) => {
-				let slot = timeout_at(expires, handle.wait_for_stream_slot()).await;
-				slot.map_err(|_| CallFault::Deadline)?.map_err(|_| CallFault::Unavailable)?;
+				let slot = handle.wait_for_stream_slot().await;
+				slot.map_err(|_| CallFault::Unavailable)?;
 				Held::Mux(handle)
 			}
 			Self::Single(transport) => {
-				let locked = timeout_at(expires, transport.lock_owned()).await;
-				let transport = locked.map_err(|_| CallFault::Deadline)?;
+				let transport = transport.lock_owned().await;
 				if !transport.is_leasable() {
 					return Err(CallFault::Unavailable);
 				}

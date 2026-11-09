@@ -949,6 +949,108 @@ tb_scenario! {
 	}
 }
 
+/// The call limit of an edge whose callers withhold their bodies.
+const WITHHELD_LIMIT: Duration = Duration::from_millis(300);
+
+/// How long a scenario waits for the edge to end a withheld call.
+const WITHHELD_WAIT: Duration = Duration::from_secs(3);
+
+/// A call of `method` whose request message never arrives, ended by the edge
+/// within [`WITHHELD_WAIT`], or `None` when the edge never ends it.
+async fn withheld(channel: &tonic::transport::Channel, method: &'static str) -> Option<tonic::Code> {
+	let mut grpc = tonic::client::Grpc::new(channel.clone());
+	grpc.ready().await.ok()?;
+
+	let body = Request::new(futures_util::stream::pending::<Vec<u8>>());
+	let call = grpc.client_streaming(body, PathAndQuery::from_static(method), RawCodec);
+	let answered = tokio::time::timeout(WITHHELD_WAIT, call).await.ok()?;
+	answered.err().map(|status| status.code())
+}
+
+/// Stage the orders edge with one coupled lane and calls of at most
+/// [`WITHHELD_LIMIT`].
+fn stage_withheld(context: &Coupled, trace: &TraceCollector, stage: fn(Edge, Dial)) -> Result<(), TightBeamError> {
+	let lanes = core::num::NonZeroUsize::MIN;
+	let streams = core::num::NonZeroU32::MIN;
+	let coupler = context
+		.orders(trace, &context.answers)?
+		.with_call_limits(WITHHELD_LIMIT, lanes, streams);
+	context.stage_coupler(stage, coupler)
+}
+
+coupled!(WithheldEdge, WithheldGateway);
+
+tb_assert_spec! {
+	/// A granted call that withholds its body ends at its deadline, before
+	/// the coupler admits it.
+	pub WithheldBodySpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(COUPLED_CALL_REFUSED, exactly!(1), equals!("deadline")),
+			(COUPLED_CALL_ADMITTED, exactly!(0))
+		]
+	}
+}
+
+// A granted caller that never sends its body holds its lane until its deadline.
+tb_scenario! {
+	name: a_call_that_withholds_its_body_ends_at_its_deadline,
+	spec: WithheldBodySpec,
+	environment Cluster {
+		context: Coupled::mint(),
+		start: |SetupEnv { trace, context }| async move {
+			stage_withheld(&context, &trace, WithheldEdge::stage)?;
+			context.gateway::<WithheldGateway>(&trace).await
+		},
+		hives: |SetupEnv { trace, context }| vec![async move { context.hive(&trace).await }],
+		client: |ClusterEnv { context, cluster, .. }| async move {
+			let billing = context.billing(&cluster).await?;
+			let ended = withheld(&billing, GET).await;
+			assert_eq!(ended, Some(tonic::Code::DeadlineExceeded), "the edge MUST end the call at its deadline");
+
+			cluster.stop();
+			Ok(())
+		}
+	}
+}
+
+coupled!(DeniedHeadEdge, DeniedHeadGateway);
+
+tb_assert_spec! {
+	/// A call that no grant names refuses on its head, before its body.
+	pub DeniedHeadSpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(COUPLED_CALL_REFUSED, exactly!(1), equals!("denied")),
+			(COUPLED_CALL_ADMITTED, exactly!(0))
+		]
+	}
+}
+
+// The billing caller holds no grant for `List`, so its call takes no lane.
+tb_scenario! {
+	name: a_call_that_no_grant_names_refuses_before_its_body,
+	spec: DeniedHeadSpec,
+	environment Cluster {
+		context: Coupled::mint(),
+		start: |SetupEnv { trace, context }| async move {
+			stage_withheld(&context, &trace, DeniedHeadEdge::stage)?;
+			context.gateway::<DeniedHeadGateway>(&trace).await
+		},
+		hives: |SetupEnv { trace, context }| vec![async move { context.hive(&trace).await }],
+		client: |ClusterEnv { context, cluster, .. }| async move {
+			let billing = context.billing(&cluster).await?;
+			let ended = withheld(&billing, LIST).await;
+			assert_eq!(ended, Some(tonic::Code::PermissionDenied), "the edge MUST refuse the head");
+
+			cluster.stop();
+			Ok(())
+		}
+	}
+}
+
 coupled!(MidExchangeEdge, MidExchangeGateway);
 
 tb_assert_spec! {

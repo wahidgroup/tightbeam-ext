@@ -210,19 +210,20 @@ Under `couple`, `Edge::Coupled(EdgeTls, Coupler)` serves stock gRPC callers besi
 
 ### Steps of a coupled call
 
-| Step | The coupler                                                | Refuses with        |
-| ---- | ---------------------------------------------------------- | ------------------- |
-| 1    | reads the caller, the route, `grpc-timeout`, and the claim | 16, 12, 3           |
-| 2    | opens the call on its lane                                 | 14                  |
-| 3    | verifies the claim                                         | 16                  |
-| 4    | checks the grant and the assurance floor                   | 7                   |
-| 5    | signs a `CoupledCall` under its `Voucher`                  | 8, 13               |
-| 6    | finds the loopback session open                            | 14                  |
-| 7    | holds a live session within the deadline                   | 4, 14               |
-| 8    | spends the claim                                           | 16                  |
-| 9    | sends the work                                             | 4, or colony status |
-| 10   | checks the answer id and its pinned signer                 | 13                  |
+| Step | The coupler                                                           | Refuses with  |
+| ---- | --------------------------------------------------------------------- | ------------- |
+| 1    | reads the caller, the route, the grant, `grpc-timeout`, and the claim | 16, 12, 7, 3  |
+| 2    | opens the call on its lane                                            | 14            |
+| 3    | reads the body, and verifies the claim                                | 16            |
+| 4    | checks the assurance floor                                            | 7             |
+| 5    | signs a `CoupledCall` under its `Voucher`                             | 8, 13         |
+| 6    | finds the loopback session open                                       | 14            |
+| 7    | holds a live session                                                  | 14            |
+| 8    | spends the claim                                                      | 16            |
+| 9    | sends the work                                                        | colony status |
+| 10   | checks the answer id and its pinned signer                            | 13            |
 
+- The deadline of the call bounds steps 2 to 10, and refuses with 4 once it passes.
 - The coupler never sends a call twice.
 - A spent claim is forgotten only when the frame provably never left.
 - The loopback session runs into the coupler's own listener, so the gateway admits it like any edge client.
