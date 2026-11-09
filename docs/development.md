@@ -20,7 +20,7 @@ It drills down from the [repository README](../README.md) for engineers who work
 
 ## Projects
 
-Every top-level directory that owns a `Makefile` is an extension project: `asn`, `pubsub`, `wire`, and `ws`. Each project owns its targets in `<project>/Makefile` and its setup in `<project>/scripts/setup.sh`, and the root `Makefile` composes them. A project name after a target scopes the target to that project, and with no project name a target runs for every project.
+Every top-level directory that owns a `Makefile` is an extension project: `asn`, `grpc`, `pubsub`, `wire`, and `ws`. Each project owns its targets in `<project>/Makefile` and its setup in `<project>/scripts/setup.sh`, and the root `Makefile` composes them. A project name after a target scopes the target to that project, and with no project name a target runs for every project.
 
 ```sh
 make test ws     # ws only: cargo + vitest + its e2e lanes
@@ -69,30 +69,41 @@ make setup ws    # skips the pubsub install entirely
 
 ## Tests
 
-Every suite runs the real engine and the real peers of the stack:
-
-- A behavior that needs a peer runs in the node lane or the browser lane of its project, against the docker stack. A server mode that the stack lacks goes on the demo server.
-- A behavior that needs no peer runs on its owner, over frames that the real engine builds.
-- The shared rule `scripts/eslint/real-dependencies.mjs` refuses `vi.mock`, `vi.spyOn`, `vi.hoisted`, `vi.fn`, and every call assertion in each TypeScript package. A test asserts what a run shows instead: a value, a code, or what a peer received.
+- Tests run real engines and real peers. No mocks.
+- A behavior that needs a peer runs in an e2e lane against the docker stack.
+- A behavior with no peer runs on its owner, over frames that the real engine builds.
+- A server mode that the stack lacks goes on the demo server.
+- `scripts/eslint/real-dependencies.mjs` refuses `vi.mock`, `vi.spyOn`, `vi.hoisted`, `vi.fn`, and call assertions.
 
 ### Rust integration tests
 
-Each Rust integration test under `tests/` is a scenario of the tightbeam testing framework: a `tb_scenario!` whose `tb_assert_spec!` grades the trace of the run. Unit tests inside `src/` stay plain `#[test]` and `#[tokio::test]` functions.
+Every test under `tests/` is a `tb_scenario!` graded by a `tb_assert_spec!`. Unit tests in `src/` stay plain.
 
-- The environment fits the run. `ServiceClient` serves one server and drives one client, `Cluster` starts a gateway and registers its hives, and `Bare` runs one body, such as a set of peers that dial each other.
-- Every transport that the run can trace records on the trace of the scenario. `server!` takes `with_trace`, a pool takes `with_trace`, and a dialed or hand-built transport takes `TcpTransport::with_trace` before its handshake. `ClientBuilder` and `client!` take no trace in tightbeam 0.18, so a scenario that proves one of them counts the server side alone.
-- The spec counts what the code under test records: the handshakes, gate verdicts, pool reuses, colony routes, and renewals of tightbeam, and the audit trail of each extension under its `instrument` feature, such as the served-plane verdicts of `tightbeam-ws` and the registry decisions of `tightbeam-pubsub`.
-- A spec counts only the events that the scenario owns. A colony records its own background work, such as the beat that a gateway dials its hives with, on the same trace, so a spec over a colony counts its routes and the reuses of its edge, and no dial.
-- A fact that no code under test records goes on the trace as an event of the scenario itself, under a `test` URN, such as the status that a raw peer read. The spec grades its value with `equals!`.
-- A server side that records after it answers, such as a hand-built server, or a transport that files a refusal after its answer leaves, is waited on before the client of the scenario returns: on a signal that the server raises, or on the event itself.
-- A claim about order adds a `tb_process_spec!` through `ScenarioConfig::with_csp`, such as the steps of an in-band renewal, or an expulsion before its departure. The process grades the order of the events of its alphabet, and drops the rest. It never asks that a run end in a terminal state, so the counts of the spec grade completeness beside it.
-- The specs of the suites that every transport shares live in `tightbeam_ws::testing::specs`, beside the suites, so each transport grades the same suite with the same spec. `tightbeam-ws/tests/specs.rs` breaks the behavior of each one and expects `Expect::Violation(Layer::Assertion)`, so each shared spec is shown to reject a broken run.
-- A path that only a failing trace takes runs on a trace whose `FaultModel` injects the failure, under the `testing-fault` feature of tightbeam, such as a gate verdict that the trace refuses to record.
+| To test                                | Use                                                   |
+| -------------------------------------- | ----------------------------------------------------- |
+| One server and one client              | `environment ServiceClient`                           |
+| A gateway and its hives                | `environment Cluster`                                 |
+| Anything else                          | `environment Bare`                                    |
+| An order of events                     | `tb_process_spec!` through `ScenarioConfig::with_csp` |
+| A fact that no code under test records | An event under a `test` URN, graded with `equals!`    |
+| A path that only a failing trace takes | A `FaultModel` under `testing-fault`                  |
+| That a spec rejects a broken run       | `Expect::Violation(Layer::Assertion)`                 |
 
-The macro emits a plain `#[test]` or `#[tokio::test]`, so two kinds of suite stay outside it:
+- Attach the scenario trace to every transport you can: `with_trace` on `server!` and on a pool, and `TcpTransport::with_trace` on a hand-built transport. `client!` and `ClientBuilder` take none.
+- Count only the events the scenario owns. A colony records its own background work, such as heartbeat dials, on the same trace.
+- A process grades order, not completion. Pair it with counts.
+- Wait for an event that a server records after it answers before the client returns.
+- The specs of the suites that every transport shares live in `tightbeam_ws::testing::specs`.
 
-- A suite of the browser engine runs under `wasm-bindgen-test` on `wasm32`, which the macro has no runner for: `tightbeam-ws-wasm/tests` and `tightbeam-asn/tests/wasm_js_roundtrip.rs`.
-- A proof that has nothing to run is a compile-time item, such as the `const` of `tightbeam-asn/tests/marker.rs`, which names every fixture under the `AsnCodec` bound.
+Outside the macro:
+
+- Browser suites run under `wasm-bindgen-test`: `tightbeam-ws-wasm/tests` and `tightbeam-asn/tests/wasm_js_roundtrip.rs`.
+- Compile-time proofs are `const` items, such as `tightbeam-asn/tests/marker.rs`.
+
+### Docker stack
+
+- Scenarios that need the stack compile under the `e2e` feature, such as the hop and stock lanes of grpc. `make test` leaves it off, `make lint` compiles it, and `<project>/scripts/test-e2e.sh` runs it.
+- A project adds its own certificates with a `STACK_CERT_STEPS` entry in its `scripts/stack-env.sh`.
 
 ## Releases
 
@@ -113,7 +124,7 @@ make release yank=1                    # yank a published version
 3. Wait for the merge.
 4. Push the tag `releases/<ext>/v<version>`, signed with GPG or SSH.
 
-Before it prepares anything, the script resolves every crate the release publishes against crates.io. A crate that requires a release of another extension that crates.io does not have yet refuses the release, so `tightbeam-wire` releases before `tightbeam-ws`, and `tightbeam-ws` before `tightbeam-pubsub`.
+Before it prepares anything, the script resolves every crate the release publishes against crates.io. A crate that requires a release of another extension that crates.io does not have yet refuses the release, so `tightbeam-wire` releases before `tightbeam-ws` and `tightbeam-grpc`, and `tightbeam-ws` before `tightbeam-pubsub`. `tightbeam-ws` also releases before `tightbeam-grpc`, whose tests run the shared suites of the `tightbeam-ws` test support. The check resolves versions, not the items a crate uses, so it cannot see that order, and the release of `tightbeam-grpc` waits for the release of `tightbeam-ws` that the release of `tightbeam-wire` makes possible.
 
 The script compiles the release notes from the titles and labels of the merged pull requests. The push of that tag publishes the publishable crates of that extension to crates.io, as one Cargo multi-package publish in dependency order, and creates the GitHub release. It publishes only the crates of that extension, and never the whole workspace.
 

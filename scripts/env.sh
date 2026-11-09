@@ -20,10 +20,16 @@
 #   STACK_ENV_VARS      variable names passed through to the env file.
 #   STACK_COMPOSE_FILES compose files layered into the one stack (consumed
 #                       by stack.sh, which sources this file).
+#   STACK_CERT_STEPS    commands that stack.sh runs with CERT_DIR exported,
+#                       after the shared identities exist, so a project adds
+#                       its own material under CERT_DIR. Each step is
+#                       idempotent.
 STACK_PORT_SPECS=()
 STACK_ENV_VARS=()
 # shellcheck disable=SC2034
 STACK_COMPOSE_FILES=()
+# shellcheck disable=SC2034
+STACK_CERT_STEPS=()
 
 for stack_fragment in "$ROOT"/*/scripts/stack-env.sh; do
 	if [ -f "$stack_fragment" ]; then

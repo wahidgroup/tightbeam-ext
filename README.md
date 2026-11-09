@@ -8,13 +8,17 @@ This project is under active development. Public APIs MAY change without notice.
 
 ## Abstract
 
-This repository holds the parts of tightbeam that sit beyond the core crate: the envelope rules that its message socket transports share, a WebSocket transport, a browser client, topic pub/sub, and an ASN.1 bridge to TypeScript. Each extension lives in its own directory with its crates, its npm packages, and its end-to-end tests. The [documentation index](docs/README.md) lists the page that specifies each part.
+This repository holds the parts of tightbeam that sit beyond the core crate: the envelope rules that its message socket transports share, a gRPC transport, a WebSocket transport, a browser client, topic pub/sub, and an ASN.1 bridge to TypeScript. Each extension lives in its own directory with its crates, its npm packages, and its end-to-end tests. The [documentation index](docs/README.md) lists the page that specifies each part.
 
 ## Extensions
 
 ### [wire/](wire): Envelope wire rules
 
 - [tightbeam-wire](wire/tightbeam-wire): the rules that every message-oriented socket transport shares, one envelope per transport message. Published to crates.io.
+
+### [grpc/](grpc): gRPC transport
+
+- [tightbeam-grpc](grpc/tightbeam-grpc): the gRPC edge of a colony, for native clients behind gRPC hops and for stock gRPC clients and servers. Published to crates.io.
 
 ### [ws/](ws): WebSocket transport
 

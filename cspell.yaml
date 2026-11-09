@@ -4,6 +4,17 @@ import:
   - ./ws/node_modules/@wahidgroup/lint-rules/cspell.base.json
 words:
   - tightbeam
+  - alpn
+  - pkix
+  - unprovisioned
+  - rustls
+  - spiffe
+  - crls
+  - extn
+  - statuscodes
+  - varint
+  - grpcurl
+  - fullstorydev
   - acking
   - cfgs
   - errorizable
@@ -78,6 +89,9 @@ words:
   - unrouted
   - unrouting
   - bindgen
+  - deadlined
+  - envoyproxy
+  - nodelay
   - oids
   - cbor
   - zstd

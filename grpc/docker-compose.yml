@@ -1,0 +1,72 @@
+# grpc extension services, composed on top of ws/docker-compose.yml by
+# scripts/stack.sh. The work gateway shares the echo image, and a pinned Envoy
+# in front of its gRPC edge is the h2c hop that the grpc e2e lane crosses.
+
+services:
+  # Cluster work-plane gateway with a gRPC edge
+  grpc-work-gateway:
+    image: ${ECHO_IMAGE:-tightbeam-ws-echo:dev}
+    command: ["grpc-work-gateway-server"]
+    environment:
+      GRPC_EDGE_PORT: "9120"
+      TBWS_SERVER_CERT: /certs/server.cert.der
+      TBWS_WORK_CERT: /certs/client.cert.der
+    volumes:
+      - ${CERT_DIR:?}:/certs:ro
+    # The image healthcheck probes the echo port.
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          'ss -ltn "sport = :$${GRPC_EDGE_PORT}" | grep -q LISTEN || exit 1',
+        ]
+      interval: 3s
+      timeout: 2s
+      start_period: 3s
+      retries: 30
+
+  grpc-coupled-gateway:
+    image: ${ECHO_IMAGE:-tightbeam-ws-echo:dev}
+    command: ["grpc-coupled-gateway-server"]
+    environment:
+      GRPC_COUPLED_PORT: "9122"
+      TBWS_SERVER_CERT: /certs/server.cert.der
+      COUPLED_CERT_DIR: /certs/coupled
+    volumes:
+      - ${CERT_DIR:?}:/certs:ro
+    ports:
+      - "${GRPC_COUPLED_HOST_PORT:-9122}:9122"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          'ss -ltn "sport = :$${GRPC_COUPLED_PORT}" | grep -q LISTEN || exit 1',
+        ]
+      interval: 3s
+      timeout: 2s
+      start_period: 3s
+      retries: 30
+
+  grpc-envoy:
+    image: envoyproxy/envoy:v1.39.5@sha256:8fc594a5d85eb76dca24155cfb9208882406873932b20cf33649a0a611194c43
+    volumes:
+      - ${GRPC_ENVOY_CONFIG:?}:/etc/envoy/envoy.yaml:ro
+    depends_on:
+      grpc-work-gateway:
+        condition: service_healthy
+    ports:
+      - "${GRPC_ENVOY_HOST_PORT:-9121}:10000"
+    # The image has no HTTP client, so the probe asks the admin endpoint over
+    # a bash socket. The admin answers HTTP/1.1 alone.
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "bash",
+          "-c",
+          "exec 3<>/dev/tcp/127.0.0.1/9901 && printf 'GET /ready HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && grep -q LIVE <&3",
+        ]
+      interval: 3s
+      timeout: 2s
+      start_period: 3s
+      retries: 30

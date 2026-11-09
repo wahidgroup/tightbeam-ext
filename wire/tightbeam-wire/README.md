@@ -28,7 +28,7 @@ A kind implements `WireStream` and `WireSink` over the halves of its socket, and
 
 ## Related
 
-The native WebSocket kind is [tightbeam-ws](../../ws/tightbeam-ws), and the browser kind is the engine [tightbeam-ws-wasm](../../ws/tightbeam-ws-wasm). See the [repository README](../../README.md) for development and release workflows.
+The native WebSocket kind is [tightbeam-ws](../../ws/tightbeam-ws), the browser kind is the engine [tightbeam-ws-wasm](../../ws/tightbeam-ws-wasm), and the gRPC kind is [tightbeam-grpc](../../grpc/tightbeam-grpc). See the [repository README](../../README.md) for development and release workflows.
 
 ## License
 
