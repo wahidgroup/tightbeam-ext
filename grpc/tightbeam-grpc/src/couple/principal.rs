@@ -1,14 +1,10 @@
-//! The principal of a coupled caller, and the caller of one TLS connection.
-//!
-//! A certificate names exactly one [`Principal`] by one rule: its SPIFFE ID
-//! when it carries one `spiffe://` URI as a subject alternative name, and its
-//! subject distinguished name when it carries none. A certificate with two
-//! SPIFFE IDs names no principal, because a grant could then match either.
+//! The principal of a coupled caller: the one SPIFFE ID of its certificate,
+//! or else its subject.
 //!
 //! # Sources
 //!
 //! - SPIFFE ID, `spiffe/spiffe` `standards/SPIFFE-ID.md`: <https://github.com/spiffe/spiffe/blob/main/standards/SPIFFE-ID.md>
-//! - RFC 5280, X.509 PKIX, May 2008, section 4.2.1.6, subject alternative name: <https://www.rfc-editor.org/rfc/rfc5280#section-4.2.1.6>
+//! - RFC 5280, X.509 PKIX, May 2008, section 4.2.1.6: <https://www.rfc-editor.org/rfc/rfc5280#section-4.2.1.6>
 
 use core::fmt;
 use core::hash::{Hash, Hasher};

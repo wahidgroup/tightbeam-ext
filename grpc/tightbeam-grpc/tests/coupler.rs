@@ -1,19 +1,7 @@
-//! Stock gRPC callers through a coupled edge, as tightbeam scenarios.
+//! Stock gRPC callers through a coupled edge to a colony servlet.
 //!
-//! Each scenario starts a colony gateway whose edge is a coupled listener,
-//! and a hive whose servlet serves the coupled methods `Get` and `Place` of an
-//! orders service. The caller is tonic itself, with its own TLS stack and a
-//! client certificate that the test PKI issues, so each call crosses a stock
-//! gRPC client, the TLS of the edge, the coupler, the loopback session, the
-//! gateway, and the hive.
-//!
-//! - `Get` and `List` require `Vouched`, and `Place` requires `Signed`.
-//! - The billing caller is the SPIFFE ID `spiffe://acme/billing`, granted
-//!   `Get`. The web caller is the subject `CN=web,O=acme,C=US`, granted all
-//!   three, and signs its claims under a tightbeam identity of the same
-//!   subject.
-//! - The servlet records the assurance it admitted each call with as an event
-//!   of the scenario, so a spec grades both ends of the call.
+//! `Get` and `List` require `Vouched`, and `Place` requires `Signed`. The
+//! billing caller holds `Get`, and the web caller holds all three.
 
 // The colony runtime macros expand `cfg(feature = ...)` probes against the
 // invoking crate's feature namespace. Those upstream feature names do not
@@ -44,7 +32,9 @@ use tightbeam_grpc::protocol::HEALTH_CHECK_PATH;
 use tightbeam_ws::testing::{Identity, WorkClient};
 use tonic::Request;
 
-use support::{call, code_of, edge_error, edge_of, rejected_by, serving, unexpected, Coupled, RawCodec, BILLING, WEB};
+use support::{
+	call, call_within, code_of, edge_error, edge_of, rejected_by, serving, unexpected, Coupled, RawCodec, BILLING, WEB,
+};
 
 /// The method that requires `Vouched`.
 const GET: &str = "/orders.v1.Orders/Get";
@@ -54,6 +44,13 @@ const PLACE: &str = "/orders.v1.Orders/Place";
 
 /// A method that requires `Vouched`, granted to the web caller alone.
 const LIST: &str = "/orders.v1.Orders/List";
+
+/// The body of a call that the servlet serves slowly, so it holds the
+/// loopback session of a gateway that offers no mux.
+const SLOW: &[u8] = b"slow";
+
+/// How long the servlet takes to serve a slow call.
+const SLOW_SERVICE: Duration = Duration::from_millis(1000);
 
 /// The assurance that the servlet admitted a call with, which the servlet
 /// records itself.
@@ -81,6 +78,9 @@ servlet! {
 		};
 
 		env.trace.event_with(SERVED_ASSURANCE, &[], assurance)?;
+		if admitted.body() == SLOW {
+			tokio::time::sleep(SLOW_SERVICE).await;
+		}
 
 		let body = [b"served:".as_slice(), admitted.body()].concat();
 		admitted.reply(Code::Ok, body, &env.signer).await
@@ -321,9 +321,7 @@ macro_rules! refused_spec {
 coupled!(NoCertificateEdge, NoCertificateGateway);
 refused_spec!(UnauthenticatedSpec, "unauthenticated", 0);
 
-// A caller with no client certificate connects, because a native tunnel
-// client needs none, and its coupled call refuses with 16 before the coupler
-// looks its method up.
+// A caller with no client certificate connects, but its coupled call refuses with 16.
 tb_scenario! {
 	name: a_call_with_no_client_certificate_is_unauthenticated,
 	spec: UnauthenticatedSpec,
@@ -402,9 +400,7 @@ tb_scenario! {
 coupled!(ForeignClaimEdge, ForeignClaimGateway);
 refused_spec!(ForeignClaimSpec, "claim-refused", 0);
 
-// The billing caller forwards a claim that the web identity signed, so the
-// signer of the claim names another principal than the TLS certificate of
-// the call.
+// The billing caller forwards a claim that the web identity signed.
 tb_scenario! {
 	name: a_claim_of_another_principal_is_refused,
 	spec: ForeignClaimSpec,
@@ -572,9 +568,7 @@ tb_assert_spec! {
 	}
 }
 
-// The route pins the session identity as the signer of its answers, so the
-// answer that the servlet signs under its own identity never reaches the
-// caller.
+// The route pins another signer than the one the servlet answers under.
 tb_scenario! {
 	name: an_answer_under_an_unpinned_signer_is_refused,
 	spec: UnpinnedSpec,
@@ -786,9 +780,7 @@ tb_assert_spec! {
 	}
 }
 
-// A connection whose first call is coupled is a coupled lane, so a tunnel call
-// on it refuses with 14, and the listener records the refusal on the trace of
-// the coupler.
+// A tunnel call on a connection that carries coupled calls refuses with 14.
 tb_scenario! {
 	name: a_tunnel_call_on_a_coupled_lane_is_unavailable,
 	spec: CoupledLaneSpec,
@@ -827,9 +819,7 @@ const WATCHED: Duration = Duration::from_millis(1500);
 
 coupled!(MutualEdge, MutualGateway);
 
-// The accept planes of the gateway authenticate each client, and trust the
-// handshake identity of the voucher, so the loopback session opens under
-// mutual authentication and the coupler serves.
+// A mutual edge that trusts the voucher opens the loopback session and serves.
 tb_scenario! {
 	name: a_mutual_edge_that_trusts_the_voucher_serves,
 	config: ordered_by(VouchedCallSpec::latest()),
@@ -869,9 +859,7 @@ tb_assert_spec! {
 	}
 }
 
-// The accept planes trust the colony identity alone, so the edge refuses the
-// handshake of the loopback session, the session never opens, the health
-// check never reads `SERVING`, and a coupled call answers 14.
+// A mutual edge that refuses the voucher never serves, and its calls answer 14.
 tb_scenario! {
 	name: an_edge_that_refuses_the_voucher_reads_not_serving,
 	spec: NotServingSpec,
@@ -899,6 +887,61 @@ tb_scenario! {
 
 			let answer = call(&channel, GET, b"order", None).await;
 			assert_eq!(code_of(answer), Some(tonic::Code::Unavailable));
+
+			cluster.stop();
+			Ok(())
+		}
+	}
+}
+
+coupled!(SingleSessionEdge, SingleSessionGateway);
+
+tb_assert_spec! {
+	/// A signed call that waits out its deadline for a single session never
+	/// spends its claim, so the slow call and the retry of the same claim
+	/// both serve. A spent claim would refuse the retry as a replay.
+	pub QueuedClaimSpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(COUPLED_CALL_ANSWERED, exactly!(2), equals!(0u32)),
+			(events::CLUSTER_WORK_ROUTED, exactly!(2))
+		]
+	}
+}
+
+// A signed call that times out waiting for a single session keeps its claim.
+tb_scenario! {
+	name: a_call_that_waits_out_its_deadline_for_the_session_keeps_its_claim,
+	spec: QueuedClaimSpec,
+	environment Cluster {
+		context: Coupled::mint(),
+		start: |SetupEnv { trace, context }| async move {
+			context.stage(&trace, SingleSessionEdge::stage)?;
+			context.single_gateway::<SingleSessionGateway>(&trace).await
+		},
+		hives: |SetupEnv { trace, context }| vec![async move { context.hive(&trace).await }],
+		client: |ClusterEnv { context, cluster, .. }| async move {
+			let billing = context.billing(&cluster).await?;
+			let (web, channel) = context.web(&cluster).await?;
+			let claim = context.claim(&web, PLACE, b"order-11").await?;
+
+			let slow = tokio::spawn(async move { call(&billing, GET, SLOW, None).await });
+			tokio::time::sleep(Duration::from_millis(200)).await;
+
+			// tonic ends the call at the deadline it sends, as CANCELLED, so
+			// the edge drops the call while it waits for the session, or
+			// refuses it with 4 when its own deadline fires first.
+			let queued = call_within(&channel, PLACE, b"order-11", &claim, Duration::from_millis(300)).await;
+			let queued = code_of(queued);
+			assert!(matches!(queued, Some(tonic::Code::Cancelled | tonic::Code::DeadlineExceeded)), "got {queued:?}");
+
+			let slow = slow.await.map_err(|_| unexpected(()))?;
+			assert!(slow.is_ok(), "the slow call MUST serve, got {slow:?}");
+
+			let retried = call(&channel, PLACE, b"order-11", Some(&claim)).await;
+			let retried = retried.map_err(|status| status.code());
+			assert_eq!(retried.as_deref(), Ok(&b"served:order-11"[..]), "the unspent claim MUST serve on retry");
 
 			cluster.stop();
 			Ok(())

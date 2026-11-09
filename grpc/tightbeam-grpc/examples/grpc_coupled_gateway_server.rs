@@ -1,20 +1,6 @@
 //! Cluster gateway with a coupled gRPC edge, for the e2e stack.
 //!
-//! This process runs a cluster gateway, a hive, and an orders servlet that
-//! answers each coupled call with its own request body. The edge serves stock
-//! gRPC callers over TLS under the material that `gen_coupled_certs` writes,
-//! which a real profile reads with `EdgeTls::from_pem` and
-//! `CallerTrust::from_pem`, so a stock client in any language calls
-//! `orders.v1.Orders/Get` on it.
-//!
-//! The coupler mints its voucher identities and the servlet its answer
-//! identity at start, so both sides of the colony trust each other in this
-//! process alone.
-//!
-//! Environment:
-//!   - `TBWS_SERVER_CERT`     path to the colony certificate DER, beside its key
-//!   - `COUPLED_CERT_DIR`     the directory that `gen_coupled_certs` wrote
-//!   - `GRPC_COUPLED_PORT`    listen port of the coupled edge
+//! Environment: `TBWS_SERVER_CERT`, `COUPLED_CERT_DIR`, and `GRPC_COUPLED_PORT`.
 
 // The colony runtime macros expand `cfg(feature = ...)` probes against the
 // invoking crate's feature namespace. Those upstream feature names do not
@@ -54,8 +40,15 @@ const CERT_DIR: EnvVar = EnvVar::new("COUPLED_CERT_DIR");
 /// The method that the edge routes, which a stock caller calls.
 const GET: &str = "/orders.v1.Orders/Get";
 
+/// The method that the edge routes as `Signed`.
+const PLACE: &str = "/orders.v1.Orders/Place";
+
 /// The stock caller that `gen_coupled_certs` issues.
 const CALLER: &str = "spiffe://acme/grpcurl";
+
+/// The signing caller that `gen_coupled_certs` issues, whose claim identity
+/// names the same subject.
+const SIGNER: &str = "CN=coupled claims,O=acme,C=US";
 
 /// How long the minted colony identities stay valid.
 const ONE_DAY: Duration = Duration::from_secs(24 * 60 * 60);
@@ -109,10 +102,13 @@ async fn main() -> Result<(), BoxError> {
 	let servlet = WorkClient::servlet("orders")?;
 
 	let callers = CallerTrust::from_pem(dir.join("root.pem"), dir.join("claims.pem"))?;
+	let claims = callers.claim_store();
 	let voucher = Voucher::new(session.signing_identity()?, vouching.signing_identity()?);
 	let orders = Servlet::new(servlet.clone(), answers.certificate().clone())?;
-	let routes = Routes::new().unary(GET, orders, Assurance::Vouched)?;
+	let routes = Routes::new().unary(GET, orders.clone(), Assurance::Vouched)?;
+	let routes = routes.unary(PLACE, orders, Assurance::Signed)?;
 	let grants = Grants::deny_all().grant(Principal::spiffe(CALLER)?, GET);
+	let grants = grants.grant(Principal::subject(SIGNER)?, PLACE);
 	let coupler = Coupler::new(callers, voucher, routes, grants)?;
 
 	let tls = EdgeTls::from_pem(dir.join("edge.crt"), dir.join("edge.key"))?;
@@ -123,7 +119,7 @@ async fn main() -> Result<(), BoxError> {
 	let config = transport.cluster_config(format!("0.0.0.0:{port}"))?;
 	let gateway = CoupledGateway::start(Arc::clone(&trace), config).await?;
 
-	let admission = AdmissionTrust::new(vouching.trust_anchor()?, answers.trust_anchor()?, answers.trust_anchor()?);
+	let admission = AdmissionTrust::new(vouching.trust_anchor()?, Arc::clone(&claims), claims);
 	let env = Arc::new(OrdersEnv { admission, signer: answers.signing_identity()? });
 	let served = OrdersServlet::start(Arc::clone(&trace), transport.servlet_config(env)?).await?;
 	let mut hive = OrdersHive::new(Some(transport.hive_config()?))?;
@@ -137,7 +133,7 @@ async fn main() -> Result<(), BoxError> {
 	}
 
 	let edge = gateway.edge_addr().ok_or("edge plane did not bind")?;
-	println!("[grpc-coupled-gateway] coupled edge https://{edge} routes {GET} to {servlet}");
+	println!("[grpc-coupled-gateway] coupled edge https://{edge} routes {GET} and {PLACE} to {servlet}");
 
 	// The topology serves from background tasks. Main only keeps the
 	// process alive for the container runtime.

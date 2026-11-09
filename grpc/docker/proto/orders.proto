@@ -1,6 +1,6 @@
 // The orders service that the coupled edge of the e2e stack routes. The
-// servlet answers each call with its own request, so `Get` takes and returns
-// one `Order`.
+// servlet answers each call with its own request, so each method takes and
+// returns one `Order`. `Place` requires a signed claim.
 syntax = "proto3";
 
 package orders.v1;
@@ -11,4 +11,5 @@ message Order {
 
 service Orders {
   rpc Get(Order) returns (Order);
+  rpc Place(Order) returns (Order);
 }

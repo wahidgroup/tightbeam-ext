@@ -1,16 +1,4 @@
-//! Tunnels over a TLS 1.3 edge, as tightbeam scenarios.
-//!
-//! Each scenario declares a staged profile of its own, mints a TLS PKI with
-//! [`TlsAuthority`] in its context, and stages the edge and the dial of that
-//! profile before the server binds:
-//!
-//! - The round trips run the shared suites over TLS and grade their traces
-//!   with the shared specs, so a tunnel inside TLS behaves as an h2c tunnel.
-//! - A dial that trusts another root, and an h2c dial to a TLS edge, never
-//!   reach a tunnel: the server accepts no connection, and the dial records
-//!   its refusal on the trace as an event of the scenario.
-//! - A colony gateway binds its edge through `EncryptedProtocol::bind_with`
-//!   under a TLS profile, and a native client submits work through it.
+//! Tunnels over a TLS 1.3 edge.
 
 // The colony runtime macros expand `cfg(feature = ...)` probes against the
 // invoking crate's feature namespace. Those upstream feature names do not
@@ -178,9 +166,7 @@ fn rejected_by(spec: &'static BuiltAssertSpec) -> Result<ScenarioConfig, Scenari
 	config.with_expect(Expect::Violation(Layer::Assertion)).build()
 }
 
-// tightbeam's `server!` and `client!` macros drive a cleartext tunnel inside
-// TLS: the server accepts the one connection, and its gate admits the one
-// request.
+// `server!` and `client!` drive a cleartext tunnel inside TLS.
 tb_scenario! {
 	name: cleartext_round_trip_over_tls,
 	spec: CleartextRoundTripSpec,
@@ -250,9 +236,7 @@ tb_scenario! {
 	}
 }
 
-// An h2c dial to a TLS edge sends an HTTP/2 preface where the edge waits for
-// a TLS ClientHello, so the edge closes the connection before any server
-// sees it.
+// An h2c dial to a TLS edge reaches no tunnel.
 tb_scenario! {
 	name: an_h2c_dial_to_a_tls_edge_reaches_no_tunnel,
 	spec: RefusedDialSpec,
@@ -302,9 +286,7 @@ fn edge_of(gateway: &TlsGateway) -> Result<GrpcAddr, TightBeamError> {
 	bound.ok_or(unbound)
 }
 
-// A signed work frame travels from a native client through the TLS edge and
-// the TCP colony to the work probe, and the signed answer of the probe
-// verifies end to end.
+// A native client submits work through a TLS edge to the colony.
 tb_scenario! {
 	name: submit_work_round_trips_through_a_tls_edge,
 	spec: EdgeWorkSpec,

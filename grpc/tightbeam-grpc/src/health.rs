@@ -1,15 +1,9 @@
-//! The `grpc.health.v1.Health/Check` call of an edge.
-//!
-//! A load balancer or an orchestrator probes an edge with the standard health
-//! check. The check names the whole server with an empty service, which is
-//! the one service an edge answers for: a tunnel edge serves while it
-//! listens, and a coupled edge serves while its loopback session is open.
-//! Each message has one field, so the edge encodes both by hand.
+//! The `grpc.health.v1.Health/Check` call of an edge. Each of its messages
+//! has one field, so the edge encodes them by hand.
 //!
 //! # Sources
 //!
 //! - gRPC health checking, `grpc/grpc` `doc/health-checking.md`: <https://github.com/grpc/grpc/blob/master/doc/health-checking.md>
-//! - Protocol Buffers encoding, `protobuf.dev/programming-guides/encoding`: <https://protobuf.dev/programming-guides/encoding/>
 
 use tonic::{Response, Status};
 

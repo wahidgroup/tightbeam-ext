@@ -1,8 +1,4 @@
-//! TLS 1.3 at each end of an edge, under the ring provider of rustls.
-//!
-//! Each config names its provider, so no process-wide provider of rustls
-//! needs to be installed, and each one admits TLS 1.3 alone and offers ALPN
-//! `h2` alone, because the edge speaks HTTP/2 and nothing else.
+//! TLS 1.3 with ALPN `h2` at each end of an edge, under the ring provider.
 
 use core::future::Future;
 use core::pin::Pin;

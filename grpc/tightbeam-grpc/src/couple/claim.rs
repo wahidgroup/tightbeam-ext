@@ -1,18 +1,9 @@
-//! The claim of a caller: its own signature over one call.
-//!
-//! A claim is a tightbeam frame of a [`ClaimBody`], signed under a tightbeam
-//! identity of the caller, which travels with the certificate of its signer
-//! and the issuers above it. The identity is issued to the same principal as
-//! the TLS certificate of the caller, and the claim covers the SHA-256 of that
-//! certificate, so a claim cannot move to another caller:
-//!
-//! - A stolen TLS key alone reaches [`Assurance::Vouched`](super::Assurance::Vouched).
-//! - A stolen claim key alone fails the principal and the certificate match.
-//! - A replay of a claim refuses at the replay window of the edge.
+//! The claim of a caller: its own signature over one call, bound to its
+//! principal and to the SHA-256 of its TLS certificate.
 //!
 //! # Sources
 //!
-//! - RFC 5652, CMS, September 2009, section 5, signed data: <https://www.rfc-editor.org/rfc/rfc5652#section-5>
+//! - RFC 5652, CMS, September 2009, section 5: <https://www.rfc-editor.org/rfc/rfc5652#section-5>
 //! - CWE-294, Authentication Bypass by Capture-replay: <https://cwe.mitre.org/data/definitions/294.html>
 
 use core::sync::atomic::{AtomicU64, Ordering};

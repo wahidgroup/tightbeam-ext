@@ -1,6 +1,4 @@
-//! The trust of a coupled edge in its callers: the TLS roots that a client
-//! chain verifies under, and the tightbeam store that a claim signer verifies
-//! under.
+//! The trust of a coupled edge in its callers.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -111,6 +109,14 @@ impl CallerTrust {
 	/// The store that verifies the signer of each claim.
 	pub(crate) fn claims(&self) -> &dyn CertificateTrust {
 		&*self.claims
+	}
+
+	/// The store that verifies the signer of each claim, which the servlets
+	/// of the edge share through `AdmissionTrust`, so a claim that the edge
+	/// verifies is a claim that each servlet verifies.
+	#[must_use]
+	pub fn claim_store(&self) -> Arc<dyn CertificateTrust> {
+		Arc::clone(&self.claims)
 	}
 }
 

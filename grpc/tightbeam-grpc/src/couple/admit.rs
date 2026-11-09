@@ -1,16 +1,4 @@
 //! The admission of a coupled call at the servlet that serves it.
-//!
-//! A servlet trusts three stores, which [`AdmissionTrust`] holds:
-//!
-//! - The vouchers: the couplers whose signature vouches for the principal
-//!   that a call names.
-//! - The direct callers: the tightbeam identities that sign their own calls,
-//!   each the principal its certificate names.
-//! - The claim store: the signers of the claims that a vouched call forwards.
-//!
-//! [`AdmittedCall::admit`] decodes the call from its frame and decides its
-//! principal and its assurance from the signer of the frame, so a frame whose
-//! origin names a principal that its signer may not vouch for never admits.
 
 use std::sync::Arc;
 

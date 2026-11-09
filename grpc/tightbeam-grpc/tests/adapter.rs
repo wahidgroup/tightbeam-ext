@@ -1,15 +1,4 @@
-//! Tightbeam work out to a stock gRPC backend, as tightbeam scenarios.
-//!
-//! Each scenario starts a colony gateway, a hive whose servlet is a
-//! [`Backend`] adapter, and a stock tonic server with its own TLS that
-//! authenticates its clients, as the orders backend. The adapter relays each
-//! coupled call it admits to the backend under its own TLS client certificate,
-//! with the principal of the call and its forwarded claim in the metadata, and
-//! the backend records what it read as events of the scenario:
-//!
-//! - A native tightbeam client signs a direct call under its own identity.
-//! - A stock caller calls through a coupled edge, whose coupler vouches for
-//!   it, so one call crosses both directions of the coupling.
+//! Colony work relayed to a stock gRPC server by a `Backend` servlet.
 
 // The colony runtime macros expand `cfg(feature = ...)` probes against the
 // invoking crate's feature namespace. Those upstream feature names do not
@@ -471,9 +460,7 @@ fn chained(spec: &'static BuiltAssertSpec) -> Result<ScenarioConfig, ScenarioCon
 
 coupled!(ChainEdge, ChainGateway);
 
-// A stock caller signs a claim and calls the coupled edge, the coupler vouches
-// for it, the adapter relays it to the stock backend with the principal and
-// the claim of the caller, and the answer of the backend returns the same way.
+// A stock caller reaches a stock backend through the coupler and the adapter.
 tb_scenario! {
 	name: a_stock_caller_reaches_a_stock_backend_through_the_colony,
 	config: chained(ChainSpec::latest()),

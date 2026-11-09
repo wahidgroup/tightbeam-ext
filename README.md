@@ -18,7 +18,7 @@ This repository holds the parts of tightbeam that sit beyond the core crate: the
 
 ### [grpc/](grpc): gRPC transport
 
-- [tightbeam-grpc](grpc/tightbeam-grpc): the native transport over one bidirectional gRPC call on h2c, which a cluster gateway takes as its edge for clients behind gRPC hops. Published to crates.io.
+- [tightbeam-grpc](grpc/tightbeam-grpc): the gRPC edge of a colony, for native clients behind gRPC hops and for stock gRPC clients and servers. Published to crates.io.
 
 ### [ws/](ws): WebSocket transport
 

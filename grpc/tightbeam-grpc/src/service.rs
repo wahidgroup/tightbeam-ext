@@ -1,16 +1,5 @@
 //! The service of an edge: the one parse of each call head, and the arm that
 //! serves it.
-//!
-//! Every call of an edge is a gRPC call, so the service refuses a method other
-//! than `POST` and a content type outside `application/grpc` first, then
-//! picks the arm of the call by its path:
-//!
-//! | The path | The arm |
-//! | --- | --- |
-//! | [`TUNNEL_PATH`] | The tunnel, which claims the lane of its connection |
-//! | [`HEALTH_CHECK_PATH`] | The health check of the edge |
-//! | A routed method of a coupled edge | The coupler |
-//! | Any other path | `grpc-status` 12, `UNIMPLEMENTED` |
 
 use core::convert::Infallible;
 use core::marker::PhantomData;

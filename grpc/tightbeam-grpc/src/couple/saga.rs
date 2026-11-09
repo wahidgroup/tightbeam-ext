@@ -1,26 +1,8 @@
 //! The saga of one coupled call, and the coupler that runs it.
 //!
-//! Each act takes the proof of the act before it by value and returns the
-//! proof the next act requires. Every proof keeps its fields private to this
-//! module, so no act runs out of order, and the [`CoupledSlot`] of the call
-//! travels inside each proof until the answer is written:
-//!
-//! | Step | Act | Yields | Refuses with |
-//! | --- | --- | --- | --- |
-//! | 1 | [`LiveCoupler::head`] | [`CoupledHead`] | 16, 12, 3 |
-//! | 2 | `Lane::open_coupled` | [`Opened`] | 14 |
-//! | 3 | [`Opened::present`] | [`Presented`] | 16 |
-//! | 4 | [`Presented::permit`] | [`Permitted`] | 7 |
-//! | 5 | `Voucher::vouch` | [`VouchedWork`] | 8, 13 |
-//! | 6 | `LoopbackSession::ready` | `Ready` | 14 |
-//! | 7 | [`LiveCoupler::spend`] | [`Spent`] | 16 |
-//! | 8 | [`Spent::send`], the pivot | [`Submitted`] | 4, the status of the gateway |
-//! | 9 | [`Submitted::verify`] | [`VerifiedAnswer`] | 13 |
-//!
-//! The send is the one act that cannot be undone, and every act that can
-//! refuse runs before it. The coupler never sends a call twice. A spent claim
-//! whose send fails before it leaves the session is forgotten, so the caller
-//! may retry it.
+//! Each act takes the proof of the act before it by value, so no act runs out
+//! of order. A claim is spent only once the call holds the session, and the
+//! send is the one act that cannot be undone.
 
 use core::fmt;
 use core::num::{NonZeroU32, NonZeroUsize};
@@ -33,7 +15,7 @@ use http::request::Parts;
 use http::HeaderValue;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::Semaphore;
-use tokio::time::timeout;
+use tokio::time::{timeout_at, Instant};
 
 use tightbeam::clock::UnixMillis;
 use tightbeam::colony::hive::ReplayGuard;
@@ -51,7 +33,7 @@ use tightbeam::trace::TraceCollector;
 
 use super::claim::{CallClaim, VerifiedClaim};
 use super::fault::CallFault;
-use super::loopback::{LoopbackSession, Ready};
+use super::loopback::{Held, LoopbackSession};
 use super::message::CoupledReply;
 use super::principal::{Caller, Principal};
 use super::routes::{Assurance, Grants, Route, Routes, Servlet};
@@ -285,9 +267,10 @@ impl<P: HandshakeProvider + Send + Sync + 'static> LiveCoupler<P> {
 		let route = self.config.routes.route(method).ok_or(CallFault::Unrouted)?.clone();
 		let asked = head.headers.get("grpc-timeout").map(Self::timeout_of).transpose()?;
 		let deadline = asked.map_or(self.config.limits.timeout, |asked| asked.min(self.config.limits.timeout));
+		let expires = Instant::now() + deadline;
 		let claim = CallClaim::of_head(&head.headers)?;
 
-		Ok(CoupledHead { caller, method: method.to_owned(), route, deadline, claim })
+		Ok(CoupledHead { caller, method: method.to_owned(), route, expires, claim })
 	}
 
 	/// The duration of a `grpc-timeout` value: one to eight ASCII digits and
@@ -336,14 +319,15 @@ impl<P: HandshakeProvider + Send + Sync + 'static> LiveCoupler<P> {
 		let request_id = self.next_request_id();
 		let vouched = self.config.voucher.vouch(permitted, request_id, self.ceiling).await?;
 		let ready = self.session.ready().ok_or(CallFault::Unavailable)?;
+		let held = ready.hold(vouched.opened.head.expires).await.ok_or(CallFault::Deadline)?;
 		let spent = self.spend(vouched)?;
 
-		let submitted = spent.send(ready, &self.replay).await?;
+		let submitted = spent.send(held, &self.replay).await?;
 		submitted.verify()
 	}
 
-	/// Step 7: spend the claim of the call in the replay window, which only
-	/// this coupler holds.
+	/// Step 8: spend the claim of the call in the replay window, which only
+	/// this coupler holds, once the call holds the session.
 	///
 	/// # Errors
 	///
@@ -420,7 +404,9 @@ pub(crate) struct CoupledHead {
 	caller: Arc<Caller>,
 	method: String,
 	route: Route<Servlet>,
-	deadline: Duration,
+	/// When the deadline of the call passes, counted from the arrival of its
+	/// head.
+	expires: Instant,
 	claim: Option<CallClaim>,
 }
 
@@ -535,16 +521,17 @@ pub(crate) struct VouchedWork {
 	claim: Option<VerifiedClaim>,
 }
 
-/// Step 7: a call whose claim is spent.
+/// Step 8: a call whose claim is spent.
 pub(crate) struct Spent {
 	vouched: VouchedWork,
 }
 
 impl Spent {
-	/// Step 8, the pivot: send the work on `ready` within the deadline of the
+	/// Step 9, the pivot: send the work on `held` within the deadline of the
 	/// call, and resolve the reply of the gateway into the frame of the
 	/// servlet. A send that fails before it leaves the session forgets the
-	/// claim in `replay`, so the caller may retry it.
+	/// claim in `replay`, so the caller may retry it. A deadline that passes
+	/// during the send keeps the claim spent, because the frame may have left.
 	///
 	/// # Errors
 	///
@@ -554,11 +541,11 @@ impl Spent {
 	/// - [`CallFault::Internal`] -- the reply does not decode.
 	async fn send<P: HandshakeProvider + Send + Sync + 'static>(
 		self,
-		ready: Ready<P>,
+		held: Held<P>,
 		replay: &ReplayGuard,
 	) -> Result<Submitted, CallFault> {
 		let VouchedWork { opened, work, request_id, claim } = self.vouched;
-		let sent = timeout(opened.head.deadline, ready.send(work)).await;
+		let sent = timeout_at(opened.head.expires, held.send(work)).await;
 		let reply = match sent {
 			Err(_) => return Err(CallFault::Deadline),
 			Ok(Err(error)) => {
@@ -597,7 +584,7 @@ impl Spent {
 	}
 }
 
-/// Step 8: the frame that the servlet answered a call with.
+/// Step 9: the frame that the servlet answered a call with.
 pub(crate) struct Submitted {
 	opened: Opened,
 	reply: Frame,
@@ -605,7 +592,7 @@ pub(crate) struct Submitted {
 }
 
 impl Submitted {
-	/// Step 9: the answer of the servlet, once its frame answers the id of the
+	/// Step 10: the answer of the servlet, once its frame answers the id of the
 	/// request and its signature verifies under the signer of the route.
 	///
 	/// # Errors
@@ -629,7 +616,7 @@ impl Submitted {
 	}
 }
 
-/// Step 9: an answer that verified, which still holds the coupled slot of its
+/// Step 10: an answer that verified, which still holds the coupled slot of its
 /// call until the response is written.
 pub(crate) struct VerifiedAnswer {
 	code: Code,

@@ -7,6 +7,10 @@
 #[doc = include_str!("../../../docs/grpc.md")]
 mod docs_grpc {}
 
+#[cfg(doctest)]
+#[doc = include_str!("../../../docs/grpc-interop.md")]
+mod docs_grpc_interop {}
+
 pub mod edge;
 pub mod events;
 pub mod io;

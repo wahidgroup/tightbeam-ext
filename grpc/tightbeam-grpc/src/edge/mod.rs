@@ -1,32 +1,11 @@
-//! The deployment profile of a gRPC edge: what a listener binds with, and what
-//! a dial connects with.
-//!
-//! tightbeam binds the edge of a gateway through
-//! [`EncryptedProtocol::bind_with`], and a client dials through
-//! [`Protocol::connect`]. Neither call carries a value for the deployment, so
-//! [`GrpcListener<P, C>`] names its deployment as the type `C`, and the
-//! [`EdgeProfile`] of `C` provisions each bind and each dial from the sources
-//! of the profile itself: a file, a secret mount, or a cell that a test fills.
-//!
-//! - [`H2c`], the default profile, runs the tunnel on HTTP/2 with prior knowledge and no TLS.
-//! - A profile whose bind returns [`Edge::Tls`] terminates TLS 1.3 at the
-//!   listener, before any byte reaches the HTTP/2 server, and its dial returns
-//!   [`Dial::Tls`], which verifies the certificate of the edge against its
-//!   roots.
-//!
-//! The tightbeam handshake inside each tunnel runs unchanged under either
-//! profile, so TLS adds a layer for the hops in front of the edge and replaces
-//! nothing.
-//!
-//! [`EncryptedProtocol::bind_with`]: tightbeam::transport::EncryptedProtocol::bind_with
-//! [`Protocol::connect`]: tightbeam::transport::Protocol::connect
-//! [`GrpcListener<P, C>`]: crate::protocol::GrpcListener
+//! The deployment profile of a gRPC edge. `bind_with` and `connect` carry no
+//! value for a deployment, so the listener names it as a type, whose
+//! [`EdgeProfile`] provisions each bind and each dial.
 //!
 //! # Sources
 //!
 //! - RFC 8446, TLS 1.3, August 2018: <https://www.rfc-editor.org/rfc/rfc8446>
-//! - RFC 7301, TLS ALPN, July 2014: <https://www.rfc-editor.org/rfc/rfc7301>
-//! - RFC 9113, HTTP/2, June 2022, section 3.2, HTTP/2 over TLS: <https://www.rfc-editor.org/rfc/rfc9113#section-3.2>
+//! - RFC 9113, HTTP/2, June 2022, section 3.2: <https://www.rfc-editor.org/rfc/rfc9113#section-3.2>
 
 use core::fmt;
 use std::io;

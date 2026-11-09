@@ -1,18 +1,5 @@
-//! The loopback session of a coupler: one encrypted tightbeam session from the
-//! coupler into the accept queue of its own listener.
-//!
-//! The gateway accepts the session as it accepts any edge connection, so each
-//! coupled call passes the same handshake, gates, and work admission as the
-//! work of a native client. The session multiplexes when the edge negotiates
-//! it, which a gateway does when its pool config carries a mux offer, and
-//! carries one call at a time otherwise.
-//!
-//! One task drives every transition of the session, and the coupler only reads
-//! its state:
-//!
-//! - `Opening`: the task queues the in-process tunnel and runs the handshake.
-//! - `Mux` or `Single`: the session carries calls until it dies.
-//! - `Backoff`: the task waits out the backoff, then opens again.
+//! The loopback session: one tightbeam session from the coupler into the
+//! accept queue of its own listener. Its task makes every change of state.
 
 use core::marker::PhantomData;
 use core::time::Duration;
@@ -20,9 +7,9 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 
 use tokio::sync::mpsc::Sender;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 use tokio::task::JoinHandle;
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout_at, Instant};
 
 use tightbeam::crypto::policy::Secp256k1Policy;
 use tightbeam::crypto::sign::SigningIdentity;
@@ -66,13 +53,39 @@ impl<P: HandshakeProvider + Send + Sync + 'static> State<P> {
 	}
 }
 
-/// What a coupler sends one work request on.
+/// The open session that a coupler holds one work request on.
 pub(crate) enum Ready<P: HandshakeProvider + Send + Sync + 'static> {
 	Mux(MuxHandle),
 	Single(Arc<Mutex<GrpcTransport<P>>>),
 }
 
 impl<P: HandshakeProvider + Send + Sync + 'static> Ready<P> {
+	/// Hold the session for one send before `expires`: a stream handle of a
+	/// multiplexed session, or the transport of a single session, which one
+	/// call holds at a time.
+	///
+	/// `None` when the deadline passes first, so a call that waited out its
+	/// deadline for the session holds nothing and sends nothing.
+	pub(crate) async fn hold(self, expires: Instant) -> Option<Held<P>> {
+		let held = match self {
+			Self::Mux(handle) => Held::Mux(handle),
+			Self::Single(transport) => {
+				let locked = timeout_at(expires, transport.lock_owned()).await;
+				Held::Single(locked.ok()?)
+			}
+		};
+
+		(Instant::now() < expires).then_some(held)
+	}
+}
+
+/// The session that one call holds for its send.
+pub(crate) enum Held<P: HandshakeProvider + Send + Sync + 'static> {
+	Mux(MuxHandle),
+	Single(OwnedMutexGuard<GrpcTransport<P>>),
+}
+
+impl<P: HandshakeProvider + Send + Sync + 'static> Held<P> {
 	/// Send `work` and return the reply of the gateway.
 	///
 	/// # Errors
@@ -81,11 +94,7 @@ impl<P: HandshakeProvider + Send + Sync + 'static> Ready<P> {
 	pub(crate) async fn send(self, work: Frame) -> Result<Option<Frame>, TransportError> {
 		match self {
 			Self::Mux(handle) => handle.emit_on_stream(&work).await,
-			Self::Single(transport) => {
-				let mut transport = transport.lock().await;
-				let reply = transport.emit(work, None).await?;
-				Ok(reply)
-			}
+			Self::Single(mut transport) => transport.emit(work, None).await,
 		}
 	}
 }

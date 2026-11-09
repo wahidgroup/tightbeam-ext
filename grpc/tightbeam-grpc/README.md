@@ -58,9 +58,12 @@ A tightbeam cluster gateway binds a gRPC edge that admits signed work frames fro
 
 ## Coupled edge
 
-The `couple` feature serves stock gRPC callers on the edge port of a gateway, beside the tunnel. The edge authenticates each caller by its TLS client certificate, grants it methods deny by default, and carries each call to a colony servlet as work that the coupler signs, then verifies the signed answer before the caller reads it. Implementation: [docs/grpc.md](../../docs/grpc.md#coupled-edge).
+The `couple` feature connects stock gRPC systems to a colony:
 
-In the other direction, a backend adapter servlet relays the coupled calls it admits to a stock gRPC server over mutual TLS, with the principal of each call in its metadata. Implementation: [docs/grpc.md](../../docs/grpc.md#backend-adapter).
+- Stock gRPC clients call colony servlets on the edge port, over mutual TLS.
+- A backend adapter servlet calls stock gRPC servers.
+
+How to: [docs/grpc-interop.md](../../docs/grpc-interop.md). Reference: [docs/grpc.md](../../docs/grpc.md#coupled-edge).
 
 ## Proxy hops
 

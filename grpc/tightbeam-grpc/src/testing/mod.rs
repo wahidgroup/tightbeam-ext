@@ -1,18 +1,6 @@
-//! Test support for the edges of this crate, under the `testing` feature.
-//!
-//! - [`TlsAuthority`] mints a TLS PKI at run time: one root, and the edge
-//!   certificates that it issues for loopback.
-//! - [`staged_profile!`](crate::staged_profile) declares an [`EdgeProfile`]
-//!   whose material a scenario stages after it mints it, because
-//!   [`EdgeProfile::edge`] and [`EdgeProfile::dial`] take no argument.
-//!
-//! rustls verifies no secp256k1 signature, so the test certificates sign
-//! under ECDSA P-256 with SHA-256, apart from the identities of the tightbeam
-//! handshake inside each tunnel.
-//!
-//! [`EdgeProfile`]: crate::edge::EdgeProfile
-//! [`EdgeProfile::edge`]: crate::edge::EdgeProfile::edge
-//! [`EdgeProfile::dial`]: crate::edge::EdgeProfile::dial
+//! Test support: a TLS PKI minted at run time, and profiles that a scenario
+//! stages. rustls verifies no secp256k1, so the test certificates sign under
+//! P-256.
 
 use core::fmt;
 use core::str::FromStr;

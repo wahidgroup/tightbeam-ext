@@ -1,8 +1,4 @@
-//! The stock gRPC harness that the coupler and the adapter scenarios share:
-//! the identities and the TLS PKI of a scenario, a coupler built from them, a
-//! stock tonic caller over its own TLS, and the configs that grade a run.
-//!
-//! Each test binary compiles this module on its own, and uses part of it.
+//! The PKI, the stock caller, and the coupler that the scenarios share.
 #![allow(dead_code)]
 
 use std::sync::Arc;
@@ -164,6 +160,14 @@ impl Coupled {
 		G::start(Arc::new(trace.share()), config).await
 	}
 
+	/// Start the gateway `G`, which offers no mux, so the loopback session of
+	/// its coupler carries one call at a time.
+	pub async fn single_gateway<G: Cluster>(&self, trace: &TraceCollector) -> Result<G, TightBeamError> {
+		let mut config = self.transport.cluster_config("127.0.0.1:0")?;
+		config.pool_config.mux_offer = None;
+		G::start(Arc::new(trace.share()), config).await
+	}
+
 	/// Start the gateway `G`, whose accept planes authenticate each client
 	/// under the certificates of `trusted` alone.
 	pub async fn mutual_gateway<G: Cluster>(
@@ -242,14 +246,40 @@ pub async fn call(
 	body: &[u8],
 	claim: Option<&CallClaim>,
 ) -> Result<Vec<u8>, Status> {
+	request(channel, method, body, claim, None).await
+}
+
+/// A unary call of `method` with `body` and `claim`, as a stock client makes
+/// it with the deadline `within`, which it sends as `grpc-timeout`.
+pub async fn call_within(
+	channel: &Channel,
+	method: &'static str,
+	body: &[u8],
+	claim: &CallClaim,
+	within: Duration,
+) -> Result<Vec<u8>, Status> {
+	request(channel, method, body, Some(claim), Some(within)).await
+}
+
+/// One unary call, with `claim` and a deadline of `within` when each is
+/// `Some`.
+async fn request(
+	channel: &Channel,
+	method: &'static str,
+	body: &[u8],
+	claim: Option<&CallClaim>,
+	within: Option<Duration>,
+) -> Result<Vec<u8>, Status> {
 	let mut grpc = tonic::client::Grpc::new(channel.clone());
 	grpc.ready().await.map_err(|error| Status::unavailable(error.to_string()))?;
 
 	let mut request = Request::new(body.to_vec());
 	if let Some(claim) = claim {
-		claim
-			.attach(request.metadata_mut())
-			.map_err(|error| Status::internal(error.to_string()))?;
+		let attached = claim.attach(request.metadata_mut());
+		attached.map_err(|error| Status::internal(error.to_string()))?;
+	}
+	if let Some(within) = within {
+		request.set_timeout(within);
 	}
 
 	let path = PathAndQuery::from_static(method);

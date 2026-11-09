@@ -1,25 +1,5 @@
-//! The outbound adapter: tightbeam work to a stock gRPC backend.
-//!
-//! A [`Backend`] is the configuration of a servlet that relays each coupled
-//! call it admits to one stock gRPC server, over mutual TLS under the identity
-//! of the adapter. The backend reads the principal of each call in the binary
-//! metadata [`Backend::PRINCIPAL_KEY`], and the claim that a signed call
-//! forwards in [`CallClaim::METADATA_KEY`], so a backend that trusts the
-//! adapter decides on the original caller, and a backend that verifies claims
-//! checks the caller end to end.
-//!
-//! The relay of one call is a saga of four acts:
-//!
-//! | Step | Act | Refuses with |
-//! | --- | --- | --- |
-//! | 1 | `AdmittedCall::admit` | `WorkRefused(Unauthenticated)` |
-//! | 2 | the grants and the route of the method | a signed reply of 12 or 7 |
-//! | 3 | the call of the backend, the pivot | a signed reply of the status of the backend, 14, or 4 |
-//! | 4 | the signed reply | 13 |
-//!
-//! The call of the backend is the one act that cannot be undone, and every act
-//! that can refuse runs before it. An answer whose reply fails to sign leaves
-//! the effect of the backend in place.
+//! The outbound adapter: coupled calls relayed to a stock gRPC server. Every
+//! act that can refuse runs before the call of the server.
 
 use core::fmt;
 use core::time::Duration;
