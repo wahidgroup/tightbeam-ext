@@ -1,4 +1,5 @@
-# Self-contained tightbeam-ws echo server image.
+# Self-contained image of the e2e stack: the echo and demo servers of ws and
+# pubsub, and the work gateway and the coupled gateway of grpc.
 
 FROM rust:1-slim-bookworm AS build
 
@@ -14,7 +15,9 @@ RUN cargo build --example echo_server_mux -p tightbeam-ws --features testing \
 	&& cargo build --example echo_server_mux_clear -p tightbeam-ws --features testing \
 	&& cargo build --example work_gateway_server -p tightbeam-ws --features colony \
 	&& cargo build --example pubsub_demo_server -p tightbeam-pubsub --features testing \
-	&& cargo build --example pubsub_processor_server -p tightbeam-pubsub --features testing
+	&& cargo build --example pubsub_processor_server -p tightbeam-pubsub --features testing \
+	&& cargo build --example grpc_work_gateway_server -p tightbeam-grpc \
+	&& cargo build --example grpc_coupled_gateway_server -p tightbeam-grpc --features couple,testing
 
 FROM debian:bookworm-slim
 
@@ -28,6 +31,8 @@ COPY --from=build /src/tightbeam-ext/target/debug/examples/echo_server_mux_clear
 COPY --from=build /src/tightbeam-ext/target/debug/examples/work_gateway_server /usr/local/bin/work-gateway-server
 COPY --from=build /src/tightbeam-ext/target/debug/examples/pubsub_demo_server /usr/local/bin/pubsub-demo-server
 COPY --from=build /src/tightbeam-ext/target/debug/examples/pubsub_processor_server /usr/local/bin/pubsub-processor-server
+COPY --from=build /src/tightbeam-ext/target/debug/examples/grpc_work_gateway_server /usr/local/bin/grpc-work-gateway-server
+COPY --from=build /src/tightbeam-ext/target/debug/examples/grpc_coupled_gateway_server /usr/local/bin/grpc-coupled-gateway-server
 
 USER echo
 

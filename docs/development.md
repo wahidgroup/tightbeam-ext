@@ -20,7 +20,7 @@ It drills down from the [repository README](../README.md) for engineers who work
 
 ## Projects
 
-Every top-level directory that owns a `Makefile` is an extension project: `asn`, `pubsub`, `wire`, and `ws`. Each project owns its targets in `<project>/Makefile` and its setup in `<project>/scripts/setup.sh`, and the root `Makefile` composes them. A project name after a target scopes the target to that project, and with no project name a target runs for every project.
+Every top-level directory that owns a `Makefile` is an extension project: `asn`, `grpc`, `pubsub`, `wire`, and `ws`. Each project owns its targets in `<project>/Makefile` and its setup in `<project>/scripts/setup.sh`, and the root `Makefile` composes them. A project name after a target scopes the target to that project, and with no project name a target runs for every project.
 
 ```sh
 make test ws     # ws only: cargo + vitest + its e2e lanes
@@ -71,7 +71,7 @@ make setup ws    # skips the pubsub install entirely
 
 Every suite runs the real engine and the real peers of the stack:
 
-- A behavior that needs a peer runs in the node lane or the browser lane of its project, against the docker stack. A server mode that the stack lacks goes on the demo server.
+- A behavior that needs a peer runs in an e2e lane of its project against the docker stack: the node or browser lane of a TypeScript package, or the cargo hop and stock lanes of grpc. A server mode that the stack lacks goes on the demo server.
 - A behavior that needs no peer runs on its owner, over frames that the real engine builds.
 - The shared rule `scripts/eslint/real-dependencies.mjs` refuses `vi.mock`, `vi.spyOn`, `vi.hoisted`, `vi.fn`, and every call assertion in each TypeScript package. A test asserts what a run shows instead: a value, a code, or what a peer received.
 
@@ -81,7 +81,7 @@ Each Rust integration test under `tests/` is a scenario of the tightbeam testing
 
 - The environment fits the run. `ServiceClient` serves one server and drives one client, `Cluster` starts a gateway and registers its hives, and `Bare` runs one body, such as a set of peers that dial each other.
 - Every transport that the run can trace records on the trace of the scenario. `server!` takes `with_trace`, a pool takes `with_trace`, and a dialed or hand-built transport takes `TcpTransport::with_trace` before its handshake. `ClientBuilder` and `client!` take no trace in tightbeam 0.18, so a scenario that proves one of them counts the server side alone.
-- The spec counts what the code under test records: the handshakes, gate verdicts, pool reuses, colony routes, and renewals of tightbeam, and the audit trail of each extension under its `instrument` feature, such as the served-plane verdicts of `tightbeam-ws` and the registry decisions of `tightbeam-pubsub`.
+- The spec counts what the code under test records: the handshakes, gate verdicts, pool reuses, colony routes, and renewals of tightbeam, and the audit trail of each extension under its `instrument` feature, such as the served-plane verdicts of `tightbeam-ws`, the refusals of a `tightbeam-grpc` listener, and the registry decisions of `tightbeam-pubsub`.
 - A spec counts only the events that the scenario owns. A colony records its own background work, such as the beat that a gateway dials its hives with, on the same trace, so a spec over a colony counts its routes and the reuses of its edge, and no dial.
 - A fact that no code under test records goes on the trace as an event of the scenario itself, under a `test` URN, such as the status that a raw peer read. The spec grades its value with `equals!`.
 - A server side that records after it answers, such as a hand-built server, or a transport that files a refusal after its answer leaves, is waited on before the client of the scenario returns: on a signal that the server raises, or on the event itself.
@@ -93,6 +93,8 @@ The macro emits a plain `#[test]` or `#[tokio::test]`, so two kinds of suite sta
 
 - A suite of the browser engine runs under `wasm-bindgen-test` on `wasm32`, which the macro has no runner for: `tightbeam-ws-wasm/tests` and `tightbeam-asn/tests/wasm_js_roundtrip.rs`.
 - A proof that has nothing to run is a compile-time item, such as the `const` of `tightbeam-asn/tests/marker.rs`, which names every fixture under the `AsnCodec` bound.
+
+A scenario that needs the docker stack compiles under a cargo feature that the unit lane never enables, because the macro passes no `#[ignore]` through. The hop and stock scenarios of grpc compile under `e2e`: `make test grpc` leaves it off, `make lint grpc` compiles the scenarios with `--all-features`, and `grpc/scripts/test-e2e.sh` runs them with `--features e2e`. A project that needs its own material beside the shared identities of the stack, such as the TLS of the coupled edge of grpc, adds a step to `STACK_CERT_STEPS` in its `scripts/stack-env.sh`, and `scripts/stack.sh` runs each step with `CERT_DIR` exported.
 
 ## Releases
 
@@ -113,7 +115,7 @@ make release yank=1                    # yank a published version
 3. Wait for the merge.
 4. Push the tag `releases/<ext>/v<version>`, signed with GPG or SSH.
 
-Before it prepares anything, the script resolves every crate the release publishes against crates.io. A crate that requires a release of another extension that crates.io does not have yet refuses the release, so `tightbeam-wire` releases before `tightbeam-ws`, and `tightbeam-ws` before `tightbeam-pubsub`.
+Before it prepares anything, the script resolves every crate the release publishes against crates.io. A crate that requires a release of another extension that crates.io does not have yet refuses the release, so `tightbeam-wire` releases before `tightbeam-ws` and `tightbeam-grpc`, and `tightbeam-ws` before `tightbeam-pubsub`. `tightbeam-ws` also releases before `tightbeam-grpc`, whose tests run the shared suites of the `tightbeam-ws` test support. The check resolves versions, not the items a crate uses, so it cannot see that order, and the release of `tightbeam-grpc` waits for the release of `tightbeam-ws` that the release of `tightbeam-wire` makes possible.
 
 The script compiles the release notes from the titles and labels of the merged pull requests. The push of that tag publishes the publishable crates of that extension to crates.io, as one Cargo multi-package publish in dependency order, and creates the GitHub release. It publishes only the crates of that extension, and never the whole workspace.
 

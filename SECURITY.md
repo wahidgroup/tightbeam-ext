@@ -2,7 +2,7 @@
 
 ## Supported Versions
 
-Only the latest published release of each extension receives security updates: `tightbeam-wire`, `tightbeam-ws` and its client, `tightbeam-pubsub` and its client, and the `tightbeam-asn` crates.
+Only the latest published release of each extension receives security updates: `tightbeam-wire`, `tightbeam-ws` and its client, `tightbeam-grpc`, `tightbeam-pubsub` and its client, and the `tightbeam-asn` crates.
 
 | Version        | Supported          |
 | -------------- | ------------------ |

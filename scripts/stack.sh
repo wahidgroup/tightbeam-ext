@@ -97,12 +97,17 @@ generate_certs() {
 	# Issue the X.509 identity fixtures the encrypted echo servers present and
 	# the browser suite pins. Idempotent per instance: reuse existing certs so
 	# restarts keep the same trust anchors.
-	if [ -f "$CERT_DIR/server.cert.der" ] && [ -f "$CERT_DIR/client.cert.der" ]; then
-		return
+	if ! [ -f "$CERT_DIR/server.cert.der" ] || ! [ -f "$CERT_DIR/client.cert.der" ]; then
+		echo "==> Generating identity fixtures under '$CERT_DIR'"
+		CERT_DIR="$CERT_DIR" cargo run -p tightbeam-ws --features testing --example gen_certs
 	fi
 
-	echo "==> Generating identity fixtures under '$CERT_DIR'"
-	CERT_DIR="$CERT_DIR" cargo run -p tightbeam-ws --features testing --example gen_certs
+	# Each project adds its own material beside the shared identities. Every
+	# step keeps the material it finds, as the shared step does.
+	local step
+	for step in "${STACK_CERT_STEPS[@]}"; do
+		CERT_DIR="$CERT_DIR" bash -c "$step"
+	done
 }
 
 case "$ACTION" in

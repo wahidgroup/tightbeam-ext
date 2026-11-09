@@ -1,0 +1,75 @@
+# tightbeam-grpc
+
+gRPC transport for the [tightbeam](https://crates.io/crates/tightbeam-rs) messaging protocol.
+
+## Status
+
+This project is under active development. Public APIs MAY change without notice. No security audit has been conducted. Use this software at your own risk.
+
+## Abstract
+
+tightbeam streams DER-encoded envelopes over raw TCP. This crate carries the same envelopes as the messages of one bidirectional gRPC call over HTTP/2, the tunnel, so native tightbeam clients reach a server through gRPC hops: sidecar meshes, L4 load balancers, and HTTP/2 proxies that route by `:authority`, in h2c or over TLS 1.3. It plugs into the transport traits of tightbeam, so the handshake, the policies, multiplexing, and pooling of tightbeam run over it unchanged, and a cluster gateway takes it as its edge.
+
+## Install
+
+```sh
+cargo add tightbeam-grpc
+```
+
+## Quick start
+
+```rust
+use tightbeam::{server, Frame};
+use tightbeam_grpc::protocol::GrpcListener;
+
+# async fn serve() -> Result<(), Box<dyn std::error::Error>> {
+let listener: GrpcListener = GrpcListener::bind_cleartext("127.0.0.1:9120").await?;
+let server_handle = server! {
+	protocol GrpcListener: listener,
+	handle: |message: Frame| async move {
+		// Echo the frame back
+		Ok(Some(message))
+	}
+};
+# server_handle.abort();
+# Ok(())
+# }
+```
+
+The listener serves in the clear here, and `bind_cleartext` says so: its tunnels are plaintext, unprotected, and unauthenticated (CWE-319). An encrypted listener binds with its certificate, and each tunnel runs the tightbeam handshake.
+
+## Transport
+
+`GrpcListener` is a tightbeam protocol: it binds, accepts, and dials tunnels, and its stream holds every read and write to the envelope rules of [tightbeam-wire](../../wire/tightbeam-wire). Each connection holds a slot and a deadline while no caller holds its tunnel. Implementation: [docs/grpc.md](../../docs/grpc.md#listener).
+
+The edge profile of a listener is a type that provisions each bind and each dial of a deployment: h2c by default, or TLS 1.3 from the certificates of the deployment. Implementation: [docs/grpc.md](../../docs/grpc.md#edge-profile).
+
+## Audit trail
+
+The `instrument` feature records each call that a listener refuses before any session exists, on the trace that `GrpcListener::with_trace` attaches. Implementation: [docs/grpc.md](../../docs/grpc.md#tunnel-call).
+
+## Security
+
+Authentication and confidentiality come from the tightbeam handshake inside the tunnel. TLS under the edge profile protects the hop to the listener, and replaces nothing inside the tunnel. Implementation: [docs/grpc.md](../../docs/grpc.md#limitations).
+
+## Cluster edge
+
+A tightbeam cluster gateway binds a gRPC edge that admits signed work frames from native clients, while the colony keeps its TCP protocol. Implementation: [docs/grpc.md](../../docs/grpc.md#cluster-work-plane).
+
+## Coupled edge
+
+The `couple` feature serves stock gRPC callers on the edge port of a gateway, beside the tunnel. The edge authenticates each caller by its TLS client certificate, grants it methods deny by default, and carries each call to a colony servlet as work that the coupler signs, then verifies the signed answer before the caller reads it. Implementation: [docs/grpc.md](../../docs/grpc.md#coupled-edge).
+
+In the other direction, a backend adapter servlet relays the coupled calls it admits to a stock gRPC server over mutual TLS, with the principal of each call in its metadata. Implementation: [docs/grpc.md](../../docs/grpc.md#backend-adapter).
+
+## Proxy hops
+
+A hop between client and server speaks HTTP/2 under the profile of the server, routes by `:authority`, sets no route timeout, and retires idle upstream connections before the server closes them, because a tunnel lives as long as its session. Implementation: [docs/grpc.md](../../docs/grpc.md#hop-requirements).
+
+## Related
+
+The WebSocket transport is [tightbeam-ws](../../ws/tightbeam-ws), which carries the same envelope rules to browsers. See the [repository README](../../README.md) for development and release workflows.
+
+## License
+
+Licensed under either of [MIT](./LICENSE-MIT) or [Apache-2.0](./LICENSE-APACHE) at your option.

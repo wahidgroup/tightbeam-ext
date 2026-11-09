@@ -8,7 +8,7 @@ This page specifies `tightbeam-wire`, the envelope rules that every message-orie
 - the socket kinds that run the rules, and where each one is tested
 - the limits of the rules against the upstream read contract
 
-It drills down from the [tightbeam-wire README](../wire/tightbeam-wire/README.md) for engineers who add a socket kind or review one. The WebSocket kinds have their own pages, [The WebSocket Transport](ws.md) and [The Browser Engine](ws-wasm.md).
+It drills down from the [tightbeam-wire README](../wire/tightbeam-wire/README.md) for engineers who add a socket kind or review one. The WebSocket kinds have their own pages, [The WebSocket Transport](ws.md) and [The Browser Engine](ws-wasm.md), and the gRPC kind has [The gRPC Transport](grpc.md).
 
 ## Contents
 
@@ -67,10 +67,11 @@ assert!(matches!(error, TransportError::OperationFailed(TransportFailure::SizeEx
 
 ## Kinds in this repository
 
-| Kind                            | Crate               | Socket                                      | Message ceiling                                          | Suite that runs the rules against a real peer                          |
-| ------------------------------- | ------------------- | ------------------------------------------- | -------------------------------------------------------- | ---------------------------------------------------------------------- |
-| `WsReadHalf`, `WsWriteHalf`     | `tightbeam-ws`      | A `tokio-tungstenite` WebSocket             | `TransportLimits::max_envelope`, set at a dial or accept | The `io` unit tests, against a tungstenite peer over an in-memory pipe |
-| `GlooReadHalf`, `GlooWriteHalf` | `tightbeam-ws-wasm` | A `gloo-net` WebSocket in a JavaScript host | None: the browser exposes no ceiling                     | `tests/gloo_stream.rs`, against the `ws` server of the ws workspace    |
+| Kind                            | Crate               | Socket                                      | Message ceiling                                                          | Suite that runs the rules against a real peer                                   |
+| ------------------------------- | ------------------- | ------------------------------------------- | ------------------------------------------------------------------------ | ------------------------------------------------------------------------------- |
+| `WsReadHalf`, `WsWriteHalf`     | `tightbeam-ws`      | A `tokio-tungstenite` WebSocket             | `TransportLimits::max_envelope`, set at a dial or accept                 | The `io` unit tests, against a tungstenite peer over an in-memory pipe          |
+| `GlooReadHalf`, `GlooWriteHalf` | `tightbeam-ws-wasm` | A `gloo-net` WebSocket in a JavaScript host | None: the browser exposes no ceiling                                     | `tests/gloo_stream.rs`, against the `ws` server of the ws workspace             |
+| `GrpcReadHalf`, `GrpcWriteHalf` | `tightbeam-grpc`    | A tonic bidirectional call over h2c         | `TransportLimits::max_envelope` in both directions, by the declared size | `tests/refusals.rs` and the `protocol` unit tests, against tonic and `h2` peers |
 
 `make test wire` runs the `io` unit tests of `tightbeam-ws` beside the documentation tests of this crate, so a scoped run proves the rules against a real peer. `make wasm wire` builds the browser engine, which links this crate for `wasm32`.
 
