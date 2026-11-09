@@ -67,7 +67,7 @@ The halves are the native socket kind of the envelope rules that `tightbeam-wire
 - Tungstenite refuses a message past the envelope ceiling of the endpoint by its declared length, before it sizes a buffer, and the stream reads that refusal as `WireFault::Oversize`.
 - A closed connection is `WireFault::Closed`, a failed byte stream is `WireFault::Io`, and every other tungstenite error, such as a protocol violation, is `WireFault::Invalid`.
 
-Cleartext and HPKE-encrypted round trips run the transport-agnostic handshake of tightbeam unchanged. `tests/round_trip.rs` drives both: the `server!` and `client!` macros over a cleartext listener, and the HPKE handshake over `bind_with`.
+Cleartext and HPKE-encrypted round trips run the transport-agnostic handshake of tightbeam unchanged. `tests/round_trip.rs` drives the `server!` and `client!` macros over a cleartext listener, and `tests/encrypted_fixtures.rs` drives the HPKE handshake over `bind_with`. The spec of each scenario counts the handshakes and the admitted requests that the server records.
 
 ## Multiplexed sessions
 
@@ -81,7 +81,9 @@ The `serve` module owns one accepted multiplexed connection: its transport gate,
 2. `AcceptedLink::spawn` spawns the mux drivers and a keepalive into the `ServedMux` that owns them. The drop of the `ServedMux` ends all three.
 3. `ServedMux::serve(dispatch, expulsion)` runs the responder until the connection ends, and every call passes the gate first.
 
-A server that pushes nothing serves through upstream `MuxAcceptor::serve`, which also keeps the gate spans of the audit trail. A call served through this module records no gate verdict in the audit trail, injects no trace fault, and labels no `HANDLER_FAILED`, because upstream does all three through crate-private traits. Each call evaluates the gate against the session that the handshake proved, and a renewal of a metered session keeps that peer.
+A server that pushes nothing serves through upstream `MuxAcceptor::serve`, which also keeps the gate spans of the audit trail. Each call evaluates the gate against the session that the handshake proved, and a renewal of a metered session keeps that peer.
+
+Under the `instrument` feature, each call records its gate verdict on the trace that the mux of the link records on, which is the trace of the transport that the link was accepted on, as upstream records it: `GATE_ACCEPT` with `Ok`, or `GATE_REJECT` with the status that the refused call answers, as the label and the value. `ServedMux::trace` lends that trace to the service, so `tightbeam-pubsub` records the decisions of its registry beside the verdicts. Upstream also names the peer key of the session as the evidence of each verdict, injects trace faults at handler entry, and labels a handler failure `HANDLER_FAILED`, all through crate-private traits, so a verdict recorded here names its status alone, and a call records none of the rest.
 
 A link refuses a transport with a `LinkError`:
 
@@ -107,13 +109,14 @@ assert_eq!(refused.to_string(), "the transport refused the split: Invalid state"
 
 ## Features
 
-| Feature            | Enables                                                                                                                           |
-| ------------------ | --------------------------------------------------------------------------------------------------------------------------------- |
-| `socket` (default) | The `tokio-tungstenite` listener, dial, and stream of `protocol` and `io`, over the envelope rules of `tightbeam-wire`            |
-| `serve`            | The accepted link of `serve`. It names no socket, so `tightbeam-pubsub` depends on `serve` alone                                  |
-| `link-parts`       | `serve`, and `AcceptedLink::from_parts`, a link from the parts of an in-memory test link. The parts name any gate and any session |
-| `testing`          | `socket` and `serve`, and the test-support module: X.509 identity fixtures and the shared multiplexed echo behavior               |
-| `colony`           | `testing`, and the upstream `colony` runtime with the gateway, hive, and servlet configs that one identity derives                |
+| Feature            | Enables                                                                                                                                                                                                                                                                         |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `socket` (default) | The `tokio-tungstenite` listener, dial, and stream of `protocol` and `io`, over the envelope rules of `tightbeam-wire`                                                                                                                                                          |
+| `serve`            | The accepted link of `serve`. It names no socket, so `tightbeam-pubsub` depends on `serve` alone                                                                                                                                                                                |
+| `link-parts`       | `serve`, and `AcceptedLink::from_parts`, a link from the parts of an in-memory test link. The parts name any gate and any session                                                                                                                                               |
+| `instrument`       | The audit trail of a served link: the gate verdict of each call, on the trace of the transport that the link was accepted on, and `ServedMux::trace`                                                                                                                           |
+| `testing`          | `socket`, `serve`, `instrument`, and the `testing` feature of `tightbeam-rs`, with the test-support module: X.509 identity fixtures, the demo security kinds and the `PeerIdentity` that a kind decides, the shared multiplexed echo behavior, the echo suites (`EchoService`, `PoolEchoes`) that every transport of the repository runs against itself, the `ReadOutcome` that a scenario records for the read of a dial, and `specs`, the specs that grade the shared suites |
+| `colony`           | `testing`, and the upstream `colony` runtime with the gateway, hive, and servlet configs that one identity derives, and the work probe that every edge transport shares: `WorkPlane`, `WorkStack`, `WorkClient`, `WorkBody`, `WorkProbeServlet`, and `WorkProbeHive`, over an optional `der` |
 
 Only test support enables `link-parts`. The examples `gen_certs`, `echo_server_mux`, and `echo_server_mux_clear` require `testing`, and `work_gateway_server` requires `colony`.
 

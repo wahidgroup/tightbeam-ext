@@ -11,6 +11,7 @@ use tightbeam::crypto::profiles::DefaultCryptoProvider;
 use tightbeam::transport::handshake::negotiation::{MuxBudgets, TransportAuthorizer, TransportOffer};
 use tightbeam::transport::handshake::receipt::ReceiptApprover;
 use tightbeam::transport::TransportEncryptionConfig;
+use tightbeam::x509::Certificate;
 use tokio::net::TcpStream;
 use tokio_tungstenite::MaybeTlsStream;
 
@@ -160,6 +161,31 @@ impl DemoConfig {
 	}
 }
 
+/// Which identity of a [`Security`] kind a client certificate is, as
+/// [`Security::peer_identity`] decides it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PeerIdentity {
+	/// The handshake authenticated no client certificate.
+	None,
+	/// The certificate is the client identity that the kind pins.
+	Pinned,
+	/// The certificate is not the client identity that the kind pins.
+	Unpinned,
+}
+
+impl PeerIdentity {
+	/// The name that the spec of a scenario grades: `none`, `pinned`, or
+	/// `unpinned`.
+	#[must_use]
+	pub const fn as_str(self) -> &'static str {
+		match self {
+			Self::None => "none",
+			Self::Pinned => "pinned",
+			Self::Unpinned => "unpinned",
+		}
+	}
+}
+
 /// How a demo server authenticates its clients, and how a dial answers a
 /// server of the same kind.
 ///
@@ -248,6 +274,33 @@ impl Security {
 		match self {
 			Self::ServerAuth => None,
 			Self::Mutual { pinned } | Self::Paywalled { pinned, .. } => Some(pinned),
+		}
+	}
+
+	/// Which identity of this kind `peer`, the client certificate that a
+	/// handshake authenticated, is.
+	///
+	/// The whole certificate decides, so a certificate that only shares the
+	/// subject of the pinned identity is another certificate.
+	///
+	/// # Examples
+	///
+	/// ```
+	/// use tightbeam_ws::testing::{PeerIdentity, Security};
+	///
+	/// assert_eq!(Security::ServerAuth.peer_identity(None), PeerIdentity::None);
+	/// ```
+	#[must_use]
+	pub fn peer_identity(&self, peer: Option<&Certificate>) -> PeerIdentity {
+		let Some(peer) = peer else {
+			return PeerIdentity::None;
+		};
+
+		let pinned = self.client_identity().map(Identity::certificate);
+		if pinned == Some(peer) {
+			PeerIdentity::Pinned
+		} else {
+			PeerIdentity::Unpinned
 		}
 	}
 

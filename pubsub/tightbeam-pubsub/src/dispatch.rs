@@ -27,6 +27,28 @@ use crate::registry::{ConnectionId, PublishError, RegisterError, RegistryView, T
 use crate::serve::{AppRoutes, ConnectionContext};
 use crate::topic::{Topic, PUB_PREFIX, SUB_PREFIX, UNSUB_PREFIX};
 
+/// A wire command, by the prefix of the id of its frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Command {
+	/// `sub/<topic>`.
+	Subscribe,
+	/// `unsub/<topic>`.
+	Unsubscribe,
+	/// `pub/<topic>`.
+	Publish,
+}
+
+impl Command {
+	/// The name that the audit trail tags a refusal of the command with.
+	const fn as_str(self) -> &'static str {
+		match self {
+			Self::Subscribe => "sub",
+			Self::Unsubscribe => "unsub",
+			Self::Publish => "pub",
+		}
+	}
+}
+
 /// Why one wire command took no effect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CommandRefusal {
@@ -149,28 +171,36 @@ impl<P: SubscribePolicy> PubsubCommands<P> {
 	/// }
 	/// ```
 	pub fn answer(&self, connection: ConnectionId, frame: &Frame) -> Option<ResponsePackage> {
-		let outcome = self.command(connection, frame)?;
-		let status = outcome.map_or_else(CommandRefusal::status, |()| TransitStatus::Ok);
+		let (command, outcome) = self.command(connection, frame)?;
+		let status = match outcome {
+			Ok(()) => TransitStatus::Ok,
+			Err(refusal) => {
+				let status = refusal.status();
+				self.registry.audit_of(connection).refused(command.as_str(), status);
+				status
+			}
+		};
+
 		let answer = ResponsePackage::new(status, None);
 		Some(answer)
 	}
 
-	/// Run `frame` when it is a pub/sub command, and return whether the
-	/// command took effect. `None` leaves the frame to the application.
-	fn command(&self, connection: ConnectionId, frame: &Frame) -> Option<Result<(), CommandRefusal>> {
+	/// Run `frame` when it is a pub/sub command, and return the command and
+	/// whether it took effect. `None` leaves the frame to the application.
+	fn command(&self, connection: ConnectionId, frame: &Frame) -> Option<(Command, Result<(), CommandRefusal>)> {
 		let id = frame.metadata().id();
 		if let Some(name) = id.strip_prefix(SUB_PREFIX.as_bytes()) {
 			let subscribed = self.subscribe(connection, name);
-			return Some(subscribed);
+			return Some((Command::Subscribe, subscribed));
 		}
 		if let Some(name) = id.strip_prefix(UNSUB_PREFIX.as_bytes()) {
 			let unsubscribed = self.unsubscribe(connection, name);
-			return Some(unsubscribed);
+			return Some((Command::Unsubscribe, unsubscribed));
 		}
 		if let Some(name) = id.strip_prefix(PUB_PREFIX.as_bytes()) {
 			let policy = self.publish.as_deref()?;
 			let published = self.publish(policy, connection, name, frame);
-			return Some(published);
+			return Some((Command::Publish, published));
 		}
 
 		None

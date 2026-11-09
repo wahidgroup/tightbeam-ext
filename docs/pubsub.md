@@ -145,6 +145,17 @@ let commands = PubsubCommands::new(registry, DenySecrets).with_publish(AllowAll)
 - Any other link that must outlive the read deadline of a quiet session runs `MuxHandle::keep_alive`.
 - `routes` is an `AppRoutes` handler: every `async fn(ConnectionContext, Arc<Frame>) -> ResponsePackage`, and every closure of that shape. `Unrouted` serves a command-only connection, so every stream that no command claims answers `Unimplemented`.
 - `ConnectionContext` names the served connection: its registry id (`connection`), its emitter (`emitter`), and the peer its handshake proved (`session`).
+- Under the `instrument` feature, each served connection records its audit trail on the trace of the transport that its link was accepted on (`ServedMux::trace`), beside the gate verdict of each call. The trail records decisions alone, never one event per update, so a publish to many subscribers leaves the gate verdicts and the handshakes in a bounded trace. A build of tightbeam without its `testing` feature keeps the label of each event and drops its value, so the label carries what the event names, and the value repeats it for the spec of a scenario. The events live in `tightbeam_pubsub::events`:
+
+| Event                 | Recorded when                                                                                       | Label                                               | Value                                           |
+| --------------------- | --------------------------------------------------------------------------------------------------- | --------------------------------------------------- | ----------------------------------------------- |
+| `CONNECTION_ADMITTED` | The registry admits the connection                                                                  | The number of its `ConnectionId`                    | The same number                                 |
+| `CONNECTION_LEFT`     | The connection leaves, because its serve ended or it was expelled                                   | The number of its `ConnectionId`                    | The count of subscriptions it held              |
+| `CONNECTION_EXPELLED` | The delivery policy votes the connection off, ahead of its `CONNECTION_LEFT`                        | The name of its GoAway reason, `enhance-your-calm` | The same name                                   |
+| `COMMAND_REFUSED`     | A wire command takes no effect                                                                      | The command and the status, such as `sub PermissionDenied` | The status it answers                    |
+| `UPDATE_DROPPED`      | The delivery policy drops an update of a full queue, or the peer or the session budget refuses one | The topic                                           | The count of drops of the subscription so far   |
+
+The registry records each departure once it released its lock, so no sink of the trail runs under the lock.
 
 ```rust
 # use std::sync::Arc;
@@ -283,11 +294,13 @@ await manager.unsubscribe("prices"); // emits `unsub/prices`
 
 ## Testing
 
-The `testing` feature holds the support for integration tests without sockets:
+The `testing` feature holds the support for tests without sockets:
 
 - `MemoryLink`, an in-memory link, with `mux_pair` for two multiplexed ends and `served` for a link that `PubsubCommands::serve` takes
 - `OpaqueFrame`, the builder of the frames that a client sends
 - `Topic::fixture`, the topic of a name that a test or an example knows is valid. It panics on a name that fails validation
+
+The unit tests of the crate and of its examples run over `MemoryLink`. The integration tests run as tightbeam scenarios over WebSocket peers on loopback, so each spec grades the audit trail of the registry under the `instrument` feature, and the GOAWAY that the transports of the run record. The two scenarios that prove the link which `served` builds from its parts run over `MemoryLink`, and they record what they observe themselves, because a mux built from parts records on no trace.
 
 The example `pubsub_demo_server` is the server that the dockerized end-to-end suite drives.
 

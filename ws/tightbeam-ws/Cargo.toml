@@ -54,8 +54,11 @@ serve = [
 # A link built from parts, for an in-memory test link that runs no handshake.
 # The parts name any gate and any session, so only test support enables it.
 link-parts = ["serve"]
-testing = ["socket", "serve"]
-colony = ["testing", "tightbeam-rs/colony"]
+# The audit trail of a served link: the verdict of each call's gate, on the
+# trace of the transport the link was accepted on.
+instrument = ["tightbeam-rs/instrument"]
+testing = ["socket", "serve", "instrument", "tightbeam-rs/testing"]
+colony = ["testing", "dep:der", "tightbeam-rs/colony"]
 
 [[example]]
 name = "gen_certs"
@@ -79,13 +82,13 @@ tightbeam-wire = { version = "0.1.0", path = "../../wire/tightbeam-wire", option
 tokio = { workspace = true, optional = true }
 tokio-tungstenite = { workspace = true, optional = true, features = ["connect", "handshake"] }
 futures-util = { workspace = true, optional = true, features = ["std", "sink"] }
+# The der crate backs the Sequence derive of the colony work body, whose
+# expansion references the crate by its absolute path.
+der = { workspace = true, optional = true, features = ["alloc", "derive", "oid"] }
 
 [dev-dependencies]
-# The der crate backs the Sequence derive in the work-gateway example,
-# whose expansion references the crate by its absolute path.
-der = { workspace = true, features = ["alloc", "derive", "oid"] }
 husky-rs = { workspace = true }
-tightbeam-rs = { workspace = true, features = ["testing"] }
+tightbeam-rs = { workspace = true, features = ["testing", "testing-csp", "testing-fault"] }
 tokio = { workspace = true, features = [
     "rt-multi-thread",
     "macros",

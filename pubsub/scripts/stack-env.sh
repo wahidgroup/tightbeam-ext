@@ -20,10 +20,11 @@
 : "${PUBSUB_TOPIC_KEY:=0707070707070707070707070707070707070707070707070707070707070707}"
 : "${PUBSUB_TOPIC_KEY_ID:=pubsub-demo-processed}"
 
-# Ordered: host-port env key -> PREFERRED_* override var.
+# Ordered: host-port env key, its PREFERRED_* override var, and the scheme of
+# its endpoint.
 STACK_PORT_SPECS+=(
-	"PUBSUB_WS_HOST_PORT:PREFERRED_PUBSUB_WS_PORT"
-	"PUBSUB_PROCESSED_WS_HOST_PORT:PREFERRED_PUBSUB_PROCESSED_WS_PORT"
+	"PUBSUB_WS_HOST_PORT:PREFERRED_PUBSUB_WS_PORT:ws"
+	"PUBSUB_PROCESSED_WS_HOST_PORT:PREFERRED_PUBSUB_PROCESSED_WS_PORT:ws"
 )
 
 # Passed through to the compose environment and the env file unchanged.

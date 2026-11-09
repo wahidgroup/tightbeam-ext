@@ -14,8 +14,9 @@
 : "${STACK_PROJECT_PREFIX:=tbws}"
 
 # Filled by the project fragments:
-#   STACK_PORT_SPECS    "HOST_PORT_KEY:PREFERRED_VAR" pairs, allocated by
-#                       stack.sh; each X_HOST_PORT also yields X_ENDPOINT.
+#   STACK_PORT_SPECS    "HOST_PORT_KEY:PREFERRED_VAR:SCHEME" triples,
+#                       allocated by stack.sh; each X_HOST_PORT also yields
+#                       X_ENDPOINT, a SCHEME://localhost URL of the port.
 #   STACK_ENV_VARS      variable names passed through to the env file.
 #   STACK_COMPOSE_FILES compose files layered into the one stack (consumed
 #                       by stack.sh, which sources this file).
@@ -40,11 +41,12 @@ render_env_file() {
 	echo "ECHO_IMAGE=$ECHO_IMAGE"
 	echo "CERT_DIR=$CERT_DIR"
 
-	local spec key
+	local spec key scheme
 	for spec in "${STACK_PORT_SPECS[@]}"; do
 		key="${spec%%:*}"
+		scheme="${spec##*:}"
 		printf '%s=%s\n' "$key" "${!key}"
-		printf '%s=ws://localhost:%s\n' "${key%_HOST_PORT}_ENDPOINT" "${!key}"
+		printf '%s=%s://localhost:%s\n' "${key%_HOST_PORT}_ENDPOINT" "$scheme" "${!key}"
 	done
 
 	local var

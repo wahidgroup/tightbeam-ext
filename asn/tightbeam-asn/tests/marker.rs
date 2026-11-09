@@ -1,5 +1,9 @@
-//! Integration check that `#[derive(AsnCodec)]` implements the marker off
+//! Compile-time proof that `#[derive(AsnCodec)]` implements the marker off
 //! `wasm32`, where the expansion needs no der derive.
+//!
+//! The proof is the build of this test target: the constant below names every
+//! fixture under the `AsnCodec` bound, so a derive that does not implement the
+//! marker fails to compile. Nothing runs, so the target holds no test.
 #![cfg(not(target_arch = "wasm32"))]
 #![allow(dead_code)]
 
@@ -84,10 +88,10 @@ struct NestMarker {
 	pair: SetOf<u8, 2>,
 }
 
-fn assert_codec<T: AsnCodec>() {}
+const fn assert_codec<T: AsnCodec>() {}
 
-#[test]
-fn fixture_implements_asn_codec() {
+/// Every fixture implements [`AsnCodec`], or this constant fails to compile.
+const _: () = {
 	assert_codec::<Fixture>();
 	assert_codec::<Status>();
 	assert_codec::<ImplicitStatus>();
@@ -97,4 +101,4 @@ fn fixture_implements_asn_codec() {
 	assert_codec::<RecordList>();
 	assert_codec::<LeafMarker>();
 	assert_codec::<NestMarker>();
-}
+};
