@@ -120,6 +120,7 @@ case "$ACTION" in
 		for spec in "${STACK_PORT_SPECS[@]}"; do
 			key="${spec%%:*}"
 			pref_var="${spec#*:}"
+			pref_var="${pref_var%%:*}"
 			printf -v "$key" '%s' \
 				"$(alloc_port "${!pref_var}" "$(read_prior "$key")")"
 		done
@@ -140,7 +141,7 @@ case "$ACTION" in
 		echo "==> Bringing up '$PROJECT' stack"
 		for spec in "${STACK_PORT_SPECS[@]}"; do
 			key="${spec%%:*}"
-			echo "    ${key%_HOST_PORT}: ws://localhost:${!key}"
+			echo "    ${key%_HOST_PORT}: ${spec##*:}://localhost:${!key}"
 		done
 
 		if ! compose up -d --wait; then

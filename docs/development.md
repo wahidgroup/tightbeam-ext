@@ -75,6 +75,25 @@ Every suite runs the real engine and the real peers of the stack:
 - A behavior that needs no peer runs on its owner, over frames that the real engine builds.
 - The shared rule `scripts/eslint/real-dependencies.mjs` refuses `vi.mock`, `vi.spyOn`, `vi.hoisted`, `vi.fn`, and every call assertion in each TypeScript package. A test asserts what a run shows instead: a value, a code, or what a peer received.
 
+### Rust integration tests
+
+Each Rust integration test under `tests/` is a scenario of the tightbeam testing framework: a `tb_scenario!` whose `tb_assert_spec!` grades the trace of the run. Unit tests inside `src/` stay plain `#[test]` and `#[tokio::test]` functions.
+
+- The environment fits the run. `ServiceClient` serves one server and drives one client, `Cluster` starts a gateway and registers its hives, and `Bare` runs one body, such as a set of peers that dial each other.
+- Every transport that the run can trace records on the trace of the scenario. `server!` takes `with_trace`, a pool takes `with_trace`, and a dialed or hand-built transport takes `TcpTransport::with_trace` before its handshake. `ClientBuilder` and `client!` take no trace in tightbeam 0.18, so a scenario that proves one of them counts the server side alone.
+- The spec counts what the code under test records: the handshakes, gate verdicts, pool reuses, colony routes, and renewals of tightbeam, and the audit trail of each extension under its `instrument` feature, such as the served-plane verdicts of `tightbeam-ws` and the registry decisions of `tightbeam-pubsub`.
+- A spec counts only the events that the scenario owns. A colony records its own background work, such as the beat that a gateway dials its hives with, on the same trace, so a spec over a colony counts its routes and the reuses of its edge, and no dial.
+- A fact that no code under test records goes on the trace as an event of the scenario itself, under a `test` URN, such as the status that a raw peer read. The spec grades its value with `equals!`.
+- A server side that records after it answers, such as a hand-built server, or a transport that files a refusal after its answer leaves, is waited on before the client of the scenario returns: on a signal that the server raises, or on the event itself.
+- A claim about order adds a `tb_process_spec!` through `ScenarioConfig::with_csp`, such as the steps of an in-band renewal, or an expulsion before its departure. The process grades the order of the events of its alphabet, and drops the rest. It never asks that a run end in a terminal state, so the counts of the spec grade completeness beside it.
+- The specs of the suites that every transport shares live in `tightbeam_ws::testing::specs`, beside the suites, so each transport grades the same suite with the same spec. `tightbeam-ws/tests/specs.rs` breaks the behavior of each one and expects `Expect::Violation(Layer::Assertion)`, so each shared spec is shown to reject a broken run.
+- A path that only a failing trace takes runs on a trace whose `FaultModel` injects the failure, under the `testing-fault` feature of tightbeam, such as a gate verdict that the trace refuses to record.
+
+The macro emits a plain `#[test]` or `#[tokio::test]`, so two kinds of suite stay outside it:
+
+- A suite of the browser engine runs under `wasm-bindgen-test` on `wasm32`, which the macro has no runner for: `tightbeam-ws-wasm/tests` and `tightbeam-asn/tests/wasm_js_roundtrip.rs`.
+- A proof that has nothing to run is a compile-time item, such as the `const` of `tightbeam-asn/tests/marker.rs`, which names every fixture under the `AsnCodec` bound.
+
 ## Releases
 
 Each top-level extension directory versions its crates on its own, so each extension releases on its own. The canonical version manifest of an extension is `<ext>/tightbeam-<ext>/Cargo.toml`.

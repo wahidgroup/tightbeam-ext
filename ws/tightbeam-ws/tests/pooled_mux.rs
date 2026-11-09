@@ -1,125 +1,51 @@
-//! Pooled multiplexing over the WebSocket transport.
+//! Pooled multiplexing over the WebSocket transport, as a tightbeam scenario.
 //!
-//! Proves [`PersistentConnection`] wires WebSocket endpoints into
-//! tightbeam's `ConnectionPool`: one encrypted, mux-negotiated WebSocket
-//! connection serves unary and streaming interactions through pooled
-//! leases against a `server!` service.
+//! Proves [`PersistentConnection`] wires WebSocket endpoints into tightbeam's
+//! `ConnectionPool`: one encrypted, mux-negotiated WebSocket connection serves
+//! unary, streaming, and duplex interactions through a pooled lease against a
+//! `server!` service. The shared spec grades the one dial of the pool, the
+//! one connection the server accepts, and the gate verdict of each stream.
 //!
 //! [`PersistentConnection`]: tightbeam::transport::PersistentConnection
 
 #![cfg(feature = "testing")]
 
-use core::num::NonZeroUsize;
-use std::sync::Arc;
 use std::time::Duration;
 
 use tightbeam::prelude::TightBeamSocketAddr;
-use tightbeam::testing::TestFrame;
+use tightbeam::tb_scenario;
+use tightbeam::testing::{ClientEnv, SetupEnv, TestFrame};
 use tightbeam::transport::handshake::negotiation::TransportOffer;
-use tightbeam::transport::multiplex::{CallContext, MuxService, ReplySink, StreamBody};
-use tightbeam::transport::{ConnectionBuilder, ConnectionPool, EncryptedProtocol, PoolConfig};
-use tightbeam::{encode, server, Frame, TightBeamError};
+use tightbeam::transport::EncryptedProtocol;
 use tightbeam_ws::protocol::WsListener;
-use tightbeam_ws::testing::Identity;
+use tightbeam_ws::testing::specs::PooledMuxSpec;
+use tightbeam_ws::testing::{EchoService, Identity, PoolEchoes};
 
-type BoxError = Box<dyn std::error::Error + Send + Sync>;
-
-/// An echo of every stream kind.
-///
-/// - Unary echoes the frame.
-/// - Streaming reassembles the body via [`StreamBody::into_frame`].
-/// - Duplex echoes each request chunk on the reply sink.
-#[derive(Clone)]
-struct PooledEchoService;
-
-impl MuxService for PooledEchoService {
-	async fn unary(&self, frame: Frame, _ctx: CallContext) -> Result<Option<Frame>, TightBeamError> {
-		Ok(Some(frame))
-	}
-
-	async fn streaming(&self, body: StreamBody, _ctx: CallContext) -> Result<Option<Frame>, TightBeamError> {
-		Ok(Some(body.into_frame().await?))
-	}
-
-	async fn duplex(
-		&self,
-		mut body: StreamBody,
-		mut reply: ReplySink,
-		_ctx: CallContext,
-	) -> Result<(), TightBeamError> {
-		while let Some(chunk) = body.chunk().await? {
-			reply.push(&chunk).await?;
-		}
-		Ok(())
-	}
+/// The identity of the pooled server, which its pool pins.
+fn server_identity() -> Identity {
+	let minted = Identity::mint("CN=pooled echo,O=tightbeam-ws,C=US", 1, Duration::from_secs(3600));
+	minted.expect("a test identity mints")
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn one_pooled_ws_connection_serves_multiple_stream_kinds() -> Result<(), BoxError> {
-	let identity = Identity::mint("CN=pooled echo,O=tightbeam-ws,C=US", 1, Duration::from_secs(3600))?;
-	let bind_addr = TightBeamSocketAddr("127.0.0.1:0".parse()?);
-	let (server, addr) = <WsListener as EncryptedProtocol>::bind_with(bind_addr, identity.server_config()?).await?;
-	let server_handle = server! {
-		protocol WsListener: server,
-		policies: { with_mux_offer: [ Some(TransportOffer::mux(8)) ] },
-		service: PooledEchoService
-	};
-
-	let pool = Arc::new(
-		ConnectionPool::<WsListener>::builder()
-			.with_config(PoolConfig {
-				idle_timeout: None,
-				max_connections: NonZeroUsize::MIN,
-				mux_offer: Some(Arc::new(TransportOffer::mux(8))),
-			})
-			.with_trust_store(identity.trust_anchor()?)
-			.build(),
-	);
-
-	// Unary through a pooled lease. Mux dial pins peer cert at handshake.
-	let mut lease = pool.connect(addr).await?;
-	assert!(
-		lease.peer_certificate().is_some(),
-		"pooled mux lease must expose handshake peer certificate"
-	);
-
-	let expected = TestFrame::v0(None, None);
-	let echoed = lease.emit(expected.clone(), None).await?;
-	assert_eq!(echoed, Some(expected.clone()), "pooled unary emit must echo over the WebSocket");
-
-	// Streaming on the same pooled connection: the frame's DER bytes
-	// arrive in two chunks and the service reassembles and echoes.
-	let der = encode(&expected)?;
-	let split_at = der.len() / 2;
-	let (mut sink, response) = lease.open_stream()?;
-	sink.push(&der[..split_at]).await?;
-	sink.close_with(&der[split_at..]).await?;
-
-	let reply = response.await?;
-	assert_eq!(
-		reply,
-		Some(expected),
-		"streamed frame must reassemble and echo over the WebSocket"
-	);
-
-	// Duplex chunk echo on the same lease.
-	let (mut duplex_sink, mut duplex_body) = lease.open_duplex()?;
-	let first = b"pooled-duplex-a";
-	let second = b"pooled-duplex-b";
-	duplex_sink.push(first).await?;
-	duplex_sink.close_with(second).await?;
-	assert_eq!(
-		duplex_body.chunk().await?,
-		Some(first.to_vec()),
-		"duplex first chunk must echo over the WebSocket"
-	);
-	assert_eq!(
-		duplex_body.chunk().await?,
-		Some(second.to_vec()),
-		"duplex final chunk must echo over the WebSocket"
-	);
-	assert_eq!(duplex_body.chunk().await?, None, "duplex body must end after last");
-
-	server_handle.abort();
-	Ok(())
+// One pooled WebSocket carries every stream kind: the pool dials once, each
+// end completes one handshake, and the server accepts the one connection and
+// admits each stream.
+tb_scenario! {
+	name: one_pooled_ws_connection_serves_multiple_stream_kinds,
+	spec: PooledMuxSpec,
+	environment ServiceClient {
+		worker_threads: 2,
+		context: server_identity(),
+		server: |SetupEnv { trace, context }| async move {
+			let loopback = TightBeamSocketAddr("127.0.0.1:0".parse()?);
+			let (listener, addr) = <WsListener as EncryptedProtocol>::bind_with(loopback, context.server_config()?).await?;
+			Ok((EchoService::serve(listener, Some(TransportOffer::mux(8)), &trace), addr))
+		},
+		client: |ClientEnv { trace, context, addr }| async move {
+			let expected = TestFrame::v0(None, None);
+			let echoes = EchoService::through_pool::<WsListener>(addr, context.trust_anchor()?, &expected, &trace).await?;
+			assert_eq!(echoes, PoolEchoes::of(&expected), "one pooled WebSocket MUST carry every stream kind unchanged");
+			Ok(())
+		}
+	}
 }

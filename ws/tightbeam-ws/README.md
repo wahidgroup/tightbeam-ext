@@ -56,7 +56,7 @@ A tightbeam cluster gateway binds a WebSocket edge that admits signed work frame
 
 ## Features
 
-`socket`, on by default, holds the listener and the dial. `serve`, `link-parts`, `testing`, and `colony` select the other parts. Implementation: [docs/ws.md](../../docs/ws.md#features).
+`socket`, on by default, holds the listener and the dial. `serve`, `link-parts`, `instrument`, `testing`, and `colony` select the other parts. Implementation: [docs/ws.md](../../docs/ws.md#features).
 
 ## Related
 

@@ -21,6 +21,10 @@ name = "tightbeam_pubsub"
 # bodies), so it needs tightbeam's AEAD surface. Its in-memory link runs no
 # handshake, so it builds the served link from its parts.
 testing = ["tightbeam-rs/aead", "tightbeam-ws/link-parts"]
+# The audit trail of each served connection: its admission and departure, its
+# expulsion, each refused command, and each dropped update, on the trace of
+# the transport its link was accepted on.
+instrument = ["tightbeam-rs/instrument", "tightbeam-ws/instrument"]
 
 [[example]]
 name = "pubsub_demo_server"
@@ -44,13 +48,13 @@ tokio = { workspace = true, features = ["rt", "sync", "macros", "time"] }
 tightbeam-ws = { version = "0.5.0", path = "../../ws/tightbeam-ws", default-features = false, features = ["serve"] }
 
 [dev-dependencies]
-# Self dev-dependency: turns the `testing` feature on for every test
-# and example build, so integration tests need no feature gate.
-tightbeam-pubsub = { path = ".", features = ["testing"] }
+# Self dev-dependency: turns the `testing` feature and the audit trail on for
+# every test and example build, so integration tests need no feature gate.
+tightbeam-pubsub = { path = ".", features = ["testing", "instrument"] }
 # The manual clock that drives a link in the deadline tests.
-tightbeam-rs = { workspace = true, features = ["testing"] }
+tightbeam-rs = { workspace = true, features = ["testing", "testing-csp"] }
 husky-rs = { workspace = true }
-tightbeam-ws = { path = "../../ws/tightbeam-ws", features = ["testing"] }
+tightbeam-ws = { version = "0.5.0", path = "../../ws/tightbeam-ws", features = ["testing"] }
 tokio-tungstenite = { workspace = true, features = ["connect", "handshake"] }
 serde_json = { workspace = true, features = ["std"] }
 tokio = { workspace = true, features = [

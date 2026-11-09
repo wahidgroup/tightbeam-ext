@@ -47,5 +47,10 @@ wasm-bindgen = { workspace = true }
 [dev-dependencies]
 tightbeam-asn-derive = { path = "../tightbeam-asn-derive" }
 
+# The scenarios of the native integration tests. The wasm32 lane runs its
+# JS round trips under wasm-bindgen-test alone.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+tightbeam-rs = { workspace = true, features = ["testing"] }
+
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 wasm-bindgen-test = "0.3"

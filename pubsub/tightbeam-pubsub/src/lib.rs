@@ -7,9 +7,11 @@
 #[doc = include_str!("../../../docs/pubsub.md")]
 mod docs_pubsub {}
 
+mod audit;
 mod backplane;
 mod dispatch;
 mod emit;
+pub mod events;
 mod frame;
 mod policy;
 mod registry;

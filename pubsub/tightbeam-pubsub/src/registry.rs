@@ -34,6 +34,7 @@ use tokio::sync::oneshot::{self, Receiver, Sender};
 use tokio::sync::Notify;
 use tokio::task::AbortHandle;
 
+use crate::audit::ConnectionAudit;
 use crate::backplane::{Backplane, BackplaneFault, DeliverError, Local, NodeSink, UpdateSink};
 use crate::emit::{Emitter, LinkLost, Settled};
 use crate::policy::{DeliveryPolicy, DeliveryVerdict, DropOldest};
@@ -424,6 +425,9 @@ struct Subscriber {
 	dropped: AtomicU64,
 	/// Shared with the registry. See [`TopicRegistry::flushed`].
 	flush: Arc<Notify>,
+	/// Shared with the connection, which records each update that the
+	/// subscription drops on it.
+	audit: ConnectionAudit,
 }
 
 impl Subscriber {
@@ -449,6 +453,7 @@ impl Subscriber {
 			notify: Notify::new(),
 			dropped: AtomicU64::new(0),
 			flush: Arc::clone(&registry.flush),
+			audit: connected.audit.share(),
 		});
 
 		let deadline = registry.options.emit_deadline;
@@ -495,7 +500,8 @@ impl Subscriber {
 	}
 
 	fn count_drop(&self) {
-		self.dropped.fetch_add(1, Ordering::Relaxed);
+		let dropped = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+		self.audit.dropped(&self.topic, dropped);
 	}
 
 	/// Queue `update` of `len` payload octets, consulting the delivery policy
@@ -663,6 +669,33 @@ struct ConnectionState {
 	topics: HashMap<Topic, SubscriberId>,
 	/// Resolves the [`Membership::expelled`] future of the connection.
 	expulsion: Sender<GoAwayReason>,
+	/// The audit trail of the connection, which its subscriptions share.
+	audit: ConnectionAudit,
+}
+
+/// A connection that left the registry, with the count of the subscriptions
+/// it held. It records its departure on the audit trail of the connection,
+/// which the holder runs once it released the registry lock, so no sink of
+/// the trail runs under the lock.
+struct Departed {
+	connection: ConnectionId,
+	state: ConnectionState,
+	subscriptions: u64,
+}
+
+impl Departed {
+	/// Record the departure of a connection whose serve ended.
+	fn left(self) {
+		self.state.audit.left(self.connection.0, self.subscriptions);
+	}
+
+	/// Expel the connection with `reason`, and record the expulsion ahead of
+	/// the departure it causes.
+	fn expel(self, reason: GoAwayReason) {
+		self.state.audit.expelled(reason);
+		self.state.audit.left(self.connection.0, self.subscriptions);
+		self.state.expel(reason);
+	}
 }
 
 impl ConnectionState {
@@ -792,17 +825,19 @@ impl State {
 	}
 
 	/// Forget `connection` and end every subscription it holds, undoing each
-	/// [`attach`](Self::attach). Returns what the connection held, or `None`
-	/// when it already left.
-	fn remove_connection(&mut self, connection: ConnectionId, registry: &Inner) -> Option<ConnectionState> {
+	/// [`attach`](Self::attach). Returns its [`Departed`], which records the
+	/// departure once the caller releases the registry lock, or `None` when
+	/// the connection already left.
+	fn remove_connection(&mut self, connection: ConnectionId, registry: &Inner) -> Option<Departed> {
 		let mut connected = self.connections.remove(&connection)?;
 
 		let topics = mem::take(&mut connected.topics);
+		let subscriptions = u64::try_from(topics.len()).unwrap_or(u64::MAX);
 		for id in topics.into_values() {
 			self.detach(id, registry);
 		}
 
-		Some(connected)
+		Some(Departed { connection, state: connected, subscriptions })
 	}
 
 	/// End every subscription, because the registry is gone: close each lane,
@@ -1138,6 +1173,14 @@ impl TopicRegistry {
 		self.inner.lock_state()
 	}
 
+	/// A share of the audit trail of `connection`, which records nothing for
+	/// a connection that left or was never admitted.
+	pub(crate) fn audit_of(&self, connection: ConnectionId) -> ConnectionAudit {
+		let state = self.lock_state();
+		let connected = state.connections.get(&connection);
+		connected.map(|connected| connected.audit.share()).unwrap_or_default()
+	}
+
 	/// The reads of this registry, as a [`RegistryView`].
 	#[must_use]
 	pub fn view(&self) -> RegistryView<'_> {
@@ -1157,7 +1200,11 @@ impl TopicRegistry {
 		let emitter = Emitter::from(served.handle().clone());
 		let clock = served.clock().clone();
 		let session = served.session().clone();
-		let connection = ConnectionState { emitter, clock, session, budget, topics: HashMap::new(), expulsion };
+		let audit = ConnectionAudit::of(served);
+		audit.admitted(id.0);
+
+		let topics = HashMap::new();
+		let connection = ConnectionState { emitter, clock, session, budget, topics, expulsion, audit };
 
 		self.lock_state().connections.insert(id, connection);
 
@@ -1334,10 +1381,13 @@ impl Inner {
 		self.state.lock().unwrap_or_else(PoisonError::into_inner)
 	}
 
-	/// Forget `connection` and drop every subscription it holds.
+	/// Forget `connection`, drop every subscription it holds, and record its
+	/// departure once the registry lock is released.
 	fn leave(&self, connection: ConnectionId) {
-		let mut state = self.lock_state();
-		let _left = state.remove_connection(connection, self);
+		let departed = self.lock_state().remove_connection(connection, self);
+		if let Some(departed) = departed {
+			departed.left();
+		}
 	}
 
 	/// End the subscription `id` of `connection` to `topic`, unless a newer
@@ -1770,6 +1820,7 @@ mod tests {
 			notify: Notify::new(),
 			dropped: AtomicU64::new(0),
 			flush: Arc::new(Notify::new()),
+			audit: ConnectionAudit::default(),
 		}
 	}
 

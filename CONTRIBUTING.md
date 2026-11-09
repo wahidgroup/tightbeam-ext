@@ -32,6 +32,7 @@ Contributors MUST:
 - Pass `make lint` (and preferably `make ci`) before opening a PR
 - Rust: no `unwrap` / `expect` / `panic` in production code. Enum error types via tightbeam's `Errorizable`, no string-based errors. Prefer `From` / `TryFrom` and `?`
 - Keep test-support Rust code behind the `testing` cargo feature. It MUST NOT compile into a default build
+- Rust: write every integration test under `tests/` as a `tb_scenario!` of tightbeam, whose spec grades the trace of the run ([Tests](docs/development.md#tests))
 
 ### Architecture notes
 
@@ -72,7 +73,7 @@ The type MUST be lowercase and one of:
 
 The scope is OPTIONAL, MUST be lowercase (`[a-z0-9/-]+`), and identifies the affected area. Recommended scopes:
 
-- Crate: `wire`, `ws`, `wasm`
+- Crate: `grpc`, `wire`, `ws`, `wasm`
 - Package: `client`, `tests`
 - Cross-cutting: `deps`, `docs`, `ci`, `scripts`
 

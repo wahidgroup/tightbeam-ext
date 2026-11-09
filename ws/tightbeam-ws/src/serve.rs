@@ -25,10 +25,17 @@
 //! crate-private constructor of [`SessionContext`]. A gate here therefore
 //! reads the receipt of the handshake.
 //!
-//! The gate answers each call with the status upstream answers. Upstream
-//! records the verdict in the audit trail, injects trace faults at the verdict
-//! and at handler entry, and labels a handler failure `HANDLER_FAILED`, all
-//! through crate-private traits. A call served here records none of them.
+//! The gate answers each call with the status upstream answers. Under the
+//! `instrument` feature, each call records the verdict on the trace that the
+//! mux of the link records on, as upstream records it: `GATE_ACCEPT` with
+//! `Ok`, or `GATE_REJECT` with the status that the refused call answers, as
+//! its label and its value.
+//!
+//! Upstream also names the peer key of the session as the evidence of each
+//! verdict, injects trace faults at handler entry, and labels a handler
+//! failure `HANDLER_FAILED`, all through crate-private traits. A verdict
+//! recorded here therefore names its status alone, and a call served here
+//! records none of the rest.
 
 use core::convert::Infallible;
 use core::future::{pending, poll_fn, Future};
@@ -36,8 +43,12 @@ use core::pin::pin;
 use std::sync::Arc;
 
 use tightbeam::clock::{Clock, Timer, Timing};
+#[cfg(feature = "instrument")]
+use tightbeam::instrumentation::events;
 use tightbeam::marker::MaybeSend;
 use tightbeam::policy::{GatePolicy, SessionContext, TransitStatus};
+#[cfg(feature = "instrument")]
+use tightbeam::trace::TraceCollector;
 use tightbeam::transport::envelopes::GoAwayReason;
 use tightbeam::transport::error::TransportError;
 use tightbeam::transport::handshake::negotiation::MuxSettings;
@@ -46,8 +57,12 @@ use tightbeam::transport::multiplex::{
 	SpawnedMux, StreamBody, StreamRoute,
 };
 use tightbeam::transport::state::EncryptedProtocolState;
+#[cfg(feature = "instrument")]
+use tightbeam::transport::GateAudit;
 use tightbeam::transport::{EnvelopeSink, EnvelopeSource, ResponsePackage, TransportResult};
-use tightbeam::{Errorizable, Frame};
+#[cfg(feature = "instrument")]
+use tightbeam::urn::Urn;
+use tightbeam::{Errorizable, Frame, TightBeamError};
 use tokio::task::JoinSet;
 
 /// Why a transport cannot become an [`AcceptedLink`].
@@ -165,6 +180,55 @@ pub struct AcceptedLink<R, W> {
 	clock: RacingClock,
 }
 
+/// The audit trail of one served link: the trace that its mux records on,
+/// under the `instrument` feature. A link with no trace, or a build without
+/// the feature, records nothing.
+struct Audit {
+	#[cfg(feature = "instrument")]
+	trace: Option<TraceCollector>,
+}
+
+impl Audit {
+	/// The audit trail of the mux of `handle`, which is the trace of the
+	/// transport that the link was accepted on.
+	fn of(handle: &MuxHandle) -> Self {
+		#[cfg(feature = "instrument")]
+		let audit = Self { trace: handle.audit_trace().map(TraceCollector::share) };
+		#[cfg(not(feature = "instrument"))]
+		let audit = {
+			let _ = handle;
+			Self {}
+		};
+
+		audit
+	}
+
+	/// Record `verdict` on the trail.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError`] -- the trace refused the event, the fault that the
+	///   `testing-fault` feature of tightbeam injects.
+	fn verdict(&self, verdict: &GateVerdict) -> Result<(), TightBeamError> {
+		#[cfg(feature = "instrument")]
+		if let Some(trace) = &self.trace {
+			let (event, status) = verdict.audited();
+			trace.emit_event_with_value(event, status.as_str(), status)?;
+		}
+
+		#[cfg(not(feature = "instrument"))]
+		let _ = verdict;
+
+		Ok(())
+	}
+
+	/// A share of the trace of the trail, when it has one.
+	#[cfg(feature = "instrument")]
+	fn trace(&self) -> Option<TraceCollector> {
+		self.trace.as_ref().map(TraceCollector::share)
+	}
+}
+
 impl<R: EnvelopeSource, W: EnvelopeSink> AcceptedLink<R, W> {
 	/// The link of `transport`, whose server handshake negotiated
 	/// multiplexing.
@@ -261,12 +325,13 @@ where
 		};
 
 		let SpawnedMux { handle, responder, drivers } = mux.spawn();
+		let audit = Audit::of(&handle);
 		let mut keepalive = JoinSet::new();
 		let probes = handle.clone().keep_alive();
 
 		keepalive.spawn(probes);
 
-		ServedMux { handle, responder, drivers, keepalive, gate, session, clock }
+		ServedMux { handle, responder, drivers, keepalive, gate, session, clock, audit }
 	}
 }
 
@@ -352,6 +417,7 @@ pub struct ServedMux {
 	gate: Box<dyn GatePolicy>,
 	session: SessionContext,
 	clock: RacingClock,
+	audit: Audit,
 }
 
 impl ServedMux {
@@ -374,12 +440,24 @@ impl ServedMux {
 		&self.clock
 	}
 
+	/// A share of the trace that the mux of the link records on, which is the
+	/// trace of the transport that the link was accepted on. The service
+	/// records its own audit trail there. `None` names a transport that
+	/// records on no trace.
+	#[cfg(feature = "instrument")]
+	#[must_use]
+	pub fn trace(&self) -> Option<TraceCollector> {
+		self.audit.trace()
+	}
+
 	/// Serve every peer stream with `dispatch` behind the transport gate,
 	/// until the connection ends.
 	///
 	/// - Each call evaluates the gate before `dispatch` sees it, as upstream
 	///   [`MuxAcceptor::serve`] does. A gate that answers `Unknown` answers
-	///   `Internal`, and any other refusal answers its own status.
+	///   `Internal`, and any other refusal answers its own status. Under the
+	///   `instrument` feature, the call records the verdict on the trace of
+	///   the link first ([`trace`](Self::trace)).
 	/// - When `expulsion` yields a reason, the connection drains with a GoAway
 	///   of that reason ([`MuxHandle::shutdown_with`]) while the responder
 	///   serves the streams in flight. A connection with no expulsion passes
@@ -395,7 +473,7 @@ impl ServedMux {
 		D: MuxDispatch + Send + Sync + 'static,
 		E: Future<Output = GoAwayReason>,
 	{
-		let Self { handle, responder, drivers, keepalive, gate, session, clock: _ } = self;
+		let Self { handle, responder, drivers, keepalive, gate, session, clock: _, audit } = self;
 		let _tasks = (drivers, keepalive);
 
 		let drain = async {
@@ -406,7 +484,7 @@ impl ServedMux {
 			pending::<Infallible>().await
 		};
 
-		let gated = GatedDispatch { dispatch, gate, session };
+		let gated = GatedDispatch { dispatch, gate, session, audit };
 		let mut served = pin!(responder.serve_with(gated));
 		let mut drain = pin!(drain);
 
@@ -446,24 +524,44 @@ impl GateVerdict {
 			refused => Self::Refused(refused),
 		}
 	}
+
+	/// The event that the audit trail records this verdict under, and the
+	/// status it records: `Ok` for an admitted call, and the status that a
+	/// refused call answers.
+	#[cfg(feature = "instrument")]
+	fn audited(&self) -> (Urn<'static>, TransitStatus) {
+		match self {
+			Self::Admitted => (events::GATE_ACCEPT, TransitStatus::Ok),
+			Self::Refused(status) => (events::GATE_REJECT, *status),
+		}
+	}
 }
 
 /// A [`MuxDispatch`] behind the transport gate of its connection.
 ///
-/// Each call evaluates the gate at dispatch against the handshake session. A
-/// refused call answers the status of its verdict and never reaches the
-/// dispatch. Upstream `GatedService` holds the same rule and is crate-private.
+/// Each call evaluates the gate at dispatch against the handshake session,
+/// and records the verdict on the audit trail of its link. A refused call
+/// answers the status of its verdict and never reaches the dispatch. Upstream
+/// `GatedService` holds the same rule and is crate-private.
 struct GatedDispatch<D> {
 	dispatch: D,
 	gate: Box<dyn GatePolicy>,
 	session: SessionContext,
+	audit: Audit,
 }
 
 impl<D> GatedDispatch<D> {
 	/// The verdict of the gate on `frame`, or on a stream with no request
-	/// frame.
-	fn verdict(&self, frame: Option<&Frame>) -> GateVerdict {
-		GateVerdict::of(self.gate.as_ref(), frame, &self.session)
+	/// frame, once the audit trail records it.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError`] -- the trace refused the verdict, so the call fails
+	///   as an upstream call does.
+	fn verdict(&self, frame: Option<&Frame>) -> Result<GateVerdict, TightBeamError> {
+		let verdict = GateVerdict::of(self.gate.as_ref(), frame, &self.session);
+		self.audit.verdict(&verdict)?;
+		Ok(verdict)
 	}
 }
 
@@ -471,7 +569,7 @@ impl<D: MuxDispatch + Sync> MuxDispatch for GatedDispatch<D> {
 	fn unary(&self, frame: Arc<Frame>) -> impl Future<Output = TransportResult<ResponsePackage>> + MaybeSend {
 		let verdict = self.verdict(Some(&frame));
 		async move {
-			match verdict {
+			match verdict? {
 				GateVerdict::Admitted => self.dispatch.unary(frame).await,
 				GateVerdict::Refused(status) => Ok(ResponsePackage::new(status, None)),
 			}
@@ -485,7 +583,7 @@ impl<D: MuxDispatch + Sync> MuxDispatch for GatedDispatch<D> {
 	) -> impl Future<Output = TransportResult<ResponsePackage>> + MaybeSend {
 		let verdict = self.verdict(None);
 		async move {
-			match verdict {
+			match verdict? {
 				GateVerdict::Admitted => self.dispatch.streaming(body, route).await,
 				GateVerdict::Refused(status) => Ok(ResponsePackage::new(status, None)),
 			}
@@ -500,7 +598,7 @@ impl<D: MuxDispatch + Sync> MuxDispatch for GatedDispatch<D> {
 	) -> impl Future<Output = TransportResult<TransitStatus>> + MaybeSend {
 		let verdict = self.verdict(None);
 		async move {
-			match verdict {
+			match verdict? {
 				GateVerdict::Admitted => self.dispatch.duplex(body, reply, route).await,
 				GateVerdict::Refused(status) => Ok(status),
 			}

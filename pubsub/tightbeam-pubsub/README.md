@@ -63,7 +63,9 @@ Topic names travel in the frame id behind the command prefixes `sub/`, `unsub/`,
 
 ## Features
 
-`testing` adds in-memory links and frame builders for integration tests without sockets. Implementation: [docs/pubsub.md](../../docs/pubsub.md#testing).
+`instrument` records the audit trail of each served connection: its admission, departure, and expulsion, its refused commands, and its dropped updates. Implementation: [docs/pubsub.md](../../docs/pubsub.md#connection-serve).
+
+`testing` adds in-memory links and frame builders for tests without sockets. Implementation: [docs/pubsub.md](../../docs/pubsub.md#testing).
 
 ## Related
 
