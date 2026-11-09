@@ -21,6 +21,7 @@ use tightbeam::transport::multiplex::{MuxConnector, MuxHandle, MuxRole, SpawnedM
 use tightbeam::transport::{ClientBuilder, ConnectionBuilder, MessageEmitter, TransportError};
 use tightbeam::Frame;
 
+use super::fault::CallFault;
 use crate::edge::{EdgeError, EdgeProfile};
 use crate::io::{GrpcStream, GrpcTransport};
 use crate::protocol::GrpcListener;
@@ -42,12 +43,12 @@ enum State<P: HandshakeProvider + Send + Sync + 'static> {
 
 impl<P: HandshakeProvider + Send + Sync + 'static> State<P> {
 	/// Whether the state carries calls: the drivers of a multiplexed session
-	/// run, or the transport of a single session is alive. A single session
-	/// that a call holds is alive.
+	/// run, or the transport of a single session may carry another exchange.
+	/// A held single session is read once its call releases it.
 	fn is_live(&self) -> bool {
 		match self {
 			Self::Mux(spawned) => !spawned.drivers.is_finished(),
-			Self::Single(transport) => transport.try_lock().map_or(true, |transport| transport.is_alive()),
+			Self::Single(transport) => transport.try_lock().map_or(true, |transport| transport.is_leasable()),
 			Self::Opening | Self::Backoff => false,
 		}
 	}
@@ -60,22 +61,37 @@ pub(crate) enum Ready<P: HandshakeProvider + Send + Sync + 'static> {
 }
 
 impl<P: HandshakeProvider + Send + Sync + 'static> Ready<P> {
-	/// Hold the session for one send before `expires`: a stream handle of a
+	/// Hold a live session for one send before `expires`: a free stream of a
 	/// multiplexed session, or the transport of a single session, which one
-	/// call holds at a time.
+	/// call holds at a time. A single session that a call left mid-exchange
+	/// carries no other call, because its stream position is lost (CWE-672).
 	///
-	/// `None` when the deadline passes first, so a call that waited out its
-	/// deadline for the session holds nothing and sends nothing.
-	pub(crate) async fn hold(self, expires: Instant) -> Option<Held<P>> {
+	/// # Errors
+	///
+	/// - [`CallFault::Deadline`] -- the deadline passed first.
+	/// - [`CallFault::Unavailable`] -- the session ended, drains, or lost its position.
+	pub(crate) async fn hold(self, expires: Instant) -> Result<Held<P>, CallFault> {
 		let held = match self {
-			Self::Mux(handle) => Held::Mux(handle),
+			Self::Mux(handle) => {
+				let slot = timeout_at(expires, handle.wait_for_stream_slot()).await;
+				slot.map_err(|_| CallFault::Deadline)?.map_err(|_| CallFault::Unavailable)?;
+				Held::Mux(handle)
+			}
 			Self::Single(transport) => {
 				let locked = timeout_at(expires, transport.lock_owned()).await;
-				Held::Single(locked.ok()?)
+				let transport = locked.map_err(|_| CallFault::Deadline)?;
+				if !transport.is_leasable() {
+					return Err(CallFault::Unavailable);
+				}
+				Held::Single(transport)
 			}
 		};
 
-		(Instant::now() < expires).then_some(held)
+		if Instant::now() >= expires {
+			return Err(CallFault::Deadline);
+		}
+
+		Ok(held)
 	}
 }
 

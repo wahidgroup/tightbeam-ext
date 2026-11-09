@@ -1,25 +1,5 @@
-//! The connection plane behind [`GrpcListener`](crate::protocol::GrpcListener).
-//!
-//! Every byte before a tunnel call parses comes from a peer that no handshake
-//! has proved, so each connection holds a slot and a deadline while no caller
-//! holds its tunnel:
-//!
-//! - A slot covers a connection from TCP accept until a caller takes its
-//!   tunnel, so a full plane leaves new connections in the backlog (CWE-770).
-//! - A connection that opens no call by `handshake_timeout` closes and returns
-//!   its slot (CWE-400). A call that ends before a caller takes its tunnel
-//!   leaves that deadline as it was.
-//! - A proxy may send the next tunnel call over a connection whose tunnel a
-//!   caller took, so the end of that call waits the connection again under a
-//!   free slot and a fresh deadline, and with no slot when none is free.
-//! - On a TLS edge, a connection completes its TLS handshake on a task of its
-//!   own under the slot and the deadline of its lane, so a slow handshake
-//!   holds back no other connection, and one that fails or passes the
-//!   deadline closes and returns its slot before the HTTP/2 server sees it.
-//!
-//! The [`Lane`] of each connection holds that state, and every change to it
-//! names the call it belongs to, so a call that a later call replaced changes
-//! nothing.
+//! The connection plane behind [`GrpcListener`](crate::protocol::GrpcListener):
+//! each connection holds a slot and a deadline until a caller holds its tunnel.
 //!
 //! # Sources
 //!
@@ -43,9 +23,9 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::Sender;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
-use tokio::time::{sleep, sleep_until, timeout, Instant, Sleep};
+use tokio::time::{sleep, sleep_until, timeout_at, Instant, Sleep};
 use tokio_rustls::server::TlsStream;
-use tokio_rustls::TlsAcceptor;
+use tokio_rustls::{Accept, TlsAcceptor};
 use tokio_stream::Stream;
 use tokio_util::sync::PollSemaphore;
 use tonic::transport::server::Connected;
@@ -220,6 +200,25 @@ impl Lane {
 	/// The deadline of a wait that starts now.
 	fn fresh_deadline(&self) -> Option<Instant> {
 		Instant::now().checked_add(self.0.terms.idle)
+	}
+
+	/// The connection, once its TLS `handshake` completes before the deadline
+	/// of the lane. `None` when the handshake fails or ends late, so the
+	/// HTTP/2 server never sees it, and the drop of the lane returns its slot.
+	async fn secure(self, handshake: Accept<TcpStream>, peer: SocketAddr) -> Option<GrpcConnection> {
+		let deadline = lock(&self.0.state).stage.deadline();
+		let secured = match deadline {
+			Some(deadline) => timeout_at(deadline, handshake).await.ok()?,
+			None => handshake.await,
+		};
+
+		let tls = secured.ok()?;
+		let late = deadline.is_some_and(|deadline| Instant::now() >= deadline);
+		if late {
+			return None;
+		}
+
+		Some(GrpcConnection::new(EdgeIo::Tls(Box::new(tls)), peer, self))
 	}
 
 	/// Admit a tunnel call on the connection, under its slot, and give its
@@ -655,16 +654,15 @@ pub(crate) struct GrpcIncoming {
 	backoff: Option<Pin<Box<Sleep>>>,
 	/// The acceptor of a TLS edge, or `None` for h2c.
 	tls: Option<TlsAcceptor>,
-	/// The TLS handshakes in flight, each under the slot of its lane. A
-	/// handshake that fails or passes the idle time of the terms yields no
-	/// connection, and the drop of its lane returns the slot.
+	/// The TLS handshakes in flight, each under the slot and the deadline of
+	/// its lane.
 	securing: JoinSet<Option<GrpcConnection>>,
 }
 
 impl GrpcIncoming {
 	/// The connections of `listener`, each under one of `slots` and the
-	/// `terms` of the server, which secures itself under `tls` within the
-	/// idle time of the terms. A failed accept queues on `arrivals`.
+	/// `terms` of the server, and secured under `tls`. A failed accept queues
+	/// on `arrivals`.
 	pub(crate) fn new(
 		listener: TcpListener,
 		slots: Arc<Slots>,
@@ -722,17 +720,11 @@ impl GrpcIncoming {
 		}
 	}
 
-	/// Secure `tcp` under `acceptor` on a task of its own, which yields the
-	/// connection once its handshake completes within the idle time, and
-	/// drops it, with its lane, otherwise.
+	/// Secure `tcp` under `acceptor` on a task of its own, by the deadline of
+	/// its `lane`.
 	fn secure(&mut self, acceptor: TlsAcceptor, tcp: TcpStream, peer: SocketAddr, lane: Lane) {
 		let handshake = acceptor.accept(tcp);
-		let idle = self.terms.idle;
-		self.securing.spawn(async move {
-			let secured = timeout(idle, handshake).await;
-			let tls = secured.ok()?.ok()?;
-			Some(GrpcConnection::new(EdgeIo::Tls(Box::new(tls)), peer, lane))
-		});
+		self.securing.spawn(lane.secure(handshake, peer));
 	}
 }
 

@@ -10,6 +10,7 @@ use tightbeam::crypto::sign::SigningIdentity;
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::TransportError;
 use tightbeam::{Frame, TightBeamError};
+use tokio::time::Instant;
 use tonic::client::Grpc;
 use tonic::metadata::MetadataValue;
 use tonic::transport::Channel;
@@ -50,8 +51,18 @@ impl BackendChannel {
 	}
 
 	/// Step 3, the pivot: call `permitted` on the backend within `timeout`,
-	/// with its principal and its forwarded claim in the metadata of the call.
+	/// which covers the wait for the channel as well as the call.
 	async fn call(&self, permitted: &Permitted, timeout: Duration) -> Answered {
+		let started = Instant::now();
+		let exchanged = tokio::time::timeout(timeout, self.exchange(permitted, timeout, started)).await;
+		exchanged
+			.unwrap_or_else(|_| Answered::status(Code::DeadlineExceeded, "the backend passed the deadline".to_owned()))
+	}
+
+	/// Wait for the channel, then call `permitted` with its principal and its
+	/// forwarded claim in the metadata, and what remains of `timeout` since
+	/// `started` as its `grpc-timeout`.
+	async fn exchange(&self, permitted: &Permitted, timeout: Duration, started: Instant) -> Answered {
 		let mut grpc = Grpc::new(self.channel.clone());
 		if let Err(error) = grpc.ready().await {
 			return Answered::status(Code::Unavailable, error.to_string());
@@ -63,7 +74,7 @@ impl BackendChannel {
 		};
 
 		let mut request = Request::new(admitted.body().to_vec());
-		request.set_timeout(timeout);
+		request.set_timeout(timeout.saturating_sub(started.elapsed()));
 
 		let principal = admitted.principal().to_string();
 		let metadata = request.metadata_mut();
@@ -73,11 +84,9 @@ impl BackendChannel {
 			metadata.insert_bin(CallClaim::METADATA_KEY, MetadataValue::from_bytes(claim));
 		}
 
-		let called = tokio::time::timeout(timeout, grpc.unary(request, path, TunnelCodec)).await;
-		match called {
-			Ok(Ok(response)) => Answered { code: Code::Ok, message: None, body: response.into_inner() },
-			Ok(Err(status)) => Answered::status(status.code(), status.message().to_owned()),
-			Err(_) => Answered::status(Code::DeadlineExceeded, "the backend passed the deadline".to_owned()),
+		match grpc.unary(request, path, TunnelCodec).await {
+			Ok(response) => Answered { code: Code::Ok, message: None, body: response.into_inner() },
+			Err(status) => Answered::status(status.code(), status.message().to_owned()),
 		}
 	}
 }

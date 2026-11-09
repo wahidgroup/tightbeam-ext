@@ -206,7 +206,7 @@ Under `couple`, `Edge::Coupled(EdgeTls, Coupler)` serves stock gRPC callers besi
 - A claim covers the method, the body hash, and the TLS certificate hash.
 - A bad claim refuses with 16. It never downgrades to `Vouched`.
 - The replay window spends each claim once: 60 s, or `Coupler::with_replay_window`.
-- A call that times out before it holds the session keeps its claim.
+- A call keeps its claim when it times out before it holds a live session, or finds the session dead.
 
 ### Steps of a coupled call
 
@@ -218,7 +218,7 @@ Under `couple`, `Edge::Coupled(EdgeTls, Coupler)` serves stock gRPC callers besi
 | 4    | checks the grant and the assurance floor                   | 7                   |
 | 5    | signs a `CoupledCall` under its `Voucher`                  | 8, 13               |
 | 6    | finds the loopback session open                            | 14                  |
-| 7    | holds the session within the deadline                      | 4                   |
+| 7    | holds a live session within the deadline                   | 4, 14               |
 | 8    | spends the claim                                           | 16                  |
 | 9    | sends the work                                             | 4, or colony status |
 | 10   | checks the answer id and its pinned signer                 | 13                  |
@@ -227,6 +227,7 @@ Under `couple`, `Edge::Coupled(EdgeTls, Coupler)` serves stock gRPC callers besi
 - A spent claim is forgotten only when the frame provably never left.
 - The loopback session runs into the coupler's own listener, so the gateway admits it like any edge client.
 - The session multiplexes when the gateway sets `pool_config.mux_offer`, and runs one call at a time otherwise.
+- A single session that a call left mid-exchange reopens before it carries another call.
 
 ### `AdmittedCall`
 
@@ -244,12 +245,12 @@ Under `couple`, `Edge::Coupled(EdgeTls, Coupler)` serves stock gRPC callers besi
 
 `couple::Backend` configures a servlet that relays each coupled call to one stock gRPC server.
 
-| Step | The adapter                                      | Refuses with                     |
-| ---- | ------------------------------------------------ | -------------------------------- |
-| 1    | admits the call                                  | `WorkRefused`, no reply          |
-| 2    | checks the route, the grant, and the floor       | a signed 12 or 7                 |
-| 3    | calls the server, within `Backend::with_timeout` | a signed server status, 14, or 4 |
-| 4    | signs the reply                                  | 13                               |
+| Step | The adapter                                        | Refuses with                     |
+| ---- | -------------------------------------------------- | -------------------------------- |
+| 1    | admits the call                                    | `WorkRefused`, no reply          |
+| 2    | checks the route, the grant, and the floor         | a signed 12 or 7                 |
+| 3    | connects and calls, within `Backend::with_timeout` | a signed server status, 14, or 4 |
+| 4    | signs the reply                                    | 13                               |
 
 - The adapter presents its client certificate, from `DialTls::with_identity`.
 - Each call carries the principal in `tightbeam-principal-bin`, and any claim in `tightbeam-claim-bin`.

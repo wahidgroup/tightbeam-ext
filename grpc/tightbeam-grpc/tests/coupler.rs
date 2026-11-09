@@ -948,3 +948,57 @@ tb_scenario! {
 		}
 	}
 }
+
+coupled!(MidExchangeEdge, MidExchangeGateway);
+
+tb_assert_spec! {
+	/// A call that ends mid-exchange on a single session leaves no reply for
+	/// the next call to read, so the next call reads its own answer.
+	pub MidExchangeSpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(COUPLED_CALL_ANSWERED, exactly!(1), equals!(0u32))
+		]
+	}
+}
+
+// A call that passes its deadline while it holds a single session.
+tb_scenario! {
+	name: a_call_that_ends_mid_exchange_leaves_no_stale_reply,
+	spec: MidExchangeSpec,
+	environment Cluster {
+		context: Coupled::mint(),
+		start: |SetupEnv { trace, context }| async move {
+			context.stage(&trace, MidExchangeEdge::stage)?;
+			context.single_gateway::<MidExchangeGateway>(&trace).await
+		},
+		hives: |SetupEnv { trace, context }| vec![async move { context.hive(&trace).await }],
+		client: |ClusterEnv { context, cluster, .. }| async move {
+			let billing = context.billing(&cluster).await?;
+			let (web, channel) = context.web(&cluster).await?;
+			let claim = context.claim(&web, PLACE, SLOW).await?;
+
+			let expired = call_within(&channel, PLACE, SLOW, &claim, Duration::from_millis(300)).await;
+			assert!(expired.is_err(), "the slow call MUST pass its deadline");
+
+			// The slow reply lands on the session that the expired call held.
+			tokio::time::sleep(SLOW_SERVICE).await;
+			let reopened = tokio::time::Instant::now() + Duration::from_secs(5);
+			let answer = loop {
+				let answer = call(&billing, GET, b"order-13", None).await;
+				let opening = matches!(&answer, Err(status) if status.code() == tonic::Code::Unavailable);
+				if !opening || tokio::time::Instant::now() >= reopened {
+					break answer;
+				}
+				tokio::time::sleep(Duration::from_millis(100)).await;
+			};
+
+			let answer = answer.map_err(|status| status.code());
+			assert_eq!(answer.as_deref(), Ok(&b"served:order-13"[..]), "the next call MUST read its own answer");
+
+			cluster.stop();
+			Ok(())
+		}
+	}
+}

@@ -12,6 +12,7 @@ use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 use std::sync::Arc;
+use std::time::Duration;
 
 use tightbeam::builder::TypeBuilder;
 use tightbeam::clock::UnixMillis;
@@ -61,6 +62,9 @@ const BACKEND_PRINCIPAL: Urn<'static> = urn!("test", "event:backend/principal");
 
 /// Whether the call that the backend served forwarded a claim.
 const BACKEND_CLAIM: Urn<'static> = urn!("test", "event:backend/claim");
+
+/// How long the adapter waits for its backend, connect included.
+const RELAY_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// The stock orders backend: a raw service on every path, which records the
 /// principal and the claim of each call, and answers `ledger:` and the body of
@@ -158,10 +162,25 @@ async fn backend(context: &Coupled, trace: &TraceCollector) -> Result<(JoinHandl
 	Ok((served, addr))
 }
 
+/// Start a backend that accepts each connection and never answers its TLS
+/// handshake.
+async fn hung_backend() -> Result<(JoinHandle<()>, GrpcAddr), TightBeamError> {
+	let listener = TcpListener::bind("127.0.0.1:0").await?;
+	let addr = GrpcAddr::from(listener.local_addr()?);
+	let held = tokio::spawn(async move {
+		let mut open = Vec::new();
+		while let Ok((tcp, _)) = listener.accept().await {
+			open.push(tcp);
+		}
+	});
+
+	Ok((held, addr))
+}
+
 /// The adapter of the backend at `addr`: it routes `Place` and `List` as
 /// `Signed`, grants both to the web principal, admits the vouchers of the
-/// scenario and the direct caller `direct`, and signs under the answer
-/// identity.
+/// scenario and the direct caller `direct`, signs under the answer identity,
+/// and waits [`RELAY_TIMEOUT`] for the backend.
 fn adapter(
 	context: &Coupled,
 	trace: &TraceCollector,
@@ -185,7 +204,7 @@ fn adapter(
 
 	let signer = context.answers.signing_identity()?;
 	let backend = Backend::new(channel, routes, grants, admission, signer).map_err(edge_error)?;
-	Ok(backend.with_trace(trace.share()))
+	Ok(backend.with_timeout(RELAY_TIMEOUT).with_trace(trace.share()))
 }
 
 /// Start the hive that hosts the adapter of the backend at `addr`, which
@@ -281,6 +300,44 @@ tb_scenario! {
 			let answer = answer_of(&context, &reply)?;
 			assert_eq!(answer.code(), Code::Ok, "the backend MUST serve the call");
 			assert_eq!(answer.body(), b"ledger:order-9", "the adapter MUST relay the answer of the backend");
+
+			cluster.stop();
+			Ok(())
+		}
+	}
+}
+
+tb_assert_spec! {
+	/// A direct call to a backend that never connects: the adapter answers 4.
+	pub HungRelaySpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(BACKEND_CALL_RELAYED, exactly!(1), equals!(4u32)),
+			(BACKEND_PRINCIPAL, exactly!(0))
+		]
+	}
+}
+
+// The adapter bounds the connect of a hung backend by its own timeout.
+tb_scenario! {
+	name: a_hung_backend_answers_deadline_exceeded,
+	spec: HungRelaySpec,
+	environment Cluster {
+		context: Coupled::mint(),
+		start: |SetupEnv { trace, context }| async move { context.gateway::<DirectGateway>(&trace).await },
+		hives: |SetupEnv { trace, context }| vec![async move {
+			let (_held, addr) = hung_backend().await?;
+			hive(&context, &trace, &addr, &context.claims).await
+		}],
+		client: |ClusterEnv { context, cluster, .. }| async move {
+			let builder = ClientBuilder::<GrpcListener>::builder().with_trust_store(context.transport.trust_anchor()?);
+			let mut client = builder.build().connect(direct_edge(&cluster)?).await?;
+
+			let frame = direct(&context.claims, PLACE, b"order-12").await?;
+			let reply = client.submit_work_to(ledger()?, &frame).await?;
+			let answer = answer_of(&context, &reply)?;
+			assert_eq!(answer.code(), Code::DeadlineExceeded, "a hung backend MUST answer 4");
 
 			cluster.stop();
 			Ok(())

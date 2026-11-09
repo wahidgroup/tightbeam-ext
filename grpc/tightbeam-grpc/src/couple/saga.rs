@@ -319,7 +319,7 @@ impl<P: HandshakeProvider + Send + Sync + 'static> LiveCoupler<P> {
 		let request_id = self.next_request_id();
 		let vouched = self.config.voucher.vouch(permitted, request_id, self.ceiling).await?;
 		let ready = self.session.ready().ok_or(CallFault::Unavailable)?;
-		let held = ready.hold(vouched.opened.head.expires).await.ok_or(CallFault::Deadline)?;
+		let held = ready.hold(vouched.opened.head.expires).await?;
 		let spent = self.spend(vouched)?;
 
 		let submitted = spent.send(held, &self.replay).await?;
