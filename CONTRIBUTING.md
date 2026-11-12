@@ -15,6 +15,7 @@ Pin files are the source of truth:
 
 - Rust: [`rust-toolchain.toml`](rust-toolchain.toml) (channel, components, and targets)
 - Node: [`.nvmrc`](.nvmrc)
+- npm: 12 or later, which `@wahidgroup/lint-rules` requires. CI pins it in [`.github/actions/node`](.github/actions/node/action.yml)
 
 `make setup` installs that Rust pin with its components and targets via `rustup toolchain install`, then each extension's tooling.
 
