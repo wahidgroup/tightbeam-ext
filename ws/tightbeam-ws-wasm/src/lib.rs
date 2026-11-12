@@ -1,8 +1,5 @@
-//! Browser (WebAssembly) WebSocket client for tightbeam.
-//!
-//! Multiplexed sessions only: the WebSocket profile of tightbeam always
-//! negotiates stream multiplexing, so one connection carries concurrent,
-//! bidirectional streams.
+//! The WebAssembly engine of the tightbeam WebSocket client, which
+//! `docs/ws-wasm.md` specifies.
 
 pub mod build;
 pub mod compress;
@@ -17,6 +14,10 @@ mod bindings;
 #[cfg(target_arch = "wasm32")]
 pub mod clock;
 #[cfg(target_arch = "wasm32")]
+mod dial;
+#[cfg(all(test, target_arch = "wasm32"))]
+mod loopback;
+#[cfg(target_arch = "wasm32")]
 mod mux;
 #[cfg(target_arch = "wasm32")]
 mod profile;
@@ -24,8 +25,6 @@ mod profile;
 mod promise;
 #[cfg(target_arch = "wasm32")]
 pub mod protocol;
-#[cfg(target_arch = "wasm32")]
-mod secure;
 #[cfg(target_arch = "wasm32")]
 mod signer;
 #[cfg(target_arch = "wasm32")]
@@ -38,7 +37,7 @@ mod streaming;
 #[cfg(target_arch = "wasm32")]
 pub use fault::JsFault;
 #[cfg(target_arch = "wasm32")]
-pub use mux::{BrowserMux, MuxTasks, MuxWsClient};
+pub use mux::{BrowserMux, MuxTasks, MuxWsClient, SessionParts};
 #[cfg(target_arch = "wasm32")]
 pub use signer::{JsSigningKeyProvider, TransportSigner};
 #[cfg(target_arch = "wasm32")]

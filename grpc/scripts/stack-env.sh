@@ -1,16 +1,18 @@
 #!/usr/bin/env bash
-# grpc contribution to the shared e2e stack. Declares the host port of the
-# Envoy hop in front of the grpc work gateway, the host port of the coupled
-# edge, the Envoy configuration, the TLS material of the coupled edge, and
-# this extension's compose file.
+# grpc contribution to the shared e2e stack: the ports, the Envoy
+# configuration, the TLS material, and the compose file of this extension.
 
 # Preferred host port of the Envoy hop. Replaced by an OS port if in use. The
-# work gateway itself never gets a host port.
+# work gateway itself listens on the compose network alone.
 : "${PREFERRED_GRPC_ENVOY_PORT:=9121}"
 
 # Preferred host port of the coupled edge, which a stock gRPC caller dials
 # directly over TLS.
 : "${PREFERRED_GRPC_COUPLED_PORT:=9122}"
+
+# Preferred loopback port of the admin endpoint of the Envoy hop, which the
+# hop lane reads the route configuration from.
+: "${PREFERRED_GRPC_ENVOY_ADMIN_PORT:=9901}"
 
 # The Envoy configuration, mounted into the Envoy container.
 : "${GRPC_ENVOY_CONFIG:=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/docker/envoy.yaml}"
@@ -20,6 +22,7 @@
 STACK_PORT_SPECS+=(
 	"GRPC_ENVOY_HOST_PORT:PREFERRED_GRPC_ENVOY_PORT:http"
 	"GRPC_COUPLED_HOST_PORT:PREFERRED_GRPC_COUPLED_PORT:https"
+	"GRPC_ENVOY_ADMIN_HOST_PORT:PREFERRED_GRPC_ENVOY_ADMIN_PORT:http"
 )
 
 # The TLS material of the coupled edge and of its stock caller, under

@@ -3,9 +3,7 @@ import { defineConfig } from "vitest/config";
 
 // The unit tests run the sources, so the loader of the `node` condition
 // resolves to its source, as the built package resolves it to `dist`.
-const nodeLoader = fileURLToPath(
-	new URL("src/engine/node.ts", import.meta.url),
-);
+const nodeLoader = fileURLToPath(new URL("src/engine/node.ts", import.meta.url));
 
 export default defineConfig({
 	resolve: {

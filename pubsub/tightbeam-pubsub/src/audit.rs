@@ -1,5 +1,5 @@
-//! The audit trail of one served connection, which the registry, its
-//! subscriptions, and its command routes share.
+//! The audit trail of one served connection. The page `docs/pubsub.md`
+//! (Connection serve) lists its events.
 
 use std::borrow::Cow;
 
@@ -14,17 +14,20 @@ use tightbeam_ws::serve::ServedMux;
 use crate::events;
 use crate::topic::Topic;
 
+/// The departure of one connection from its registry, as its trail records it.
+#[derive(Clone, Copy)]
+pub(crate) struct Departure {
+	/// The number the registry admitted the connection under.
+	pub(crate) connection: u64,
+	/// The count of the subscriptions the connection held as it left.
+	pub(crate) subscriptions: u64,
+}
+
 /// The audit trail of one served connection: the trace of the transport that
-/// its link was accepted on, under the `instrument` feature. A connection with
-/// no trace, or a build without the feature, records nothing.
+/// its link was accepted on, under the `instrument` feature.
 ///
-/// A build of tightbeam without its `testing` feature keeps the label of
-/// each event and drops its value, so the label of each record carries what
-/// the record names, and the value repeats it for the spec of a scenario.
-///
-/// The trace refuses an event only under the fault that the `testing-fault`
-/// feature of tightbeam injects. A refused event costs the record alone, and
-/// the decision it records stands, so each record drops that refusal.
+/// A refused record costs the record alone, and the decision it records
+/// stands, so each record drops the refusal.
 #[derive(Default)]
 pub(crate) struct ConnectionAudit {
 	#[cfg(feature = "instrument")]
@@ -60,19 +63,19 @@ impl ConnectionAudit {
 		self.record(events::CONNECTION_ADMITTED, || connection.to_string(), connection);
 	}
 
-	/// The connection under the number `connection` left the registry, with
-	/// `subscriptions` live.
-	pub(crate) fn left(&self, connection: u64, subscriptions: u64) {
+	/// The connection of `departure` left the registry.
+	pub(crate) fn left(&self, departure: &Departure) {
+		let Departure { connection, subscriptions } = *departure;
 		self.record(events::CONNECTION_LEFT, || connection.to_string(), subscriptions);
 	}
 
-	/// The delivery policy expelled the connection with `reason`.
+	/// The registry expelled the connection with `reason`.
 	pub(crate) fn expelled(&self, reason: GoAwayReason) {
 		let name = reason.as_str();
 		self.record(events::CONNECTION_EXPELLED, || name, name);
 	}
 
-	/// The wire command `command` took no effect, and answers `status`.
+	/// The command `command` took no effect, and answers `status`.
 	pub(crate) fn refused(&self, command: &'static str, status: TransitStatus) {
 		self.record(events::COMMAND_REFUSED, || format!("{command} {}", status.as_str()), status);
 	}
@@ -83,8 +86,7 @@ impl ConnectionAudit {
 	}
 
 	/// Record `event` with the label that `label` builds, which runs only for
-	/// a trail with a trace, and `value`. See the type for why a refused
-	/// record is dropped.
+	/// a trail with a trace, and `value`.
 	fn record<L, V>(&self, event: Urn<'static>, label: impl FnOnce() -> L, value: V)
 	where
 		L: Into<Cow<'static, str>>,

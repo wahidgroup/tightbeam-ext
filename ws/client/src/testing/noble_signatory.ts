@@ -1,7 +1,5 @@
 /**
- * Noble-backed Signatory / FrameVerifier fixtures for unit tests. The
- * secret never enters wasm; stands in for wallets, HSMs, and other BYO
- * authenticity implementations.
+ * A signatory and a verifier that the unit tests bring over noble, whose secret stays outside wasm, as a wallet's does.
  */
 
 import { secp256k1 } from "@noble/curves/secp256k1.js";
@@ -11,7 +9,7 @@ import type { Engine } from "../engine.js";
 
 /**
  * Verify a frame from its signature prehash + carried signature bytes with
- * noble secp256k1. Stands in for any non-wasm verifier (wallet SDK, …).
+ * noble secp256k1, as any verifier outside wasm, such as a wallet SDK, does.
  */
 export class NobleFrameVerifier implements FrameVerifier {
 	constructor(
@@ -30,12 +28,10 @@ export class NobleFrameVerifier implements FrameVerifier {
 			throw new Error("unexpected signature algorithm");
 		}
 
-		const ok = secp256k1.verify(
-			info.signature,
-			frame.signaturePrehash(),
-			this.publicKey,
-			{ format: "der", prehash: false },
-		);
+		const ok = secp256k1.verify(info.signature, frame.signaturePrehash(), this.publicKey, {
+			format: "der",
+			prehash: false,
+		});
 		if (!ok) {
 			throw new Error("signature verification failed");
 		}
@@ -43,7 +39,7 @@ export class NobleFrameVerifier implements FrameVerifier {
 }
 
 /**
- * A {@link Signatory} whose secret never enters wasm.
+ * A {@link Signatory} that signs in JavaScript, with a secret that stays in JavaScript memory.
  */
 export class NobleSignatory implements Signatory {
 	readonly verifier: FrameVerifier;

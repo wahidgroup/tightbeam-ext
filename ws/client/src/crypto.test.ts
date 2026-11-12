@@ -1,12 +1,12 @@
 import { runInNewContext } from "node:vm";
 
 import { bytesToHex } from "@noble/hashes/utils.js";
-import { describe, expect, expectTypeOf, it } from "vitest";
+import { describe, expect, it } from "vitest";
 
 import type { TransportErrorCode } from "./index.js";
-import { TightbeamWsClient } from "./index.js";
+import { Engine } from "./index.js";
 
-const engine = await TightbeamWsClient.init();
+const engine = await Engine.load();
 
 const KEY_ID = new TextEncoder().encode("tbws/test/kek/v1");
 
@@ -186,9 +186,7 @@ describe("Engine.oid", () => {
 		{ name: "a first arc above 2", dotted: "3.1" },
 		{ name: "a trailing dot", dotted: "1.2." },
 	])("refuses $name with InvalidOid", ({ dotted }) => {
-		expect(() => engine.oid(dotted)).toThrow(
-			expect.objectContaining({ code: "InvalidOid" }),
-		);
+		expect(() => engine.oid(dotted)).toThrow(expect.objectContaining({ code: "InvalidOid" }));
 	});
 });
 
@@ -211,12 +209,16 @@ describe("release", () => {
 		expect(() => key.signerId()).toThrow(KEY_RELEASED);
 	});
 
-	it("releases a shared key, so a later seal refuses with KeyReleased", () => {
+	it("releases a shared key, so a later seal rejects with KeyReleased", async () => {
 		const cipher = engine.aes256Gcm(SHARED_KEY);
 		cipher[Symbol.dispose]();
-		expect(() => cipher.encrypt(PREHASH, engine.profile.data)).toThrow(
-			KEY_RELEASED,
-		);
+		await expect(cipher.encrypt(PREHASH, engine.profile.data)).rejects.toThrow(KEY_RELEASED);
+	});
+
+	it("releases a signing key, so a later signature rejects with KeyReleased", async () => {
+		const key = engine.signingKey(new Uint8Array(32).fill(1));
+		key[Symbol.dispose]();
+		await expect(key.signPrehash(PREHASH)).rejects.toThrow(KEY_RELEASED);
 	});
 
 	it("releases a recipient secret, so a later open rejects", async () => {
@@ -234,17 +236,10 @@ describe("release", () => {
 		await expect(decryptor.decrypt(sealed)).rejects.toThrow(KEY_RELEASED);
 	});
 
-	it("a signing key lends its verifying key without a release", () => {
-		const key = engine.signingKey(new Uint8Array(32).fill(1));
-		const lent = key.verifyingKey();
-		expectTypeOf(lent).not.toHaveProperty(Symbol.dispose);
-		expect(Symbol.dispose in lent).toBe(false);
-	});
-
 	it("a signing key releases its one verifying key, so the lent view refuses with KeyReleased", () => {
 		const key = engine.signingKey(new Uint8Array(32).fill(1));
 		const first = key.verifyingKey();
-		const second = key.verifier;
+		const second = key.verifyingKey();
 
 		key[Symbol.dispose]();
 
@@ -252,18 +247,25 @@ describe("release", () => {
 		expect(() => first.toSec1Bytes()).toThrow(KEY_RELEASED);
 	});
 
-	it("releases an HPKE encryptor, so a later seal refuses with KeyReleased", () => {
+	it("releases a signing key after it lent its verifying key, so a later verifyingKey call refuses with KeyReleased", () => {
+		const key = engine.signingKey(new Uint8Array(32).fill(1));
+		key.verifyingKey();
+
+		key[Symbol.dispose]();
+
+		expect(() => key.verifyingKey()).toThrow(KEY_RELEASED);
+	});
+
+	it("releases an HPKE encryptor, so a later seal rejects with KeyReleased", async () => {
 		const encryptor = engine.hpkeEncryptor(RECIPIENT);
 		encryptor[Symbol.dispose]();
 
-		expect(() => encryptor.encrypt(BODY_DER, engine.profile.data)).toThrow(
-			KEY_RELEASED,
-		);
+		await expect(encryptor.encrypt(BODY_DER, engine.profile.data)).rejects.toThrow(KEY_RELEASED);
 	});
 });
 
 describe("Secp256k1SigningKey.toSpkiDer", () => {
-	// EncodePublicKey SPKI for scalar 0x01…01 (uncompressed SEC1).
+	// The EncodePublicKey SPKI of the scalar of 32 octets 0x01, an uncompressed SEC1 point.
 	const SPKI_HEX =
 		"3056301006072a8648ce3d020106052b8104000a034200041b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f70beaf8f588b541507fed6a642c5ab42dfdf8120a7f639de5122d47a69a8e8d1";
 
@@ -284,9 +286,7 @@ describe("profile Hasher", () => {
 		const digest = await engine.sha3_256.digest(abc);
 
 		const digestHex = bytesToHex(digest);
-		expect(digestHex).toBe(
-			"3a985da74fe225b2045c172d6bd390bd855f086e3e9d525b46bfe24511431532",
-		);
+		expect(digestHex).toBe("3a985da74fe225b2045c172d6bd390bd855f086e3e9d525b46bfe24511431532");
 	});
 });
 
@@ -337,17 +337,14 @@ describe("profile encryptors", () => {
 	it.each([
 		{ name: "Aes256Gcm", opener: engine.aes256Gcm(SHARED_KEY) },
 		{ name: "HpkeDecryptor", opener: engine.hpkeDecryptor(SECRET) },
-	])(
-		"$name refuses an envelope that is no AuthEnvelopedData",
-		async ({ opener }) => {
-			const sealed = {
-				envelopeDer: new Uint8Array([0x30, 0x00]),
-				ciphertext: new Uint8Array([1, 2, 3]),
-			};
+	])("$name refuses an envelope that is no AuthEnvelopedData", async ({ opener }) => {
+		const sealed = {
+			envelopeDer: new Uint8Array([0x30, 0x00]),
+			ciphertext: new Uint8Array([1, 2, 3]),
+		};
 
-			await expect(opener.decrypt(sealed)).rejects.toMatchObject({
-				code: "SerializationError",
-			});
-		},
-	);
+		await expect(opener.decrypt(sealed)).rejects.toMatchObject({
+			code: "SerializationError",
+		});
+	});
 });

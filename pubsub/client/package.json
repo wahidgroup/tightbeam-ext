@@ -37,9 +37,7 @@
 	},
 	"devDependencies": {
 		"@types/node": "24.0.4",
-		"@wahidgroup/lint-rules": "0.1.2",
 		"@wahidgroup/tightbeam-ws-client": "file:../../ws/client",
-		"typescript": "5.9.3",
 		"vitest": "4.1.12"
 	},
 	"publishConfig": {

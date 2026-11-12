@@ -1,14 +1,11 @@
-//! gRPC protocol implementation for tightbeam.
-//!
-//! [`GrpcListener`] implements tightbeam's [`Protocol`], [`EncryptedProtocol`],
-//! and [`AsyncListenerTrait`] traits over a tunnel call on HTTP/2, so a cluster
-//! gateway declares `edge: GrpcListener` the way it declares a WebSocket edge.
-//! The [`EdgeProfile`] of the listener decides whether HTTP/2 runs with prior
-//! knowledge (h2c), the default, or over TLS 1.3.
+//! The tightbeam protocol over a tunnel call on HTTP/2, which `docs/grpc.md`
+//! describes.
 //!
 //! # Sources
 //!
-//! - RFC 9113, HTTP/2, June 2022, sections 3.2 and 3.3, HTTP/2 over TLS and with prior knowledge: <https://www.rfc-editor.org/rfc/rfc9113#section-3>
+//! - RFC 9113, HTTP/2, June 2022, sections 3.2 and 3.3, HTTP/2 over TLS and
+//!   with prior knowledge:
+//!   <https://www.rfc-editor.org/rfc/rfc9113#section-3>
 
 use core::fmt;
 use core::marker::PhantomData;
@@ -17,19 +14,13 @@ use core::str::FromStr;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-#[cfg(feature = "couple")]
-use std::sync::Arc;
-
 use http::uri::Authority;
-use rustls_pki_types::ServerName;
+use rustls_pki_types::{DnsName, ServerName};
 use tokio::net::{lookup_host, TcpListener};
-use tokio::sync::mpsc::{self, Receiver};
+use tokio::sync::mpsc::Receiver;
 use tokio::sync::{oneshot, Mutex};
 use tokio_util::sync::CancellationToken;
-use tonic::transport::Server;
-
-#[cfg(feature = "couple")]
-use tokio::sync::Semaphore;
+use tonic::transport::Endpoint;
 
 use tightbeam::constants::DEFAULT_MAX_SERVER_CONNECTIONS;
 use tightbeam::crypto::aead::{RecvCipher, SendCipher};
@@ -40,30 +31,12 @@ use tightbeam::transport::{
 	TightBeamAddress, TransportEncryptionConfig, TransportError,
 };
 
-#[cfg(feature = "instrument")]
-use tightbeam::trace::TraceCollector;
-
-use crate::edge::{Edge, EdgeProfile, H2c};
-use crate::incoming::{GrpcIncoming, LaneTerms, Slots};
+use crate::edge::{EdgeProfile, H2c, PreparedEdge};
+use crate::incoming::ServerSlots;
 use crate::io::{GrpcStream, GrpcTransport};
-use crate::service::{EdgeService, Served};
-use crate::tunnel::{Arrival, RefusalAudit, TunnelService};
+use crate::tunnel::Arrival;
 
-#[cfg(feature = "couple")]
-use crate::couple::LiveCoupler;
-#[cfg(feature = "couple")]
-use crate::edge::EdgeError;
-
-pub use crate::health::HEALTH_CHECK_PATH;
-
-/// The permits of the coupled connections of an edge, which only a coupled
-/// edge holds.
-#[cfg(feature = "couple")]
-type CoupledLanes = Option<Arc<Semaphore>>;
-
-/// An edge with no coupler holds no coupled connection.
-#[cfg(not(feature = "couple"))]
-type CoupledLanes = ();
+pub use crate::health::{HEALTH_CHECK_PATH, HEALTH_WATCH_PATH};
 pub use crate::tunnel::TUNNEL_PATH;
 
 /// The address of a tunnel: a host and a port, which a dial sends as
@@ -89,18 +62,19 @@ pub struct GrpcAddr {
 	port: u16,
 }
 
-/// The longest DNS name, in octets (RFC 1035 section 2.3.4).
+/// The longest DNS name in its dotted text form, which RFC 1035 section
+/// 2.3.4 bounds at 255 octets.
 const MAX_NAME: usize = 253;
 
 /// The longest label of a DNS name, in octets (RFC 1035 section 2.3.4).
 const MAX_LABEL: usize = 63;
 
 /// The host of a [`GrpcAddr`]: an IP address, or a registered name in lower
-/// case, because a DNS name compares without case.
+/// case, which a TLS dial verifies the server under as it is.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum Host {
 	Ip(IpAddr),
-	Name(String),
+	Name(DnsName<'static>),
 }
 
 impl Host {
@@ -130,7 +104,8 @@ impl Host {
 			return Err(TransportError::InvalidAddress);
 		}
 
-		Ok(Self::Name(text.to_ascii_lowercase()))
+		let name = DnsName::try_from(text.to_ascii_lowercase()).map_err(|_| TransportError::InvalidAddress)?;
+		Ok(Self::Name(name))
 	}
 
 	/// Whether `label` is one label of a DNS name: one to 63 letters, digits,
@@ -142,6 +117,27 @@ impl Host {
 		let ends = !label.starts_with('-') && !label.ends_with('-');
 
 		length && characters && ends
+	}
+
+	/// The name that a TLS dial verifies the server under: the IP address, or
+	/// the DNS name.
+	fn server_name(&self) -> ServerName<'static> {
+		match self {
+			Self::Ip(ip) => ServerName::IpAddress((*ip).into()),
+			Self::Name(name) => ServerName::DnsName(name.clone()),
+		}
+	}
+}
+
+/// The host form of an authority: an IPv6 address in brackets, an IPv4
+/// address, or the DNS name.
+impl fmt::Display for Host {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		match self {
+			Self::Ip(IpAddr::V6(ip)) => write!(f, "[{ip}]"),
+			Self::Ip(IpAddr::V4(ip)) => write!(f, "{ip}"),
+			Self::Name(name) => f.write_str(name.as_ref()),
+		}
 	}
 }
 
@@ -179,11 +175,7 @@ impl From<SocketAddr> for GrpcAddr {
 /// The authority form: `host:port`, with an IPv6 host in brackets.
 impl fmt::Display for GrpcAddr {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		match &self.host {
-			Host::Ip(IpAddr::V6(ip)) => write!(f, "[{ip}]:{}", self.port),
-			Host::Ip(IpAddr::V4(ip)) => write!(f, "{ip}:{}", self.port),
-			Host::Name(name) => write!(f, "{name}:{}", self.port),
-		}
+		write!(f, "{}:{}", self.host, self.port)
 	}
 }
 
@@ -197,24 +189,26 @@ impl From<GrpcAddr> for Vec<u8> {
 impl TightBeamAddress for GrpcAddr {}
 
 impl GrpcAddr {
-	/// The name that a TLS dial verifies the server under: the IP address, or
-	/// the DNS name, of the host.
+	/// The tonic endpoint of a dial to the address, under the `http` scheme.
 	///
 	/// # Errors
 	///
-	/// - [`TransportError::InvalidAddress`] -- rustls refuses the DNS name.
-	pub(crate) fn server_name(&self) -> Result<ServerName<'static>, TransportError> {
-		match &self.host {
-			Host::Ip(ip) => Ok(ServerName::IpAddress((*ip).into())),
-			Host::Name(name) => ServerName::try_from(name.clone()).map_err(|_| TransportError::InvalidAddress),
-		}
+	/// - [`TransportError::InvalidAddress`] -- tonic refuses the URI of the address.
+	pub(crate) fn endpoint(&self) -> Result<Endpoint, TransportError> {
+		Endpoint::from_shared(format!("http://{self}")).map_err(|_| TransportError::InvalidAddress)
+	}
+
+	/// The name that a TLS dial verifies the server under: the IP address, or
+	/// the DNS name, of the host.
+	pub(crate) fn server_name(&self) -> ServerName<'static> {
+		self.host.server_name()
 	}
 
 	/// Bind the first socket address that the host resolves to and that binds.
 	///
 	/// # Errors
 	///
-	/// - The I/O error of the resolve, or of the last bind that failed.
+	/// - The [`io::Error`] of the resolve, or of the last bind that failed.
 	async fn bind(&self) -> io::Result<TcpListener> {
 		let mut last_failure = io::Error::from(io::ErrorKind::AddrNotAvailable);
 		let candidates = lookup_host(self.to_string()).await?;
@@ -232,21 +226,18 @@ impl GrpcAddr {
 /// A tightbeam listener that speaks the protocol over tunnel calls, under the
 /// deployment that its profile `C` provisions.
 ///
-/// Every accepted transport builds from the one [`EndpointConfig`] the
-/// listener holds, so the listener's provisioning and ceilings reach each
-/// connection.
-///
-/// `C` provisions each bind through [`EdgeProfile::edge`] and each dial
-/// through [`EdgeProfile::dial`]. [`H2c`], the default, runs no TLS, so
-/// `GrpcListener` names the h2c listener. Under a profile that binds
-/// [`Edge::Tls`], each connection completes its TLS handshake under its slot
-/// and before its deadline, or closes, before any byte reaches the HTTP/2
-/// server.
-///
-/// The listener serves on a task of its own, so a tunnel call queues whether
-/// or not a caller is waiting in [`accept`](Self::accept). The drop of the
-/// listener stops the server: it closes the socket, and every tunnel that no
-/// caller took ends.
+/// - Every accepted transport builds from the one [`EndpointConfig`] that the
+///   listener holds, so its provisioning and ceilings reach each connection.
+/// - `C` provisions each bind through [`EdgeProfile::edge`] and each dial
+///   through [`EdgeProfile::dial`]. The default, [`H2c`], runs no TLS, so a
+///   bare `GrpcListener` is the h2c listener.
+/// - Under a profile that binds [`Edge::tls`](crate::edge::Edge::tls), each
+///   connection completes its TLS handshake under its slot and before its
+///   deadline, or closes, before any byte reaches the HTTP/2 server.
+/// - The listener serves on a task of its own, so a tunnel call queues
+///   whether or not a caller waits in [`accept`](Self::accept).
+/// - The drop of the listener closes the socket and ends every tunnel that no
+///   caller took.
 ///
 /// # Examples
 ///
@@ -269,30 +260,29 @@ pub struct GrpcListener<P: CryptoProvider = DefaultCryptoProvider, C: EdgeProfil
 	_shutdown: oneshot::Sender<()>,
 	local_addr: SocketAddr,
 	config: EndpointConfig<P>,
-	/// Shared with the service of the server, which records each call it
-	/// refuses on it.
-	#[cfg(feature = "instrument")]
-	refusals: RefusalAudit,
 	_profile: PhantomData<fn() -> C>,
 }
 
 impl<P: HandshakeProvider + Send + Sync + 'static, C: EdgeProfile> GrpcListener<P, C> {
-	/// Provision the bind of `C`, then bind `addr`, so a profile that cannot
-	/// provision binds no socket.
+	/// Provision and prepare the bind of `C` under `config`, then bind
+	/// `addr`, so a profile whose provision fails binds no socket.
 	///
 	/// # Errors
 	///
 	/// - The [`TransportError`] of the [`crate::edge::EdgeError`] of the profile.
 	/// - [`TransportError::IoError`] -- the host resolves to no address that binds.
-	async fn provision(addr: &GrpcAddr) -> Result<(TcpListener, Edge), TransportError> {
-		let edge = C::edge()?;
+	async fn provision(
+		addr: &GrpcAddr,
+		config: &EndpointConfig<P>,
+	) -> Result<(TcpListener, PreparedEdge), TransportError> {
+		let edge = C::edge()?.prepare(config)?;
 		let listener = addr.bind().await?;
 		Ok((listener, edge))
 	}
 
 	/// Start the server on `listener` under `edge`, with one slot per
 	/// connection a server admits by default.
-	fn serve(listener: TcpListener, config: EndpointConfig<P>, edge: &Edge) -> Result<Self, TransportError> {
+	fn serve(listener: TcpListener, config: EndpointConfig<P>, edge: PreparedEdge) -> Result<Self, TransportError> {
 		Self::with_slots(listener, config, DEFAULT_MAX_SERVER_CONNECTIONS, edge)
 	}
 
@@ -302,49 +292,21 @@ impl<P: HandshakeProvider + Send + Sync + 'static, C: EdgeProfile> GrpcListener<
 		listener: TcpListener,
 		config: EndpointConfig<P>,
 		capacity: NonZeroUsize,
-		edge: &Edge,
+		edge: PreparedEdge,
 	) -> Result<Self, TransportError> {
 		let local_addr = listener.local_addr()?;
+		let config = edge.clocked(config);
 		let limits = config.limits();
-		let ceiling = limits.max_envelope();
 
-		// A live tunnel holds a slot, so the queue holds every live tunnel and
-		// one failed accept. A coupler sends its loopback tunnel with a send
-		// that waits for room, so it never drops.
-		let slots = Slots::new(capacity.get());
-		let (queue, arrivals) = mpsc::channel(capacity.get() + 1);
-		let (served, coupled) = Self::served(edge, &config, &queue, local_addr, ceiling)?;
-		#[cfg(not(feature = "couple"))]
-		let () = coupled;
-
-		let streams = edge.stream_limit();
-		let terms = LaneTerms {
-			idle: limits.handshake_timeout,
-			replaces: streams == 1,
-			#[cfg(feature = "couple")]
-			coupled,
-		};
-
-		let acceptor = edge.acceptor()?;
-		let incoming = GrpcIncoming::new(listener, slots, terms, acceptor, queue.clone());
-		let refusals = RefusalAudit::default();
-		// A gateway binds its edge through `bind_with`, which takes no trace,
-		// so a coupled edge records its refusals on the trace of its coupler.
-		#[cfg(all(feature = "couple", feature = "instrument"))]
-		if let Some(trace) = edge.trace() {
-			refusals.attach(trace.share());
-		}
-
-		let tunnel = TunnelService::new(queue, ceiling, refusals.clone());
-		let service = EdgeService::new(tunnel, refusals.clone(), served);
+		let ServerSlots { slots, queue, arrivals } = ServerSlots::new(capacity);
+		let bind = edge.bind::<P, C>(queue, local_addr, limits);
 
 		let (shutdown, signal) = oneshot::channel::<()>();
 		let stopping = async {
 			let _ = signal.await;
 		};
 
-		let builder = Server::builder().max_concurrent_streams(streams);
-		let server = builder.serve_with_incoming_shutdown(service, incoming, stopping);
+		let server = bind.serve(listener, slots, stopping);
 
 		let stopped = CancellationToken::new();
 		let finished = stopped.clone();
@@ -359,67 +321,16 @@ impl<P: HandshakeProvider + Send + Sync + 'static, C: EdgeProfile> GrpcListener<
 			_shutdown: shutdown,
 			local_addr,
 			config,
-			#[cfg(feature = "instrument")]
-			refusals,
 			_profile: PhantomData,
 		})
 	}
 
-	/// What the edge serves beside its tunnel, and the permits of its coupled
-	/// connections: the tunnel alone for an h2c or a TLS edge, and the coupler
-	/// of a coupled edge, which starts here under the certificate that `config`
-	/// presents, so its loopback session pins it.
-	///
-	/// # Errors
-	///
-	/// - [`EdgeError::RequiresEncryption`] -- a coupled edge binds in the clear.
-	/// - The errors of the coupler as it starts.
-	#[cfg_attr(not(feature = "couple"), allow(unused_variables))]
-	fn served(
-		edge: &Edge,
-		config: &EndpointConfig<P>,
-		queue: &mpsc::Sender<Arrival>,
-		local: SocketAddr,
-		ceiling: usize,
-	) -> Result<(Served<P>, CoupledLanes), TransportError> {
-		match edge {
-			Edge::H2c | Edge::Tls(_) => Ok((Served::Tunnel(PhantomData), CoupledLanes::default())),
-			#[cfg(feature = "couple")]
-			Edge::Coupled(_, coupler) => {
-				let gateway = config.encryption().server_certificate().ok_or(EdgeError::RequiresEncryption)?;
-				let live = LiveCoupler::start::<C>(coupler.clone(), queue.clone(), local, gateway, ceiling)?;
-				let lanes = live.lanes();
-				Ok((Served::Coupled(Arc::new(live)), Some(lanes)))
-			}
-		}
-	}
-
-	/// Record each call that this listener refuses before any session exists
-	/// on `trace`, as [`TUNNEL_REFUSED`], in place of the trace of an earlier
-	/// call.
-	///
-	/// The server runs from the bind on, so a call that it refuses before
-	/// this attach records nothing. A session that a tunnel opens records on
-	/// the trace of its own transport, which `server!` attaches through
-	/// `with_trace`. A listener
-	/// that a colony gateway binds for its edge takes no trace, because the
-	/// gateway binds it through [`EncryptedProtocol::bind_with`].
-	///
-	/// [`TUNNEL_REFUSED`]: crate::events::TUNNEL_REFUSED
-	#[cfg(feature = "instrument")]
-	#[must_use]
-	pub fn with_trace(self, trace: TraceCollector) -> Self {
-		self.refusals.attach(trace);
-		self
-	}
-
 	/// Bind a cleartext listener to `addr`, such as `127.0.0.1:0`.
 	///
-	/// Accepted transports run no tightbeam handshake, so they carry no
-	/// end-to-end confidentiality, integrity, or peer authentication
-	/// (CWE-319), and the name says it. TLS under the profile `C` protects
-	/// each hop to the listener alone. An encrypted bind goes through
-	/// [`EncryptedProtocol::bind_with`].
+	/// - Its transports run no tightbeam handshake, so they carry no end-to-end
+	///   confidentiality, integrity, or peer authentication (CWE-319).
+	/// - TLS under the profile `C` protects each hop to the listener alone.
+	/// - [`EncryptedProtocol::bind_with`] binds an encrypted listener.
 	///
 	/// # Errors
 	///
@@ -428,12 +339,13 @@ impl<P: HandshakeProvider + Send + Sync + 'static, C: EdgeProfile> GrpcListener<
 	/// - [`TransportError::IoError`] -- the host resolves to no address that binds.
 	pub async fn bind_cleartext(addr: impl AsRef<str>) -> Result<Self, TransportError> {
 		let addr = GrpcAddr::from_str(addr.as_ref())?;
-		let (listener, edge) = Self::provision(&addr).await?;
 		let config = EndpointConfig::cleartext();
-		Self::serve(listener, config, &edge)
+		let (listener, edge) = Self::provision(&addr, &config).await?;
+		Self::serve(listener, config, edge)
 	}
 
-	/// The local address the listener is bound to.
+	/// The local address that the listener is bound to, with the port that
+	/// the system picked for a bind on port 0.
 	pub fn local_addr(&self) -> SocketAddr {
 		self.local_addr
 	}
@@ -481,10 +393,10 @@ impl<P: HandshakeProvider + Send + Sync + 'static, C: EdgeProfile> Protocol for 
 	}
 
 	async fn bind_cleartext(addr: Self::Address) -> Result<(Self::Listener, Self::Address), Self::Error> {
-		let (listener, edge) = Self::provision(&addr).await?;
 		let config = EndpointConfig::cleartext();
+		let (listener, edge) = Self::provision(&addr, &config).await?;
 
-		let bound = Self::serve(listener, config, &edge)?;
+		let bound = Self::serve(listener, config, edge)?;
 		let local_addr = GrpcAddr::from(bound.local_addr);
 		Ok((bound, local_addr))
 	}
@@ -513,9 +425,9 @@ impl<P: HandshakeProvider + Send + Sync + 'static, C: EdgeProfile> EncryptedProt
 		config: TransportEncryptionConfig<P>,
 	) -> Result<(Self::Listener, Self::Address), Self::Error> {
 		let config = EndpointConfig::try_from(config)?;
-		let (listener, edge) = Self::provision(&addr).await?;
+		let (listener, edge) = Self::provision(&addr, &config).await?;
 
-		let bound = Self::serve(listener, config, &edge)?;
+		let bound = Self::serve(listener, config, edge)?;
 		let local_addr = GrpcAddr::from(bound.local_addr);
 		Ok((bound, local_addr))
 	}
@@ -544,43 +456,125 @@ impl<P: HandshakeProvider + Send + Sync + 'static, C: EdgeProfile> PersistentCon
 
 #[cfg(test)]
 mod tests {
+	use core::future::{poll_fn, Future};
+	use core::pin::pin;
+	use core::task::Poll;
 	use core::time::Duration;
+	use std::io;
 	use std::sync::Arc;
 
 	use bytes::Bytes;
 	use h2::client::{ResponseFuture, SendRequest};
-	use h2::SendStream;
+	use h2::{Ping, PingPong, SendStream};
 	use http::header::{CONTENT_TYPE, TE};
 	use http::{Method, Request};
-	use tokio::io::AsyncReadExt;
 	use tokio::net::TcpStream;
 	use tokio::task::JoinHandle;
-	use tokio::time::{timeout, Instant};
+	use tokio::time::timeout;
 
-	use tightbeam::transport::{AsyncProtocolStream, TransportLimits};
+	use tightbeam::clock::{Clock, ManualClock, SystemClock};
+	use tightbeam::testing::macros::BuiltAssertSpec;
+	use tightbeam::testing::specs::ProcessSpec;
+	use tightbeam::testing::{ScenarioConfig, ScenarioConfigError, SetupEnv};
+	use tightbeam::trace::TraceCollector;
+	use tightbeam::transport::{AsyncProtocolStream, MessageIO, TransportFailure, TransportLimits};
+	use tightbeam::urn::Urn;
+	use tightbeam::{exactly, tb_assert_spec, tb_process_spec, tb_scenario, urn, TightBeamError};
 
 	use super::*;
-	use crate::edge::Dial;
+	use crate::edge::{Dial, Edge};
+	use crate::events::EDGE_REFUSED;
 
 	type BoxError = Box<dyn std::error::Error + Send + Sync>;
-	type TestResult = Result<(), BoxError>;
 
-	/// How long a healthy dial, accept, or close may take on loopback.
+	/// How long a healthy dial, accept, or close may take on loopback, which
+	/// bounds a wait that would hang.
 	const PROMPT: Duration = Duration::from_secs(2);
 
-	/// How long a test watches for a dial that MUST NOT finish.
-	const HELD: Duration = Duration::from_millis(200);
+	/// The idle deadline of the scenarios that watch a connection close, past
+	/// [`PROMPT`], so only an advance of the clock of the plane closes it in
+	/// time.
+	const IDLE: Duration = Duration::from_secs(10);
 
-	/// The idle deadline of the tests that watch a connection close.
-	const IDLE: Duration = Duration::from_millis(400);
+	/// The span short of [`IDLE`] that a scenario advances first, at which the
+	/// connection still answers.
+	const SHORT_OF_IDLE: Duration = IDLE.saturating_sub(Duration::from_millis(1));
+
+	/// A dial that completed, of the first peer of a scenario.
+	const FIRST_DIALED: Urn<'static> = urn!("test", "event:plane/first-dialed");
+
+	/// A dial that completed, of a later peer of a scenario.
+	const NEXT_DIALED: Urn<'static> = urn!("test", "event:plane/next-dialed");
+
+	/// A tunnel that a caller of `accept` took, of the first peer.
+	const FIRST_ACCEPTED: Urn<'static> = urn!("test", "event:plane/first-accepted");
+
+	/// A tunnel that a caller of `accept` took, of a later peer.
+	const NEXT_ACCEPTED: Urn<'static> = urn!("test", "event:plane/next-accepted");
+
+	/// A tunnel that a caller of `accept` took, of the sentinel peer.
+	const SENTINEL_ACCEPTED: Urn<'static> = urn!("test", "event:plane/sentinel-accepted");
+
+	/// A connection that the plane closed, as its peer read the close.
+	const CLOSED: Urn<'static> = urn!("test", "event:plane/closed");
+
+	/// The `grpc-status` that a peer read of a tunnel call.
+	const CALL_STATUS: Urn<'static> = urn!("test", "event:plane/call-status");
+
+	/// The `grpc-status` that a peer read of a tunnel call that the plane
+	/// refused.
+	const REFUSED_STATUS: Urn<'static> = urn!("test", "event:plane/refused-status");
+
+	/// A ping that the plane answered a millisecond before the deadline of its
+	/// connection.
+	const ANSWERED_BEFORE: Urn<'static> = urn!("test", "event:plane/answered-before");
+
+	/// A read of an accepted tunnel transport that its read deadline ended.
+	const READ_LAPSED: Urn<'static> = urn!("test", "event:plane/read-lapsed");
+
+	/// The failure of a wait of a scenario, or of a peer, as an I/O error that
+	/// holds the failure as its inner error.
+	fn unexpected(error: impl Into<BoxError>) -> TightBeamError {
+		TightBeamError::IoError(io::Error::other(error))
+	}
+
+	/// `future`, within [`PROMPT`], so a wait that hangs fails the scenario.
+	async fn prompt<F: Future>(future: F) -> Result<F::Output, TightBeamError> {
+		timeout(PROMPT, future).await.map_err(unexpected)
+	}
+
+	/// The config that grades a run with `spec` and the order of `process`.
+	fn ordered(
+		spec: &'static BuiltAssertSpec,
+		process: impl ProcessSpec + Send + Sync + 'static,
+	) -> Result<ScenarioConfig, ScenarioConfigError> {
+		ScenarioConfig::builder().with_spec(spec).with_csp(process).build()
+	}
 
 	/// A cleartext listener with `capacity` slots under `limits`, on an
-	/// ephemeral loopback port.
-	async fn plane(limits: TransportLimits, capacity: usize) -> Result<GrpcListener, BoxError> {
-		let capacity = NonZeroUsize::new(capacity).ok_or("a plane holds one slot or more")?;
+	/// ephemeral loopback port, whose edge records on `trace` and runs on
+	/// `clock`.
+	async fn plane(
+		limits: TransportLimits,
+		capacity: usize,
+		trace: &TraceCollector,
+		clock: Arc<dyn Clock>,
+	) -> Result<GrpcListener, TightBeamError> {
+		let capacity = NonZeroUsize::new(capacity).ok_or_else(|| unexpected("a plane holds one slot or more"))?;
 		let listener = TcpListener::bind("127.0.0.1:0").await?;
 		let config = EndpointConfig::cleartext().with_limits(limits)?;
-		Ok(GrpcListener::with_slots(listener, config, capacity, &Edge::H2c)?)
+		let edge = Edge::h2c()
+			.with_trace(trace.share())
+			.with_clock(clock)
+			.prepare(&config)
+			.map_err(TransportError::from)?;
+		Ok(GrpcListener::with_slots(listener, config, capacity, edge)?)
+	}
+
+	/// A plane on the operating system's clocks, for a scenario that waits on
+	/// no deadline of the plane.
+	fn system() -> Arc<dyn Clock> {
+		Arc::new(SystemClock)
 	}
 
 	/// Limits whose connections close after `IDLE` with no call.
@@ -589,35 +583,65 @@ mod tests {
 	}
 
 	/// Dial a tunnel to `plane` under the default limits.
-	async fn dial(plane: &GrpcListener) -> Result<GrpcStream, TransportError> {
-		let addr = GrpcAddr::from(plane.local_addr());
-		GrpcStream::dial(&addr, &TransportLimits::default(), &Dial::H2c).await
+	async fn dial(plane: &GrpcListener) -> Result<GrpcStream, TightBeamError> {
+		let (addr, limits) = (GrpcAddr::from(plane.local_addr()), TransportLimits::default());
+		Ok(prompt(GrpcStream::dial(&addr, &limits, &Dial::H2c)).await??)
+	}
+
+	/// The next tunnel that a caller of `accept` takes from `plane`, and the
+	/// peer of its connection.
+	async fn accepted(
+		plane: &GrpcListener,
+	) -> Result<(GrpcTransport<DefaultCryptoProvider>, SocketAddr), TightBeamError> {
+		Ok(prompt(plane.accept()).await??)
 	}
 
 	/// An HTTP/2 connection to a plane from the `h2` client, and the task that
 	/// drives it, whose end is the end of the connection.
 	struct H2Connection {
 		calls: SendRequest<Bytes>,
+		pings: PingPong,
 		driver: JoinHandle<Result<(), h2::Error>>,
 		authority: SocketAddr,
 		local: SocketAddr,
 	}
 
 	impl H2Connection {
-		async fn open(plane: &GrpcListener) -> Result<Self, BoxError> {
+		/// Open a connection, and ping it once, so the plane answers it under
+		/// a lane, which read its deadline when the plane accepted it.
+		async fn open(plane: &GrpcListener) -> Result<Self, TightBeamError> {
 			let authority = plane.local_addr();
 			let tcp = TcpStream::connect(authority).await?;
 			let local = tcp.local_addr()?;
-			let (calls, connection) = h2::client::handshake(tcp).await?;
+			let (calls, mut connection) = prompt(h2::client::handshake(tcp)).await?.map_err(unexpected)?;
+			let pings = connection
+				.ping_pong()
+				.ok_or_else(|| unexpected("a new connection holds its pings"))?;
 			let driver = tokio::spawn(connection);
-			Ok(Self { calls, driver, authority, local })
+
+			let mut opened = Self { calls, pings, driver, authority, local };
+			opened.ping().await?;
+			Ok(opened)
+		}
+
+		/// Ping the plane, and wait for its answer.
+		async fn ping(&mut self) -> Result<(), TightBeamError> {
+			prompt(self.pings.ping(Ping::opaque())).await?.map_err(unexpected)?;
+			Ok(())
+		}
+
+		/// Ping the plane, and record on `trace` that it answered.
+		async fn answered(&mut self, trace: &TraceCollector) -> Result<(), TightBeamError> {
+			self.ping().await?;
+			trace.event(ANSWERED_BEFORE)?;
+			Ok(())
 		}
 
 		/// Open a call on the tunnel path with `headers` added to its head.
 		async fn call(
 			&mut self,
 			headers: &[(&'static str, &'static str)],
-		) -> Result<(ResponseFuture, SendStream<Bytes>), BoxError> {
+		) -> Result<(ResponseFuture, SendStream<Bytes>), TightBeamError> {
 			let uri = format!("http://{}{TUNNEL_PATH}", self.authority);
 			let mut head = Request::builder().method(Method::POST).uri(uri);
 			head = head.header(CONTENT_TYPE, "application/grpc").header(TE, "trailers");
@@ -626,178 +650,516 @@ mod tests {
 				head = head.header(*name, *value);
 			}
 
-			let ready = timeout(PROMPT, self.calls.clone().ready()).await?;
-			let mut calls = ready?;
-			let call = calls.send_request(head.body(())?, false)?;
-			Ok(call)
+			let mut calls = prompt(self.calls.clone().ready()).await?.map_err(unexpected)?;
+			let call = calls.send_request(head.body(()).map_err(unexpected)?, false);
+			call.map_err(unexpected)
 		}
 
-		/// Whether the server closes the connection within `within`.
-		async fn closes_within(&mut self, within: Duration) -> bool {
-			let closed = timeout(within, &mut self.driver).await;
-			closed.is_ok()
+		/// Wait until the plane closes the connection, and record the close on
+		/// `trace`.
+		async fn closed(&mut self, trace: &TraceCollector) -> Result<(), TightBeamError> {
+			let _ended = prompt(&mut self.driver).await?;
+			trace.event(CLOSED)?;
+			Ok(())
 		}
 	}
 
-	#[tokio::test]
-	async fn a_full_plane_holds_a_dial_until_a_tunnel_is_accepted() -> TestResult {
-		let plane = Arc::new(plane(TransportLimits::default(), 1).await?);
-
-		let _first = timeout(PROMPT, dial(&plane)).await??;
-		let waiting = Arc::clone(&plane);
-		let mut second = tokio::spawn(async move { dial(&waiting).await });
-
-		let held = timeout(HELD, &mut second).await;
-		assert!(held.is_err());
-
-		timeout(PROMPT, plane.accept()).await??;
-		let _second = timeout(PROMPT, second).await???;
-		Ok(())
-	}
-
-	#[tokio::test]
-	async fn a_connection_with_no_call_closes_at_its_deadline_and_returns_its_slot() -> TestResult {
-		let plane = plane(idle_limits(), 1).await?;
-		let started = Instant::now();
-		let mut idle = TcpStream::connect(plane.local_addr()).await?;
-
-		let mut received = Vec::new();
-		let _ = timeout(PROMPT, idle.read_to_end(&mut received)).await?;
-		assert!(started.elapsed() >= IDLE);
-
-		let _next = timeout(PROMPT, dial(&plane)).await??;
-		Ok(())
-	}
-
-	#[tokio::test]
-	async fn a_connection_whose_tunnel_ended_carries_the_next_call_under_the_one_slot() -> TestResult {
-		let plane = plane(idle_limits(), 1).await?;
-		let mut connection = H2Connection::open(&plane).await?;
-
-		let (response, requests) = connection.call(&[]).await?;
-		let (transport, _peer) = timeout(PROMPT, plane.accept()).await??;
-		drop(transport);
-
-		let response = timeout(PROMPT, response).await??;
+	/// The `grpc-status` of the trailers of `response`, recorded on `trace`.
+	async fn trailed(response: ResponseFuture, trace: &TraceCollector) -> Result<(), TightBeamError> {
+		let response = prompt(response).await?.map_err(unexpected)?;
 		let mut responses = response.into_body();
-		let trailers = timeout(PROMPT, responses.trailers()).await??;
+		let trailers = prompt(responses.trailers()).await?.map_err(unexpected)?;
 		let status = trailers.as_ref().and_then(|trailers| trailers.get("grpc-status"));
-		assert_eq!(status.map(|value| value.as_bytes()), Some(&b"0"[..]));
-
-		// The server resets the request side once its response is complete
-		// (RFC 9113 section 8.1), so the stream has closed both ways.
-		drop(requests);
-
-		let (_next, _next_requests) = connection.call(&[]).await?;
-		timeout(PROMPT, plane.accept()).await??;
-		assert!(connection.closes_within(PROMPT).await);
+		let status = status.map(|value| String::from_utf8_lossy(value.as_bytes()).into_owned());
+		trace.event_with(CALL_STATUS, &[], status.unwrap_or_default())?;
 		Ok(())
 	}
 
-	#[tokio::test]
-	async fn a_connection_whose_tunnel_ends_with_no_free_slot_refuses_its_next_call_and_drains() -> TestResult {
-		let plane = plane(idle_limits(), 1).await?;
-		let mut connection = H2Connection::open(&plane).await?;
-
-		let (response, requests) = connection.call(&[]).await?;
-		let (transport, _peer) = timeout(PROMPT, plane.accept()).await??;
-		let _holder = timeout(PROMPT, dial(&plane)).await??;
-
-		drop(transport);
-		let response = timeout(PROMPT, response).await??;
-		let mut responses = response.into_body();
-		timeout(PROMPT, responses.trailers()).await??;
-		drop(requests);
-
-		let (refused, _refused_requests) = connection.call(&[]).await?;
-		let refused = timeout(PROMPT, refused).await??;
-		let status = refused.headers().get("grpc-status").map(|value| value.as_bytes());
-		assert_eq!(status, Some(&b"14"[..]));
-		assert!(connection.closes_within(PROMPT).await);
-		Ok(())
+	tb_assert_spec! {
+		/// Two dials of a plane of one slot, and both of their tunnels taken.
+		pub FullPlaneSpec,
+		V(1,0,0): {
+			mode: Accept,
+			assertions: [
+				(FIRST_DIALED, exactly!(1)),
+				(FIRST_ACCEPTED, exactly!(1)),
+				(NEXT_DIALED, exactly!(1)),
+				(NEXT_ACCEPTED, exactly!(1)),
+				(EDGE_REFUSED, exactly!(0))
+			]
+		}
 	}
 
-	#[tokio::test]
-	async fn a_tunnel_no_caller_takes_closes_its_connection_at_its_deadline() -> TestResult {
-		let plane = plane(idle_limits(), 1).await?;
-		let started = Instant::now();
-		let mut connection = H2Connection::open(&plane).await?;
-
-		let (_silent, _silent_requests) = connection.call(&[]).await?;
-		assert!(connection.closes_within(PROMPT).await);
-		assert!(started.elapsed() >= IDLE);
-
-		let _next = timeout(PROMPT, dial(&plane)).await??;
-		timeout(PROMPT, plane.accept()).await??;
-		Ok(())
+	tb_process_spec! {
+		/// The second dial of a full plane completes only once a caller took
+		/// the tunnel of the first, which returns the one slot.
+		pub FullPlaneOrder,
+		events {
+			observable { FIRST_DIALED, FIRST_ACCEPTED, NEXT_DIALED, NEXT_ACCEPTED }
+			hidden { }
+		}
+		states {
+			Open => { FIRST_DIALED => Dialed },
+			Dialed => { FIRST_ACCEPTED => Freed },
+			Freed => { NEXT_DIALED => Waited },
+			Waited => { NEXT_ACCEPTED => Done },
+			Done => { }
+		}
+		terminal { Done }
 	}
 
-	#[tokio::test]
-	async fn a_call_reset_before_accept_holds_no_second_slot_and_never_reaches_a_caller() -> TestResult {
-		let plane = plane(TransportLimits::default(), 2).await?;
-		let mut connection = H2Connection::open(&plane).await?;
+	tb_scenario! {
+		name: a_full_plane_takes_a_dial_once_a_tunnel_is_accepted,
+		config: ordered(FullPlaneSpec::latest(), FullPlaneOrder),
+		environment Bare {
+			exec: |SetupEnv { trace, .. }| async move {
+				let plane = Arc::new(plane(TransportLimits::default(), 1, &trace, system()).await?);
+				let _first = dial(&plane).await?;
+				trace.event(FIRST_DIALED)?;
 
-		let (reset, mut reset_requests) = connection.call(&[]).await?;
-		reset_requests.send_reset(h2::Reason::CANCEL);
-		drop(reset);
+				let (waiting, recorded) = (Arc::clone(&plane), trace.share());
+				let second = tokio::spawn(async move {
+					let dialed = dial(&waiting).await?;
+					recorded.event(NEXT_DIALED)?;
+					Ok::<_, TightBeamError>(dialed)
+				});
 
-		let _other = timeout(PROMPT, dial(&plane)).await??;
-		let (_other_tunnel, other_peer) = timeout(PROMPT, plane.accept()).await??;
-		assert_ne!(other_peer, connection.local);
-
-		let (_next, _next_requests) = connection.call(&[]).await?;
-		let (_next_tunnel, next_peer) = timeout(PROMPT, plane.accept()).await??;
-		assert_eq!(next_peer, connection.local);
-
-		let none_left = timeout(HELD, plane.accept()).await;
-		assert!(none_left.is_err());
-		Ok(())
-	}
-
-	#[tokio::test]
-	async fn calls_refused_after_their_parse_never_renew_the_deadline() -> TestResult {
-		let plane = plane(idle_limits(), 1).await?;
-		let started = Instant::now();
-		let mut connection = H2Connection::open(&plane).await?;
-
-		// A peer that renews the deadline with each refused call would keep
-		// the connection open until the loop gives up at three deadlines.
-		let closed_after = loop {
-			let Ok((refused, _requests)) = connection.call(&[("grpc-encoding", "gzip")]).await else {
-				break started.elapsed();
-			};
-			let _ = timeout(PROMPT, refused).await;
-
-			let closed = connection.closes_within(IDLE / 4).await;
-			if closed || started.elapsed() > IDLE * 3 {
-				break started.elapsed();
+				accepted(&plane).await?;
+				trace.event(FIRST_ACCEPTED)?;
+				let _second = prompt(second).await?.map_err(unexpected)??;
+				accepted(&plane).await?;
+				trace.event(NEXT_ACCEPTED)?;
+				Ok(())
 			}
-		};
-
-		assert!(closed_after >= IDLE);
-		assert!(closed_after < IDLE + IDLE / 2);
-		Ok(())
+		}
 	}
 
-	#[tokio::test]
-	async fn a_dropped_listener_ends_every_tunnel_no_caller_took() -> TestResult {
-		let plane = plane(TransportLimits::default(), 2).await?;
-		let mut stream = timeout(PROMPT, dial(&plane)).await??;
-		drop(plane);
-
-		let read = timeout(PROMPT, stream.read_frame(64)).await?;
-		assert!(matches!(read, Err(TransportError::ConnectionClosed)));
-		Ok(())
+	tb_assert_spec! {
+		/// A connection with no call, which answers a millisecond before its
+		/// deadline and closes at it, then a dial that takes its slot.
+		pub IdleCloseSpec,
+		V(1,0,0): {
+			mode: Accept,
+			assertions: [
+				(ANSWERED_BEFORE, exactly!(1)),
+				(CLOSED, exactly!(1)),
+				(NEXT_DIALED, exactly!(1)),
+				(EDGE_REFUSED, exactly!(0))
+			]
+		}
 	}
 
-	#[tokio::test]
-	async fn a_dropped_listener_closes_its_idle_connections() -> TestResult {
-		let plane = plane(TransportLimits::default(), 2).await?;
-		let mut connection = H2Connection::open(&plane).await?;
-		drop(plane);
+	tb_scenario! {
+		name: a_connection_with_no_call_closes_at_its_deadline_and_returns_its_slot,
+		spec: IdleCloseSpec,
+		environment Bare {
+			exec: |SetupEnv { trace, .. }| async move {
+				let clock = Arc::new(ManualClock::default());
+				let plane = plane(idle_limits(), 1, &trace, Arc::clone(&clock) as Arc<dyn Clock>).await?;
+				let mut idle = H2Connection::open(&plane).await?;
 
-		assert!(connection.closes_within(PROMPT).await);
-		Ok(())
+				clock.advance(SHORT_OF_IDLE);
+				idle.answered(&trace).await?;
+				clock.advance(IDLE - SHORT_OF_IDLE);
+				idle.closed(&trace).await?;
+
+				let _next = dial(&plane).await?;
+				trace.event(NEXT_DIALED)?;
+				Ok(())
+			}
+		}
+	}
+
+	tb_assert_spec! {
+		/// Two tunnels in turn on one connection under the one slot: each ends
+		/// with status 0 and a caller takes each, and the connection then
+		/// closes at the deadline that the end of the second one read.
+		pub NextCallSpec,
+		V(1,0,0): {
+			mode: Accept,
+			assertions: [
+				(FIRST_ACCEPTED, exactly!(1)),
+				(CALL_STATUS, exactly!(2), equals!("0")),
+				(NEXT_ACCEPTED, exactly!(1)),
+				(CLOSED, exactly!(1)),
+				(EDGE_REFUSED, exactly!(0))
+			]
+		}
+	}
+
+	tb_scenario! {
+		name: a_connection_whose_tunnel_ended_carries_the_next_call_under_the_one_slot,
+		spec: NextCallSpec,
+		environment Bare {
+			exec: |SetupEnv { trace, .. }| async move {
+				let clock = Arc::new(ManualClock::default());
+				let plane = plane(idle_limits(), 1, &trace, Arc::clone(&clock) as Arc<dyn Clock>).await?;
+				let mut connection = H2Connection::open(&plane).await?;
+
+				let (response, requests) = connection.call(&[]).await?;
+				let (transport, _peer) = accepted(&plane).await?;
+				trace.event(FIRST_ACCEPTED)?;
+				drop(transport);
+				trailed(response, &trace).await?;
+
+				// The server resets the request side once its response is
+				// complete (RFC 9113 section 8.1), so the stream has closed
+				// both ways.
+				drop(requests);
+
+				let (next, next_requests) = connection.call(&[]).await?;
+				accepted(&plane).await?;
+				trace.event(NEXT_ACCEPTED)?;
+				// The end of the second call returns the connection to its
+				// slot under a fresh deadline before the trailers of the call.
+				trailed(next, &trace).await?;
+				drop(next_requests);
+				clock.advance(IDLE);
+				connection.closed(&trace).await
+			}
+		}
+	}
+
+	tb_assert_spec! {
+		/// A connection whose tunnel ends short of its first deadline: it
+		/// answers past that deadline, and closes at the deadline that the end
+		/// of the tunnel read.
+		pub RenewedSpec,
+		V(1,0,0): {
+			mode: Accept,
+			assertions: [
+				(CALL_STATUS, exactly!(1), equals!("0")),
+				(ANSWERED_BEFORE, exactly!(1)),
+				(CLOSED, exactly!(1)),
+				(EDGE_REFUSED, exactly!(0))
+			]
+		}
+	}
+
+	tb_scenario! {
+		name: a_connection_whose_tunnel_ended_waits_out_the_deadline_from_its_end,
+		spec: RenewedSpec,
+		environment Bare {
+			exec: |SetupEnv { trace, .. }| async move {
+				let clock = Arc::new(ManualClock::default());
+				let plane = plane(idle_limits(), 1, &trace, Arc::clone(&clock) as Arc<dyn Clock>).await?;
+				let mut connection = H2Connection::open(&plane).await?;
+
+				clock.advance(SHORT_OF_IDLE);
+				let (response, requests) = connection.call(&[]).await?;
+				let (transport, _peer) = accepted(&plane).await?;
+				drop(transport);
+				trailed(response, &trace).await?;
+				drop(requests);
+
+				clock.advance(IDLE - SHORT_OF_IDLE);
+				connection.answered(&trace).await?;
+				clock.advance(SHORT_OF_IDLE);
+				connection.closed(&trace).await
+			}
+		}
+	}
+
+	tb_assert_spec! {
+		/// A tunnel that ends while a dial holds the one slot: the next call of
+		/// its connection is refused with 14 as `no-slot`, and the connection
+		/// drains.
+		pub DrainedSpec,
+		V(1,0,0): {
+			mode: Accept,
+			assertions: [
+				(CALL_STATUS, exactly!(1)),
+				(REFUSED_STATUS, exactly!(1), equals!("14")),
+				(EDGE_REFUSED, exactly!(1), equals!("no-slot")),
+				(CLOSED, exactly!(1))
+			]
+		}
+	}
+
+	tb_scenario! {
+		name: a_connection_whose_tunnel_ends_with_no_free_slot_refuses_its_next_call_and_drains,
+		spec: DrainedSpec,
+		environment Bare {
+			exec: |SetupEnv { trace, .. }| async move {
+				let clock = Arc::new(ManualClock::default());
+				let plane = plane(idle_limits(), 1, &trace, Arc::clone(&clock) as Arc<dyn Clock>).await?;
+				let mut connection = H2Connection::open(&plane).await?;
+
+				let (response, requests) = connection.call(&[]).await?;
+				let (transport, _peer) = accepted(&plane).await?;
+				let _holder = dial(&plane).await?;
+
+				drop(transport);
+				trailed(response, &trace).await?;
+				drop(requests);
+
+				let (refused, _refused_requests) = connection.call(&[]).await?;
+				let refused = prompt(refused).await?.map_err(unexpected)?;
+				let status = refused.headers().get("grpc-status");
+				let status = status.map(|value| String::from_utf8_lossy(value.as_bytes()).into_owned());
+				trace.event_with(REFUSED_STATUS, &[], status.unwrap_or_default())?;
+
+				// The refusal drained the connection under the deadline that
+				// the end of its tunnel or the refusal read, whichever came
+				// first.
+				clock.advance(IDLE);
+				connection.closed(&trace).await
+			}
+		}
+	}
+
+	tb_assert_spec! {
+		/// A tunnel that no caller takes, whose connection answers a
+		/// millisecond before its deadline and closes at it, then a dial that
+		/// takes its slot and a caller that takes its tunnel.
+		pub IdleTunnelSpec,
+		V(1,0,0): {
+			mode: Accept,
+			assertions: [
+				(ANSWERED_BEFORE, exactly!(1)),
+				(CLOSED, exactly!(1)),
+				(NEXT_DIALED, exactly!(1)),
+				(NEXT_ACCEPTED, exactly!(1)),
+				(EDGE_REFUSED, exactly!(0))
+			]
+		}
+	}
+
+	tb_scenario! {
+		name: a_tunnel_no_caller_takes_closes_its_connection_at_its_deadline,
+		spec: IdleTunnelSpec,
+		environment Bare {
+			exec: |SetupEnv { trace, .. }| async move {
+				let clock = Arc::new(ManualClock::default());
+				let plane = plane(idle_limits(), 1, &trace, Arc::clone(&clock) as Arc<dyn Clock>).await?;
+				let mut connection = H2Connection::open(&plane).await?;
+
+				// The head answers once the plane queued the tunnel under its
+				// deadline.
+				let (silent, _silent_requests) = connection.call(&[]).await?;
+				let _head = prompt(silent).await?.map_err(unexpected)?;
+				clock.advance(SHORT_OF_IDLE);
+				connection.answered(&trace).await?;
+				clock.advance(IDLE - SHORT_OF_IDLE);
+				connection.closed(&trace).await?;
+
+				let _next = dial(&plane).await?;
+				trace.event(NEXT_DIALED)?;
+				accepted(&plane).await?;
+				trace.event(NEXT_ACCEPTED)?;
+				Ok(())
+			}
+		}
+	}
+
+	tb_assert_spec! {
+		/// A call reset before any caller took its tunnel, then a tunnel of
+		/// another connection, the next call of the reset connection, and a
+		/// sentinel, each taken once.
+		pub ResetSpec,
+		V(1,0,0): {
+			mode: Accept,
+			assertions: [
+				(FIRST_ACCEPTED, exactly!(1)),
+				(NEXT_ACCEPTED, exactly!(1)),
+				(SENTINEL_ACCEPTED, exactly!(1)),
+				(EDGE_REFUSED, exactly!(0))
+			]
+		}
+	}
+
+	tb_process_spec! {
+		/// A caller of `accept` takes the tunnel of the other connection first,
+		/// so the reset call holds no slot. The sentinel comes last, so nothing
+		/// else was queued.
+		pub ResetOrder,
+		events {
+			observable { FIRST_ACCEPTED, NEXT_ACCEPTED, SENTINEL_ACCEPTED }
+			hidden { }
+		}
+		states {
+			Open => { FIRST_ACCEPTED => Other },
+			Other => { NEXT_ACCEPTED => Next },
+			Next => { SENTINEL_ACCEPTED => Done },
+			Done => { }
+		}
+		terminal { Done }
+	}
+
+	tb_scenario! {
+		name: a_call_reset_before_accept_holds_no_second_slot_and_never_reaches_a_caller,
+		config: ordered(ResetSpec::latest(), ResetOrder),
+		environment Bare {
+			exec: |SetupEnv { trace, .. }| async move {
+				let plane = plane(TransportLimits::default(), 2, &trace, system()).await?;
+				let mut connection = H2Connection::open(&plane).await?;
+
+				// Each tunnel that a caller takes records the role of its peer.
+				let reset_peer = connection.local;
+				let role = move |peer: SocketAddr, sentinel: Option<SocketAddr>| match peer {
+					peer if Some(peer) == sentinel => SENTINEL_ACCEPTED,
+					peer if peer == reset_peer => NEXT_ACCEPTED,
+					_ => FIRST_ACCEPTED,
+				};
+
+				let (reset, mut reset_requests) = connection.call(&[]).await?;
+				reset_requests.send_reset(h2::Reason::CANCEL);
+				drop(reset);
+
+				let _other = dial(&plane).await?;
+				let (_other_tunnel, peer) = accepted(&plane).await?;
+				trace.event(role(peer, None))?;
+
+				let (_next, _next_requests) = connection.call(&[]).await?;
+				let (_next_tunnel, peer) = accepted(&plane).await?;
+				trace.event(role(peer, None))?;
+
+				let mut sentinel = H2Connection::open(&plane).await?;
+				let (_sentinel, _sentinel_requests) = sentinel.call(&[]).await?;
+				let (_sentinel_tunnel, peer) = accepted(&plane).await?;
+				trace.event(role(peer, Some(sentinel.local)))?;
+				Ok(())
+			}
+		}
+	}
+
+	tb_assert_spec! {
+		/// A call that tonic refuses after its parse with 12, a millisecond
+		/// before the deadline of its connection, which still closes at it.
+		pub UnrenewedSpec,
+		V(1,0,0): {
+			mode: Accept,
+			assertions: [
+				(CALL_STATUS, exactly!(1), equals!("12")),
+				(CLOSED, exactly!(1)),
+				(EDGE_REFUSED, exactly!(0))
+			]
+		}
+	}
+
+	// A call refused after its parse holds no lane, so the connection closes
+	// one millisecond after it, at the deadline that its open read.
+	tb_scenario! {
+		name: calls_refused_after_their_parse_never_renew_the_deadline,
+		spec: UnrenewedSpec,
+		environment Bare {
+			exec: |SetupEnv { trace, .. }| async move {
+				let clock = Arc::new(ManualClock::default());
+				let plane = plane(idle_limits(), 1, &trace, Arc::clone(&clock) as Arc<dyn Clock>).await?;
+				let mut connection = H2Connection::open(&plane).await?;
+
+				clock.advance(SHORT_OF_IDLE);
+				let (refused, _requests) = connection.call(&[("grpc-encoding", "gzip")]).await?;
+				let refused = prompt(refused).await?.map_err(unexpected)?;
+				let status = refused.headers().get("grpc-status");
+				let status = status.map(|value| String::from_utf8_lossy(value.as_bytes()).into_owned());
+				trace.event_with(CALL_STATUS, &[], status.unwrap_or_default())?;
+
+				clock.advance(IDLE - SHORT_OF_IDLE);
+				connection.closed(&trace).await
+			}
+		}
+	}
+
+	tb_assert_spec! {
+		/// A tunnel whose dialer stays silent: the read of the transport that a
+		/// caller of `accept` took ends at the read deadline of the plane.
+		pub SilentTunnelSpec,
+		V(1,0,0): {
+			mode: Accept,
+			assertions: [
+				(READ_LAPSED, exactly!(1)),
+				(EDGE_REFUSED, exactly!(0))
+			]
+		}
+	}
+
+	// The read deadline of an accepted transport runs on the clock of the
+	// plane, so the read ends once the clock passes it, and only then.
+	tb_scenario! {
+		name: a_tunnel_read_ends_at_the_read_deadline_on_the_clock_of_the_plane,
+		spec: SilentTunnelSpec,
+		environment Bare {
+			exec: |SetupEnv { trace, .. }| async move {
+				let clock = Arc::new(ManualClock::default());
+				let limits = TransportLimits { operation_timeout: IDLE, ..TransportLimits::default() };
+				let plane = plane(limits, 1, &trace, Arc::clone(&clock) as Arc<dyn Clock>).await?;
+				let _silent = dial(&plane).await?;
+				let (mut transport, _peer) = accepted(&plane).await?;
+
+				// The first poll reads the deadline of the read and waits.
+				let mut read = pin!(transport.read_envelope_bytes());
+				let waits = poll_fn(|cx| Poll::Ready(read.as_mut().poll(cx).is_pending())).await;
+				if !waits {
+					return Err(unexpected("the read of a silent tunnel MUST wait"));
+				}
+
+				clock.advance(IDLE);
+				let lapsed = prompt(read).await?;
+				if !matches!(lapsed, Err(TransportError::OperationFailed(TransportFailure::DeadlineExceeded))) {
+					return Err(unexpected(format!("the read MUST end at its deadline, got {lapsed:?}")));
+				}
+
+				trace.event(READ_LAPSED)?;
+				Ok(())
+			}
+		}
+	}
+
+	tb_assert_spec! {
+		/// A tunnel that no caller took, which the drop of its listener ends.
+		pub DroppedTunnelSpec,
+		V(1,0,0): {
+			mode: Accept,
+			assertions: [
+				(CLOSED, exactly!(1)),
+				(EDGE_REFUSED, exactly!(0))
+			]
+		}
+	}
+
+	tb_scenario! {
+		name: a_dropped_listener_ends_every_tunnel_no_caller_took,
+		spec: DroppedTunnelSpec,
+		environment Bare {
+			exec: |SetupEnv { trace, .. }| async move {
+				let plane = plane(TransportLimits::default(), 2, &trace, system()).await?;
+				let mut stream = dial(&plane).await?;
+				drop(plane);
+
+				let read = prompt(stream.read_frame(64)).await?;
+				if !matches!(read, Err(TransportError::ConnectionClosed)) {
+					return Err(unexpected(format!("the tunnel MUST end with its listener, got {read:?}")));
+				}
+				trace.event(CLOSED)?;
+				Ok(())
+			}
+		}
+	}
+
+	tb_assert_spec! {
+		/// An idle connection, which the drop of its listener closes.
+		pub DroppedConnectionSpec,
+		V(1,0,0): {
+			mode: Accept,
+			assertions: [
+				(CLOSED, exactly!(1)),
+				(EDGE_REFUSED, exactly!(0))
+			]
+		}
+	}
+
+	tb_scenario! {
+		name: a_dropped_listener_closes_its_idle_connections,
+		spec: DroppedConnectionSpec,
+		environment Bare {
+			exec: |SetupEnv { trace, .. }| async move {
+				let plane = plane(TransportLimits::default(), 2, &trace, system()).await?;
+				let mut connection = H2Connection::open(&plane).await?;
+				drop(plane);
+				connection.closed(&trace).await
+			}
+		}
 	}
 
 	#[test]

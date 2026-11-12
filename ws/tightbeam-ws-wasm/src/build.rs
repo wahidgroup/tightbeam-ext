@@ -10,10 +10,11 @@ use tightbeam::clock::UnixMillis;
 use tightbeam::cms::compressed_data::CompressedData;
 use tightbeam::cms::content_info::CmsVersion;
 use tightbeam::cms::signed_data::{EncapsulatedContentInfo, SignerIdentifier, SignerInfo};
-use tightbeam::compress::Inflator;
+use tightbeam::core::IntegrityVerdict;
 use tightbeam::crypto::aead::{Aes256GcmOid, DecryptContent, Encryptor};
 use tightbeam::crypto::cms::{BareKemKey, KemRecipient};
 use tightbeam::crypto::commitment::CommitmentSalt;
+use tightbeam::crypto::hash::ConstantTimeDigest;
 use tightbeam::crypto::hpke::{HpkeDecryptor, HpkeEncryptor};
 use tightbeam::crypto::k256::{PublicKey, Secp256k1};
 use tightbeam::crypto::key::{Aes256GcmKeyProvider, DiffieHellman, Secp256k1KeyProvider};
@@ -23,9 +24,8 @@ use tightbeam::crypto::sign::{CmsSigner, SignedContent, SignerInfoDraft};
 use tightbeam::crypto::x509::utils::Skid;
 use tightbeam::der::asn1::OctetString;
 use tightbeam::der::{Any, Decode, Encode};
-use tightbeam::matrix::{MatrixDyn, MatrixLike};
+use tightbeam::matrix::MatrixDyn;
 use tightbeam::oids::DATA;
-use tightbeam::router::CleartextFrame;
 use tightbeam::spki::{AlgorithmIdentifierOwned, EncodePublicKey, SubjectPublicKeyInfoOwned};
 use tightbeam::{DigestInfo, Errorizable, Frame, MessagePriority, Opaque, TightBeamError, Version, ZeroizingBytes};
 
@@ -47,12 +47,37 @@ pub enum BuildRefusal {
 	/// A digest holds no octets, so it commits to nothing.
 	#[error("a digest must hold at least one octet")]
 	EmptyDigest,
-	/// A shared key identifier holds no octets, so it names no key.
-	#[error("a shared key identifier must name the key")]
-	EmptyKeyId,
 	/// A signer key identifier holds no octets, so it names no certificate.
 	#[error("a signer key identifier must name the certificate of the key")]
 	EmptySignerId,
+	/// The frame builds at another version than the caller asserted.
+	#[error("the frame builds as {built:?}, not the asserted {asserted:?}")]
+	VersionMismatch {
+		/// The version the caller asserted.
+		asserted: Version,
+		/// The version the frame builds at.
+		built: Version,
+	},
+}
+
+/// A build or decode step that the engine refuses: a rule of this crate, or
+/// an error of tightbeam.
+#[derive(Debug, Errorizable)]
+pub enum StepError {
+	/// A rule of this crate refuses the value.
+	#[error("{0}")]
+	#[from]
+	Refused(BuildRefusal),
+	/// tightbeam refuses the step.
+	#[error("{0}")]
+	#[from]
+	Engine(TightBeamError),
+}
+
+impl From<tightbeam::der::Error> for StepError {
+	fn from(error: tightbeam::der::Error) -> Self {
+		Self::Engine(TightBeamError::from(error))
+	}
 }
 
 /// A security field that a caller installs after the structural build.
@@ -130,7 +155,7 @@ impl SecurityFields {
 /// # Examples
 ///
 /// ```
-/// use tightbeam::{TightBeamError, Version};
+/// use tightbeam::Version;
 /// use tightbeam_ws_wasm::build::{BodyDer, FrameConfig, SecurityField};
 ///
 /// let body = BodyDer::opaque(*b"body")?;
@@ -139,13 +164,14 @@ impl SecurityFields {
 ///
 /// let summary = config.assemble()?.summary()?;
 /// assert_eq!(summary.version, Version::V1);
-/// # Ok::<(), TightBeamError>(())
+/// # Ok::<(), Box<dyn core::error::Error>>(())
 /// ```
 #[derive(Default)]
 pub struct FrameConfig {
 	version: Option<Version>,
+	asserted: Option<Version>,
 	declared: SecurityFields,
-	id: Vec<u8>,
+	id: Option<Vec<u8>>,
 	order: Option<u64>,
 	message: Option<BodyDer>,
 	priority: Option<MessagePriority>,
@@ -162,9 +188,17 @@ impl FrameConfig {
 		self
 	}
 
-	/// Set the opaque message identifier.
+	/// Assert the version the frame builds at, so the assembly refuses
+	/// another version before any security step runs.
+	pub fn assert_version(&mut self, version: Version) -> &mut Self {
+		self.asserted = Some(version);
+		self
+	}
+
+	/// Set the opaque message identifier. A frame without one is refused at
+	/// the assembly, as tightbeam refuses it.
 	pub fn with_id(&mut self, id: impl Into<Vec<u8>>) -> &mut Self {
-		self.id = id.into();
+		self.id = Some(id.into());
 		self
 	}
 
@@ -230,21 +264,18 @@ impl FrameConfig {
 		structural.into_iter().flatten()
 	}
 
-	/// The gated fields the frame carries: the structural fields, then the
-	/// declared security fields.
-	fn gated_fields(&self) -> impl Iterator<Item = GatedField> + '_ {
-		self.structural_fields().chain(self.declared.gated())
-	}
-
 	/// The version the frame carries: the pinned version, or the floor of its
 	/// gated fields, which is the latest [`GatedField::since`] among them.
 	///
-	/// A frame with no gated field stays at V0.
+	/// - A frame with no gated field stays at V0.
+	/// - tightbeam refuses a structural field that a pin forbids as it builds.
+	/// - A declared field installs after the build, so this check refuses a declared field before any
+	///   security step runs.
 	///
 	/// # Errors
 	///
 	/// - [`TightBeamError::UnsupportedField`] -- the pinned version is below
-	///   the floor of a gated field.
+	///   the floor of a declared field.
 	fn effective_version(&self) -> Result<Version, TightBeamError> {
 		let Some(version) = self.version else {
 			let structural = self.structural_fields().map(GatedField::since);
@@ -252,12 +283,27 @@ impl FrameConfig {
 			return Ok(floor);
 		};
 
-		let refused = self.gated_fields().find(|field| !version.allows(*field));
+		let refused = self.declared.gated().find(|field| !version.allows(*field));
 		if let Some(field) = refused {
 			return Err(TightBeamError::UnsupportedField { field, version });
 		}
 
 		Ok(version)
+	}
+
+	/// The version the frame builds at, once it matches the asserted one.
+	///
+	/// # Errors
+	///
+	/// - The errors of [`Self::effective_version`].
+	/// - [`BuildRefusal::VersionMismatch`] -- the frame builds at another
+	///   version than [`Self::assert_version`] named.
+	fn checked_version(&self) -> Result<Version, StepError> {
+		let built = self.effective_version()?;
+		match self.asserted {
+			Some(asserted) if asserted != built => Err(BuildRefusal::VersionMismatch { asserted, built }.into()),
+			_ => Ok(built),
+		}
 	}
 
 	/// The order the frame carries: the configured stamp, or the current Unix
@@ -274,47 +320,53 @@ impl FrameConfig {
 
 	/// Assemble the structural frame, ready for the [`FrameAssembly`] steps.
 	///
-	/// `message` is installed as the frame body. The builder never
-	/// re-encodes it, so any `Message` schema round-trips bit-exactly.
+	/// The configured body is installed as the frame body byte for byte, so
+	/// any `Message` schema round-trips bit-exactly.
 	///
 	/// # Errors
 	///
 	/// - [`TightBeamError::UnsupportedField`] -- the pinned version is below the floor of a
 	///   requested field.
-	pub fn assemble(self) -> Result<FrameAssembly, TightBeamError> {
-		let version = self.effective_version()?;
+	/// - [`BuildRefusal::VersionMismatch`] -- the frame builds at another version than the
+	///   asserted one.
+	/// - [`TightBeamError::BuildError`] -- the config names no id.
+	pub fn assemble(self) -> Result<FrameAssembly, StepError> {
+		let version = self.checked_version()?;
 		let order = self.stamped_order();
 
 		// The upstream builder requires a typed message. Build with the empty
 		// opaque body, then install the caller's body DER.
 		let placeholder = Opaque::new(Vec::new())?;
-
 		let mut builder = FrameBuilder::<Opaque>::from(version)
-			.with_id(self.id)
 			.with_order(order)
 			.with_message(placeholder);
 
+		if let Some(id) = self.id {
+			builder = builder.with_id(id);
+		}
 		if let Some(priority) = self.priority {
 			builder = builder.with_priority(priority);
 		}
 		if let Some(lifetime) = self.lifetime {
 			builder = builder.with_lifetime(lifetime);
 		}
-		if let Some(previous_hash) = self.previous_hash {
-			let parent = previous_hash.into_info()?;
-			builder = builder.with_previous_hash(parent);
+
+		let parent = self.previous_hash;
+		if let Some(previous_hash) = parent.clone() {
+			builder = builder.with_previous_hash(previous_hash.into_info()?);
 		}
 		if let Some(matrix) = self.matrix {
 			builder = builder.with_matrix_dyn(matrix);
 		}
 
 		let frame = builder.build()?;
+		let digests = CarriedDigests { previous_frame: parent, ..CarriedDigests::default() };
 		let Some(body) = self.message else {
-			return Ok(FrameAssembly(frame));
+			return Ok(FrameAssembly { frame, digests });
 		};
 
 		let frame = frame.with_body(body.into_bytes())?;
-		Ok(FrameAssembly(frame))
+		Ok(FrameAssembly { frame, digests })
 	}
 
 	/// Assemble the structural frame and return its DER.
@@ -322,8 +374,8 @@ impl FrameConfig {
 	/// # Errors
 	///
 	/// - The errors of [`Self::assemble`] and [`FrameAssembly::encode`].
-	pub fn build(self) -> Result<Vec<u8>, TightBeamError> {
-		self.assemble()?.encode()
+	pub fn build(self) -> Result<Vec<u8>, StepError> {
+		Ok(self.assemble()?.encode()?)
 	}
 }
 
@@ -381,12 +433,13 @@ impl BodyDer {
 		Ok(Opaque::from_der(&self.0)?.into_bytes())
 	}
 
-	/// The message-commitment preimage over this body under `salt`:
-	/// `0x00 || body DER` for an empty salt, or
-	/// `0x01 || len(salt) as u64 BE || salt || body DER` otherwise.
+	/// The message-commitment preimage over this body under `salt`, in the
+	/// layout that [`CommitmentSalt::preimage`] states:
 	///
-	/// [`CommitmentSalt::preimage`] states the layout, and this collects its
-	/// parts for a caller that hashes with any digest. Install the digest with
+	/// - `0x00 || body DER` for an empty salt.
+	/// - `0x01 || len(salt) as u64 BE || salt || body DER` otherwise.
+	///
+	/// A caller hashes it with any digest and installs the digest with
 	/// [`FrameAssembly::with_message_integrity`].
 	pub fn commitment_preimage(&self, salt: &CommitmentSalt) -> Vec<u8> {
 		let mut preimage = Vec::new();
@@ -394,12 +447,13 @@ impl BodyDer {
 		preimage
 	}
 
-	/// The DER octets.
+	/// A view of the one DER value that the parse admitted.
 	pub fn as_bytes(&self) -> &[u8] {
 		&self.0
 	}
 
-	/// The DER octets.
+	/// The one DER value that the parse admitted, moved out for a frame to
+	/// carry.
 	pub fn into_bytes(self) -> Vec<u8> {
 		self.0
 	}
@@ -452,12 +506,59 @@ impl NamedDigest {
 		&self.digest
 	}
 
+	/// Judge `recomputed`, the digest that `algorithm_oid` produced over the
+	/// preimage, against this digest.
+	///
+	/// - The algorithm decides first, because it is public.
+	/// - The octets then compare in constant time through [`ConstantTimeDigest`], the one home of that
+	///   comparison in tightbeam.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError::SerializationError`] -- `recomputed` exceeds the DER length limit.
+	pub fn verdict(
+		&self,
+		algorithm_oid: ObjectIdentifier,
+		recomputed: impl Into<Vec<u8>>,
+	) -> Result<IntegrityVerdict, TightBeamError> {
+		if algorithm_oid != self.algorithm_oid {
+			return Ok(IntegrityVerdict::AlgorithmMismatch);
+		}
+
+		let carried = Self::info(self.algorithm_oid, self.digest.clone())?;
+		let recomputed = Self::info(algorithm_oid, recomputed.into())?;
+		if carried.digest_matches(&recomputed) {
+			return Ok(IntegrityVerdict::Verified);
+		}
+
+		Ok(IntegrityVerdict::Mismatch)
+	}
+
 	/// The `DigestInfo` that a frame carries: the digest under a
 	/// parameterless `AlgorithmIdentifier`.
 	fn into_info(self) -> Result<DigestInfo, TightBeamError> {
-		let algorithm = AlgorithmIdentifierOwned { oid: self.algorithm_oid, parameters: None };
-		let digest = OctetString::new(self.digest)?;
+		Self::info(self.algorithm_oid, self.digest)
+	}
+
+	/// `digest` under the parameterless `AlgorithmIdentifier` of
+	/// `algorithm_oid`.
+	fn info(algorithm_oid: ObjectIdentifier, digest: Vec<u8>) -> Result<DigestInfo, TightBeamError> {
+		let algorithm = AlgorithmIdentifierOwned { oid: algorithm_oid, parameters: None };
+		let digest = OctetString::new(digest)?;
 		Ok(DigestInfo { algorithm, digest })
+	}
+}
+
+/// A digest that a frame carries, admitted under the rule of
+/// [`NamedDigest::new`].
+impl TryFrom<&DigestInfo> for NamedDigest {
+	type Error = BuildRefusal;
+
+	/// # Errors
+	///
+	/// - [`BuildRefusal::EmptyDigest`] -- the carried digest holds no octets.
+	fn try_from(info: &DigestInfo) -> Result<Self, Self::Error> {
+		Self::new(info.algorithm.oid, info.digest.as_bytes())
 	}
 }
 
@@ -555,10 +656,10 @@ impl SignerKeyId {
 /// A frame that awaits the signature of one key: the frame, and the CMS
 /// `SignerInfo` drafted over it, which names the key.
 ///
-/// [`FrameAssembly::signing`] consumes the frame to draft it, the key signs
-/// [`prehash`](Self::prehash), and [`complete`](Self::complete) consumes the
-/// draft to attach the signature. A draft therefore completes the frame it
-/// was drafted over, and it completes that frame once.
+/// - [`FrameAssembly::signing`] consumes the frame to draft it.
+/// - The key signs [`prehash`](Self::prehash).
+/// - [`complete`](Self::complete) consumes the draft to attach the signature, so a draft completes the
+///   frame it was drafted over, and it completes that frame once.
 ///
 /// # Examples
 ///
@@ -572,7 +673,7 @@ impl SignerKeyId {
 /// let signer = SignerKeyId::of(key.verifying_key())?;
 ///
 /// let mut config = FrameConfig::default();
-/// config.with_version(Version::V1).with_message(BodyDer::opaque(*b"body")?);
+/// config.with_id(*b"id").with_version(Version::V1).with_message(BodyDer::opaque(*b"body")?);
 /// let signing = config.assemble()?.signing(&signer)?;
 ///
 /// let signature: Secp256k1Signature = key.sign_prehash(signing.prehash())?;
@@ -605,18 +706,19 @@ impl Signing {
 		let Self { assembly, draft } = self;
 		let signer_info = draft.complete(signature, None)?;
 
-		let mut frame = assembly.0;
+		let FrameAssembly { mut frame, digests } = assembly;
 		frame.attach_signer_info(signer_info)?;
-		Ok(FrameAssembly(frame))
+		Ok(FrameAssembly { frame, digests })
 	}
 }
 
-/// A frame between two assembly steps.
+/// A frame between two assembly steps. The caller's own cryptography runs
+/// between the steps, so each step installs or reads one field.
 ///
-/// The caller's own cryptography runs between the steps, so each step
-/// installs or reads one field. A step that installs a field refuses a field
-/// the frame's version forbids. It also refuses to run behind a later step
-/// that the frame holds, in the order of tightbeam's [`InstallStep`]:
+/// - A step that installs a field refuses a field that the version of the frame forbids.
+/// - A step refuses to run behind a later step that the frame holds.
+///
+/// The steps run in the order of tightbeam's [`InstallStep`]:
 ///
 /// 1. The message commitment.
 /// 2. The compactness.
@@ -654,17 +756,39 @@ impl Signing {
 /// ```
 ///
 /// [`InstallStep`]: tightbeam::asn1::InstallStep
-pub struct FrameAssembly(Frame);
+pub struct FrameAssembly {
+	frame: Frame,
+	digests: CarriedDigests,
+}
+
+/// The digests a frame carries, each admitted once as a [`NamedDigest`]: as
+/// the frame decodes, or as the step that installs it runs.
+#[derive(Clone, Default)]
+struct CarriedDigests {
+	previous_frame: Option<NamedDigest>,
+	message_integrity: Option<NamedDigest>,
+	frame_integrity: Option<NamedDigest>,
+}
 
 impl FrameAssembly {
-	/// Decode the frame that `frame_der` encodes.
+	/// Decode the frame that `frame_der` encodes, and admit each digest it
+	/// carries as a [`NamedDigest`].
 	///
 	/// # Errors
 	///
 	/// - [`TightBeamError::SerializationError`] -- the octets are no frame.
-	pub fn decode(frame_der: impl AsRef<[u8]>) -> Result<Self, TightBeamError> {
+	/// - [`BuildRefusal::EmptyDigest`] -- a digest the frame carries holds no octets.
+	pub fn decode(frame_der: impl AsRef<[u8]>) -> Result<Self, StepError> {
 		let frame = Frame::from_der(frame_der.as_ref())?;
-		Ok(Self(frame))
+		let metadata = frame.metadata();
+		let admitted = |carried: Option<&DigestInfo>| carried.map(NamedDigest::try_from).transpose();
+
+		let digests = CarriedDigests {
+			previous_frame: admitted(metadata.previous_frame())?,
+			message_integrity: admitted(metadata.integrity())?,
+			frame_integrity: admitted(frame.integrity())?,
+		};
+		Ok(Self { frame, digests })
 	}
 
 	/// The DER of the frame.
@@ -673,16 +797,16 @@ impl FrameAssembly {
 	///
 	/// - [`TightBeamError::SerializationError`] -- the frame exceeds the DER length limit.
 	pub fn encode(&self) -> Result<Vec<u8>, TightBeamError> {
-		Ok(self.0.to_der()?)
+		Ok(self.frame.to_der()?)
 	}
 
 	/// The message-commitment preimage over the body this frame holds, under
-	/// `salt`. Hash it with any digest, and install the digest with
-	/// [`with_message_integrity`](Self::with_message_integrity).
+	/// `salt`, in the layout that [`CommitmentSalt::preimage`] states.
 	///
-	/// [`CommitmentSalt::preimage`] states the layout. Read the preimage
-	/// before any step that replaces the body, because the commitment covers
-	/// the body as the caller wrote it.
+	/// - A caller hashes it with any digest and installs the digest with
+	///   [`with_message_integrity`](Self::with_message_integrity).
+	/// - Read the preimage before any step that replaces the body, because the commitment covers the body
+	///   as the caller wrote it.
 	///
 	/// # Errors
 	///
@@ -694,23 +818,6 @@ impl FrameAssembly {
 		Ok(body.commitment_preimage(salt))
 	}
 
-	/// The body this frame carries, inflated by `inflator`: the step a
-	/// cleartext compressed frame takes before its body decodes
-	/// ([`CleartextFrame::inflate`]). A frame that carries no compactness
-	/// keeps its body.
-	///
-	/// # Errors
-	///
-	/// - [`RouterError::ConfidentialFrame`](tightbeam::router::RouterError::ConfidentialFrame) --
-	///   the frame is sealed, so its body opens through a decrypt.
-	/// - The errors of [`Frame::inflate_in_place`], among them the error of
-	///   [`Inflator::decompress`] when the codec refuses the body.
-	pub fn inflate(&self, inflator: &dyn Inflator) -> Result<Vec<u8>, TightBeamError> {
-		let frame = self.0.clone();
-		let inflated = CleartextFrame::inflate(frame, inflator)?;
-		Ok(inflated.frame().message().to_vec())
-	}
-
 	/// The plaintext body of the frame. The frame decides from its own
 	/// confidentiality and compactness whether the body is plaintext.
 	///
@@ -719,11 +826,11 @@ impl FrameAssembly {
 	/// - [`TightBeamError::OpaqueBody`] -- the body still needs a decrypt or an inflate.
 	/// - [`TightBeamError::SerializationError`] -- the body is not one DER value.
 	fn plain_body(&self) -> Result<BodyDer, TightBeamError> {
-		if let Some(transform) = self.0.body_transform() {
+		if let Some(transform) = self.frame.body_transform() {
 			return Err(TightBeamError::OpaqueBody(transform));
 		}
 
-		BodyDer::try_from(self.0.message().to_vec())
+		BodyDer::try_from(self.frame.message().to_vec())
 	}
 
 	/// Install a message-integrity commitment: the digest of
@@ -735,8 +842,11 @@ impl FrameAssembly {
 	/// - [`TightBeamError::UnsupportedField`] -- the frame's version predates the field.
 	/// - [`TightBeamError::InstallOutOfOrder`] -- the frame holds a later step.
 	pub fn with_message_integrity(self, commitment: NamedDigest) -> Result<Self, TightBeamError> {
-		let commitment = commitment.into_info()?;
-		Ok(Self(self.0.with_message_integrity(commitment)?))
+		let Self { frame, mut digests } = self;
+		let frame = frame.with_message_integrity(commitment.clone().into_info()?)?;
+
+		digests.message_integrity = Some(commitment);
+		Ok(Self { frame, digests })
 	}
 
 	/// Replace the frame body with the compressed body and record how it
@@ -749,7 +859,10 @@ impl FrameAssembly {
 	/// - [`TightBeamError::InvalidMetadata`] -- the compactness info is malformed.
 	pub fn with_compactness(self, compactness: Compactness) -> Result<Self, TightBeamError> {
 		let described = CompressedData::try_from(&compactness)?;
-		Ok(Self(self.0.with_compactness(described, compactness.compressed)?))
+		let Self { frame, digests } = self;
+
+		let frame = frame.with_compactness(described, compactness.compressed)?;
+		Ok(Self { frame, digests })
 	}
 
 	/// Replace the frame body with the ciphertext of `sealed` and install its
@@ -764,7 +877,9 @@ impl FrameAssembly {
 	/// - [`TightBeamError::InstallOutOfOrder`] -- the frame holds a later step.
 	/// - [`TightBeamError::InvalidMetadata`] -- the envelope carries the ciphertext inside it.
 	pub fn with_confidentiality(self, sealed: SealedBody) -> Result<Self, TightBeamError> {
-		Ok(Self(self.0.with_confidentiality(sealed.envelope, sealed.ciphertext)?))
+		let Self { frame, digests } = self;
+		let frame = frame.with_confidentiality(sealed.envelope, sealed.ciphertext)?;
+		Ok(Self { frame, digests })
 	}
 
 	/// The frame-integrity (witness) preimage: hash it with any digest and
@@ -778,7 +893,7 @@ impl FrameAssembly {
 	/// - [`TightBeamError::SerializationError`] -- the metadata does not encode.
 	pub fn witness_preimage(&self) -> Result<Vec<u8>, TightBeamError> {
 		let mut preimage = Vec::new();
-		self.0.witness_preimage(|part| preimage.extend_from_slice(part))?;
+		self.frame.witness_preimage(|part| preimage.extend_from_slice(part))?;
 		Ok(preimage)
 	}
 
@@ -791,8 +906,11 @@ impl FrameAssembly {
 	/// - [`TightBeamError::UnsupportedField`] -- the frame's version predates the field.
 	/// - [`TightBeamError::InstallOutOfOrder`] -- the frame holds a later step.
 	pub fn with_witness(self, witness: NamedDigest) -> Result<Self, TightBeamError> {
-		let witness = witness.into_info()?;
-		Ok(Self(self.0.with_frame_integrity(witness)?))
+		let Self { frame, mut digests } = self;
+		let frame = frame.with_frame_integrity(witness.clone().into_info()?)?;
+
+		digests.frame_integrity = Some(witness);
+		Ok(Self { frame, digests })
 	}
 
 	/// The to-be-signed octets of the frame: everything but the signature.
@@ -804,7 +922,7 @@ impl FrameAssembly {
 	///
 	/// - [`TightBeamError::SerializationError`] -- the frame does not encode.
 	pub fn tbs(&self) -> Result<Vec<u8>, TightBeamError> {
-		self.0.to_tbs()
+		self.frame.to_tbs()
 	}
 
 	/// Draft the signature that the key `signer` names owes this frame, and
@@ -835,28 +953,33 @@ impl FrameAssembly {
 	/// - [`TightBeamError::SerializationError`] -- the frame or its signed attributes do not
 	///   encode.
 	pub fn signature_prehash(&self) -> Result<Vec<u8>, TightBeamError> {
-		let signer_info = self.0.nonrepudiation().ok_or(TightBeamError::MissingSignature)?;
+		let signer_info = self.frame.nonrepudiation().ok_or(TightBeamError::MissingSignature)?;
 		let draft = self.signature_draft(signer_info.sid.clone())?;
 		Ok(draft.prehash().to_vec())
 	}
 
 	/// Verify the frame's non-repudiation signature under a pinned profile
-	/// key.
+	/// key, over the signed attributes, which bind the frame's TBS.
 	///
-	/// The key is the trust decision, so the check reads no certificate. The
-	/// signature verifies over the signed attributes, which bind the frame's
-	/// TBS.
+	/// The key is the trust decision, so the check reads the key alone.
 	///
 	/// # Errors
 	///
 	/// - [`TightBeamError::MissingSignature`] -- the frame is unsigned.
 	/// - [`TightBeamError::SignatureError`] -- the signature does not verify under `key`.
 	pub fn verify_signature(&self, key: &Secp256k1VerifyingKey) -> Result<(), TightBeamError> {
-		let signer_info = self.0.nonrepudiation().ok_or(TightBeamError::MissingSignature)?;
-		let tbs = self.0.to_tbs()?;
+		let signer_info = self.frame.nonrepudiation().ok_or(TightBeamError::MissingSignature)?;
+		let tbs = self.frame.to_tbs()?;
 
 		CmsSigner::verify::<Secp256k1Signature, _>(signer_info, key, SignedContent::data(&tbs))?;
 		Ok(())
+	}
+
+	/// The octets the frame body holds now: the body DER, its compressed form
+	/// once the compactness step ran, or its ciphertext once sealed.
+	#[must_use]
+	pub fn body(&self) -> &[u8] {
+		self.frame.message()
 	}
 
 	/// The body, the metadata, and the carried security fields of the frame,
@@ -866,35 +989,29 @@ impl FrameAssembly {
 	///
 	/// - [`TightBeamError::SerializationError`] -- a carried field does not encode.
 	pub fn summary(&self) -> Result<FrameSummary, TightBeamError> {
-		let frame = &self.0;
+		let frame = &self.frame;
 		let metadata = frame.metadata();
-
-		let compactness = metadata.compactness().map(CompactnessSummary::try_from).transpose()?;
-		let confidentiality = metadata.confidentiality().map(ConfidentialitySummary::try_from).transpose()?;
-		let signature = frame.nonrepudiation().map(|signed| SignatureSummary::from(&**signed));
-		let matrix = metadata.matrix().map(MatrixSummary::from);
+		let digests = self.digests.clone();
 
 		Ok(FrameSummary {
 			version: frame.version(),
 			id: metadata.id().to_vec(),
 			order: metadata.order(),
-			body_der: frame.message().to_vec(),
+			body: FrameBody::of(frame)?,
 			priority: metadata.priority(),
 			lifetime: metadata.lifetime(),
-			previous_frame: metadata.previous_frame().map(DigestSummary::from),
-			matrix,
-			message_integrity: metadata.integrity().map(DigestSummary::from),
-			frame_integrity: frame.integrity().map(DigestSummary::from),
-			compactness,
-			confidentiality,
-			signature,
+			previous_frame: digests.previous_frame,
+			matrix: metadata.matrix().cloned(),
+			message_integrity: digests.message_integrity,
+			frame_integrity: digests.frame_integrity,
+			signature: frame.nonrepudiation().map(|signed| SignatureSummary::from(&**signed)),
 		})
 	}
 
 	/// The CMS `SignerInfo` that the frame's signature completes, naming
 	/// `sid`, over the TBS under the profile signature.
 	fn signature_draft(&self, sid: SignerIdentifier) -> Result<SignerInfoDraft, TightBeamError> {
-		let tbs = self.0.to_tbs()?;
+		let tbs = self.frame.to_tbs()?;
 		Ok(CmsSigner::draft::<Secp256k1Signature>(sid, SignedContent::data(&tbs))?)
 	}
 }
@@ -915,74 +1032,71 @@ pub struct FrameSummary {
 	/// Unix timestamp or a dense per-channel counter. When omitted at build
 	/// time, the profile defaults to the current Unix time in seconds.
 	pub order: u64,
-	/// The raw frame body: the caller's body DER when cleartext, or the
-	/// ciphertext when confidential. Decode a profile opaque body with
-	/// [`BodyDer::opaque_message`]. Typed bodies decode under the caller's
-	/// schema.
-	pub body_der: Vec<u8>,
+	/// The body, and the layer a reader reverses first.
+	pub body: FrameBody,
 	/// Message priority, when present (V2+).
 	pub priority: Option<MessagePriority>,
 	/// Time-to-live in seconds, when present (V2+).
 	pub lifetime: Option<u64>,
 	/// The parent-frame link by content digest, when present (V2+).
-	pub previous_frame: Option<DigestSummary>,
+	pub previous_frame: Option<NamedDigest>,
 	/// The control matrix, when present (V3+).
-	pub matrix: Option<MatrixSummary>,
+	pub matrix: Option<MatrixDyn>,
 	/// The message commitment, when committed.
-	pub message_integrity: Option<DigestSummary>,
+	pub message_integrity: Option<NamedDigest>,
 	/// The witness, when witnessed.
-	pub frame_integrity: Option<DigestSummary>,
-	/// How the body compressed, when compressed.
-	pub compactness: Option<CompactnessSummary>,
-	/// The envelope that seals the body, when confidential.
-	pub confidentiality: Option<ConfidentialitySummary>,
+	pub frame_integrity: Option<NamedDigest>,
 	/// The non-repudiation signature, when signed.
 	pub signature: Option<SignatureSummary>,
 }
 
-/// A carried digest: its algorithm and its octets.
-pub struct DigestSummary {
-	/// The digest algorithm OID.
-	pub algorithm_oid: ObjectIdentifier,
-	/// The digest octets.
-	pub digest: Vec<u8>,
+/// The body a frame carries, by the layer a reader reverses first, in the
+/// order of tightbeam's `Frame::body_transform`: the seal before the
+/// compression.
+pub enum FrameBody {
+	/// A cleartext body that decodes as it is.
+	Plain(Vec<u8>),
+	/// A cleartext body that a reader inflates before it decodes.
+	Compressed {
+		/// The compressed octets.
+		data: Vec<u8>,
+		/// How the body compressed.
+		compactness: CompactnessSummary,
+	},
+	/// A sealed body that a reader opens first, and inflates next when the
+	/// sender compressed it before the seal.
+	Sealed {
+		/// The ciphertext, detached from its envelope.
+		ciphertext: Vec<u8>,
+		/// The envelope that seals the body.
+		confidentiality: ConfidentialitySummary,
+		/// How the body compressed under the seal, when it did.
+		compactness: Option<CompactnessSummary>,
+	},
 }
 
-impl From<&DigestInfo> for DigestSummary {
-	fn from(info: &DigestInfo) -> Self {
-		let algorithm_oid = info.algorithm.oid;
-		let digest = info.digest.as_bytes().to_vec();
+impl FrameBody {
+	/// The body of `frame`, with the layer its confidentiality and
+	/// compactness name.
+	///
+	/// # Errors
+	///
+	/// - [`TightBeamError::SerializationError`] -- a carried info does not encode.
+	fn of(frame: &Frame) -> Result<Self, TightBeamError> {
+		let metadata = frame.metadata();
+		let octets = frame.message().to_vec();
+		let compactness = metadata.compactness().map(CompactnessSummary::try_from).transpose()?;
 
-		Self { algorithm_oid, digest }
-	}
-}
+		let body = match (metadata.confidentiality(), compactness) {
+			(Some(envelope), compactness) => {
+				let confidentiality = ConfidentialitySummary::try_from(envelope)?;
+				Self::Sealed { ciphertext: octets, confidentiality, compactness }
+			}
+			(None, Some(compactness)) => Self::Compressed { data: octets, compactness },
+			(None, None) => Self::Plain(octets),
+		};
 
-/// A carried N×N control matrix (V3+), as the frame decoded it.
-pub struct MatrixSummary {
-	n: u8,
-	data: Vec<u8>,
-}
-
-impl From<&MatrixDyn> for MatrixSummary {
-	fn from(matrix: &MatrixDyn) -> Self {
-		let n = matrix.n();
-		let data = matrix.as_bytes().to_vec();
-
-		Self { n, data }
-	}
-}
-
-impl MatrixSummary {
-	/// The dimension N, from 1 to 255.
-	#[must_use]
-	pub fn n(&self) -> u8 {
-		self.n
-	}
-
-	/// The row-major octets, `n * n` of them.
-	#[must_use]
-	pub fn data(&self) -> &[u8] {
-		&self.data
+		Ok(body)
 	}
 }
 
@@ -1015,6 +1129,8 @@ impl TryFrom<&CompressedData> for CompactnessSummary {
 pub struct ConfidentialitySummary {
 	/// The content-encryption algorithm OID.
 	pub algorithm_oid: ObjectIdentifier,
+	/// The content type that the envelope authenticates for the sealed body.
+	pub content_oid: ObjectIdentifier,
 	/// The DER `AuthEnvelopedData`. The ciphertext travels in the body,
 	/// detached from it.
 	pub envelope_der: Vec<u8>,
@@ -1024,9 +1140,11 @@ impl TryFrom<&AuthEnvelopedData> for ConfidentialitySummary {
 	type Error = TightBeamError;
 
 	fn try_from(envelope: &AuthEnvelopedData) -> Result<Self, Self::Error> {
-		let algorithm_oid = envelope.auth_encrypted_content_info.content_enc_alg.oid;
+		let content = &envelope.auth_encrypted_content_info;
+		let algorithm_oid = content.content_enc_alg.oid;
+		let content_oid = content.content_type;
 		let envelope_der = envelope.to_der()?;
-		Ok(Self { algorithm_oid, envelope_der })
+		Ok(Self { algorithm_oid, content_oid, envelope_der })
 	}
 }
 
@@ -1103,11 +1221,11 @@ impl SealedBody {
 	}
 
 	/// Open the ciphertext under `decryptor`, against the envelope that seals
-	/// it, returning the plaintext body DER.
+	/// it, returning the octets that were sealed.
 	///
 	/// # Errors
 	///
-	/// - [`TightBeamError`] -- `decryptor` refuses the envelope or the ciphertext.
+	/// - The [`TightBeamError`] of a `decryptor` that refuses the envelope or the ciphertext.
 	async fn open(self, decryptor: &impl DecryptContent) -> Result<Vec<u8>, TightBeamError> {
 		let Self { envelope, mut ciphertext } = self;
 		decryptor.decrypt_content(&envelope, &mut ciphertext).await?;
@@ -1116,69 +1234,64 @@ impl SealedBody {
 	}
 }
 
-/// A shared key-encryption key and the identifier that names it to every
-/// holder. The identifier holds at least one octet.
-///
-/// # Examples
-///
-/// ```
-/// use tightbeam::ZeroizingBytes;
-/// use tightbeam_ws_wasm::build::{BuildRefusal, SharedKey};
-///
-/// let key = ZeroizingBytes::new(vec![0x42; 32]);
-/// let refused = SharedKey::new(key, Vec::new());
-/// assert!(matches!(refused, Err(BuildRefusal::EmptyKeyId)));
-/// ```
-pub struct SharedKey {
-	key: ZeroizingBytes,
-	key_id: Vec<u8>,
-}
-
-impl SharedKey {
-	/// The raw 32-byte `key`, named by `key_id`, the identifier an envelope
-	/// carries in the clear. The buffer of `key` wipes once a provider reads
-	/// it, or once this call refuses it.
-	///
-	/// # Errors
-	///
-	/// - [`BuildRefusal::EmptyKeyId`] -- `key_id` is empty, so it names no key.
-	pub fn new(key: ZeroizingBytes, key_id: impl Into<Vec<u8>>) -> Result<Self, BuildRefusal> {
-		let key_id = key_id.into();
-		if key_id.is_empty() {
-			return Err(BuildRefusal::EmptyKeyId);
-		}
-
-		Ok(Self { key, key_id })
-	}
+/// A shared key that the profile cipher refuses.
+#[derive(Debug, Errorizable)]
+pub enum SharedKeyRefusal {
+	/// The key identifier holds no octets, so it names no key.
+	#[error("a shared key identifier must name the key")]
+	EmptyKeyId,
+	/// tightbeam refuses the key, such as a key that is not 32 octets.
+	#[error("{0}")]
+	#[from]
+	Key(TightBeamError),
 }
 
 /// Profile key-encryption key: a 32-byte shared key that wraps a fresh
 /// AES-256-GCM content key per seal, in a `KEKRecipientInfo` named by its
 /// key identifier (RFC 5652 § 6.2.3).
+///
+/// # Examples
+///
+/// ```
+/// use tightbeam::ZeroizingBytes;
+/// use tightbeam_ws_wasm::build::{Aes256GcmKey, SharedKeyRefusal};
+///
+/// let key = ZeroizingBytes::new(vec![0x42; 32]);
+/// let refused = Aes256GcmKey::new(key, Vec::new());
+/// assert!(matches!(refused, Err(SharedKeyRefusal::EmptyKeyId)));
+/// ```
 pub struct Aes256GcmKey {
 	provider: Aes256GcmKeyProvider,
 }
 
 impl Aes256GcmKey {
-	/// Hold `shared`.
+	/// The raw 32-byte `key`, named by `key_id`, the identifier an envelope
+	/// carries in the clear to name the key to every holder.
 	///
-	/// The buffer that holds the key wipes once the provider reads it,
-	/// whether or not the provider admits its length.
+	/// The buffer that holds the key wipes once the provider reads it, or once
+	/// this call refuses it.
 	///
 	/// # Errors
 	///
-	/// - [`TightBeamError::KeyError`] -- the key is not 32 octets.
-	pub fn new(shared: SharedKey) -> Result<Self, TightBeamError> {
-		let provider = Aes256GcmKeyProvider::new(shared.key, shared.key_id)?;
+	/// - [`SharedKeyRefusal::EmptyKeyId`] -- `key_id` is empty, so it names no key.
+	/// - [`SharedKeyRefusal::Key`] -- tightbeam refuses the key, which is not 32 octets.
+	pub fn new(key: ZeroizingBytes, key_id: impl Into<Vec<u8>>) -> Result<Self, SharedKeyRefusal> {
+		let key_id = key_id.into();
+		if key_id.is_empty() {
+			return Err(SharedKeyRefusal::EmptyKeyId);
+		}
+
+		let provider = Aes256GcmKeyProvider::new(key, key_id).map_err(TightBeamError::from)?;
 		Ok(Self { provider })
 	}
 
-	/// Seal `plaintext` (a [`BodyDer`]) of type `content_oid`, or `id-data`
-	/// without one, under a fresh content key.
+	/// Seal `plaintext` of type `content_oid`, or `id-data` without one,
+	/// under a fresh content key.
 	///
 	/// # Errors
 	///
-	/// - [`TightBeamError`] -- the content cipher or the key wrap fails.
+	/// - The [`TightBeamError`] of a seal that fails, such as a random source, a key wrap or a content
+	///   cipher that fails, or an envelope past a DER length.
 	pub fn seal(
 		&self,
 		plaintext: impl AsRef<[u8]>,
@@ -1188,11 +1301,12 @@ impl Aes256GcmKey {
 		SealedBody::try_from(sealed?)
 	}
 
-	/// Open a sealed body, returning the plaintext body DER.
+	/// Open a sealed body, returning the octets that were sealed.
 	///
 	/// # Errors
 	///
-	/// - [`TightBeamError`] -- the envelope names another key, or the ciphertext fails its tag.
+	/// - The [`TightBeamError`] of an envelope or a ciphertext that the key refuses, such as an envelope that
+	///   names another key, or a ciphertext that fails its tag.
 	pub async fn open(&self, sealed: SealedBody) -> Result<Vec<u8>, TightBeamError> {
 		sealed.open(&self.provider).await
 	}
@@ -1209,7 +1323,7 @@ impl HpkeSecp256k1Encryptor {
 	///
 	/// # Errors
 	///
-	/// - [`TightBeamError`] -- the octets are no secp256k1 point.
+	/// - The [`TightBeamError`] of octets that are no secp256k1 point.
 	pub fn from_sec1(recipient_public_key: impl AsRef<[u8]>) -> Result<Self, TightBeamError> {
 		let key = Secp256k1VerifyingKey::from_sec1_bytes(recipient_public_key.as_ref())?;
 		let spki = key.to_public_key_der()?;
@@ -1223,7 +1337,7 @@ impl HpkeSecp256k1Encryptor {
 	///
 	/// # Errors
 	///
-	/// - [`TightBeamError`] -- the key agreement or the content cipher fails.
+	/// - The [`TightBeamError`] of a key agreement or a content cipher that fails.
 	pub fn seal(
 		&self,
 		plaintext: impl AsRef<[u8]>,
@@ -1244,22 +1358,21 @@ impl HpkeSecp256k1Decryptor {
 	///
 	/// # Errors
 	///
-	/// - [`TightBeamError`] -- the key does not form a KEM recipient key.
+	/// - The [`TightBeamError`] of a key that forms no KEM recipient key.
 	pub fn new(signing_key: Secp256k1SigningKey) -> Result<Self, TightBeamError> {
 		let public = PublicKey::from(signing_key.verifying_key());
-
 		let backend: Arc<dyn DiffieHellman<Secp256k1>> = Arc::new(Secp256k1KeyProvider::from(signing_key));
-		let inner = HpkeDecryptor::new(BareKemKey::new(public, backend)?);
 
+		let inner = HpkeDecryptor::new(BareKemKey::new(public, backend)?);
 		Ok(Self { inner })
 	}
 
-	/// Open a sealed body, returning the plaintext body DER.
+	/// Open a sealed body, returning the octets that were sealed.
 	///
 	/// # Errors
 	///
-	/// - [`TightBeamError`] -- the envelope names another recipient, or the ciphertext fails
-	///   its tag.
+	/// - The [`TightBeamError`] of an envelope or a ciphertext that the recipient refuses, such as an
+	///   envelope that names another recipient, or a ciphertext that fails its tag.
 	pub async fn open(&self, sealed: SealedBody) -> Result<Vec<u8>, TightBeamError> {
 		sealed.open(&self.inner).await
 	}
@@ -1271,6 +1384,7 @@ mod tests {
 	use std::time::{SystemTime, UNIX_EPOCH};
 
 	use tightbeam::asn1::{BodyTransform, GatedField};
+	use tightbeam::builder::error::{BuildError, MetadataError};
 	use tightbeam::core::IntegrityVerdict;
 	use tightbeam::crypto::commitment::{CommitmentSalt, Opening};
 	use tightbeam::crypto::hash::{Digest as _, Sha3_256};
@@ -1280,19 +1394,24 @@ mod tests {
 	use tightbeam::crypto::sign::ecdsa::{Secp256k1Signature, Secp256k1SigningKey};
 	use tightbeam::crypto::sign::PrehashSigner;
 	use tightbeam::crypto::x509::{KeyPurposes, PeerCertificate, Signing};
+	use tightbeam::der::asn1::OctetString;
 	use tightbeam::der::{Decode, Encode, Sequence};
 	use tightbeam::matrix::{MatrixDyn, MatrixLike};
-	use tightbeam::oids::{AES_256_GCM, DHKEM_SECP256K1, HASH_SHA3_256, SIGNER_ECDSA_WITH_SHA3_256};
+	use tightbeam::oids::{AES_256_GCM, DATA, DHKEM_SECP256K1, HASH_SHA3_256, SIGNER_ECDSA_WITH_SHA3_256};
+	use tightbeam::spki::AlgorithmIdentifierOwned;
 	use tightbeam::testing::{unhex, TestCertificate};
-	use tightbeam::{tb_cases, Beamable, Frame, MessagePriority, Opaque, TightBeamError, Version, ZeroizingBytes};
+	use tightbeam::{
+		tb_cases, Beamable, DigestInfo, Frame, MessagePriority, Opaque, TightBeamError, Version, ZeroizingBytes,
+	};
 
 	use tightbeam::compress::{Compressor, ZstdCompression};
 
 	use tightbeam::spki::EncodePublicKey;
 
 	use super::{
-		Aes256GcmKey, BodyDer, Compactness, FrameAssembly, FrameConfig, FrameSummary, HpkeSecp256k1Decryptor,
-		HpkeSecp256k1Encryptor, NamedDigest, SealedBody, SecurityField, SharedKey, SignerKeyId,
+		Aes256GcmKey, BodyDer, BuildRefusal, Compactness, CompactnessSummary, ConfidentialitySummary, FrameAssembly,
+		FrameBody, FrameConfig, FrameSummary, HpkeSecp256k1Decryptor, HpkeSecp256k1Encryptor, NamedDigest, SealedBody,
+		SecurityField, SignerKeyId, StepError,
 	};
 
 	type TestResult = core::result::Result<(), Box<dyn core::error::Error>>;
@@ -1362,6 +1481,33 @@ mod tests {
 		Ok(FrameAssembly::decode(frame_der)?.summary()?)
 	}
 
+	/// The octets of a cleartext body.
+	fn plain_body(body: FrameBody) -> AnyResult<Vec<u8>> {
+		let FrameBody::Plain(der) = body else {
+			return Err("the body is not cleartext".into());
+		};
+
+		Ok(der)
+	}
+
+	/// The ciphertext of a sealed body and the envelope that seals it.
+	fn sealed_body(body: FrameBody) -> AnyResult<(Vec<u8>, ConfidentialitySummary)> {
+		let FrameBody::Sealed { ciphertext, confidentiality, .. } = body else {
+			return Err("the body is not sealed".into());
+		};
+
+		Ok((ciphertext, confidentiality))
+	}
+
+	/// The octets of a compressed cleartext body and how it compressed.
+	fn compressed_body(body: FrameBody) -> AnyResult<(Vec<u8>, CompactnessSummary)> {
+		let FrameBody::Compressed { data, compactness } = body else {
+			return Err("the body is not compressed cleartext".into());
+		};
+
+		Ok((data, compactness))
+	}
+
 	/// A salt long enough to hide a body.
 	const HIDING_SALT: &[u8] = b"tbws-commitment-salt";
 
@@ -1369,9 +1515,9 @@ mod tests {
 	const KEY_ID: &[u8] = b"tbws/test/kek/v1";
 
 	/// A shared key of 32 `fill` octets, named by [`KEY_ID`].
-	fn shared_key(fill: u8) -> SharedKey {
+	fn shared_key(fill: u8) -> Aes256GcmKey {
 		let key = ZeroizingBytes::new(vec![fill; 32]);
-		let shared = SharedKey::new(key, KEY_ID);
+		let shared = Aes256GcmKey::new(key, KEY_ID);
 		shared.expect("the fixture key names itself")
 	}
 
@@ -1415,6 +1561,22 @@ mod tests {
 		assert_eq!(frame.metadata().order(), 42);
 		assert!(frame.integrity().is_none());
 		assert!(frame.nonrepudiation().is_none());
+		Ok(())
+	}
+
+	#[test]
+	fn a_frame_without_an_id_is_refused() -> TestResult {
+		let mut config = FrameConfig::default();
+		config.with_order(1).with_message(sample_body_der()?);
+
+		let refused = config.assemble();
+		let missing_id = matches!(
+			refused,
+			Err(StepError::Engine(TightBeamError::BuildError(BuildError::InvalidMetadata(
+				MetadataError::MissingId
+			))))
+		);
+		assert!(missing_id);
 		Ok(())
 	}
 
@@ -1514,9 +1676,57 @@ mod tests {
 		let refused = config.build();
 		assert!(matches!(
 			refused,
-			Err(TightBeamError::UnsupportedField { field: GatedField::Confidentiality, version: Version::V0 })
+			Err(StepError::Engine(TightBeamError::UnsupportedField {
+				field: GatedField::Confidentiality,
+				version: Version::V0
+			}))
 		));
 		Ok(())
+	}
+
+	/// An asserted version that the frame misses refuses at the assembly,
+	/// before any security step runs.
+	#[test]
+	fn an_asserted_version_the_frame_misses_is_refused() -> TestResult {
+		let mut config = base_config(b"asserted", 1)?;
+		config.declare(SecurityField::Nonrepudiation).assert_version(Version::V0);
+
+		let refused = config.assemble();
+		let mismatch = BuildRefusal::VersionMismatch { asserted: Version::V0, built: Version::V1 };
+		assert!(matches!(refused, Err(StepError::Refused(refusal)) if refusal == mismatch));
+		Ok(())
+	}
+
+	#[test]
+	fn a_decoded_frame_that_carries_an_empty_digest_is_refused() -> TestResult {
+		let algorithm = AlgorithmIdentifierOwned { oid: HASH_SHA3_256, parameters: None };
+		let empty = DigestInfo { algorithm, digest: OctetString::new(Vec::new())? };
+		let frame = tightbeam::compose! {
+			V2: id: "empty-parent",
+				order: 1u64,
+				message: Opaque::new(sample_message())?,
+				previous_frame: empty
+		}?;
+
+		let refused = FrameAssembly::decode(frame.to_der()?);
+		assert!(matches!(refused, Err(StepError::Refused(BuildRefusal::EmptyDigest))));
+		Ok(())
+	}
+
+	// The algorithm decides first, and the octets compare after it.
+	tb_cases! {
+		fn a_digest_judges_a_recomputed_digest((algorithm, recomputed, verdict): (&str, Vec<u8>, IntegrityVerdict)) -> TestResult {
+			let carried = NamedDigest::new(HASH_SHA3_256, [0xAA; 32])?;
+
+			let judged = carried.verdict(algorithm.parse()?, recomputed)?;
+			assert_eq!(judged, verdict);
+			Ok(())
+		}
+		cases {
+			verified => ("2.16.840.1.101.3.4.2.8", vec![0xAA; 32], IntegrityVerdict::Verified),
+			mismatch => ("2.16.840.1.101.3.4.2.8", vec![0xAB; 32], IntegrityVerdict::Mismatch),
+			algorithm_mismatch => ("2.16.840.1.101.3.4.2.10", vec![0xAA; 32], IntegrityVerdict::AlgorithmMismatch),
+		}
 	}
 
 	#[test]
@@ -1526,12 +1736,13 @@ mod tests {
 		assert_eq!(summary.version, Version::V0);
 		assert_eq!(summary.id, b"view-1");
 		assert_eq!(summary.order, 11);
-		assert_eq!(summary.body_der, sample_body()?);
-		assert_eq!(BodyDer::try_from(summary.body_der)?.opaque_message()?, sample_message());
 		assert!(summary.signature.is_none());
 		assert!(summary.message_integrity.is_none());
 		assert!(summary.frame_integrity.is_none());
-		assert!(summary.confidentiality.is_none());
+
+		let body = plain_body(summary.body)?;
+		assert_eq!(body, sample_body()?);
+		assert_eq!(BodyDer::try_from(body)?.opaque_message()?, sample_message());
 		Ok(())
 	}
 
@@ -1550,10 +1761,10 @@ mod tests {
 		let matrix = summary.matrix.ok_or("the frame carries a matrix")?;
 		assert_eq!(summary.priority, Some(MessagePriority::Expedited));
 		assert_eq!(summary.lifetime, Some(300));
-		assert_eq!(previous_frame.algorithm_oid.to_string(), "2.16.840.1.101.3.4.2.10");
-		assert_eq!(previous_frame.digest, digest_octets);
+		assert_eq!(previous_frame.algorithm_oid().to_string(), "2.16.840.1.101.3.4.2.10");
+		assert_eq!(previous_frame.digest(), digest_octets);
 		assert_eq!(matrix.n(), 2);
-		assert_eq!(matrix.data(), [0, 1, 1, 0]);
+		assert_eq!(matrix.as_bytes(), [0, 1, 1, 0]);
 		Ok(())
 	}
 
@@ -1562,7 +1773,7 @@ mod tests {
 		let summary = summary_of(seal_frame(b"bare", 1)?)?;
 		assert_eq!(summary.priority, None);
 		assert_eq!(summary.lifetime, None);
-		assert!(summary.compactness.is_none());
+		assert!(matches!(summary.body, FrameBody::Plain(_)));
 		assert!(summary.previous_frame.is_none());
 		assert!(summary.matrix.is_none());
 		Ok(())
@@ -1576,8 +1787,8 @@ mod tests {
 		let frame_integrity = summary.frame_integrity.ok_or("the frame is witnessed")?;
 		assert_eq!(signature.algorithm_oid.to_string(), "2.16.840.1.101.3.4.3.10");
 		assert_eq!(signature.digest_algorithm_oid.to_string(), "2.16.840.1.101.3.4.2.8");
-		assert_eq!(message_integrity.algorithm_oid.to_string(), "2.16.840.1.101.3.4.2.8");
-		assert_eq!(frame_integrity.algorithm_oid.to_string(), "2.16.840.1.101.3.4.2.8");
+		assert_eq!(message_integrity.algorithm_oid().to_string(), "2.16.840.1.101.3.4.2.8");
+		assert_eq!(frame_integrity.algorithm_oid().to_string(), "2.16.840.1.101.3.4.2.8");
 		assert!(!signature.signature.is_empty());
 		Ok(())
 	}
@@ -1654,7 +1865,8 @@ mod tests {
 		Ok(())
 	}
 
-	/// A signature that is no DER `ECDSA-Sig-Value` never reaches the frame.
+	/// A compact signature of 64 raw octets is no DER `ECDSA-Sig-Value`, the
+	/// one form the attach takes.
 	#[test]
 	fn a_compact_signature_is_refused_at_attach() -> TestResult {
 		let key = signing_key()?;
@@ -1733,18 +1945,18 @@ mod tests {
 		let key = [0x42u8; 32];
 		let der = pinned_config(b"sealed", 8, Version::V1)?.build()?;
 
-		let aes = Aes256GcmKey::new(shared_key(0x42))?;
+		let aes = shared_key(0x42);
 		let sealed = aes.seal(sample_body()?, None)?;
 		assert_eq!(sealed.algorithm_oid(), AES_256_GCM);
 
 		let envelope_der = sealed.envelope_der().to_vec();
 		let der = FrameAssembly::decode(&der)?.with_confidentiality(sealed)?.encode()?;
 
-		let summary = summary_of(&der)?;
-		let confidentiality = summary.confidentiality.ok_or("the frame is sealed")?;
+		let (ciphertext, confidentiality) = sealed_body(summary_of(&der)?.body)?;
 		assert_eq!(confidentiality.algorithm_oid, AES_256_GCM);
+		assert_eq!(confidentiality.content_oid, DATA);
 		assert_eq!(confidentiality.envelope_der, envelope_der);
-		assert_ne!(summary.body_der, sample_body()?);
+		assert_ne!(ciphertext, sample_body()?);
 
 		let holder = Aes256GcmKeyProvider::new(key.to_vec(), KEY_ID.to_vec())?;
 		let frame = Frame::from_der(&der)?;
@@ -1767,18 +1979,17 @@ mod tests {
 				confidentiality: holder
 		}?;
 
-		let summary = summary_of(frame.to_der()?)?;
-		let confidentiality = summary.confidentiality.ok_or("the frame is sealed")?;
-		let sealed = SealedBody::new(&confidentiality.envelope_der, summary.body_der)?;
+		let (ciphertext, confidentiality) = sealed_body(summary_of(frame.to_der()?)?.body)?;
+		let sealed_body = SealedBody::new(&confidentiality.envelope_der, ciphertext)?;
 
-		let opened = Aes256GcmKey::new(shared_key(0x42))?.open(sealed).await?;
+		let opened = shared_key(0x42).open(sealed_body).await?;
 		assert_eq!(BodyDer::try_from(opened)?.opaque_message()?, sample_message());
 		Ok(())
 	}
 
 	#[tokio::test]
 	async fn aead_seal_open_round_trips() -> TestResult {
-		let aes = Aes256GcmKey::new(shared_key(0x42))?;
+		let aes = shared_key(0x42);
 		let preimage = sample_body()?;
 
 		let sealed = aes.seal(&preimage, None)?;
@@ -1789,15 +2000,15 @@ mod tests {
 
 	#[tokio::test]
 	async fn aead_open_rejects_wrong_key() -> TestResult {
-		let sealed = Aes256GcmKey::new(shared_key(0x42))?.seal(sample_body()?, None)?;
-		let other = Aes256GcmKey::new(shared_key(0x43))?;
+		let sealed = shared_key(0x42).seal(sample_body()?, None)?;
+		let other = shared_key(0x43);
 		assert!(other.open(sealed).await.is_err());
 		Ok(())
 	}
 
 	#[tokio::test]
 	async fn aead_open_rejects_a_tampered_body() -> TestResult {
-		let aes = Aes256GcmKey::new(shared_key(0x42))?;
+		let aes = shared_key(0x42);
 		let sealed = aes.seal(sample_body()?, None)?;
 		let mut ciphertext = sealed.ciphertext().to_vec();
 		*ciphertext.first_mut().ok_or("the seal holds ciphertext")? ^= 0x01;
@@ -1832,11 +2043,12 @@ mod tests {
 		Ok(())
 	}
 
-	/// A splice of a sealed body keeps the frame gate: V0 forbids confidentiality.
+	/// A splice of a sealed body keeps the frame gate: V0 forbids
+	/// confidentiality.
 	#[test]
 	fn a_v0_frame_refuses_an_envelope() -> TestResult {
 		let der = seal_frame(b"v0-sealed", 1)?;
-		let sealed = Aes256GcmKey::new(shared_key(0x42))?.seal(sample_body()?, None)?;
+		let sealed = shared_key(0x42).seal(sample_body()?, None)?;
 
 		let installed = FrameAssembly::decode(&der)?.with_confidentiality(sealed);
 		assert!(installed.is_err());
@@ -1848,7 +2060,7 @@ mod tests {
 	#[test]
 	fn a_sealed_frame_whose_ciphertext_parses_as_der_is_refused() -> TestResult {
 		let der = pinned_config(b"sealed-der", 1, Version::V1)?.build()?;
-		let sealed = Aes256GcmKey::new(shared_key(0x42))?.seal(sample_body()?, None)?;
+		let sealed = shared_key(0x42).seal(sample_body()?, None)?;
 		let der_ciphertext = SealedBody::new(sealed.envelope_der(), vec![0x04, 0x01, 0xAA])?;
 		let assembly = FrameAssembly::decode(&der)?.with_confidentiality(der_ciphertext)?;
 
@@ -1857,7 +2069,8 @@ mod tests {
 		Ok(())
 	}
 
-	/// Bytes that are no envelope never become a sealed body.
+	/// `SealedBody::new` parses the envelope once, so bytes that are no
+	/// `AuthEnvelopedData` refuse there.
 	#[test]
 	fn a_malformed_envelope_is_refused() {
 		let sealed = SealedBody::new(&[0x30, 0x00], vec![1, 2, 3]);
@@ -1890,7 +2103,8 @@ mod tests {
 		Ok(())
 	}
 
-	// Octets that hold no DER value, or more than one, never become a body.
+	// A body holds exactly one DER value, so octets that hold none, or more
+	// than one, refuse with `SerializationError`.
 	tb_cases! {
 		fn a_body_that_is_not_one_der_value_is_refused(octets: Vec<u8>) {
 			let refused = BodyDer::try_from(octets);
@@ -1912,7 +2126,8 @@ mod tests {
 
 	/// A caller-side zstd compression (compress + install) must carry the
 	/// exact compactness info tightbeam's own compressor emits, and inflate
-	/// with tightbeam's inflator: pins the compactness wire layout.
+	/// with tightbeam's inflator: pins the encoded layout of the compactness
+	/// info.
 	#[test]
 	fn caller_side_compression_inflates_with_tightbeam() -> TestResult {
 		let der = seal_frame(b"packed", 5)?;
@@ -1935,8 +2150,8 @@ mod tests {
 		Ok(())
 	}
 
-	/// The commitment `Opening::prove::<Sha3_256>` publishes over the
-	/// shared opening fixture: pins the detached-commitment digest the TS.
+	/// The commitment that `Opening::prove::<Sha3_256>` publishes over the
+	/// shared opening fixture is the digest that `commitment.test.ts` pins.
 	#[test]
 	fn opening_commitment_matches_typescript_fixture() -> TestResult {
 		const FIXTURE_HEX: &str = "678bec1605c349a2af6ceaa627569d31d57759ee2fbeffd2ac33026df930e04e";
@@ -1968,7 +2183,7 @@ mod tests {
 
 		let compressor = ZstdCompression::default();
 		let (compressed, info) = compressor.compress(&sample_body()?, None)?;
-		let sealed = Aes256GcmKey::new(shared_key(0x42))?.seal(&compressed, None)?;
+		let sealed = shared_key(0x42).seal(&compressed, None)?;
 		let compactness = Compactness {
 			algorithm_oid: info.compression_alg.oid,
 			parameters_der: None,
@@ -2000,12 +2215,11 @@ mod tests {
 		};
 		let der = FrameAssembly::decode(&der)?.with_compactness(compactness)?.encode()?;
 
-		let summary = summary_of(&der)?;
-		let compactness = summary.compactness.ok_or("the frame is compressed")?;
+		let (data, compactness) = compressed_body(summary_of(&der)?.body)?;
 		assert_eq!(compactness.algorithm_oid.to_string(), "1.3.6.1.4.1.64586.2.1");
 		assert_eq!(compactness.content_oid.to_string(), "1.2.840.113549.1.7.1");
 		assert_eq!(compactness.parameters_der, None);
-		assert_eq!(summary.body_der, compressed);
+		assert_eq!(data, compressed);
 		Ok(())
 	}
 

@@ -30,15 +30,15 @@ use tightbeam::Errorizable;
 ///
 /// /// The messages of a socket library.
 /// enum Message {
-///     Binary(Vec<u8>),
-///     Text(String),
-///     Close,
+/// 	Binary(Vec<u8>),
+/// 	Text(String),
+/// 	Close,
 /// }
 ///
 /// let classify = |message| match message {
-///     Message::Binary(envelope) => Wire::Envelope(envelope),
-///     Message::Text(_) => Wire::Skip,
-///     Message::Close => Wire::Closed,
+/// 	Message::Binary(envelope) => Wire::Envelope(envelope),
+/// 	Message::Text(_) => Wire::Skip,
+/// 	Message::Close => Wire::Closed,
 /// };
 ///
 /// let wire = classify(Message::Text(String::from("ping")));
@@ -48,7 +48,7 @@ use tightbeam::Errorizable;
 pub enum Wire {
 	/// A message that carries one envelope.
 	Envelope(Vec<u8>),
-	/// A message outside the tightbeam wire format, such as a text or control
+	/// A message that carries no tightbeam envelope, such as a text or control
 	/// message.
 	Skip,
 	/// The peer closed the connection, or the message stream ended.
@@ -71,7 +71,9 @@ pub enum Wire {
 /// ```
 #[derive(Debug, Errorizable)]
 pub enum WireFault {
-	/// The connection closed before the operation finished.
+	/// The connection closed before the operation finished. Each socket kind
+	/// names the errors of its library that close a connection, and reads the
+	/// loss of a connection as this class or as [`WireFault::Io`].
 	#[error("the connection closed")]
 	Closed,
 	/// The byte stream under the socket failed.
@@ -81,17 +83,18 @@ pub enum WireFault {
 	/// cap of a read.
 	#[error("a message passed its ceiling")]
 	Oversize,
-	/// The socket broke its protocol, lost its connection, or refused a send.
-	#[error("the socket failed")]
+	/// The socket or its peer broke the protocol of the socket.
+	#[error("the socket broke its protocol")]
 	Invalid,
 }
 
 /// The transport error of each fault class:
 ///
-/// - [`WireFault::Closed`] -- [`TransportError::ConnectionClosed`].
-/// - [`WireFault::Io`] -- [`TransportError::IoError`].
-/// - [`WireFault::Oversize`] -- [`TransportError::OperationFailed`] with [`TransportFailure::SizeExceeded`].
-/// - [`WireFault::Invalid`] -- [`TransportError::InvalidMessage`].
+/// - [`WireFault::Closed`] becomes [`TransportError::ConnectionClosed`].
+/// - [`WireFault::Io`] becomes [`TransportError::IoError`].
+/// - [`WireFault::Oversize`] becomes [`TransportError::OperationFailed`] with
+///   [`TransportFailure::SizeExceeded`].
+/// - [`WireFault::Invalid`] becomes [`TransportError::InvalidMessage`].
 impl From<WireFault> for TransportError {
 	fn from(fault: WireFault) -> Self {
 		match fault {
@@ -108,14 +111,13 @@ impl From<WireFault> for TransportError {
 /// Every kind meets one contract:
 ///
 /// - A message that carries an envelope is [`Wire::Envelope`].
-/// - A message outside the wire format is [`Wire::Skip`].
+/// - A message that carries no envelope is [`Wire::Skip`].
 /// - A close, or the end of the message stream, is [`Wire::Closed`].
 /// - Any other error is [`Wire::Failed`].
 /// - A socket with a message ceiling refuses a message past it as
-///   [`WireFault::Oversize`] before the kind sizes a buffer for it, because a
-///   reader sees only whole messages and cannot refuse one any earlier. A
-///   socket without one, such as a browser WebSocket, delivers every message
-///   whole.
+///   [`WireFault::Oversize`] before the kind sizes a buffer for it. A reader
+///   sees only whole messages, so that refusal is the earliest one. A socket
+///   without one, such as a browser WebSocket, delivers every message whole.
 ///
 /// # Examples
 ///
@@ -124,8 +126,8 @@ impl From<WireFault> for TransportError {
 ///
 /// /// Whether the peer of `socket` closed before it sent anything else.
 /// async fn closed_first(socket: &mut impl WireStream) -> bool {
-///     let first = socket.next_wire().await;
-///     matches!(first, Wire::Closed)
+/// 	let first = socket.next_wire().await;
+/// 	matches!(first, Wire::Closed)
 /// }
 /// ```
 pub trait WireStream {
@@ -142,10 +144,10 @@ pub trait WireStream {
 ///
 /// /// Send the envelopes of `batch` through `socket` in order.
 /// async fn send_all(socket: &mut impl WireSink, batch: &[Vec<u8>]) -> Result<(), WireFault> {
-///     for envelope in batch {
-///         socket.send_envelope(envelope).await?;
-///     }
-///     Ok(())
+/// 	for envelope in batch {
+/// 		socket.send_envelope(envelope).await?;
+/// 	}
+/// 	Ok(())
 /// }
 /// ```
 pub trait WireSink {
@@ -159,7 +161,7 @@ pub trait WireSink {
 
 /// One read of an envelope from a [`WireStream`], under a cap.
 ///
-/// The reader skips every message outside the wire format and admits the
+/// The reader skips every message that carries no envelope and admits the
 /// first envelope within its cap. A close ends the read.
 pub(crate) struct EnvelopeReader<'s, S> {
 	stream: &'s mut S,
@@ -176,7 +178,8 @@ impl<'s, S: WireStream> EnvelopeReader<'s, S> {
 	///
 	/// # Errors
 	///
-	/// - [`TransportError::InvalidLimits`] with [`LimitsRefusal::ZeroCeiling`] -- `cap` is zero.
+	/// - [`TransportError::InvalidLimits`] -- `cap` is zero, which the error
+	///   carries as [`LimitsRefusal::ZeroCeiling`].
 	pub(crate) fn new(stream: &'s mut S, cap: usize) -> Result<Self, TransportError> {
 		let Some(cap) = NonZeroUsize::new(cap) else {
 			return Err(TransportError::InvalidLimits(LimitsRefusal::ZeroCeiling));
@@ -189,8 +192,8 @@ impl<'s, S: WireStream> EnvelopeReader<'s, S> {
 	///
 	/// # Errors
 	///
-	/// - [`TransportError::OperationFailed`] with [`TransportFailure::SizeExceeded`] -- the envelope
-	///   passes the cap.
+	/// - [`TransportError::OperationFailed`] -- the envelope passes the cap,
+	///   which the error carries as [`TransportFailure::SizeExceeded`].
 	/// - [`TransportError::ConnectionClosed`] -- the stream closed before an envelope arrived.
 	/// - The [`TransportError`] of the [`WireFault`] that failed the stream.
 	pub(crate) async fn read(self) -> Result<Vec<u8>, TransportError> {
@@ -283,15 +286,9 @@ where
 /// One socket as a tightbeam stream: the read and write halves of a socket
 /// kind, and whether both still read as connected.
 ///
-/// Every read and write settles into one liveness record, so the duplex reads
-/// as dead at its first failure. [`SplittableStream::into_split`] hands out
-/// the two halves, which run the same rules apart.
-///
-/// Upstream [`AsyncProtocolStream::read_frame`] asks a stream to refuse a frame
-/// past the cap of a read before it sizes any buffer. A socket kind hands over
-/// only whole messages, so the duplex checks the cap of each read on a whole
-/// message, and the message ceiling of the socket, where it has one, bounds
-/// what a peer can make it buffer.
+/// - Every read and write settles into one liveness record, so the duplex reads as dead at its first failure.
+/// - [`SplittableStream::into_split`] hands out the two halves, which run the same rules apart.
+/// - Each read checks its cap on a whole message, as `docs/wire.md` (Limitations) states.
 ///
 /// # Examples
 ///
@@ -302,11 +299,11 @@ where
 /// /// The first envelope of the socket whose halves are `stream` and `sink`.
 /// async fn first_envelope<R, W>(stream: R, sink: W) -> Result<Vec<u8>, TransportError>
 /// where
-///     R: WireStream + Send + Unpin,
-///     W: WireSink + Send + Unpin,
+/// 	R: WireStream + Send + Unpin,
+/// 	W: WireSink + Send + Unpin,
 /// {
-///     let mut duplex = WireDuplex::new(stream, sink);
-///     duplex.read_frame(64).await
+/// 	let mut duplex = WireDuplex::new(stream, sink);
+/// 	duplex.read_frame(64).await
 /// }
 /// ```
 #[derive(Debug)]

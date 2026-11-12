@@ -1,11 +1,5 @@
 /**
- * Typed dispatch for server-initiated streams.
- *
- * A serve handler receives every stream the server opens, so applications
- * demultiplex by frame id. The router makes that pairing checkable: each route
- * binds an id prefix to a codec or an envelope and a handler whose message
- * type it proves, so the decoder and its handler cannot disagree at compile
- * time.
+ * The typed dispatch of server-initiated streams by frame id, as the routing section of `docs/ws-client.md` describes.
  */
 
 import type { Envelope } from "./envelope.js";
@@ -17,13 +11,10 @@ const TEXT = new TextDecoder();
 
 /**
  * Answers one routed stream: receives the decoded message and the frame
- * it rode in on, and returns (or resolves with) the response frame, or
+ * that carried it, and returns (or resolves with) the response frame, or
  * `undefined` for a bodiless acceptance.
  */
-export type RouteHandler<T> = (
-	message: T,
-	frame: Frame,
-) => Promise<Frame | undefined> | Frame | undefined;
+export type RouteHandler<T> = (message: T, frame: Frame) => Promise<Frame | undefined> | Frame | undefined;
 
 /**
  * A server-initiated stream arrived with an id no route matches. Thrown
@@ -45,24 +36,21 @@ export class UnroutedTopicError extends StreamRefusal {
 
 /**
  * One dispatch table entry: a decoder and handler pair whose message type
- * agrees.
- *
- * - {@link Route.of} decodes a cleartext body under a codec.
- * - {@link Route.sealed} unwraps under an envelope, so a declared signature
- *   verifies and a declared seal opens before the handler sees a message.
+ * agrees. {@link Route.of} decodes a cleartext body under a codec, and
+ * {@link Route.sealed} unwraps the frame under an envelope first.
  */
 export class Route {
-	private constructor(
-		private readonly serve: (frame: Frame) => Promise<Frame | undefined>,
-	) {}
+	private constructor(private readonly serve: (frame: Frame) => Promise<Frame | undefined>) {}
 
 	/**
 	 * Bind `codec` to `handle`: the cleartext body decodes under `codec`, and
-	 * `handle` receives exactly the message type `codec` decodes.
+	 * `handle` receives exactly the message type `codec` decodes. A sealed or
+	 * compressed body refuses with `OpaqueBody`, so a route that reads one
+	 * declares an envelope through {@link Route.sealed}.
 	 */
 	static of<T>(codec: MessageCodec<T>, handle: RouteHandler<T>): Route {
 		const serve = async (frame: Frame): Promise<Frame | undefined> => {
-			const message = frame.message(codec);
+			const message = await frame.open(codec);
 			const response = await handle(message, frame);
 			return response;
 		};
@@ -73,11 +61,11 @@ export class Route {
 
 	/**
 	 * Bind `envelope` to `handle`: each frame unwraps under the envelope's
-	 * declared layers before `handle` runs, so a route that declares
-	 * `signed` or `verified` refuses an unsigned or forged frame before
-	 * any decode.
+	 * declared layers before `handle` runs. An envelope that declares `signed`
+	 * refuses an unsigned or forged frame, and one that declares `sealed`
+	 * refuses a cleartext frame, before any decode.
 	 */
-	static sealed<T>(envelope: Envelope<T>, handle: RouteHandler<T>): Route {
+	static sealed<T>(envelope: Envelope<T, boolean, true>, handle: RouteHandler<T>): Route {
 		const serve = async (frame: Frame): Promise<Frame | undefined> => {
 			const message = await envelope.unwrap(frame);
 			const response = await handle(message, frame);
@@ -98,27 +86,9 @@ export class Route {
 }
 
 /**
- * A table of id-prefix routes, served as one stream handler.
- *
- * The frame id decodes as UTF-8 and the longest matching prefix wins, so
- * `"tick/spot/"` shadows `"tick/"` regardless of table order. An id no
- * prefix matches throws {@link UnroutedTopicError}, answering the stream
- * with an `Unimplemented` status.
- *
- * ```ts
- * const routes = new Router({
- * 	"tick/": Route.of(TickCodec, (tick) => {
- * 		store.applyTick(tick);
- * 		return undefined;
- * 	}),
- * 	"chat/": Route.sealed(chat, (message, request) => {
- * 		store.appendChat(message);
- * 		return receipt(request);
- * 	}),
- * });
- *
- * client.serve((request) => routes.dispatch(request));
- * ```
+ * A table of id-prefix routes, served as one stream handler. The frame id decodes as UTF-8, and the longest matching
+ * prefix wins whatever the table order. An id that no prefix matches throws {@link UnroutedTopicError}. The routing
+ * section of `docs/ws-client.md` shows a router whose dispatch serves each stream.
  */
 export class Router {
 	private readonly byLongestPrefix: readonly (readonly [string, Route])[];
@@ -128,9 +98,7 @@ export class Router {
 	 */
 	constructor(table: Readonly<Record<string, Route>>) {
 		const entries = Object.entries(table);
-		this.byLongestPrefix = entries.sort(
-			([left], [right]) => right.length - left.length,
-		);
+		this.byLongestPrefix = entries.sort(([left], [right]) => right.length - left.length);
 	}
 
 	/**

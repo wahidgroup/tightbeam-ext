@@ -20,3 +20,6 @@ name = "tightbeam_wire"
 # Upstream refuses `async-transport` without a handshake protocol, so the
 # crate names `transport-hpke`, the protocol every socket kind runs.
 tightbeam-rs = { workspace = true, features = ["std", "async-transport", "transport-hpke"] }
+
+[lints]
+workspace = true

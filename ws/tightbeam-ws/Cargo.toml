@@ -51,11 +51,9 @@ serve = [
     "tightbeam-rs/transport-hpke",
     "tightbeam-rs/transport-multiplex",
 ]
-# A link built from parts, for an in-memory test link that runs no handshake.
-# The parts name any gate and any session, so only test support enables it.
-link-parts = ["serve"]
-# The audit trail of a served link: the verdict of each call's gate, on the
-# trace of the transport the link was accepted on.
+# The audit trail of a served link: the verdict of each call's gate and each
+# answered keepalive probe, on the trace of the transport the link was
+# accepted on.
 instrument = ["tightbeam-rs/instrument"]
 testing = ["socket", "serve", "instrument", "tightbeam-rs/testing"]
 colony = ["testing", "dep:der", "tightbeam-rs/colony"]
@@ -94,5 +92,9 @@ tokio = { workspace = true, features = [
     "macros",
     "net",
     "sync",
+    "test-util",
     "time",
 ] }
+
+[lints]
+workspace = true

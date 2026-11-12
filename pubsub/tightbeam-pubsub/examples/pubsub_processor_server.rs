@@ -1,29 +1,12 @@
-//! Backend payload processor servlet for the processed-board demo.
-//!
-//! The demo server's `RelayBackplane` dials this servlet over a multiplexed
-//! encrypted tightbeam-ws connection and relays each publish through it. The
-//! registry then sequences and fans out the inner frame in each answer.
-//!
-//! Each relayed payload is an inner tightbeam frame whose body is a JSON note.
-//! [`TopicSeal::transformed`] uppercases the note's `text` and rebuilds the
-//! frame, sealed under the topic key of the stack. The rebuilt frame is
-//! unsigned, because the changed note invalidates the publisher's signature.
-//!
-//! The [`DemoConfig`] of the environment decides the [`Security`] of every
-//! connection. The processor pins the client certificate under mutual auth and
-//! under the paywall alike, because the relay dial presents it in both.
-//!
-//! The processor pushes no stream of its own, so every connection serves
-//! through upstream [`MuxAcceptor::serve`], behind the gate of its transport.
+//! The payload processor servlet that the processed demo server relays each
+//! publish through. The page `docs/pubsub.md` (Testing) states what it does.
 //!
 //! Environment:
 //!   - `TBWS_SERVER_CERT`       path to the server certificate DER, beside its key
-//!   - `PUBSUB_PROCESSOR_PORT`  listen port (default `9111`)
+//!   - `PUBSUB_PROCESSOR_PORT`  listen port, which the compose file of the stack sets
 //!   - `PUBSUB_TOPIC_KEY`       the key-encryption key of the processed topic, as 64 hex digits
 //!   - `PUBSUB_TOPIC_KEY_ID`    the `kekid` that names the key in each sealed envelope
 //!   - the variables of [`DemoConfig`]
-//!
-//! [`Security`]: tightbeam_ws::testing::Security
 
 use core::fmt;
 use core::str::{from_utf8, FromStr};
@@ -31,14 +14,16 @@ use std::error::Error;
 use std::sync::Arc;
 
 use serde_json::Value;
+use tightbeam::builder::{FrameBuilder, TypeBuilder};
+use tightbeam::crypto::key::Aes256GcmKeyProvider;
 use tightbeam::der::{Decode, Encode};
 use tightbeam::policy::{SessionContext, TransitStatus};
 use tightbeam::prelude::TightBeamSocketAddr;
 use tightbeam::transport::error::TransportError;
 use tightbeam::transport::multiplex::MuxAcceptor;
 use tightbeam::transport::EncryptedProtocol;
-use tightbeam::{Frame, Opaque, TightBeamError};
-use tightbeam_pubsub::testing::OpaqueFrame;
+use tightbeam::{Frame, Opaque, TightBeamError, Version};
+use tightbeam_pubsub::OpaqueFrame;
 use tightbeam_ws::io::WsTransport;
 use tightbeam_ws::protocol::WsListener;
 use tightbeam_ws::serve::LinkError;
@@ -77,7 +62,7 @@ impl FromStr for TopicKey {
 	///
 	/// # Errors
 	///
-	/// - [`NotATopicKey`]: `hex` is not 64 hex digits.
+	/// - The [`NotATopicKey`] of a `hex` that is not 64 hex digits.
 	fn from_str(hex: &str) -> Result<Self, Self::Err> {
 		let digits = hex.as_bytes();
 		let spelled = digits.len() == 2 * TOPIC_KEY_LEN && digits.iter().all(u8::is_ascii_hexdigit);
@@ -122,18 +107,34 @@ impl TopicSeal {
 		let id = String::from_utf8_lossy(inner.metadata().id()).into_owned();
 		let order = inner.metadata().order();
 		let note = serde_json::to_vec(&note)?;
-		let frame = OpaqueFrame { id: &id, order, payload: &note };
 
-		let rebuilt = frame.sealed(&self.key.0, self.key_id.as_bytes())?;
+		let rebuilt = self.sealed(&id, order, &note)?;
 		Ok(rebuilt.to_der()?)
+	}
+
+	/// The V1 frame of the id `id` and the order `order` whose opaque body
+	/// carries `note`, sealed to this seal in a `KEKRecipientInfo`.
+	///
+	/// # Sources
+	///
+	/// - RFC 5652 § 6.2.3, `KEKRecipientInfo`:
+	///   <https://datatracker.ietf.org/doc/html/rfc5652#section-6.2.3>
+	fn sealed(&self, id: &str, order: u64, note: &[u8]) -> Result<Frame, TightBeamError> {
+		let body = Opaque::new(note)?;
+		let sealer = Aes256GcmKeyProvider::new(self.key.0.to_vec(), self.key_id.as_bytes().to_vec())?;
+		let framed = FrameBuilder::<Opaque>::from(Version::V1)
+			.with_id(id)
+			.with_order(order)
+			.with_message(body);
+		framed.with_encryptor(sealer).build()
 	}
 
 	/// Answer one relayed publish: transform the inner frame's note.
 	///
 	/// # Errors
 	///
-	/// - A refusal with [`TransitStatus::InvalidArgument`]: the body is not
-	///   opaque, or its inner frame carries no note to transform.
+	/// - The [`TightBeamError`] of a [`TransitStatus::InvalidArgument`] refusal, for a body that is
+	///   not opaque, or an inner frame that carries no note to transform.
 	/// - The [`TightBeamError`] of the answer frame, which answers
 	///   [`TransitStatus::Internal`].
 	async fn answer(&self, frame: Frame) -> Result<Option<Frame>, TightBeamError> {
@@ -205,7 +206,7 @@ impl ProcessorConnection {
 
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
-	let port = PORT.parsed_or(9111u32)?;
+	let port: u16 = PORT.parsed()?;
 	let bind_addr = TightBeamSocketAddr(format!("0.0.0.0:{port}").parse()?);
 	let demo = Arc::new(DemoConfig::from_env()?);
 	let key = TOPIC_KEY.parsed()?;
@@ -222,16 +223,7 @@ async fn main() -> Result<(), BoxError> {
 	);
 
 	loop {
-		// A failed accept is the listener's own fault, such as a descriptor
-		// shortage, and it clears on retry.
-		let (transport, peer) = match listener.accept().await {
-			Ok(accepted) => accepted,
-			Err(error) => {
-				eprintln!("[pubsub-processor] accept failed: {error}");
-				continue;
-			}
-		};
-
+		let (transport, peer) = listener.accept().await?;
 		let connection = ProcessorConnection { transport, demo: Arc::clone(&demo), seal: Arc::clone(&seal) };
 		tokio::spawn(async move {
 			if let Err(error) = connection.serve().await {

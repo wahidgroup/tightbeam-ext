@@ -1,6 +1,6 @@
 # asn
 
-DER-backed ASN.1 codec bridge for TypeScript `MessageCodec` façades over [tightbeam](https://crates.io/crates/tightbeam-rs) wire types.
+DER-backed ASN.1 codec bridge for TypeScript `MessageCodec` façades over [tightbeam](https://crates.io/crates/tightbeam-rs) DER types.
 
 ## Status
 

@@ -23,7 +23,7 @@ keywords = ["websocket", "transport", "messaging", "protocol", "tightbeam"]
 categories = ["network-programming", "asynchronous"]
 
 [workspace.dependencies]
-tightbeam-rs = { version = "0.18.0", default-features = false }
+tightbeam-rs = { version = "0.19.0", default-features = false }
 tokio = { version = "1.53.1", default-features = false }
 tokio-tungstenite = { version = "0.30.0", default-features = false }
 futures-util = { version = "0.3.33", default-features = false }
@@ -38,8 +38,13 @@ gloo-net = { version = "0.7.0", default-features = false }
 
 # Pinned to 0.7 to match the der version the RustCrypto stack is built against.
 der = { version = "0.7", default-features = false }
-# Git hooks manager
 husky-rs = "0.4.0"
+
+[workspace.lints.clippy]
+# The house format indents Rust with tabs, in the samples of the docs too.
+tabs_in_doc_comments = "allow"
+# Every public fn that returns a Result documents its errors.
+missing_errors_doc = "warn"
 
 [profile.release]
 lto = true

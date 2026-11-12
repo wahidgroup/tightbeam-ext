@@ -1,13 +1,5 @@
-//! Runtime proof that tightbeam's two target-specific handshake hazards work
-//! on `wasm32-unknown-unknown` under a JavaScript host:
-//!
-//! 1. Clock: `OffsetDateTime::now_utc()`
-//! 2. RNG: `OsRng` (`getrandom/js`)
-//!
-//! Both panic on wasm without the `wasm` (getrandom/js) and `time/wasm-bindgen`
-//! feature wiring. A pass here therefore proves that wiring at runtime. The
-//! suite runs under Node, and the Playwright e2e lane proves the same
-//! handshake in a browser.
+//! The two hazards of a handshake on `wasm32-unknown-unknown`, the host
+//! clock and the RNG, as the tests section of `docs/ws-wasm.md` describes.
 #![cfg(target_arch = "wasm32")]
 
 use tightbeam::time::OffsetDateTime;

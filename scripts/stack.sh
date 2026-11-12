@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Self-contained e2e stack orchestrator for the tightbeam-ws echo server.
+# Self-contained e2e stack orchestrator: the images, certificates, ports,
+# and compose files that the project fragments declare (scripts/env.sh).
 #
-#   ./scripts/stack.sh up   <e2e>   Assemble context, build image, start (waits healthy)
-#   ./scripts/stack.sh down <e2e>   Stop the stack and remove volumes + context
-#   ./scripts/stack.sh env  <e2e>   Print the path to the instance env file
-#   ./scripts/stack.sh logs <e2e>   Follow container logs
+# - `./scripts/stack.sh up <e2e>` assembles the context, builds the images, and starts the stack, then
+#   waits until it is healthy.
+# - `./scripts/stack.sh down <e2e>` stops the stack and removes its volumes and its context.
+# - `./scripts/stack.sh env <e2e>` prints the path to the env file of the instance.
+# - `./scripts/stack.sh logs <e2e>` follows the logs of the containers.
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
@@ -35,7 +37,15 @@ CONTEXT_DIR="$INSTANCE_DIR/context"
 ENV_FILE="$INSTANCE_DIR/.env"
 CERT_DIR="$INSTANCE_DIR/certs"
 PROJECT="${STACK_PROJECT_PREFIX}-$INSTANCE"
-ECHO_IMAGE="${STACK_PROJECT_PREFIX}-echo:$INSTANCE"
+
+# Each image a fragment declares, tagged for this instance.
+for image in "${STACK_IMAGES[@]}"; do
+	key="${image%%:*}"
+	name="$(tr '[:upper:]_' '[:lower:]-' <<< "${key%_IMAGE}")"
+	printf -v "$key" '%s-%s:%s' "$STACK_PROJECT_PREFIX" "$name" "$INSTANCE"
+	export "${key?}"
+done
+unset image key name
 
 # One stack for every extension: each project fragment (stack-env.sh)
 # contributed its compose file.
@@ -67,9 +77,22 @@ read_prior() {
 	fi
 }
 
+# The checkout of tightbeam-rs when Cargo resolves it from a local path, or
+# nothing when it resolves from a registry.
+local_tightbeam_checkout() {
+	local manifest
+	manifest="$(cargo metadata --format-version 1 --manifest-path "$ROOT/Cargo.toml" \
+		| jq -r '.packages[] | select(.name == "tightbeam-rs" and .source == null) | .manifest_path')"
+	if [ -n "$manifest" ]; then
+		dirname "$(cargo locate-project --workspace --message-format plain --manifest-path "$manifest")"
+	fi
+}
+
 assemble_context() {
-	# Stage the repo under the context so the image build is self-contained;
-	# tightbeam-rs resolves from crates.io inside the build.
+	# Stage the repo under the context so the image build is self-contained.
+	# The context has the layout of the parent of the repo, so a path
+	# dependency that leaves the repo resolves inside the build as it does on
+	# the host.
 	rm -rf "$CONTEXT_DIR"
 	mkdir -p "$CONTEXT_DIR/tightbeam-ext"
 
@@ -84,26 +107,29 @@ assemble_context() {
 	)
 	rsync -a "${excludes[@]}" "$ROOT/" "$CONTEXT_DIR/tightbeam-ext/"
 
-	# When Cargo.toml patches tightbeam-rs to the sibling checkout (local
-	# development), stage that checkout too so the in-image build resolves
-	# the same source.
-	if grep -q '^tightbeam-rs = { path = "../tightbeam/tightbeam" }' "$ROOT/Cargo.toml"; then
-		echo "==> Staging local tightbeam checkout (patched Cargo.toml)"
-		rsync -a "${excludes[@]}" "$ROOT/../tightbeam/" "$CONTEXT_DIR/tightbeam/"
+	# When Cargo resolves tightbeam-rs from a local checkout, stage that
+	# checkout too so the in-image build resolves the same source.
+	local checkout parent
+	checkout="$(local_tightbeam_checkout)"
+	if [ -n "$checkout" ]; then
+		parent="$(dirname "$ROOT")"
+		case "$checkout" in
+			"$parent"/*) ;;
+			*)
+				echo "Local tightbeam checkout '$checkout' is outside '$parent', so the build context cannot hold it" >&2
+				exit 1
+				;;
+		esac
+		echo "==> Staging local tightbeam checkout '$checkout'"
+		mkdir -p "$CONTEXT_DIR/${checkout#"$parent"/}"
+		rsync -a "${excludes[@]}" "$checkout/" "$CONTEXT_DIR/${checkout#"$parent"/}/"
 	fi
 }
 
 generate_certs() {
-	# Issue the X.509 identity fixtures the encrypted echo servers present and
-	# the browser suite pins. Idempotent per instance: reuse existing certs so
-	# restarts keep the same trust anchors.
-	if ! [ -f "$CERT_DIR/server.cert.der" ] || ! [ -f "$CERT_DIR/client.cert.der" ]; then
-		echo "==> Generating identity fixtures under '$CERT_DIR'"
-		CERT_DIR="$CERT_DIR" cargo run -p tightbeam-ws --features testing --example gen_certs
-	fi
-
-	# Each project adds its own material beside the shared identities. Every
-	# step keeps the material it finds, as the shared step does.
+	# Each project issues its own material under CERT_DIR. Every step keeps
+	# the material it finds, so restarts keep the same trust anchors.
+	echo "==> Generating certificates under '$CERT_DIR'"
 	local step
 	for step in "${STACK_CERT_STEPS[@]}"; do
 		CERT_DIR="$CERT_DIR" bash -c "$step"
@@ -130,18 +156,21 @@ case "$ACTION" in
 				"$(alloc_port "${!pref_var}" "$(read_prior "$key")")"
 		done
 
-		export ECHO_IMAGE CERT_DIR
+		export CERT_DIR
 		generate_certs
 		render_env_file > "$ENV_FILE"
 
 		echo "==> Assembling build context for '$PROJECT'"
 		assemble_context
 
-		echo "==> Building image '$ECHO_IMAGE'"
-		DOCKER_BUILDKIT=1 docker build \
-			-f "$ROOT/ws/docker/echo-server/Dockerfile" \
-			-t "$ECHO_IMAGE" \
-			"$CONTEXT_DIR"
+		for image in "${STACK_IMAGES[@]}"; do
+			key="${image%%:*}"
+			echo "==> Building image '${!key}'"
+			DOCKER_BUILDKIT=1 docker build \
+				-f "${image#*:}" \
+				-t "${!key}" \
+				"$CONTEXT_DIR"
+		done
 
 		echo "==> Bringing up '$PROJECT' stack"
 		for spec in "${STACK_PORT_SPECS[@]}"; do

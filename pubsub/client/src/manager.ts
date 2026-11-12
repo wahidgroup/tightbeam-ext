@@ -1,23 +1,6 @@
 /**
- * Client-side subscription lifecycle over a multiplexed tightbeam
- * connection.
- *
- * # Ports
- *
- * {@link ClientPorts.split} splits a client once into its
- * {@link CommandPort} and its {@link ServePort}. The `Engine` that dialed the
- * client builds and decodes the frames of both. The manager claims the serve
- * port exclusively, so a later `client.serve` throws instead of silently
- * unrouting updates. Updates dispatch by exact topic match, `end/<topic>`
- * completes a subscription, and every other stream goes to the application's
- * own {@link ManagerOptions.fallback} (or answers `Unimplemented`).
- *
- * # Commands
- *
- * Every command leaves through the {@link CommandLane} of its topic, the one
- * holder of the command port. Subscribing sends `sub/<topic>`, which the
- * server's `Ok` acknowledges. Publishing sends `pub/<topic>` with the encoded
- * message, answered by servers that enable client publish.
+ * The subscription manager of one multiplexed tightbeam client. The page
+ * `docs/pubsub-client.md` states its ports, its commands, and its dispatch.
  */
 
 import type {
@@ -29,59 +12,53 @@ import type {
 	MuxStreamHandler,
 	ServeOptions,
 } from "@wahidgroup/tightbeam-ws-client";
-import {
-	ClientTransportError,
-	HeldCodec,
-	UnroutedTopicError,
-} from "@wahidgroup/tightbeam-ws-client";
+import { HeldCodec, UnroutedTopicError } from "@wahidgroup/tightbeam-ws-client";
 
+import type { Gap, Stamp } from "./gate.js";
+import type { CommandPayload } from "./topic.js";
 import { PullChannel } from "./channel.js";
 import { TopicGate } from "./gate.js";
-import type { CommandBody } from "./topic.js";
-import { Command, Topic } from "./topic.js";
-
-const TEXT = new TextDecoder();
+import { Push, Topic } from "./topic.js";
+import type { Command } from "./topic.js";
 
 /**
- * One decoded update: the typed message, the frame it rode in on, and
+ * The decoder of the id that labels an unrouted push. It keeps a leading
+ * U+FEFF, so the label names the topic the server pushed.
+ */
+const TEXT = new TextDecoder("utf-8", { ignoreBOM: true });
+
+/**
+ * One decoded update: the typed message, the frame that carried it, and
  * the topic that routed it.
  */
 export interface Update<T> {
 	readonly message: T;
 	readonly frame: Frame;
-	readonly topic: string;
+	readonly topic: Topic;
 }
 
 /**
- * Receives one decoded update. The manager awaits the result before
- * acknowledging the stream, so a slow handler back-pressures the
- * server's delivery lane instead of piling up.
+ * Receives one decoded update. The manager acknowledges the stream once the
+ * result settles, so a slow handler slows the delivery lane of the server.
  */
-export type UpdateHandler<T> = (
-	message: T,
-	frame: Frame,
-	topic: string,
-) => void | Promise<void>;
+export type UpdateHandler<T> = (message: T, frame: Frame, topic: Topic) => void | Promise<void>;
 
 /**
- * Observes a detected gap: updates between `expected` and `received`
- * were dropped (delivery policy) for this subscriber. The update that
- * revealed the gap is still delivered, even when the observer throws:
- * the failure surfaces only after the delivery settles. When omitted,
- * the manager re-emits the `sub/` command before that delivery, so a
- * replay-capable server can fill the gap first.
+ * Observes a detected gap: the updates from `gap.expected` up to
+ * `gap.received` were lost for this subscriber.
+ *
+ * - An update that revealed the gap still delivers. A throw of the observer
+ *   surfaces only after that delivery settles.
+ * - An `end/<topic>` that reveals the gap passes one past the last order of
+ *   the topic as `gap.received`.
  */
-export type GapHandler = (
-	topic: string,
-	expected: bigint,
-	received: bigint,
-) => void | Promise<void>;
+export type GapHandler = (topic: Topic, gap: Gap) => void | Promise<void>;
 
 /**
- * Observes topic completion: the server pushed `end/<topic>` (quiesce).
+ * Observes topic completion: the server pushed `end/<topic>` (drain).
  * The subscription is already removed when this fires.
  */
-export type EndHandler = (topic: string) => void;
+export type EndHandler = (topic: Topic) => void;
 
 /**
  * The optional observers every subscription takes. With
@@ -95,20 +72,36 @@ export interface SubscriptionObservers<T> {
 }
 
 /**
- * How a topic's payload rides a frame, in exactly one of two shapes:
+ * How the updates of a subscription carry its payload, in exactly one of
+ * two shapes:
  *
  * - `codec`: the frame body is the message under a {@link MessageCodec}.
- * - `envelope`: the frame body carries a full inner frame, built and
- *   unwrapped (verified, opened, inflated, decoded) under the
- *   {@link Envelope}'s declared layers.
+ * - `envelope`: the frame body carries a full inner frame, unwrapped
+ *   (verified, opened, inflated, decoded) under the declared layers of an
+ *   {@link Envelope} that holds every receive half.
  */
-export type PayloadSource<T> =
+export type SubscribePayload<T> =
 	| {
 			readonly codec: MessageCodec<T>;
 			readonly envelope?: undefined;
 	  }
 	| {
-			readonly envelope: Envelope<T>;
+			readonly envelope: Envelope<T, boolean, true>;
+			readonly codec?: undefined;
+	  };
+
+/**
+ * How a publish carries its payload: a {@link MessageCodec}, or an
+ * {@link Envelope} that holds every send half and builds a full inner frame
+ * under its declared layers.
+ */
+export type PublishPayload<T> =
+	| {
+			readonly codec: MessageCodec<T>;
+			readonly envelope?: undefined;
+	  }
+	| {
+			readonly envelope: Envelope<T, true, boolean>;
 			readonly codec?: undefined;
 	  };
 
@@ -116,149 +109,147 @@ export type PayloadSource<T> =
  * Everything one subscription needs: how updates decode, plus the
  * observers.
  */
-export type SubscribeOptions<T> = SubscriptionObservers<T> & PayloadSource<T>;
+export type SubscribeOptions<T> = SubscriptionObservers<T> & SubscribePayload<T>;
 
 /**
- * A topic payload: how a message builds into a command frame on publish,
- * and how an update frame decodes into a message on delivery.
- *
- * The two kinds are the codec and the envelope of {@link PayloadSource}.
- * {@link PayloadShape.of} is the one decider: it picks the kind, and for a
- * codec whether the shape decodes or builds, so no other step asks which
- * kind it holds.
+ * How a subscription decodes the message an update frame carries.
  */
-export interface PayloadShape<T> extends Disposable {
+export interface DecodingShape<T> {
 	/**
-	 * Build the frame that carries `message` from `command`, the builder
-	 * that already names the command.
+	 * Decode the message that `update` carries.
 	 */
-	build(command: FrameBuilder, message: T): Promise<Frame>;
-
-	/**
-	 * Decode the message an update frame carries.
-	 */
-	decode(update: Frame): T | Promise<T>;
+	decode(update: Frame): Promise<T>;
 }
 
 /**
- * The codec kind: the body is the message under a codec.
- *
- * A subscription only decodes, so its shape holds the caller's codec and
- * reads no handle of it. A publish builds its frame at the turn of its
- * command, possibly after a reconnect, so its shape holds the codec under a
- * copy of its content type and frees the copy as the command settles.
+ * The codec kind of a subscription: the body is the message under a codec.
+ * The shape holds the codec of the caller and reads no handle of it, so the
+ * caller may free its content type.
  */
-class CodecShape<T> implements PayloadShape<T> {
-	private readonly codec: MessageCodec<T>;
+class CodecDecoding<T> implements DecodingShape<T> {
+	readonly #codec: MessageCodec<T>;
 
-	/**
-	 * The copy a publish holds, which the disposal frees.
-	 */
-	readonly #held: HeldCodec<T> | undefined;
-
-	private constructor(codec: MessageCodec<T>, held?: HeldCodec<T>) {
-		this.codec = codec;
-		this.#held = held;
-	}
-
-	/**
-	 * The shape that decodes under `codec`, which it holds as the caller
-	 * passed it.
-	 */
-	static decoding<T>(codec: MessageCodec<T>): CodecShape<T> {
-		const shape = new CodecShape(codec);
-		return shape;
-	}
-
-	/**
-	 * The shape that builds under a copy of `codec`, freed by the disposal.
-	 */
-	static building<T>(codec: MessageCodec<T>): CodecShape<T> {
-		const held = HeldCodec.of(codec);
-		const shape = new CodecShape(held, held);
-		return shape;
-	}
-
-	build(command: FrameBuilder, message: T): Promise<Frame> {
-		const built = command.withMessage(this.codec, message).build();
-		return built;
-	}
-
-	decode(update: Frame): T {
-		const message = update.message(this.codec);
-		return message;
-	}
-
-	/**
-	 * Free the copy a publish holds. A decoding shape holds none.
-	 */
-	[Symbol.dispose](): void {
-		this.#held?.[Symbol.dispose]();
-	}
-}
-
-/**
- * The envelope kind: the body is a full inner frame under the envelope's
- * declared layers, which the registry relays byte-for-byte. The `framed`
- * codec of the engine carries the inner frame.
- */
-class EnvelopeShape<T> implements PayloadShape<T> {
-	constructor(
-		private readonly envelope: Envelope<T>,
-		private readonly framed: MessageCodec<Frame>,
-	) {}
-
-	async build(command: FrameBuilder, message: T): Promise<Frame> {
-		const inner = await this.envelope.frame(message).build();
-		const built = await command.withMessage(this.framed, inner).build();
-		return built;
+	constructor(codec: MessageCodec<T>) {
+		this.#codec = codec;
 	}
 
 	decode(update: Frame): Promise<T> {
-		const inner = update.message(this.framed);
-		const message = this.envelope.unwrap(inner);
+		const message = update.open(this.#codec);
 		return message;
-	}
-
-	/**
-	 * Nothing to free: the envelope holds its own copies.
-	 */
-	[Symbol.dispose](): void {
-		// The envelope keeps the copies it took for as long as it lives.
 	}
 }
 
 /**
- * What a payload shape serves: the updates a subscription decodes, or the
- * commands a publish builds.
+ * The envelope kind of a subscription: the body is a full inner frame,
+ * carried by the `framed` codec of the engine, which unwraps under the
+ * declared layers of the envelope.
  */
-export type ShapeUse = "decoding" | "building";
+class EnvelopeDecoding<T> implements DecodingShape<T> {
+	readonly #envelope: Envelope<T, boolean, true>;
+
+	readonly #framed: MessageCodec<Frame>;
+
+	constructor(envelope: Envelope<T, boolean, true>, framed: MessageCodec<Frame>) {
+		this.#envelope = envelope;
+		this.#framed = framed;
+	}
+
+	async decode(update: Frame): Promise<T> {
+		const inner = await update.open(this.#framed);
+		const message = await this.#envelope.unwrap(inner);
+		return message;
+	}
+}
 
 /**
- * The ways to make a {@link PayloadShape}.
+ * The codec kind of a publish. The command builds its frame at its turn,
+ * possibly after a reconnect, so the payload holds the codec under a copy of
+ * its content type and frees the copy as the command settles.
+ */
+class CodecBuilding<T> implements CommandPayload {
+	readonly #held: HeldCodec<T>;
+
+	readonly #message: T;
+
+	constructor(codec: MessageCodec<T>, message: T) {
+		this.#held = HeldCodec.of(codec);
+		this.#message = message;
+	}
+
+	begin(engine: Engine): FrameBuilder {
+		const begun = engine.messageBuilder(this.#held, this.#message);
+		return begun;
+	}
+
+	[Symbol.dispose](): void {
+		this.#held[Symbol.dispose]();
+	}
+}
+
+/**
+ * The envelope kind of a publish: the body is a full inner frame under the
+ * declared layers of the envelope, which the registry relays byte for byte.
+ * The inner frame takes the topic as its id, and the `framed` codec of the
+ * engine carries it.
+ */
+class EnvelopeBuilding<T> implements CommandPayload {
+	readonly #envelope: Envelope<T, true, boolean>;
+
+	readonly #message: T;
+
+	constructor(envelope: Envelope<T, true, boolean>, message: T) {
+		this.#envelope = envelope;
+		this.#message = message;
+	}
+
+	async begin(engine: Engine, topic: Topic): Promise<FrameBuilder> {
+		const layered = this.#envelope.frame(this.#message);
+		const inner = await layered.withId(topic.name).build();
+		const begun = engine.messageBuilder(engine.framed, inner);
+		return begun;
+	}
+
+	/**
+	 * Free nothing, because the envelope keeps the copies it took for as long
+	 * as it lives.
+	 */
+	[Symbol.dispose](): void {
+		return;
+	}
+}
+
+/**
+ * The payload shapes of a topic. Each factory picks the kind its payload
+ * names, so no other step asks which kind it holds.
  */
 export const PayloadShape = {
 	/**
-	 * The shape `source` names for `use`, whose frames `engine` builds and
-	 * decodes. A building codec shape holds a copy of every handle it reads
-	 * at the turn of its command, freed by its disposal.
+	 * The shape that decodes the updates of a subscription under `payload`,
+	 * through `engine`.
 	 */
-	of<T>(
-		source: PayloadSource<T>,
-		engine: Engine,
-		use: ShapeUse,
-	): PayloadShape<T> {
-		if (source.envelope !== undefined) {
-			const shape = new EnvelopeShape(source.envelope, engine.framed);
-			return shape;
-		}
-		if (use === "decoding") {
-			const shape = CodecShape.decoding(source.codec);
+	decoding<T>(payload: SubscribePayload<T>, engine: Engine): DecodingShape<T> {
+		if (payload.envelope !== undefined) {
+			const shape = new EnvelopeDecoding(payload.envelope, engine.framed);
 			return shape;
 		}
 
-		const shape = CodecShape.building(source.codec);
+		const shape = new CodecDecoding(payload.codec);
 		return shape;
+	},
+
+	/**
+	 * The body of the `pub/` command that publishes `message` under
+	 * `payload`. A codec body holds a copy of every handle it reads at the
+	 * turn of its command, freed as the command settles.
+	 */
+	building<T>(payload: PublishPayload<T>, message: T): CommandPayload {
+		if (payload.envelope !== undefined) {
+			const body = new EnvelopeBuilding(payload.envelope, message);
+			return body;
+		}
+
+		const body = new CodecBuilding(payload.codec, message);
+		return body;
 	},
 };
 
@@ -273,15 +264,10 @@ export const PayloadShape = {
 export type SubscriptionState = "pending" | "live" | "deferred" | "ended";
 
 /**
- * Why the manager refuses a subscription call: `AlreadySubscribed` for a
- * second subscribe to a live topic, `AlreadyIterating` for a second iterator
- * over one {@link IteratingSubscription}, `Disposed` for a subscribe, a
- * publish, or a reattach on a disposed manager, and `DeferralFull` for a
- * command that a lost connection would defer past the {@link MAX_DEFERRED}
- * commands that one manager keeps across its topics.
+ * The rule that a refused subscription call breaks. The page
+ * `docs/pubsub-client.md` (Subscriptions) states each one.
  */
-export type SubscriptionErrorCode =
-	"AlreadySubscribed" | "AlreadyIterating" | "Disposed" | "DeferralFull";
+export type SubscriptionErrorCode = "AlreadySubscribed" | "AlreadyIterating" | "Disposed" | "DeferralFull";
 
 /**
  * The most commands that the lanes of one manager keep, across every topic,
@@ -293,29 +279,33 @@ export const MAX_DEFERRED = 256;
 
 /**
  * The deferral budget of one manager: the slots of {@link MAX_DEFERRED} that
- * its lanes hold. A lane draws a slot as it defers a command, and returns it
- * as the command leaves its queue: on a replay, or on a drop.
+ * its lanes hold. A lane draws a slot as it defers a command, and the
+ * deferred command holds it until it leaves its queue: on a replay, or on a
+ * drop.
  */
 export class DeferralBudget {
 	#held = 0;
 
 	/**
-	 * Take one slot, or answer `false` when every slot is held.
+	 * Take one slot, or answer `undefined` when every slot is held. The
+	 * disposal of the slot returns it once, however often it runs.
 	 */
-	draw(): boolean {
+	draw(): Disposable | undefined {
 		if (this.#held >= MAX_DEFERRED) {
-			return false;
+			return undefined;
 		}
 
 		this.#held += 1;
-		return true;
-	}
-
-	/**
-	 * Return the `count` slots of commands that left a queue.
-	 */
-	refund(count: number): void {
-		this.#held -= count;
+		let held = true;
+		const slot: Disposable = {
+			[Symbol.dispose]: (): void => {
+				if (held) {
+					held = false;
+					this.#held -= 1;
+				}
+			},
+		};
+		return slot;
 	}
 }
 
@@ -344,9 +334,9 @@ export class SubscriptionError extends Error {
  */
 export interface HandlerSubscription {
 	/**
-	 * The topic name the subscription dispatches.
+	 * The topic the subscription dispatches.
 	 */
-	readonly topic: string;
+	readonly topic: Topic;
 
 	/**
 	 * Where the subscription stands right now.
@@ -360,6 +350,12 @@ export interface HandlerSubscription {
 	 * a newer subscription to the same topic live.
 	 */
 	unsubscribe(): Promise<void>;
+
+	/**
+	 * Resolve once the subscription has ended and every update it began to
+	 * deliver has settled: delivered before the end, or dropped by it.
+	 */
+	settled(): Promise<void>;
 }
 
 /**
@@ -370,15 +366,14 @@ export interface HandlerSubscription {
  * ```ts
  * const prices = await manager.subscribe("prices", { codec: engine.opaque });
  * for await (const { message, frame } of prices) {
- *     render(message, frame.order);
+ * 	render(message, frame.order);
  * }
  * ```
  *
- * Iteration ends when the topic completes or unsubscribes, and a `break`
- * out of the loop unsubscribes the topic.
+ * - Iteration ends when the topic completes or unsubscribes.
+ * - A `break` out of the loop unsubscribes the topic.
  */
-export interface IteratingSubscription<T>
-	extends HandlerSubscription, AsyncIterable<Update<T>> {
+export interface IteratingSubscription<T> extends HandlerSubscription, AsyncIterable<Update<T>> {
 	/**
 	 * The one iterator of the subscription. Its `return`, which a `break`
 	 * calls, unsubscribes the topic.
@@ -461,20 +456,52 @@ export interface Subscriber {
 	refused(): void;
 
 	/**
-	 * Answer whether the subscription was live on the lost connection. A
-	 * lapsed subscription replays its `sub/` before the deferred commands,
-	 * because it was acknowledged before any of them was sent.
+	 * Lapse with the lost connection, and answer the `sub/` the subscription
+	 * replays, or `undefined` when it was not live. A lapsed subscription
+	 * replays its `sub/` before the deferred commands, because it was
+	 * acknowledged before any of them was sent.
 	 */
-	lapse(): boolean;
+	lapse(): Command | undefined;
+}
+
+/**
+ * One command a lane replays, with the subscriber it speaks for.
+ */
+interface Replay {
+	readonly command: Command;
+	readonly subscriber: Subscriber | undefined;
 }
 
 /**
  * A command that a lost connection deferred, with the subscriber it speaks
- * for.
+ * for and the slot of the deferral budget it holds.
  */
-interface Deferred {
-	readonly command: Command;
-	readonly subscriber: Subscriber | undefined;
+class Deferred implements Disposable {
+	readonly #replay: Replay;
+
+	readonly #slot: Disposable;
+
+	constructor(replay: Replay, slot: Disposable) {
+		this.#replay = replay;
+		this.#slot = slot;
+	}
+
+	/**
+	 * Leave the queue for a replay: return the slot, and hand over the
+	 * command, which the replay settles.
+	 */
+	replay(): Replay {
+		this.#slot[Symbol.dispose]();
+		return this.#replay;
+	}
+
+	/**
+	 * Drop the command: return the slot, and free what the command holds.
+	 */
+	[Symbol.dispose](): void {
+		this.#slot[Symbol.dispose]();
+		this.#replay.command[Symbol.dispose]();
+	}
 }
 
 /**
@@ -533,12 +560,7 @@ export class CommandLane implements AsyncDisposable {
 	 */
 	readonly #budget: DeferralBudget;
 
-	constructor(
-		topic: Topic,
-		port: CommandPort,
-		engine: Engine,
-		budget: DeferralBudget,
-	) {
+	constructor(topic: Topic, port: CommandPort, engine: Engine, budget: DeferralBudget) {
 		this.topic = topic;
 		this.#port = port;
 		this.#engine = engine;
@@ -572,17 +594,13 @@ export class CommandLane implements AsyncDisposable {
 	 * Replay the commands that `lost`, the lane of the lost connection,
 	 * deferred, as the first turn of this lane.
 	 *
-	 * The replay waits for `lost` to settle. A lapsed `subscriber` then
-	 * replays its `sub/` first, and the deferred commands follow in the
-	 * order they were sent.
+	 * 1. The replay waits for `lost` to settle.
+	 * 2. A lapsed `subscriber` replays its `sub/` first.
+	 * 3. The deferred commands follow in the order they were sent.
 	 *
-	 * Resolves with the refusal of each replayed command the server
-	 * refused.
+	 * Resolves with the refusal of each replayed command the server refused.
 	 */
-	adopt(
-		lost: CommandLane | undefined,
-		subscriber: Subscriber | undefined,
-	): Promise<unknown[]> {
+	adopt(lost: CommandLane | undefined, subscriber: Subscriber | undefined): Promise<unknown[]> {
 		const run = (): Promise<unknown[]> => this.#replay(lost, subscriber);
 		const replayed = this.#after(run);
 		return replayed;
@@ -613,20 +631,17 @@ export class CommandLane implements AsyncDisposable {
 	 * Replay the deferred commands of `lost` through this lane, after the
 	 * `sub/` of a lapsed `subscriber`.
 	 */
-	async #replay(
-		lost: CommandLane | undefined,
-		subscriber: Subscriber | undefined,
-	): Promise<unknown[]> {
-		const replays: Deferred[] = [];
+	async #replay(lost: CommandLane | undefined, subscriber: Subscriber | undefined): Promise<unknown[]> {
+		const replays: Replay[] = [];
 		if (lost !== undefined) {
 			await lost.#tail;
-			const deferred = lost.#deferred.splice(0);
-			this.#budget.refund(deferred.length);
-			replays.push(...deferred);
+			for (const deferred of lost.#deferred.splice(0)) {
+				replays.push(deferred.replay());
+			}
 		}
 
-		if (subscriber?.lapse() === true) {
-			const resubscribing = this.topic.subscribe();
+		const resubscribing = subscriber?.lapse();
+		if (resubscribing !== undefined) {
 			replays.unshift({ command: resubscribing, subscriber });
 		}
 
@@ -675,19 +690,21 @@ export class CommandLane implements AsyncDisposable {
 		try {
 			await this.#port.emit(frame);
 		} catch (failure) {
-			if (!ClientTransportError.isConnectionClosed(failure)) {
+			const closed = this.#engine.isTransportError(failure) && failure.code === "ConnectionClosed";
+			if (!closed) {
 				subscriber?.refused();
 				throw failure;
 			}
 
 			const slot = this.#budget.draw();
-			if (!slot) {
+			if (slot === undefined) {
 				subscriber?.refused();
 				const message = `the manager already holds ${MAX_DEFERRED} deferred commands`;
 				throw new SubscriptionError("DeferralFull", message);
 			}
 
-			this.#deferred.push({ command, subscriber });
+			const deferred = new Deferred({ command, subscriber }, slot);
+			this.#deferred.push(deferred);
 			subscriber?.deferred();
 			return true;
 		}
@@ -699,31 +716,34 @@ export class CommandLane implements AsyncDisposable {
 	/**
 	 * Wait for the turns in flight, then drop the commands the lost
 	 * connection deferred, which no replay will send, and free what each one
-	 * holds. A command that defers while the disposal waits drops with the
-	 * rest.
+	 * holds.
 	 *
-	 * An emit has no deadline of its own, so the wait ends as each command
-	 * settles: the server answers it, or the client closes, which settles
-	 * every pending emit with `ConnectionClosed`.
+	 * - A command that defers while the disposal waits drops with the rest.
+	 * - The wait ends as each command settles: the server answers it, or the client closes, which
+	 *   settles every pending emit with `ConnectionClosed`.
 	 */
 	async [Symbol.asyncDispose](): Promise<void> {
 		await this.#tail;
 
-		const dropped = this.#deferred.splice(0);
-		this.#budget.refund(dropped.length);
-		for (const { command } of dropped) {
-			command[Symbol.dispose]();
+		for (const dropped of this.#deferred.splice(0)) {
+			dropped[Symbol.dispose]();
 		}
 	}
 }
 
 /**
+ * The key of the member of {@link ClientPorts} that opens a lane. The module
+ * keeps it, so only the manager opens one.
+ */
+const OPEN_LANE: unique symbol = Symbol("ClientPorts.openLane");
+
+/**
  * A client split once into the uses the manager makes of it.
  *
- * The command port sits in a private field, which only
- * {@link ClientPorts.lane} reads, so every command the manager sends passes
- * a {@link CommandLane}. The manager reaches the {@link ServePort} alone,
- * which holds no `emit`, and through it the engine that dialed the client.
+ * - The command port sits in a private field that only the lanes of the manager read, so every
+ *   command the manager sends passes a lane.
+ * - The manager reaches the {@link ServePort} alone, which holds no `emit`, and through it the
+ *   engine that dialed the client.
  */
 export class ClientPorts {
 	/**
@@ -759,7 +779,7 @@ export class ClientPorts {
 	 * A new lane for the commands of `topic`, over the command port, which
 	 * defers into `budget`, the budget of the manager.
 	 */
-	lane(topic: Topic, budget: DeferralBudget): CommandLane {
+	[OPEN_LANE](topic: Topic, budget: DeferralBudget): CommandLane {
 		const commands = this.#commands;
 		const lane = new CommandLane(topic, commands, this.engine, budget);
 		return lane;
@@ -773,15 +793,6 @@ export class ClientPorts {
 interface HeldFailure {
 	readonly cause: unknown;
 }
-
-/**
- * How a subscription ends.
- *
- * - `unsubscribed`: the application unsubscribed.
- * - `refused`: the server refused its `sub/`, on subscribe or on reattach.
- * - `completed`: the server pushed `end/<topic>`.
- */
-export type Ending = "unsubscribed" | "refused" | "completed";
 
 /**
  * How an entry hands each update to the application. The two kinds are
@@ -806,7 +817,7 @@ export interface Delivery {
 export class HandlerDelivery<T> implements Delivery {
 	constructor(
 		private readonly topic: Topic,
-		private readonly shape: PayloadShape<T>,
+		private readonly shape: DecodingShape<T>,
 		private readonly onUpdate: UpdateHandler<T>,
 	) {}
 
@@ -816,7 +827,7 @@ export class HandlerDelivery<T> implements Delivery {
 			return;
 		}
 
-		await this.onUpdate(message, update, this.topic.name);
+		await this.onUpdate(message, update, this.topic);
 	}
 
 	end(): void {
@@ -828,11 +839,12 @@ export class HandlerDelivery<T> implements Delivery {
 	 */
 	handle(entry: Entry, release: () => Promise<void>): HandlerSubscription {
 		const subscription: HandlerSubscription = {
-			topic: this.topic.name,
+			topic: this.topic,
 			get state(): SubscriptionState {
 				return entry.state;
 			},
 			unsubscribe: release,
+			settled: () => entry.settled(),
 		};
 		return subscription;
 	}
@@ -853,7 +865,7 @@ export class ChannelDelivery<T> implements Delivery {
 
 	constructor(
 		private readonly topic: Topic,
-		private readonly shape: PayloadShape<T>,
+		private readonly shape: DecodingShape<T>,
 	) {}
 
 	async deliver(update: Frame, live: () => boolean): Promise<void> {
@@ -865,7 +877,7 @@ export class ChannelDelivery<T> implements Delivery {
 		const pulled: Update<T> = {
 			message,
 			frame: update,
-			topic: this.topic.name,
+			topic: this.topic,
 		};
 		await this.channel.put(pulled);
 	}
@@ -877,17 +889,15 @@ export class ChannelDelivery<T> implements Delivery {
 	/**
 	 * The handle of `entry`, which `release` unsubscribes.
 	 */
-	handle(
-		entry: Entry,
-		release: () => Promise<void>,
-	): IteratingSubscription<T> {
+	handle(entry: Entry, release: () => Promise<void>): IteratingSubscription<T> {
 		const iterate = (): AsyncIterator<Update<T>> => this.iterator(release);
 		const subscription: IteratingSubscription<T> = {
-			topic: this.topic.name,
+			topic: this.topic,
 			get state(): SubscriptionState {
 				return entry.state;
 			},
 			unsubscribe: release,
+			settled: () => entry.settled(),
 			[Symbol.asyncIterator]: iterate,
 		};
 		return subscription;
@@ -898,8 +908,7 @@ export class ChannelDelivery<T> implements Delivery {
 	 */
 	private iterator(release: () => Promise<void>): AsyncIterator<Update<T>> {
 		if (this.iterated) {
-			const message =
-				"a subscription has one iterator: keep the first one, or subscribe again";
+			const message = "a subscription has one iterator: keep the first one, or subscribe again";
 			throw new SubscriptionError("AlreadyIterating", message);
 		}
 
@@ -928,12 +937,8 @@ export const Delivery = {
 	 * the one iterator of a subscription without one. `engine` decodes each
 	 * update.
 	 */
-	of<T>(
-		topic: Topic,
-		options: SubscribeOptions<T>,
-		engine: Engine,
-	): HandlerDelivery<T> | ChannelDelivery<T> {
-		const shape = PayloadShape.of(options, engine, "decoding");
+	of<T>(topic: Topic, options: SubscribeOptions<T>, engine: Engine): HandlerDelivery<T> | ChannelDelivery<T> {
+		const shape = PayloadShape.decoding(options, engine);
 		const onUpdate = options.onUpdate;
 		if (onUpdate !== undefined) {
 			const delivery = new HandlerDelivery(topic, shape, onUpdate);
@@ -946,19 +951,46 @@ export const Delivery = {
 };
 
 /**
+ * The observers an entry takes: the gap observer, and the end observer.
+ */
+export interface EntryObservers {
+	readonly onGap?: GapHandler | undefined;
+	readonly onEnd?: EndHandler | undefined;
+}
+
+/**
+ * Where an entry stands. Each mode maps to one {@link SubscriptionState},
+ * and two modes hold what the state hides:
+ *
+ * - `unsent`: pending, and its first `sub/` has not left.
+ * - `abandoned`: ended before its first `sub/` left. That `sub/` still
+ *   leaves, so the server answers the subscribe call.
+ */
+type Mode = "unsent" | "pending" | "live" | "deferred" | "abandoned" | "ended";
+
+/**
+ * The public state of each mode.
+ */
+const STATE_OF_MODE: Readonly<Record<Mode, SubscriptionState>> = {
+	unsent: "pending",
+	pending: "pending",
+	live: "live",
+	deferred: "deferred",
+	abandoned: "ended",
+	ended: "ended",
+};
+
+/**
  * The dispatch record of one subscription while its topic stays desired.
  *
- * {@link Entries.end} ends an entry in the same step that removes it from
- * the map, so an entry is open exactly while it holds its topic. That is the
- * unsubscribe fence: the delivery path re-checks it after every await, so
- * in-flight work respects unsubscribe and completion.
- *
- * Against {@link TopicGate}, classify before delivery. Advance after
- * delivery while the entry stays open, so a failed decode or handler leaves
- * the stamp free for a later gap.
- *
- * The state moves only through the {@link Subscriber} answers and
- * {@link end}, and an ended entry stays ended.
+ * - {@link Entries.end} ends an entry in the same step that removes it from the map, so an entry
+ *   is open exactly while it holds its topic.
+ * - That is the unsubscribe fence: the delivery path re-checks it after every await, so in-flight
+ *   work respects unsubscribe and completion.
+ * - Against {@link TopicGate}, classify before delivery, and settle the stamp of the update once
+ *   the delivery settles.
+ * - The mode moves only through the {@link Subscriber} answers and {@link end}, and an ended
+ *   entry stays ended.
  */
 export class Entry implements Subscriber {
 	private readonly gate = new TopicGate();
@@ -976,19 +1008,20 @@ export class Entry implements Subscriber {
 
 	private readonly entries: Entries;
 
-	private mode: SubscriptionState = "pending";
+	private mode: Mode = "unsent";
 
 	/**
-	 * Whether a `sub/` of the entry has left.
+	 * The updates whose delivery began and has not settled.
 	 */
-	private subscribed = false;
+	private delivering = 0;
 
-	constructor(
-		topic: Topic,
-		delivery: Delivery,
-		observers: Pick<SubscriptionObservers<unknown>, "onEnd" | "onGap">,
-		entries: Entries,
-	) {
+	/**
+	 * The callers of {@link settled} that wait for the entry to end and its
+	 * deliveries to settle.
+	 */
+	private readonly waiters: (() => void)[] = [];
+
+	constructor(topic: Topic, delivery: Delivery, observers: EntryObservers, entries: Entries) {
 		this.topic = topic;
 		this.delivery = delivery;
 		this.onGap = observers.onGap;
@@ -1000,63 +1033,105 @@ export class Entry implements Subscriber {
 	 * Where the subscription stands.
 	 */
 	get state(): SubscriptionState {
-		return this.mode;
+		const state = STATE_OF_MODE[this.mode];
+		return state;
 	}
 
 	/**
 	 * Whether the entry still holds its topic.
 	 */
 	private get open(): boolean {
-		const open = this.mode !== "ended";
+		const open = this.state !== "ended";
 		return open;
 	}
 
 	/**
-	 * Receive one update: classify it against the gate, answer a gap it
-	 * reveals, deliver it, then commit its stamp while the entry stays open.
-	 *
-	 * Without a gap observer, `resync` answers the gap before the delivery,
-	 * so a replay-capable server fills it while the gate still expects the
-	 * missing stamps. A gap observer answers in its place. The revealing
-	 * update delivers even when the answer fails, and that failure throws
-	 * once the delivery settles. A failed delivery throws in its place.
+	 * Whether a push of the topic reaches this entry: its `sub/` left on the
+	 * current connection. A push that arrives before then belongs to an
+	 * earlier subscription of the topic.
 	 */
-	async receive(update: Frame, resync: () => Promise<void>): Promise<void> {
+	get reachable(): boolean {
+		const reachable = this.mode === "pending" || this.mode === "live";
+		return reachable;
+	}
+
+	/**
+	 * Receive one update: classify it against the gate, report a gap it
+	 * reveals, deliver it, then settle its stamp.
+	 *
+	 * - The gap observer runs before the delivery.
+	 * - The update delivers even when the observer fails, and that failure
+	 *   throws once the delivery settles. A failed delivery throws in its
+	 *   place.
+	 */
+	async receive(update: Frame): Promise<void> {
 		const order = update.order;
-		const expected = this.gate.expected;
 		const verdict = this.gate.classify(order);
-		if (verdict === "stale") {
+		if (verdict.kind === "stale") {
 			return;
 		}
 
-		let answered: HeldFailure | undefined;
-		if (verdict === "gap" && expected !== undefined) {
-			answered = await this.answerGap(expected, order, resync);
-		}
+		this.delivering += 1;
+		try {
+			let answered: HeldFailure | undefined;
+			if (verdict.kind === "gap") {
+				answered = await this.answerGap(verdict.gap);
+			}
 
-		const delivered = await this.deliverWhileOpen(update);
-		const failure = delivered ?? answered;
-		if (failure !== undefined) {
-			throw failure.cause;
+			const delivered = await this.deliverWhileOpen(update, verdict.stamp);
+			const failure = delivered ?? answered;
+			if (failure !== undefined) {
+				throw failure.cause;
+			}
+		} finally {
+			this.delivering -= 1;
+			this.wake();
 		}
 	}
 
 	/**
-	 * Answer the gap from `expected` to `received`: hand it to the gap
-	 * observer, or run `resync` without one. The failure of either is held,
-	 * so the revealing update still delivers.
+	 * Resolve once the entry has ended and every update it began to deliver
+	 * has settled.
 	 */
-	private async answerGap(
-		expected: bigint,
-		received: bigint,
-		resync: () => Promise<void>,
-	): Promise<HeldFailure | undefined> {
+	settled(): Promise<void> {
+		if (this.quiet) {
+			return Promise.resolve();
+		}
+
+		const waiting = new Promise<void>((resolve) => {
+			this.waiters.push(resolve);
+		});
+		return waiting;
+	}
+
+	/**
+	 * Whether the entry has ended with no delivery in flight.
+	 */
+	private get quiet(): boolean {
+		const quiet = !this.open && this.delivering === 0;
+		return quiet;
+	}
+
+	/**
+	 * Release the callers of {@link settled} once the entry is quiet.
+	 */
+	private wake(): void {
+		if (!this.quiet) {
+			return;
+		}
+
+		for (const waiter of this.waiters.splice(0)) {
+			waiter();
+		}
+	}
+
+	/**
+	 * Report `gap` to the gap observer. Its failure is held, so the revealing
+	 * update still delivers.
+	 */
+	private async answerGap(gap: Gap): Promise<HeldFailure | undefined> {
 		try {
-			if (this.onGap === undefined) {
-				await resync();
-			} else {
-				await this.onGap(this.topic.name, expected, received);
-			}
+			await this.onGap?.(this.topic, gap);
 		} catch (cause) {
 			const failure = { cause };
 			return failure;
@@ -1066,13 +1141,11 @@ export class Entry implements Subscriber {
 	}
 
 	/**
-	 * Deliver `update` while the entry stays open, then commit its stamp. A
-	 * failed delivery witnesses the stamp instead, so the next update reveals
-	 * the loss as a gap even before any baseline.
+	 * Deliver `update` while the entry stays open, then settle its `stamp`:
+	 * delivered, or failed, so the next update reveals the loss as a gap
+	 * even before any baseline.
 	 */
-	private async deliverWhileOpen(
-		update: Frame,
-	): Promise<HeldFailure | undefined> {
+	private async deliverWhileOpen(update: Frame, stamp: Stamp): Promise<HeldFailure | undefined> {
 		if (!this.open) {
 			return undefined;
 		}
@@ -1081,38 +1154,61 @@ export class Entry implements Subscriber {
 		try {
 			await this.delivery.deliver(update, live);
 		} catch (cause) {
-			this.gate.witness(update.order);
+			stamp.failed();
 			const failure = { cause };
 			return failure;
 		}
 
-		/*
-		 * The entry may have ended by the time the delivery path returns.
-		 */
-		if (this.open) {
-			this.gate.advance(update.order);
-		}
-
+		stamp.delivered();
 		return undefined;
 	}
 
 	/**
+	 * Complete the subscription at `order`, the last order of its topic, as
+	 * the `end/<topic>` of a drain carries it, then end it.
+	 *
+	 * - One past `order` classifies against the gate, so each update after the baseline that the
+	 *   subscription lost reports as a gap first.
+	 * - An entry that still held its topic notifies the end observer once it ended.
+	 * - A failure of the gap observer throws once the entry ended.
+	 */
+	async complete(order: bigint): Promise<void> {
+		const verdict = this.gate.classify(order + 1n);
+		let answered: HeldFailure | undefined;
+		if (verdict.kind === "gap") {
+			answered = await this.answerGap(verdict.gap);
+		}
+
+		const ended = this.entries.end(this);
+		if (ended) {
+			this.onEnd?.(this.topic);
+		}
+
+		if (answered !== undefined) {
+			throw answered.cause;
+		}
+	}
+
+	/**
 	 * The first `sub/` of the entry always leaves, so the server answers the
-	 * subscribe call. Each later one, a resync or a replay, leaves while the
-	 * entry holds its topic.
+	 * subscribe call. A replay leaves while the entry holds its topic.
 	 */
 	wants(): boolean {
-		const wanted = !this.subscribed || this.open;
+		const wanted = this.mode !== "ended";
 		return wanted;
 	}
 
 	/**
-	 * A `sub/` leaves, and a deferred subscription is pending again.
+	 * A `sub/` leaves: an unsent or deferred subscription is pending, and an
+	 * abandoned one has sent the `sub/` it owed.
 	 */
 	leaving(): void {
-		this.subscribed = true;
-		if (this.mode === "deferred") {
+		if (this.mode === "unsent" || this.mode === "deferred") {
 			this.mode = "pending";
+			return;
+		}
+		if (this.mode === "abandoned") {
+			this.mode = "ended";
 		}
 	}
 
@@ -1136,41 +1232,43 @@ export class Entry implements Subscriber {
 	}
 
 	/**
-	 * The server refused `sub/`: a pending subscription ends. A live one
-	 * stays live, because the refusal answered a gap resync.
+	 * The server refused `sub/`: a pending subscription ends.
 	 */
 	refused(): void {
 		if (this.mode === "pending") {
-			this.entries.end(this, "refused");
+			this.entries.end(this);
 		}
 	}
 
 	/**
-	 * A live subscription lapses with its lost connection: it waits for the
-	 * replay, and its gate resets, so the next update re-baselines. Answers
-	 * whether it lapsed.
+	 * The subscription lapses with its lost connection: its gate resets in
+	 * every mode, so the next update of the replacement connection
+	 * re-baselines. A live one waits for the replay. Answers the `sub/` it
+	 * replays, or `undefined` when it was not live.
 	 */
-	lapse(): boolean {
-		if (this.mode !== "live") {
-			return false;
-		}
-
+	lapse(): Command | undefined {
 		this.gate.reset();
+		if (this.mode !== "live") {
+			return undefined;
+		}
+
 		this.mode = "deferred";
-		return true;
+		const resubscribing = this.topic.subscribe();
+		return resubscribing;
 	}
 
 	/**
-	 * End the subscription and its delivery. A completion then notifies the
-	 * end observer.
+	 * End the subscription and its delivery.
 	 */
-	end(ending: Ending): void {
-		this.mode = "ended";
-		this.delivery.end();
-
-		if (ending === "completed") {
-			this.onEnd?.(this.topic.name);
+	end(): void {
+		if (this.mode === "unsent") {
+			this.mode = "abandoned";
+		} else {
+			this.mode = "ended";
 		}
+
+		this.delivery.end();
+		this.wake();
 	}
 }
 
@@ -1194,11 +1292,7 @@ export class Entries {
 	 * @throws SubscriptionError with code `AlreadySubscribed` when an entry
 	 * already holds the topic.
 	 */
-	open(
-		topic: Topic,
-		delivery: Delivery,
-		observers: Pick<SubscriptionObservers<unknown>, "onEnd" | "onGap">,
-	): Entry {
+	open(topic: Topic, delivery: Delivery, observers: EntryObservers): Entry {
 		if (this.held.has(topic.name)) {
 			const message = `already subscribed to topic: ${topic.name}`;
 			throw new SubscriptionError("AlreadySubscribed", message);
@@ -1218,7 +1312,7 @@ export class Entries {
 	}
 
 	/**
-	 * Every entry.
+	 * The entries in the order they opened.
 	 */
 	values(): IterableIterator<Entry> {
 		const entries = this.held.values();
@@ -1226,33 +1320,18 @@ export class Entries {
 	}
 
 	/**
-	 * End `entry` for `ending` and take it out of the map in one step, while
-	 * it holds its topic. Answers whether it did, and leaves a newer entry of
-	 * the topic alone.
+	 * End `entry` and take it out of the map in one step, while it holds its topic.
+	 * Answers whether it did, and leaves a newer entry of the topic alone.
 	 */
-	end(entry: Entry, ending: Ending): boolean {
+	end(entry: Entry): boolean {
 		const name = entry.topic.name;
 		if (this.held.get(name) !== entry) {
 			return false;
 		}
 
 		this.held.delete(name);
-		entry.end(ending);
+		entry.end();
 		return true;
-	}
-
-	/**
-	 * End the entry of `topic` as completed. Answers whether an entry held
-	 * the topic.
-	 */
-	complete(topic: Topic): boolean {
-		const entry = this.held.get(topic.name);
-		if (entry === undefined) {
-			return false;
-		}
-
-		const ended = this.end(entry, "completed");
-		return ended;
 	}
 }
 
@@ -1311,13 +1390,8 @@ class Attachment {
 /**
  * Topic subscriptions over the {@link ClientPorts} of one client.
  *
- * Construction installs the serve handler immediately (exclusively), so
- * updates racing the `sub/` acknowledgment are never unrouted. After a
- * reconnect, pass the ports of the replacement client to {@link reattach}:
- * the commands the lost connection deferred replay, and the desired topics
- * re-subscribe. A disposal, through `await using` or
- * `[Symbol.asyncDispose]`, ends every subscription and detaches the serve
- * handler.
+ * The constructor claims the serve port of the client exclusively, so an
+ * update that races the acknowledgment of its `sub/` still routes.
  */
 export class SubscriptionManager {
 	private ports: ClientPorts;
@@ -1349,7 +1423,7 @@ export class SubscriptionManager {
 
 		const route: MuxStreamHandler = (update) => this.dispatch(update);
 		this.attachment = new Attachment(route);
-		this.install();
+		this.install(ports);
 	}
 
 	/**
@@ -1360,17 +1434,14 @@ export class SubscriptionManager {
 	}
 
 	/**
-	 * Subscribe to `topic`, resolving once the server acknowledges.
+	 * Subscribe to `topic`, and resolve once the server acknowledges.
 	 *
-	 * The dispatch entry registers before the command leaves, so an
-	 * update racing the acknowledgment still routes. A refusal
-	 * (`PermissionDenied`, `Unavailable`, ...) removes the entry and
-	 * rethrows. A connection loss keeps the topic in the desired set
-	 * with a `deferred` state: delivery starts after {@link reattach}.
-	 *
-	 * With an `onUpdate` handler, the subscription is a
-	 * {@link HandlerSubscription}. Without one, it is an
-	 * {@link IteratingSubscription}.
+	 * - A refusal of the server removes the entry and throws.
+	 * - A lost connection keeps the subscription `deferred` until
+	 *   {@link reattach}.
+	 * - With an `onUpdate` handler, the subscription is a
+	 *   {@link HandlerSubscription}, and without one an
+	 *   {@link IteratingSubscription}.
 	 *
 	 * @throws TopicError for an invalid topic name, and SubscriptionError
 	 * with code `AlreadySubscribed` when the topic is already subscribed, or
@@ -1392,7 +1463,8 @@ export class SubscriptionManager {
 
 		const parsed = Topic.parse(topic);
 		const delivery = Delivery.of(parsed, options, this.ports.engine);
-		const entry = this.entries.open(parsed, delivery, options);
+		const observers = { onGap: options.onGap, onEnd: options.onEnd };
+		const entry = this.entries.open(parsed, delivery, observers);
 		const release = (): Promise<void> => this.release(entry);
 		const subscription = delivery.handle(entry, release);
 
@@ -1402,45 +1474,30 @@ export class SubscriptionManager {
 	}
 
 	/**
-	 * Publish `message` on `topic` through the wire's `pub/<topic>`
-	 * command, resolving once the server acknowledges or a connection loss
-	 * defers the command to {@link reattach}.
+	 * Publish `message` on `topic` with a `pub/<topic>` command, and resolve
+	 * once the server acknowledges or a lost connection defers the command to
+	 * {@link reattach}.
 	 *
-	 * A `codec` source encodes the message directly as the command's body.
-	 * An `envelope` source publishes frame-in-frame: the message travels as
-	 * a full inner frame with the envelope's declared layers applied, which
-	 * the registry relays byte-for-byte.
+	 * The page `docs/pubsub-client.md` (Publish) states each payload shape.
 	 *
-	 * The server must enable client publish (a `PublishPolicy` on its
-	 * `PubsubCommands`). Otherwise the command falls through to its
-	 * application routes and typically rejects `Unimplemented`.
-	 *
-	 * @throws TopicError for an invalid topic name, and SubscriptionError
-	 * with code `Disposed` once the manager is disposed.
+	 * @throws TopicError for an invalid topic name.
+	 * @throws SubscriptionError with code `Disposed` once the manager is disposed.
 	 */
-	async publish<T>(
-		topic: Topic | string,
-		message: T,
-		source: PayloadSource<T>,
-	): Promise<void> {
+	async publish<T>(topic: Topic | string, message: T, payload: PublishPayload<T>): Promise<void> {
 		this.attachment.requireAttached("publish");
 
 		const parsed = Topic.parse(topic);
-		const shape = PayloadShape.of(source, this.ports.engine, "building");
-		const body: CommandBody = (command) => shape.build(command, message);
-
-		const publishing = parsed.publish(body, shape);
+		const body = PayloadShape.building(payload, message);
+		const publishing = parsed.publish(body);
 		await this.send(publishing);
 	}
 
 	/**
-	 * Emit `unsub/<topic>` and stop dispatching the topic locally.
+	 * Stop dispatching `topic` locally, then emit `unsub/<topic>` once a
+	 * `sub/` still pending for the topic settles.
 	 *
-	 * Local removal happens first and is the fence: an update already
-	 * in flight re-checks it after every await, so no update dispatches
-	 * after this call regardless of the command's fate. The `unsub/`
-	 * leaves after a `sub/` still pending for the topic settles. A
-	 * connection loss defers it to {@link reattach}.
+	 * The local removal is the fence: an update in flight re-checks it after
+	 * every await, so no update dispatches after this call.
 	 *
 	 * @throws TopicError for an invalid topic name.
 	 */
@@ -1456,29 +1513,27 @@ export class SubscriptionManager {
 
 	/**
 	 * Resume on the ports of a replacement connection after the previous
-	 * one closed. Installs the serve handler, then gives each topic a new
-	 * lane whose first turn replays the topic:
+	 * one closed. Installs the serve handler on the new client first, then
+	 * gives each topic a new lane whose first turn replays the topic:
 	 *
 	 * 1. The replay waits for the commands still in flight on the old lane.
-	 * 2. A subscription that was live re-sends its `sub/`, and its gate
-	 *    re-baselines on the next update.
+	 * 2. The gate of the subscription resets, and a subscription that was live
+	 *    re-sends its `sub/`.
 	 * 3. The commands the lost connection deferred follow, in the order they
 	 *    were sent.
 	 *
-	 * Every command sent after this call follows the replay of its topic.
-	 * A refused `sub/` replay ends its topic, and a connection loss defers
-	 * the command for the next reattach. When the server refused any replay,
-	 * an `AggregateError` of every refusal throws after all settle. The
-	 * surviving topics are already consistent.
+	 * - Every command sent after this call follows the replay of its topic.
+	 * - A refused `sub/` replay ends its topic.
+	 * - When the server refused any replay, an `AggregateError` of every refusal throws once all settle.
 	 *
-	 * @throws SubscriptionError with code `Disposed` once the manager is
-	 * disposed, before it installs any handler.
+	 * @throws SubscriptionError with code `Disposed` once the manager is disposed, before it installs any handler.
+	 * @throws The serve refusal of a new client, which leaves the manager on the ports it had.
 	 */
 	async reattach(ports: ClientPorts): Promise<void> {
 		this.attachment.requireAttached("reattach");
 
+		this.install(ports);
 		this.ports = ports;
-		this.install();
 
 		const topics = new Map<string, Topic>();
 		for (const lane of this.lanes.values()) {
@@ -1492,7 +1547,7 @@ export class SubscriptionManager {
 		for (const topic of topics.values()) {
 			const lost = this.lanes.get(topic.name);
 			const subscriber = this.entries.get(topic.name);
-			const lane = ports.lane(topic, this.deferrals);
+			const lane = ports[OPEN_LANE](topic, this.deferrals);
 			this.lanes.set(topic.name, lane);
 
 			const replayed = lane.adopt(lost, subscriber);
@@ -1509,16 +1564,11 @@ export class SubscriptionManager {
 	}
 
 	/**
-	 * Dispose the manager. The serve handler detaches first, so no later push
-	 * reaches the manager, and every subscription then ends and sends its
-	 * `unsub/` through the lane of its topic. Resolves once every `unsub/`
-	 * settles and every lane drops what its lost connection deferred, after
-	 * the commands still in flight settle, and a later disposal ends nothing
-	 * more. A later `subscribe`, `publish`, or `reattach` refuses with
-	 * `Disposed`.
+	 * Detach the serve handler, then end every subscription and send its
+	 * `unsub/`. The page `docs/pubsub-client.md` (Manager) states when the
+	 * disposal resolves.
 	 *
-	 * When the server refused any `unsub/`, an `AggregateError` of every
-	 * refusal throws after all settle.
+	 * @throws AggregateError of every `unsub/` that the server refused, once all settle.
 	 */
 	async [Symbol.asyncDispose](): Promise<void> {
 		this.attachment.detach();
@@ -1554,22 +1604,13 @@ export class SubscriptionManager {
 	 * subscription to the same topic alone.
 	 */
 	private async release(entry: Entry): Promise<void> {
-		const released = this.entries.end(entry, "unsubscribed");
+		const released = this.entries.end(entry);
 		if (!released) {
 			return;
 		}
 
 		const leaving = entry.topic.unsubscribe();
 		await this.send(leaving);
-	}
-
-	/**
-	 * Re-send `sub/` for `entry` to answer a gap, so a replay-capable server
-	 * fills it.
-	 */
-	private async resync(entry: Entry): Promise<void> {
-		const resubscribing = entry.topic.subscribe();
-		await this.send(resubscribing, entry);
 	}
 
 	/**
@@ -1591,7 +1632,7 @@ export class SubscriptionManager {
 			return held;
 		}
 
-		const lane = this.ports.lane(topic, this.deferrals);
+		const lane = this.ports[OPEN_LANE](topic, this.deferrals);
 		this.lanes.set(topic.name, lane);
 		return lane;
 	}
@@ -1600,10 +1641,7 @@ export class SubscriptionManager {
 	 * Forget `lane` once `settling` settles and the lane goes idle, unless a
 	 * later lane took its place.
 	 */
-	private async retire(
-		lane: CommandLane,
-		settling: Promise<unknown>,
-	): Promise<void> {
+	private async retire(lane: CommandLane, settling: Promise<unknown>): Promise<void> {
 		await whenSettled(settling);
 
 		const name = lane.topic.name;
@@ -1614,40 +1652,33 @@ export class SubscriptionManager {
 	}
 
 	/**
-	 * Register the handler of the attachment on the current serve port,
-	 * claiming dispatch exclusively so a later `client.serve` cannot silently
-	 * unroute updates.
+	 * Register the handler of the attachment on the serve port of `ports`,
+	 * claiming dispatch exclusively, so every update stays routed to the manager.
 	 *
-	 * The client holds the attachment, which reaches the manager until a
-	 * disposal detaches it.
+	 * The client holds the attachment, which reaches the manager until a disposal detaches it.
 	 */
-	private install(): void {
+	private install(ports: ClientPorts): void {
 		const handler = this.attachment.handler;
-		this.ports.serving.serve(handler, { claim: "exclusive" });
+		ports.serving.serve(handler, { claim: "exclusive" });
 	}
 
 	/**
-	 * Route one server-initiated stream.
+	 * Route one server-initiated stream by its id, parsed once: a push of a
+	 * topic to the entry that the push reaches, and every other push to the
+	 * fallback.
 	 */
 	private async dispatch(update: Frame): Promise<Frame | undefined | null> {
-		const id = TEXT.decode(update.id);
-		const completed = Command.parse(id)?.completed;
-		if (completed !== undefined) {
-			const ended = this.entries.complete(completed);
-			if (ended) {
-				return undefined;
-			}
-
-			return this.unmatched(update, id);
+		const push = Push.parse(update.id);
+		if (push === undefined) {
+			return this.unmatched(update);
 		}
 
-		const entry = this.entries.get(id);
-		if (entry === undefined) {
-			return this.unmatched(update, id);
+		const entry = this.entries.get(push.topic.name);
+		if (entry === undefined || !entry.reachable) {
+			return this.unmatched(update);
 		}
 
-		const resync = (): Promise<void> => this.resync(entry);
-		await entry.receive(update, resync);
+		await Push.route(push, entry, update);
 		return undefined;
 	}
 
@@ -1655,14 +1686,12 @@ export class SubscriptionManager {
 	 * Hand an unmatched stream to the fallback, or answer
 	 * `Unimplemented`.
 	 */
-	private unmatched(
-		update: Frame,
-		id: string,
-	): Promise<Frame | undefined | null> | Frame | undefined | null {
+	private unmatched(update: Frame): Promise<Frame | undefined | null> | Frame | undefined | null {
 		if (this.fallback !== undefined) {
 			return this.fallback(update);
 		}
 
+		const id = TEXT.decode(update.id);
 		throw new UnroutedTopicError(id);
 	}
 }

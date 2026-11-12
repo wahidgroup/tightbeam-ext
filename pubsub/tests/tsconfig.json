@@ -9,13 +9,15 @@
 		"forceConsistentCasingInFileNames": true,
 		"noEmit": true,
 		"types": ["@playwright/test", "node"],
-		"lib": ["ES2022", "DOM", "DOM.Iterable"],
+		"lib": ["ES2022", "ESNext.Array", "ESNext.Disposable", "DOM", "DOM.Iterable"],
 		"resolveJsonModule": true,
 		"paths": {
+			"#pubsub-codecs": ["../client/src/testing/codecs.ts"],
 			"#pubsub-wire": ["../client/src/wire.generated.json"],
 			"#ws-env": ["../../ws/tests/env.ts"],
 			"#ws-fixtures": ["../../ws/tests/fixtures.ts"],
-			"#ws-signer": ["../../ws/tests/signer.ts"]
+			"#ws-signer": ["../../ws/tests/signer.ts"],
+			"#ws-util": ["../../ws/tests/util.ts"]
 		}
 	},
 	"include": [
@@ -23,6 +25,8 @@
 		"specs",
 		"node",
 		"aliases.ts",
+		"app_port.ts",
+		"fixtures.ts",
 		"vite.config.ts",
 		"vitest.config.ts",
 		"playwright.config.ts"

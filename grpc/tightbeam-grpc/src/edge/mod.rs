@@ -1,6 +1,4 @@
-//! The deployment profile of a gRPC edge. `bind_with` and `connect` carry no
-//! value for a deployment, so the listener names it as a type, whose
-//! [`EdgeProfile`] provisions each bind and each dial.
+//! The deployment profile of a gRPC edge, which `docs/grpc.md` describes.
 //!
 //! # Sources
 //!
@@ -8,47 +6,91 @@
 //! - RFC 9113, HTTP/2, June 2022, section 3.2: <https://www.rfc-editor.org/rfc/rfc9113#section-3.2>
 
 use core::fmt;
+use core::future::Future;
+use core::marker::PhantomData;
 use std::io;
+use std::net::SocketAddr;
+use std::sync::Arc;
 
+use tightbeam::clock::{Clock, SystemClock};
+use tightbeam::transport::handshake::HandshakeProvider;
+use tightbeam::transport::{EndpointConfig, TransportError, TransportLimits};
+use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::{Channel, Server};
 
-use tightbeam::transport::TransportError;
+#[cfg(feature = "instrument")]
+use tightbeam::trace::TraceCollector;
 
+use crate::incoming::{Arrivals, GrpcIncoming, LaneTerms, Securing, Slots};
 use crate::io::EndClass;
 use crate::protocol::GrpcAddr;
+use crate::service::{EdgeService, Served};
+use crate::tunnel::{EdgeAudit, TunnelService};
 
+#[cfg(feature = "couple")]
+use crate::couple::{CallRecorder, CoupleError, LiveCoupler, PreparedCoupler};
+
+mod proxy;
+mod staged;
 mod tls;
 
-pub use tls::{DialTls, EdgeTls};
+pub use proxy::ProxyHops;
+pub use staged::StagedCell;
+#[cfg(feature = "couple")]
+pub(crate) use tls::EdgeTlsPolicy;
+pub(crate) use tls::TlsEndpoint;
+pub use tls::{DialTls, EdgeTls, EdgeTlsFiles};
 
 /// The deployment of a gRPC edge, as a type that provisions itself.
 ///
-/// [`GrpcListener<P, C>`](crate::protocol::GrpcListener) calls
-/// [`EdgeProfile::edge`] once for each bind, before it binds the socket, and
-/// [`EdgeProfile::dial`] once for each dial, before it connects. A profile
-/// that reads its material from files caches what it read, if a dial must not
-/// read them again.
+/// - [`GrpcListener<P, C>`](crate::protocol::GrpcListener) calls
+///   [`EdgeProfile::edge`] before each bind and [`EdgeProfile::dial`] before
+///   each dial.
+/// - A profile that reads its material from files caches it when a dial must
+///   not read the files again.
 ///
 /// # Examples
 ///
-/// ```no_run
-/// use tightbeam_grpc::edge::{Dial, DialTls, Edge, EdgeError, EdgeProfile, EdgeTls};
+/// ```
+/// use std::path::PathBuf;
 ///
-/// /// The edge of the orders gateway, under the certificates that its pod mounts.
+/// use tightbeam_grpc::edge::{Dial, DialTls, Edge, EdgeError, EdgeProfile, EdgeTls, EdgeTlsFiles};
+/// # use tightbeam_grpc::testing::{CoupledStack, MintError};
+///
+/// /// The edge of the orders gateway, under the certificates that its pod
+/// /// mounts at `EDGE_CERTS`.
 /// struct Orders;
 ///
-/// impl EdgeProfile for Orders {
-///     fn edge() -> Result<Edge, EdgeError> {
-///         let tls = EdgeTls::from_pem("/run/edge/tls.crt", "/run/edge/tls.key")?;
-///         Ok(Edge::Tls(tls))
-///     }
-///
-///     fn dial() -> Result<Dial, EdgeError> {
-///         let tls = DialTls::from_pem("/run/edge/ca.crt")?;
-///         Ok(Dial::Tls(tls))
-///     }
+/// impl Orders {
+/// 	/// The mounted file `name`.
+/// 	fn mounted(name: &str) -> PathBuf {
+/// 		PathBuf::from(std::env::var_os("EDGE_CERTS").unwrap_or_default()).join(name)
+/// 	}
 /// }
+///
+/// impl EdgeProfile for Orders {
+/// 	fn edge() -> Result<Edge, EdgeError> {
+/// 		let files = EdgeTlsFiles { chain: Self::mounted("edge.crt"), key: Self::mounted("edge.key") };
+/// 		let tls = EdgeTls::from_pem(files)?;
+/// 		Ok(Edge::tls(tls))
+/// 	}
+///
+/// 	fn dial() -> Result<Dial, EdgeError> {
+/// 		let tls = DialTls::from_pem(Self::mounted("root.pem"))?;
+/// 		Ok(Dial::Tls(tls))
+/// 	}
+/// }
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// # let dir = std::env::temp_dir().join(format!("tightbeam-grpc-doc-profile-{}", std::process::id()));
+/// # let stack = CoupledStack::at(dir);
+/// # stack.write(core::time::Duration::from_secs(60), |_| Ok::<(), MintError>(()))?;
+/// # std::env::set_var("EDGE_CERTS", stack.dir());
+/// # Orders::edge()?;
+/// # Orders::dial()?;
+/// # std::fs::remove_dir_all(stack.dir())?;
+/// # Ok(())
+/// # }
 /// ```
 pub trait EdgeProfile: Send + Sync + 'static {
 	/// The setup of one bind.
@@ -74,7 +116,7 @@ pub struct H2c;
 
 impl EdgeProfile for H2c {
 	fn edge() -> Result<Edge, EdgeError> {
-		Ok(Edge::H2c)
+		Ok(Edge::h2c())
 	}
 
 	fn dial() -> Result<Dial, EdgeError> {
@@ -82,63 +124,300 @@ impl EdgeProfile for H2c {
 	}
 }
 
-/// The setup of one bind of an edge.
+/// The setup of one bind of an edge: how it secures and serves its
+/// connections, the trace that records what it refuses, and the hops whose
+/// PROXY headers it reads.
+///
+/// # Examples
+///
+/// ```
+/// use tightbeam_grpc::edge::{Edge, EdgeTls, EdgeTlsFiles, ProxyHops};
+/// # use tightbeam_grpc::testing::{CoupledStack, MintError};
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// # let dir = std::env::temp_dir().join(format!("tightbeam-grpc-doc-hops-{}", std::process::id()));
+/// # let stack = CoupledStack::at(dir);
+/// # stack.write(core::time::Duration::from_secs(60), |_| Ok::<(), MintError>(()))?;
+/// # let (chain, key) = (stack.edge_chain(), stack.edge_key());
+///
+/// let tls = EdgeTls::from_pem(EdgeTlsFiles { chain, key })?;
+/// let edge = Edge::tls(tls).with_proxy_protocol(ProxyHops::new(["10.0.0.0/8"])?);
+/// # std::fs::remove_dir_all(stack.dir())?;
+/// # Ok(())
+/// # }
+/// ```
+pub struct Edge {
+	kind: EdgeKind,
+	hops: ProxyHops,
+	clock: Arc<dyn Clock>,
+	#[cfg(feature = "instrument")]
+	trace: Option<TraceCollector>,
+}
+
+/// How an edge secures and serves its connections.
 #[derive(Clone, Debug)]
-pub enum Edge {
+enum EdgeKind {
 	/// The tunnel on HTTP/2 with prior knowledge, and no TLS.
 	H2c,
 	/// TLS 1.3 under the certificate of the [`EdgeTls`], with ALPN `h2`.
 	Tls(EdgeTls),
-	/// TLS 1.3 under the certificate of the [`EdgeTls`], which verifies the
-	/// client chain of each caller under the trust of the [`Coupler`], and
-	/// the coupler, which serves the routed methods of stock gRPC callers
-	/// beside the tunnel.
-	///
-	/// [`Coupler`]: crate::couple::Coupler
+	/// TLS 1.3 that verifies the client chain of each caller under the trust
+	/// of the coupler, and the coupler, which serves routed methods beside
+	/// the tunnel.
 	#[cfg(feature = "couple")]
-	Coupled(EdgeTls, crate::couple::Coupler),
+	Coupled(EdgeTls, Box<crate::couple::Coupler>),
 }
 
-impl Edge {
-	/// The acceptor that secures each connection of the bind, or `None` when
-	/// the bind runs no TLS. A coupled bind verifies the client chain of a
-	/// connection that presents one, and admits a connection that presents
-	/// none, such as a native tunnel client.
+impl EdgeKind {
+	/// What a bind of this kind under `config` builds before its socket binds:
+	/// the acceptor of its TLS, and the coupler of a coupled edge, which runs
+	/// on `clock`.
 	///
 	/// # Errors
 	///
-	/// - [`EdgeError::Tls`] -- rustls refuses the material of a coupled bind.
-	/// - [`EdgeError::Verifier`] -- rustls refuses the CRLs of a coupled bind.
-	pub(crate) fn acceptor(&self) -> Result<Option<TlsAcceptor>, EdgeError> {
+	/// - [`EdgeError::RequiresEncryption`] -- a coupled edge binds in the clear.
+	/// - [`EdgeError::Tls`] -- rustls refuses the TLS of the bind.
+	/// - [`EdgeError::Verifier`] -- rustls refuses the client verifier of the bind.
+	/// - [`EdgeError::Trust`] -- tightbeam refuses the certificate of the gateway as the pin of the coupler.
+	fn prepare<P>(&self, config: &EndpointConfig<P>, clock: &Arc<dyn Clock>) -> Result<Prepared, EdgeError>
+	where
+		P: HandshakeProvider + Send + Sync + 'static,
+	{
+		#[cfg(not(feature = "couple"))]
+		let _ = (config, clock);
+
 		match self {
-			Self::H2c => Ok(None),
-			Self::Tls(tls) => Ok(Some(tls.acceptor())),
+			Self::H2c => Ok(Prepared::Tunnel(None)),
+			Self::Tls(tls) => Ok(Prepared::Tunnel(Some(tls.acceptor(None)?))),
 			#[cfg(feature = "couple")]
 			Self::Coupled(tls, coupler) => {
-				let verifier = coupler.callers().verifier(tls::provider())?;
-				Ok(Some(tls.verifying(verifier)?))
+				let gateway = config.encryption().server_certificate().ok_or(EdgeError::RequiresEncryption)?;
+				let coupler = coupler.prepare(gateway, clock)?;
+				let acceptor = tls.acceptor(Some(coupler.verifier()))?;
+				Ok(Prepared::Coupled(acceptor, Box::new(coupler)))
 			}
 		}
 	}
+}
 
-	/// The trace that a coupled bind records on, which its coupler holds.
-	#[cfg(all(feature = "couple", feature = "instrument"))]
-	pub(crate) fn trace(&self) -> Option<&tightbeam::trace::TraceCollector> {
-		match self {
-			Self::H2c | Self::Tls(_) => None,
-			Self::Coupled(_, coupler) => coupler.trace(),
+impl Edge {
+	/// The tunnel on HTTP/2 with prior knowledge (h2c), and no TLS.
+	#[must_use]
+	pub fn h2c() -> Self {
+		Self::of(EdgeKind::H2c)
+	}
+
+	/// TLS 1.3 under the certificate of `tls`, with ALPN `h2`.
+	#[must_use]
+	pub fn tls(tls: EdgeTls) -> Self {
+		Self::of(EdgeKind::Tls(tls))
+	}
+
+	/// TLS 1.3 under the certificate of `tls`, which verifies the client
+	/// chain of each caller under the trust of `coupler`, and `coupler`,
+	/// which serves the routed methods of stock gRPC callers beside the
+	/// tunnel.
+	#[cfg(feature = "couple")]
+	#[must_use]
+	pub fn coupled(tls: EdgeTls, coupler: crate::couple::Coupler) -> Self {
+		Self::of(EdgeKind::Coupled(tls, Box::new(coupler)))
+	}
+
+	fn of(kind: EdgeKind) -> Self {
+		Self {
+			kind,
+			hops: ProxyHops::default(),
+			clock: Arc::new(SystemClock),
+			#[cfg(feature = "instrument")]
+			trace: None,
 		}
 	}
 
-	/// The HTTP/2 streams that a connection of the bind admits at once: one
-	/// for a tunnel edge, which carries one tunnel per connection, and the
-	/// stream limit of the coupler for a coupled edge.
-	pub(crate) fn stream_limit(&self) -> u32 {
+	/// Record what the edge refuses before any session exists, each PROXY
+	/// header it reads, and each admission, refusal, and answer of its
+	/// coupler, on `trace`, from the first connection of each bind on.
+	#[cfg(feature = "instrument")]
+	#[must_use]
+	pub fn with_trace(mut self, trace: TraceCollector) -> Self {
+		self.trace = Some(trace);
+		self
+	}
+
+	/// Read a PROXY protocol v2 header at the start of each connection from
+	/// `hops`, and take the source address it names as the peer of the
+	/// connection.
+	///
+	/// - A connection from a hop that sends no header closes.
+	/// - The edge reads no header from any other address.
+	/// - Under `instrument`, the trace of the edge records each header it reads, and each that it refuses.
+	#[must_use]
+	pub fn with_proxy_protocol(mut self, hops: ProxyHops) -> Self {
+		self.hops = hops;
+		self
+	}
+
+	/// Run on `clock`, in place of [`SystemClock`], the timers and the unix
+	/// readings of each bind of the edge that `docs/grpc.md` (Edge profile)
+	/// lists.
+	#[must_use]
+	pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+		self.clock = clock;
+		self
+	}
+
+	/// What a bind of the edge under `config` builds before its socket binds:
+	/// the acceptor of its TLS, the coupler of a coupled edge, and the audit
+	/// trail of the bind. A profile whose material is refused binds no socket.
+	///
+	/// # Errors
+	///
+	/// - The errors of [`EdgeKind::prepare`].
+	pub(crate) fn prepare<P>(&self, config: &EndpointConfig<P>) -> Result<PreparedEdge, EdgeError>
+	where
+		P: HandshakeProvider + Send + Sync + 'static,
+	{
+		let prepared = self.kind.prepare(config, &self.clock)?;
+
+		#[cfg(feature = "instrument")]
+		let audit = EdgeAudit::on(self.trace.as_ref().map(TraceCollector::share));
+		#[cfg(not(feature = "instrument"))]
+		let audit = EdgeAudit::default();
+
+		Ok(PreparedEdge { prepared, hops: self.hops.clone(), audit, clock: Arc::clone(&self.clock) })
+	}
+}
+
+/// How a prepared bind secures and serves its connections.
+enum Prepared {
+	/// The tunnel alone, in the clear or under the TLS of this acceptor.
+	Tunnel(Option<TlsAcceptor>),
+	/// The tunnel and a coupler, under the TLS of this acceptor, which
+	/// verifies the client chain of each caller.
+	#[cfg(feature = "couple")]
+	Coupled(TlsAcceptor, Box<PreparedCoupler>),
+}
+
+impl Prepared {
+	/// What the bind serves beside its tunnel, and the acceptor of its TLS,
+	/// for the listener of profile `C` once its socket bound at `local`. A
+	/// coupled edge starts its coupler here, which records on `audit`, queues
+	/// its loopback tunnel on `queue`, and holds every message to `ceiling`.
+	fn serve<P, C>(
+		self,
+		audit: &EdgeAudit,
+		queue: &Arrivals,
+		local: SocketAddr,
+		ceiling: usize,
+	) -> (Served<P>, Option<TlsAcceptor>)
+	where
+		P: HandshakeProvider + Send + Sync + 'static,
+		C: EdgeProfile,
+	{
+		#[cfg(not(feature = "couple"))]
+		let _ = (audit, queue, local, ceiling, PhantomData::<C>);
+
 		match self {
-			Self::H2c | Self::Tls(_) => 1,
+			Self::Tunnel(tls) => (Served::Tunnel(PhantomData), tls),
 			#[cfg(feature = "couple")]
-			Self::Coupled(_, coupler) => coupler.stream_limit(),
+			Self::Coupled(tls, coupler) => {
+				let recorder = CallRecorder::new(audit.clone());
+				let live = LiveCoupler::start::<C>(*coupler, recorder, queue.clone(), local, ceiling);
+				(Served::Coupled(Arc::new(live)), Some(tls))
+			}
 		}
+	}
+}
+
+/// A bind of an edge, prepared before its socket binds.
+pub(crate) struct PreparedEdge {
+	prepared: Prepared,
+	hops: ProxyHops,
+	audit: EdgeAudit,
+	clock: Arc<dyn Clock>,
+}
+
+impl PreparedEdge {
+	/// `config` on the clock of the edge, so each tunnel transport of the
+	/// bind measures its deadlines there.
+	pub(crate) fn clocked<P: HandshakeProvider>(&self, config: EndpointConfig<P>) -> EndpointConfig<P> {
+		config.with_clock(Arc::clone(&self.clock))
+	}
+
+	/// The bind of the listener of profile `C` once its socket bound at
+	/// `local`, which queues its tunnels on `queue` under `limits`:
+	///
+	/// - What it serves beside its tunnel. A coupled edge starts its coupler
+	///   here, which records on the audit trail of the bind.
+	/// - The terms that each of its connections waits under.
+	/// - How each connection passes the PROXY header of a hop and the TLS
+	///   handshake, which the audit trail records.
+	pub(crate) fn bind<P, C>(self, queue: Arrivals, local: SocketAddr, limits: &TransportLimits) -> EdgeBind<P>
+	where
+		P: HandshakeProvider + Send + Sync + 'static,
+		C: EdgeProfile,
+	{
+		let Self { prepared, hops, audit, clock } = self;
+		let ceiling = limits.max_envelope();
+		let (served, tls) = prepared.serve::<P, C>(&audit, &queue, local, ceiling);
+
+		let terms = LaneTerms::of(limits.handshake_timeout, &served, clock);
+		let securing = Securing::new(hops, tls, audit.clone());
+		EdgeBind { served, terms, securing, audit, queue, ceiling }
+	}
+}
+
+/// One bind of an edge, which the edge builds whole: what it serves, the
+/// terms of its lanes, how each connection is secured, the audit trail that
+/// records them, the queue of its tunnels, and the ceiling of every message
+/// of a tunnel.
+pub(crate) struct EdgeBind<P: HandshakeProvider + Send + Sync + 'static> {
+	served: Served<P>,
+	terms: LaneTerms,
+	securing: Securing,
+	audit: EdgeAudit,
+	queue: Arrivals,
+	ceiling: usize,
+}
+
+impl<P: HandshakeProvider + Send + Sync + 'static> EdgeBind<P> {
+	/// The server of the bind on `listener` until `stopping` resolves: each
+	/// connection under one of `slots`, each tunnel queued on the queue of
+	/// the bind, and every message of a tunnel held to its ceiling.
+	pub(crate) fn serve(
+		self,
+		listener: TcpListener,
+		slots: Arc<Slots>,
+		stopping: impl Future<Output = ()> + Send + 'static,
+	) -> impl Future<Output = Result<(), tonic::transport::Error>> + Send + 'static {
+		let Self { served, terms, securing, audit, queue, ceiling } = self;
+		let streams = terms.streams();
+		let incoming = GrpcIncoming::new(listener, slots, terms, securing, queue.clone());
+		let tunnel = TunnelService::new(queue, ceiling, audit.clone());
+		let service = EdgeService::new(tunnel, audit, served);
+
+		let builder = Server::builder().max_concurrent_streams(streams.get());
+		builder.serve_with_incoming_shutdown(service, incoming, stopping)
+	}
+}
+
+/// A clone records on the trace of the original.
+impl Clone for Edge {
+	fn clone(&self) -> Self {
+		Self {
+			kind: self.kind.clone(),
+			hops: self.hops.clone(),
+			clock: Arc::clone(&self.clock),
+			#[cfg(feature = "instrument")]
+			trace: self.trace.as_ref().map(TraceCollector::share),
+		}
+	}
+}
+
+impl fmt::Debug for Edge {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.debug_struct("Edge")
+			.field("kind", &self.kind)
+			.field("hops", &self.hops)
+			.finish_non_exhaustive()
 	}
 }
 
@@ -159,21 +438,17 @@ impl Dial {
 	///
 	/// # Errors
 	///
-	/// - [`TransportError::InvalidAddress`] -- tonic refuses the URI of `addr`,
-	///   or TLS cannot name its host.
+	/// - [`TransportError::InvalidAddress`] -- tonic refuses the URI of `addr`.
 	/// - The [`TransportError`] of the [`EndClass`] of the failed connect.
 	pub(crate) async fn channel(&self, addr: &GrpcAddr) -> Result<Channel, TransportError> {
 		let connected = match self {
-			Self::H2c => {
-				let uri = format!("http://{addr}");
-				let endpoint = Endpoint::from_shared(uri).map_err(|_| TransportError::InvalidAddress)?;
-				endpoint.connect().await
-			}
+			Self::H2c => addr.endpoint()?.connect().await,
 			Self::Tls(tls) => {
-				let (endpoint, dialer) = tls.endpoint(addr)?;
+				let TlsEndpoint { endpoint, dialer } = tls.endpoint(addr)?;
 				endpoint.connect_with_connector(dialer).await
 			}
 		};
+
 		let channel = connected.map_err(|error| EndClass::of_error(error.into()))?;
 		Ok(channel)
 	}
@@ -192,28 +467,23 @@ pub enum EdgeError {
 	/// certificate, or a root that does not parse.
 	Tls(rustls::Error),
 	/// The profile holds no material, such as a staged profile that its
-	/// scenario has not staged.
+	/// deployment has not staged.
 	Unprovisioned,
 	/// A bind in the clear of a coupled edge, whose loopback session needs
 	/// the tightbeam handshake.
 	RequiresEncryption,
-	/// A coupler that routes no method.
-	#[cfg(feature = "couple")]
-	NoRoute,
+	/// A PROXY hop that is no address, or no address and prefix length.
+	ProxyHop(String),
 	/// rustls refuses the client verifier of a coupled edge, such as one of
 	/// its CRLs.
 	#[cfg(feature = "couple")]
 	Verifier(rustls::server::VerifierBuilderError),
-	/// A principal that names no SPIFFE ID or distinguished name.
-	#[cfg(feature = "couple")]
-	Principal(String),
-	/// A method that is no unary gRPC path, that a route names twice, that a
-	/// reserved path takes, or that a grant names and no route serves.
-	#[cfg(feature = "couple")]
-	Method(String),
 	/// tightbeam refuses a certificate or a trust store of the coupler.
 	#[cfg(feature = "couple")]
 	Trust(tightbeam::crypto::x509::error::CertificateValidationError),
+	/// The coupler of the profile refuses its configuration.
+	#[cfg(feature = "couple")]
+	Couple(CoupleError),
 }
 
 impl fmt::Display for EdgeError {
@@ -225,16 +495,13 @@ impl fmt::Display for EdgeError {
 			Self::Tls(error) => write!(f, "TLS refuses the material of the profile: {error}"),
 			Self::Unprovisioned => f.write_str("the profile holds no material"),
 			Self::RequiresEncryption => f.write_str("a coupled edge binds only through EncryptedProtocol::bind_with"),
+			Self::ProxyHop(hop) => write!(f, "`{hop}` is no address or CIDR range of a PROXY hop"),
 			#[cfg(feature = "couple")]
-			Self::Principal(text) => write!(f, "`{text}` names no SPIFFE ID or distinguished name"),
-			#[cfg(feature = "couple")]
-			Self::Method(method) => write!(f, "`{method}` is no method a coupled edge can route"),
+			Self::Verifier(error) => write!(f, "rustls refuses the client verifier of the edge: {error}"),
 			#[cfg(feature = "couple")]
 			Self::Trust(error) => write!(f, "tightbeam refuses a certificate of the coupler: {error}"),
 			#[cfg(feature = "couple")]
-			Self::NoRoute => f.write_str("the coupler routes no method"),
-			#[cfg(feature = "couple")]
-			Self::Verifier(error) => write!(f, "rustls refuses the client verifier of the edge: {error}"),
+			Self::Couple(error) => write!(f, "the coupler refuses its configuration: {error}"),
 		}
 	}
 }
@@ -250,8 +517,8 @@ impl std::error::Error for EdgeError {
 			#[cfg(feature = "couple")]
 			Self::Verifier(error) => Some(error),
 			#[cfg(feature = "couple")]
-			Self::Principal(_) | Self::Method(_) | Self::NoRoute => None,
-			Self::NoCertificate | Self::Unprovisioned | Self::RequiresEncryption => None,
+			Self::Couple(error) => Some(error),
+			Self::NoCertificate | Self::Unprovisioned | Self::RequiresEncryption | Self::ProxyHop(_) => None,
 		}
 	}
 }
@@ -287,21 +554,31 @@ impl From<tightbeam::crypto::x509::error::CertificateValidationError> for EdgeEr
 	}
 }
 
+#[cfg(feature = "couple")]
+impl From<CoupleError> for EdgeError {
+	fn from(error: CoupleError) -> Self {
+		Self::Couple(error)
+	}
+}
+
 impl From<rustls::Error> for EdgeError {
 	fn from(error: rustls::Error) -> Self {
 		Self::Tls(error)
 	}
 }
 
-/// A bind or a dial fails with the I/O error of a profile that cannot read
-/// its material, and with an `InvalidInput` I/O error that holds every other
-/// failure as its source.
+/// A bind or a dial fails with the transport error of the refusal where
+/// tightbeam names one: the I/O error of material that cannot be read, a
+/// missing encryption, or a refused certificate. Every other refusal is an
+/// `InvalidInput` I/O error that holds it as its inner error.
 impl From<EdgeError> for TransportError {
 	fn from(error: EdgeError) -> Self {
-		let error = match error {
-			EdgeError::Io(error) => error,
-			refused => io::Error::new(io::ErrorKind::InvalidInput, refused),
-		};
-		error.into()
+		match error {
+			EdgeError::Io(error) => error.into(),
+			EdgeError::RequiresEncryption => Self::MissingEncryption,
+			#[cfg(feature = "couple")]
+			EdgeError::Trust(error) => Self::InvalidCertificate(error),
+			refused => io::Error::new(io::ErrorKind::InvalidInput, refused).into(),
+		}
 	}
 }

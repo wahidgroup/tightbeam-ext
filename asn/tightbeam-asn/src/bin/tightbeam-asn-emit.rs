@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use tightbeam::Errorizable;
-use tightbeam_asn::emit::{EmitError, EmitOptions};
+use tightbeam_asn::emit::{CodecPairs, EmitError, EmitOptions};
 
 #[derive(Debug, Errorizable)]
 enum CliError {
@@ -56,7 +56,8 @@ fn run() -> Result<(), CliError> {
 			Ok(())
 		}
 		Parsed::Run(args) => {
-			let pairs = args.opts.emit(&args.from_dts, &args.out)?;
+			let pairs = CodecPairs::read(&args.from_dts)?;
+			pairs.write(&args.opts, &args.out)?;
 			let count = pairs.names().len();
 			eprintln!("tightbeam-asn-emit: wrote {count} codec(s) to {}", args.out.display());
 			Ok(())

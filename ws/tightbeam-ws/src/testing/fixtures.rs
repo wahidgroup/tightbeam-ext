@@ -1,13 +1,8 @@
-//! X.509 identity fixtures for the encrypted WebSocket end-to-end tests.
-//!
-//! The browser cannot issue certificates (it has no clock), so identities
-//! are generated natively here and provisioned as DER certificate + raw signing
-//! key bytes. A single code path issues, serializes, and reloads them, keeping
-//! the generator binary, the encrypted echo server, and the integration tests
-//! on one source of truth.
+//! The X.509 identity fixtures of the e2e stack, as `docs/ws.md` (Test
+//! support) states it.
 
 use std::fs;
-use std::io::{Error as IoError, ErrorKind};
+use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,11 +19,11 @@ use tightbeam::random::OsRng;
 use tightbeam::spki::SubjectPublicKeyInfoOwned;
 use tightbeam::transport::TransportEncryptionConfig;
 use tightbeam::x509::Certificate;
-use tightbeam::{Frame, TightBeamError};
+use tightbeam::{Errorizable, Frame, TightBeamError};
 
 use super::env::EnvVar;
 use super::handshake::Pinned;
-use crate::Result;
+use super::Result;
 
 /// Size in bytes of a raw secp256k1 signing scalar.
 pub const SIGNING_KEY_LEN: usize = 32;
@@ -46,10 +41,10 @@ const SIGNING_KEY_SUFFIX: &str = ".key";
 /// A self-signed X.509 identity: an end-entity certificate paired with its
 /// secp256k1 signing key.
 ///
-/// The certificate asserts `digitalSignature`, which a handshake and a frame
-/// signature read, and it names no `extendedKeyUsage`, so it serves the
-/// server, client, and signer roles alike. A CA certificate asserts only
-/// `keyCertSign`, and the signing use refuses it.
+/// - The certificate asserts `digitalSignature`, which a handshake and a frame signature read.
+/// - It names no `extendedKeyUsage`, so it serves the server, client, and signer roles alike.
+/// - A CA certificate asserts only `keyCertSign`, and the signing use refuses it.
+/// - Each constructor pairs the key with the certificate once, and refuses a key of another certificate.
 ///
 /// # Examples
 ///
@@ -62,10 +57,11 @@ const SIGNING_KEY_SUFFIX: &str = ".key";
 /// let certificate = issued.certificate_der()?;
 /// let reloaded = Identity::from_der(&certificate, &issued.signing_key_bytes())?;
 /// assert_eq!(reloaded.certificate_der()?, certificate);
-/// # Ok::<(), tightbeam_ws::Error>(())
+/// # Ok::<(), tightbeam_ws::testing::Error>(())
 /// ```
 pub struct Identity {
-	certificate: Certificate,
+	/// The certificate and the provider of its key, paired at construction.
+	signing: SigningIdentity,
 	signing_key: Secp256k1SigningKey,
 }
 
@@ -74,8 +70,7 @@ impl Identity {
 	///
 	/// # Errors
 	///
-	/// - [`Error::Tightbeam`](crate::Error::Tightbeam): the certificate fails
-	///   to issue.
+	/// - [`Error::Ws`](super::Error::Ws) -- the certificate fails to issue.
 	pub fn mint(subject: &str, serial: u32, validity: Duration) -> Result<Self> {
 		let signing_key = Secp256k1SigningKey::random(&mut OsRng);
 		Self::from_key(signing_key, subject, serial, validity)
@@ -84,14 +79,12 @@ impl Identity {
 	/// Issue a self-signed identity over `signing_key`, valid for `validity`
 	/// from now.
 	///
-	/// A frame that `signing_key` signs verifies under this identity, whatever
-	/// certificate the signer presented, so a fixed test key yields a probe
-	/// that checks the signatures of its peers.
+	/// - A frame that `signing_key` signs verifies under this identity, whatever certificate the signer
+	///   presented, so a fixed test key yields a probe that checks the signatures of its peers.
 	///
 	/// # Errors
 	///
-	/// - [`Error::Tightbeam`](crate::Error::Tightbeam): the certificate fails
-	///   to issue.
+	/// - [`Error::Ws`](super::Error::Ws) -- the certificate fails to issue.
 	///
 	/// # Examples
 	///
@@ -106,7 +99,7 @@ impl Identity {
 	/// let scalar: [u8; 32] = key.to_bytes().into();
 	/// let probe = Identity::from_key(key, "CN=probe,O=tightbeam-ws,C=US", 1, Duration::from_secs(60))?;
 	/// assert_eq!(probe.signing_key_bytes(), scalar);
-	/// # Ok::<(), tightbeam_ws::Error>(())
+	/// # Ok::<(), tightbeam_ws::testing::Error>(())
 	/// ```
 	pub fn from_key(signing_key: Secp256k1SigningKey, subject: &str, serial: u32, validity: Duration) -> Result<Self> {
 		Ok(Self::issued(signing_key, subject, serial, validity)?)
@@ -134,22 +127,33 @@ impl Identity {
 			signer: &signer
 		)?;
 
-		Ok(Self { certificate, signing_key })
+		Self::paired(certificate, signing_key)
 	}
 
-	/// Reconstruct an identity from a DER certificate and a raw 32-byte key,
-	/// exactly as the generator writes and the server/browser reload it.
+	/// The identity of `certificate` beside `signing_key`, once the pair
+	/// proves that the key is the key of the certificate.
+	fn paired(
+		certificate: Certificate,
+		signing_key: Secp256k1SigningKey,
+	) -> core::result::Result<Self, TightBeamError> {
+		let key = Arc::new(Secp256k1KeyProvider::from(signing_key.clone()));
+		let signing = SigningIdentity::new(certificate, key)?;
+		Ok(Self { signing, signing_key })
+	}
+
+	/// The identity of a DER certificate and a raw 32-byte key, the form that
+	/// [`IdentityFiles`] holds.
 	///
 	/// # Errors
 	///
-	/// - [`Error::Tightbeam`](crate::Error::Tightbeam): the certificate or
-	///   the key does not decode.
+	/// - [`Error::Ws`](super::Error::Ws) -- the certificate or the key does not decode, or the key is not the
+	///   key of the certificate.
 	pub fn from_der(certificate_der: &[u8], signing_key: &[u8; SIGNING_KEY_LEN]) -> Result<Self> {
 		let certificate = Certificate::from_der(certificate_der).map_err(TightBeamError::from)?;
 		let scalar = *signing_key;
 		let signing_key = Secp256k1SigningKey::from_bytes(&scalar.into()).map_err(TightBeamError::from)?;
 
-		Ok(Self { certificate, signing_key })
+		Ok(Self::paired(certificate, signing_key)?)
 	}
 
 	/// Load the server identity from the files that `TBWS_SERVER_CERT` names,
@@ -162,19 +166,18 @@ impl Identity {
 		IdentityFiles::from_env(SERVER_CERT)?.load()
 	}
 
-	/// Borrow the certificate.
+	/// The certificate that a peer pins as this identity.
 	pub fn certificate(&self) -> &Certificate {
-		&self.certificate
+		self.signing.certificate()
 	}
 
 	/// DER-encode the certificate for provisioning to peers.
 	///
 	/// # Errors
 	///
-	/// - [`Error::Tightbeam`](crate::Error::Tightbeam): the certificate does
-	///   not encode.
+	/// - [`Error::Ws`](super::Error::Ws) -- the certificate does not encode.
 	pub fn certificate_der(&self) -> Result<Vec<u8>> {
-		Ok(self.certificate.to_der().map_err(TightBeamError::from)?)
+		Ok(self.certificate().to_der().map_err(TightBeamError::from)?)
 	}
 
 	/// The raw 32-byte secp256k1 signing scalar.
@@ -185,31 +188,20 @@ impl Identity {
 	/// This identity as the certificate and key provider a handshake and a
 	/// frame signature take, for a server's reply and a mutual client's
 	/// Finished alike.
-	///
-	/// # Errors
-	///
-	/// - [`Error::Tightbeam`](crate::Error::Tightbeam): the certificate does
-	///   not match the key.
-	pub fn signing_identity(&self) -> Result<SigningIdentity> {
-		let key = Arc::new(Secp256k1KeyProvider::from(self.signing_key.clone()));
-		let identity = SigningIdentity::new(self.certificate.clone(), key).map_err(TightBeamError::from)?;
-		Ok(identity)
+	pub fn signing_identity(&self) -> SigningIdentity {
+		self.signing.clone()
 	}
 
-	/// Build the server-side transport encryption config that presents this
-	/// identity during the HPKE handshake.
-	///
-	/// # Errors
-	///
-	/// - The errors of [`signing_identity`](Self::signing_identity).
-	pub fn server_config(&self) -> Result<TransportEncryptionConfig<DefaultCryptoProvider>> {
-		Ok(TransportEncryptionConfig::new(self.signing_identity()?))
+	/// The server transport encryption config that presents this identity in
+	/// the HPKE handshake.
+	pub fn server_config(&self) -> TransportEncryptionConfig<DefaultCryptoProvider> {
+		TransportEncryptionConfig::new(self.signing_identity())
 	}
 
 	/// Whether `frame` carries a signature that the certificate of this
 	/// identity verifies over the bytes this end received.
 	pub fn verifies(&self, frame: &Frame) -> bool {
-		let certificate = self.certificate.clone();
+		let certificate = self.certificate().clone();
 		let signer = PeerCertificate::<Signing<DefaultCryptoProvider>>::parse(certificate, KeyPurposes::HOUSE.signer);
 		signer.is_ok_and(|signer| frame.verify(&signer).is_ok())
 	}
@@ -221,7 +213,7 @@ impl Identity {
 	///
 	/// - The errors of [`Pinned::trust`].
 	pub fn trust_anchor(&self) -> Result<Arc<dyn CertificateTrust>> {
-		let pinned = Pinned::from(self.certificate.clone());
+		let pinned = Pinned::from(self.certificate().clone());
 		pinned.trust()
 	}
 }
@@ -244,12 +236,12 @@ impl Identity {
 /// fs::create_dir_all(&dir)?;
 ///
 /// let files = IdentityFiles::new(&dir, "doc")?;
-/// let minted = Identity::mint("CN=doc,O=tightbeam-ws,C=US", 1, Duration::from_secs(60))?;
-/// files.provision(&minted)?;
+/// let issued = Identity::mint("CN=doc,O=tightbeam-ws,C=US", 1, Duration::from_secs(60))?;
+/// files.provision(&issued)?;
 ///
 /// let loaded = files.load()?;
-/// assert_eq!(loaded.certificate_der()?, minted.certificate_der()?);
-/// # Ok::<(), tightbeam_ws::Error>(())
+/// assert_eq!(loaded.certificate_der()?, issued.certificate_der()?);
+/// # Ok::<(), tightbeam_ws::testing::Error>(())
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IdentityFiles {
@@ -262,12 +254,11 @@ impl IdentityFiles {
 	///
 	/// # Errors
 	///
-	/// - [`Error::Io`](crate::Error::Io): `name` is empty, so it names no file.
+	/// - [`IdentityFilesError::Unnamed`] -- `name` is empty, so it names no file.
 	pub fn new(dir: impl Into<PathBuf>, name: impl Into<String>) -> Result<Self> {
 		let name = name.into();
 		if name.is_empty() {
-			let unnamed = IoError::new(ErrorKind::InvalidInput, "an identity file name must name the identity");
-			return Err(unnamed.into());
+			return Err(IdentityFilesError::Unnamed.into());
 		}
 
 		Ok(Self { dir: dir.into(), name })
@@ -278,23 +269,39 @@ impl IdentityFiles {
 	///
 	/// # Errors
 	///
-	/// - [`Error::Env`](crate::Error::Env): the variable is unset.
-	/// - [`Error::Io`](crate::Error::Io): the path names no `{name}.cert.der` file.
+	/// - [`Error::Env`](super::Error::Env) -- the variable is unset.
+	/// - [`IdentityFilesError::NotACertificate`] -- the path names no `{name}.cert.der` file.
 	pub fn from_env(certificate: EnvVar) -> Result<Self> {
-		let path = certificate.path()?;
+		let path = certificate.required_path()?;
 		Self::of_certificate(path)
 	}
 
-	/// Write `identity` to these files.
+	/// Write `identity` to these files, so that a certificate file always
+	/// has its own key beside it.
+	///
+	/// The certificate publishes the identity, so the steps run in this order:
+	///
+	/// 1. Write both files into a sibling staging directory.
+	/// 2. Remove the published certificate, which unpublishes an older identity.
+	/// 3. Rename the key into place, then the certificate.
 	///
 	/// # Errors
 	///
-	/// - [`Error::Io`](crate::Error::Io): a file does not write.
+	/// - [`Error::Ws`](super::Error::Ws) -- a file does not write or move.
 	/// - The errors of [`Identity::certificate_der`].
 	pub fn provision(&self, identity: &Identity) -> Result<()> {
-		let certificate_der = identity.certificate_der()?;
-		fs::write(self.certificate(), certificate_der)?;
-		fs::write(self.signing_key(), identity.signing_key_bytes())?;
+		let staged = self.staged()?;
+		fs::write(staged.certificate(), identity.certificate_der()?)?;
+		fs::write(staged.signing_key(), identity.signing_key_bytes())?;
+
+		match fs::remove_file(self.certificate()) {
+			Err(error) if error.kind() != ErrorKind::NotFound => return Err(error.into()),
+			_unpublished => {}
+		}
+
+		fs::rename(staged.signing_key(), self.signing_key())?;
+		fs::rename(staged.certificate(), self.certificate())?;
+		fs::remove_dir(&staged.dir)?;
 		Ok(())
 	}
 
@@ -302,16 +309,15 @@ impl IdentityFiles {
 	///
 	/// # Errors
 	///
-	/// - [`Error::Io`](crate::Error::Io): a file does not read, or the key file holds another
-	///   size than 32 bytes.
+	/// - [`Error::Ws`](super::Error::Ws) -- a file does not read.
+	/// - [`IdentityFilesError::KeyLength`] -- the key file holds another size than [`SIGNING_KEY_LEN`].
 	/// - The errors of [`Identity::from_der`].
 	pub fn load(&self) -> Result<Identity> {
 		let certificate_der = fs::read(self.certificate())?;
 		let key_bytes = fs::read(self.signing_key())?;
 
 		let Ok(key) = <[u8; SIGNING_KEY_LEN]>::try_from(key_bytes.as_slice()) else {
-			let wrong_size = IoError::new(ErrorKind::InvalidData, "signing key file must hold exactly 32 bytes");
-			return Err(wrong_size.into());
+			return Err(IdentityFilesError::KeyLength(key_bytes.len()).into());
 		};
 
 		Identity::from_der(&certificate_der, &key)
@@ -322,12 +328,24 @@ impl IdentityFiles {
 		let file_name = path.file_name().and_then(|file_name| file_name.to_str());
 		let name = file_name.and_then(|file_name| file_name.strip_suffix(CERTIFICATE_SUFFIX));
 		let Some(name) = name else {
-			let refused = IoError::new(ErrorKind::InvalidInput, "an identity certificate file name ends in .cert.der");
-			return Err(refused.into());
+			return Err(IdentityFilesError::NotACertificate.into());
 		};
 
 		let dir = path.parent().map(PathBuf::from).unwrap_or_default();
 		Self::new(dir, name)
+	}
+
+	/// The same files in an empty staging directory beside these, on the
+	/// same file system, so a rename publishes each one whole.
+	fn staged(&self) -> Result<Self> {
+		let dir = self.dir.join(format!(".{}.staging", self.name));
+		match fs::remove_dir_all(&dir) {
+			Err(error) if error.kind() != ErrorKind::NotFound => return Err(error.into()),
+			_cleared => {}
+		}
+
+		fs::create_dir(&dir)?;
+		Ok(Self { dir, name: self.name.clone() })
 	}
 
 	/// The certificate file.
@@ -341,6 +359,30 @@ impl IdentityFiles {
 	}
 }
 
+/// The refusal of a name, a certificate path, or a key file of
+/// [`IdentityFiles`].
+///
+/// # Examples
+///
+/// ```
+/// use tightbeam_ws::testing::{Error, IdentityFiles, IdentityFilesError};
+///
+/// let refused = IdentityFiles::new("/certs", "");
+/// assert!(matches!(refused, Err(Error::IdentityFiles(IdentityFilesError::Unnamed))));
+/// ```
+#[derive(Clone, Debug, Errorizable, PartialEq, Eq)]
+pub enum IdentityFilesError {
+	/// The name of the identity is empty, so it names no file.
+	#[error("an identity file name must name the identity")]
+	Unnamed,
+	/// The name of the certificate file does not end in `.cert.der`.
+	#[error("an identity certificate file name ends in .cert.der")]
+	NotACertificate,
+	/// The key file holds this many bytes, not [`SIGNING_KEY_LEN`].
+	#[error("a signing key file holds exactly 32 bytes, not {0}")]
+	KeyLength(usize),
+}
+
 #[cfg(test)]
 mod tests {
 	use std::path::PathBuf;
@@ -348,14 +390,17 @@ mod tests {
 	use std::{env, fs, process};
 
 	use tightbeam::builder::TypeBuilder;
+	use tightbeam::crypto::sign::SignerError;
 	use tightbeam::testing::{TestIdentity, TestKey, TestMessage};
-	use tightbeam::{Frame, Version};
+	use tightbeam::{Frame, TightBeamError, Version};
 
-	use super::{Identity, IdentityFiles};
+	use super::{Identity, IdentityFiles, IdentityFilesError};
+	use crate::testing::Error;
 
-	/// A fresh directory for the files of one test.
+	/// A fresh, empty directory for the files of one test.
 	fn scratch_dir(test: &str) -> PathBuf {
 		let dir = env::temp_dir().join(format!("tbws-{test}-{}", process::id()));
+		let _absent = fs::remove_dir_all(&dir);
 		let created = fs::create_dir_all(&dir);
 		created.expect("the scratch directory should create");
 
@@ -395,12 +440,30 @@ mod tests {
 	#[test]
 	fn identity_files_load_what_they_provision() -> Result<(), Box<dyn core::error::Error>> {
 		let files = IdentityFiles::new(scratch_dir("identity-files"), "probe")?;
-		let minted = Identity::mint("CN=probe,O=tightbeam-ws,C=US", 7, Duration::from_secs(60))?;
-		files.provision(&minted)?;
+		let issued = Identity::mint("CN=probe,O=tightbeam-ws,C=US", 7, Duration::from_secs(60))?;
+		files.provision(&issued)?;
 
 		let loaded = files.load()?;
-		assert_eq!(loaded.certificate_der()?, minted.certificate_der()?);
-		assert_eq!(loaded.signing_key_bytes(), minted.signing_key_bytes());
+		assert_eq!(loaded.certificate_der()?, issued.certificate_der()?);
+		assert_eq!(loaded.signing_key_bytes(), issued.signing_key_bytes());
+		Ok(())
+	}
+
+	#[test]
+	fn an_interrupted_provision_publishes_no_certificate() -> Result<(), Box<dyn core::error::Error>> {
+		let files = IdentityFiles::new(scratch_dir("interrupted-provision"), "probe")?;
+		let identity = Identity::mint("CN=probe,O=tightbeam-ws,C=US", 9, Duration::from_secs(60))?;
+
+		// A directory where the key file goes fails the rename of the key into
+		// place.
+		fs::create_dir(files.signing_key())?;
+		let provisioned = files.provision(&identity);
+
+		assert!(provisioned.is_err(), "a provision whose key fails to move into place MUST fail");
+		assert!(
+			!files.certificate().exists(),
+			"an interrupted provision MUST publish no certificate"
+		);
 		Ok(())
 	}
 
@@ -414,12 +477,43 @@ mod tests {
 	#[test]
 	fn an_empty_identity_name_is_refused() {
 		let files = IdentityFiles::new("/certs", "");
-		assert!(files.is_err());
+		assert!(matches!(files, Err(Error::IdentityFiles(IdentityFilesError::Unnamed))));
 	}
 
 	#[test]
 	fn a_certificate_path_without_the_suffix_is_refused() {
 		let files = IdentityFiles::of_certificate(PathBuf::from("/certs/client.der"));
-		assert!(files.is_err());
+		assert!(matches!(files, Err(Error::IdentityFiles(IdentityFilesError::NotACertificate))));
+	}
+
+	#[test]
+	fn a_key_file_of_another_length_is_refused() -> Result<(), Box<dyn core::error::Error>> {
+		let files = IdentityFiles::new(scratch_dir("key-length"), "probe")?;
+		let issued = Identity::mint("CN=probe,O=tightbeam-ws,C=US", 11, Duration::from_secs(60))?;
+		files.provision(&issued)?;
+		fs::write(files.signing_key(), [0_u8; 31])?;
+
+		let loaded = files.load();
+		assert!(matches!(loaded, Err(Error::IdentityFiles(IdentityFilesError::KeyLength(31)))));
+		Ok(())
+	}
+
+	#[test]
+	fn a_key_of_another_identity_is_refused_at_load() -> Result<(), Box<dyn core::error::Error>> {
+		let files = IdentityFiles::new(scratch_dir("mismatched-key"), "probe")?;
+		let issued = Identity::mint("CN=probe,O=tightbeam-ws,C=US", 13, Duration::from_secs(60))?;
+		let other = Identity::mint("CN=other,O=tightbeam-ws,C=US", 14, Duration::from_secs(60))?;
+		files.provision(&issued)?;
+		fs::write(files.signing_key(), other.signing_key_bytes())?;
+
+		let loaded = files.load();
+		let refused = matches!(
+			loaded,
+			Err(Error::Ws(crate::Error::Tightbeam(TightBeamError::Signer(
+				SignerError::KeyMismatch
+			))))
+		);
+		assert!(refused, "a key of another identity MUST fail to load");
+		Ok(())
 	}
 }

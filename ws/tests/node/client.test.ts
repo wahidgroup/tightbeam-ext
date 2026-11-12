@@ -1,9 +1,11 @@
 import { describe, expect, it } from "vitest";
 
-import type { MuxStreamHandler } from "@wahidgroup/tightbeam-ws-client";
-import { TightbeamWsClient } from "@wahidgroup/tightbeam-ws-client";
+import { Buffer } from "node:buffer";
 
-import { withClient } from "../fixtures.js";
+import type { MuxStreamHandler, TightbeamWsClient } from "@wahidgroup/tightbeam-ws-client";
+import { Engine } from "@wahidgroup/tightbeam-ws-client";
+
+import { EchoDials } from "../fixtures.js";
 import { STACK } from "../stack.js";
 
 /**
@@ -11,23 +13,12 @@ import { STACK } from "../stack.js";
  * sends, how an `await using` scope closes, and the serve claims it reads.
  */
 
-/**
- * The options of every cleartext dial: the stream cap of the stack, which no
- * handshake negotiates.
- */
-const CLEARTEXT = { streams: STACK.streams };
-
-const ENGINE = await TightbeamWsClient.init();
+const ENGINE = await Engine.load();
 
 /**
- * The readyState of an open socket.
+ * The dials of this lane against the echo servers of the stack.
  */
-const OPEN = 1;
-
-/**
- * The readyState of a closed socket.
- */
-const CLOSED = 3;
+const DIALS = EchoDials.of(ENGINE, STACK);
 
 /**
  * A handler that accepts each stream without a body.
@@ -39,10 +30,7 @@ const ACCEPT: MuxStreamHandler = () => undefined;
  * compare bivariant, so the loose claim compiles without assertions.
  */
 interface LooseServer {
-	serve(
-		handler: MuxStreamHandler,
-		options?: { readonly claim?: unknown },
-	): void;
+	serve(handler: MuxStreamHandler, options?: { readonly claim?: unknown }): void;
 }
 
 /**
@@ -62,40 +50,10 @@ function run(fill: number): Uint8Array {
 }
 
 /**
- * Dial the duplex echo server, which answers each chunk with the same octets.
- */
-function connectDuplex(): Promise<TightbeamWsClient> {
-	const dialing = ENGINE.connectCleartext(STACK.muxDuplexEndpoint, CLEARTEXT);
-	return dialing;
-}
-
-/**
- * Dial the cleartext echo server.
- */
-function connectEcho(): Promise<TightbeamWsClient> {
-	const dialing = ENGINE.connectCleartext(STACK.muxClearEndpoint, CLEARTEXT);
-	return dialing;
-}
-
-/**
- * Every chunk that `body` yields until the peer ends it.
- */
-async function collected(
-	body: AsyncIterable<Uint8Array>,
-): Promise<Uint8Array[]> {
-	const chunks: Uint8Array[] = [];
-	for await (const chunk of body) {
-		chunks.push(chunk);
-	}
-
-	return chunks;
-}
-
-/**
  * A client that an `await using` scope held, once the scope ended.
  */
 async function scopedClient(): Promise<ScopedClient> {
-	await using client = await connectEcho();
+	await using client = await DIALS.cleartext();
 	const inScope = client.readyState;
 
 	const scoped = { client, inScope };
@@ -104,58 +62,80 @@ async function scopedClient(): Promise<ScopedClient> {
 
 describe("a push against the duplex echo server", () => {
 	it("sends the octets a chunk held at the push, not a later write", async () => {
-		const echoed = await withClient(connectDuplex, async (client) => {
-			const duplex = client.openDuplex();
-			const chunk = run(0xa1);
-			const pushed = duplex.push(chunk);
+		await using client = await DIALS.duplex();
+		const duplex = client.openDuplex();
+		const chunk = run(0xa1);
+		const pushed = duplex.push(chunk);
 
-			chunk.fill(0xb2);
+		chunk.fill(0xb2);
 
-			await pushed;
-			await duplex.close();
+		await pushed;
+		await duplex.close();
 
-			const chunks = await collected(duplex.body);
-			return chunks;
-		});
-
+		const echoed = await Array.fromAsync(duplex.body);
 		expect(echoed).toEqual([run(0xa1)]);
 	});
 
 	it("sends the octets of a chunk whose buffer moves away after the push", async () => {
-		const echoed = await withClient(connectDuplex, async (client) => {
-			const duplex = client.openDuplex();
-			const chunk = run(0xc3);
-			const pushed = duplex.push(chunk);
+		await using client = await DIALS.duplex();
+		const duplex = client.openDuplex();
+		const chunk = run(0xc3);
+		const pushed = duplex.push(chunk);
 
-			structuredClone(chunk.buffer, { transfer: [chunk.buffer] });
+		structuredClone(chunk.buffer, { transfer: [chunk.buffer] });
 
-			await pushed;
-			await duplex.close();
+		await pushed;
+		await duplex.close();
 
-			const chunks = await collected(duplex.body);
-			return chunks;
-		});
-
+		const echoed = await Array.fromAsync(duplex.body);
 		expect(echoed).toEqual([run(0xc3)]);
+	});
+
+	it("sends the octets a reused Buffer held at each call that waits behind a push", async () => {
+		await using client = await DIALS.duplex();
+		const duplex = client.openDuplex();
+		const chunk = Buffer.alloc(64, 0xa1);
+		const first = duplex.push(chunk);
+		chunk.fill(0xb2);
+		const second = duplex.push(chunk);
+		chunk.fill(0xc3);
+		const last = duplex.closeWith(chunk);
+
+		chunk.fill(0xd4);
+
+		await Promise.all([first, second, last]);
+		const echoed = await Array.fromAsync(duplex.body);
+		expect(echoed).toEqual([run(0xa1), run(0xb2), run(0xc3)]);
+	});
+
+	it("refuses a chunk whose buffer moved away before the push with InvalidBytes, and the stream still closes", async () => {
+		await using client = await DIALS.duplex();
+		const duplex = client.openDuplex();
+		const chunk = run(0xe5);
+		structuredClone(chunk.buffer, { transfer: [chunk.buffer] });
+
+		await expect(duplex.push(chunk)).rejects.toMatchObject({ code: "InvalidBytes" });
+		await duplex.closeWith(run(0xf6));
+
+		const echoed = await Array.fromAsync(duplex.body);
+		expect(echoed).toEqual([run(0xf6)]);
 	});
 });
 
 describe("an `await using` client", () => {
 	it("closes the client and its socket as the scope ends", async () => {
 		const { client, inScope } = await scopedClient();
-		expect(inScope).toBe(OPEN);
-		expect(client.readyState).toBe(CLOSED);
+		expect(inScope).toBe(WebSocket.OPEN);
+		expect(client.readyState).toBe(WebSocket.CLOSED);
 	});
 });
 
 describe("a serve claim", () => {
 	it("refuses a claim other than shared or exclusive with InvalidServeClaim", async () => {
-		await withClient(connectEcho, (client) => {
-			const loose: LooseServer = client;
-			expect(() => loose.serve(ACCEPT, { claim: "Exclusive" })).toThrow(
-				expect.objectContaining({ code: "InvalidServeClaim" }),
-			);
-			return Promise.resolve();
-		});
+		await using client = await DIALS.cleartext();
+		const loose: LooseServer = client;
+		expect(() => loose.serve(ACCEPT, { claim: "Exclusive" })).toThrow(
+			expect.objectContaining({ code: "InvalidServeClaim" }),
+		);
 	});
 });

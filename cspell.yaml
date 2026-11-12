@@ -5,6 +5,9 @@ import:
 words:
   - tightbeam
   - alpn
+  - bidi
+  - svid
+  - xfcc
   - pkix
   - unprovisioned
   - rustls
@@ -43,6 +46,7 @@ words:
   - dockerized
   - rustup
   - RUSTDOCFLAGS
+  - RUSTSEC
   - tbws
   - buildkit
   - parameterised
@@ -89,6 +93,7 @@ words:
   - unrouted
   - unrouting
   - bindgen
+  - externref
   - deadlined
   - envoyproxy
   - nodelay
@@ -143,7 +148,6 @@ words:
   - unhex
   - paywalled
   - encodestring
-  - decodestring
   - hexdigit
   - ruzstd
   - blocksize
@@ -151,6 +155,14 @@ words:
   - clevels
   - upto
   - seekable
+  - supertrait
+  - supertraits
+  - unraw
+  - libtest
+  - Addrs
+  - ltrimstr
+  - shellcheck
+  - elif
 ignorePaths:
   - node_modules/**
   - "**/sbom.json"
@@ -161,6 +173,8 @@ ignorePaths:
   - "**/dist/**"
   - "**/wasm/**"
   - "**/wasm-node/**"
+  - asn/tests/fixture/**
+  - asn/tests/codecs.ts
   - Cargo.lock
   - package-lock.json
   - .git/**

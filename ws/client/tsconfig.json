@@ -1,18 +1,19 @@
 {
 	"compilerOptions": {
 		"target": "ES2022",
+		"lib": ["ES2022", "DOM", "DOM.Iterable", "ESNext.Disposable"],
 		"module": "ESNext",
 		"moduleResolution": "Bundler",
 		"declaration": true,
-		"outDir": "dist",
-		"rootDir": "src",
 		"strict": true,
 		"noUncheckedIndexedAccess": true,
 		"skipLibCheck": true,
 		"forceConsistentCasingInFileNames": true,
+		"types": ["node"],
 		"paths": {
 			"#wasm": ["./wasm/tightbeam_ws_wasm.d.ts"],
-			"#engine": ["./src/engine/web.ts"]
+			"#engine": ["./src/engine/web.ts"],
+			"typescript": ["../node_modules/typescript"]
 		}
 	},
 	"include": ["src"]

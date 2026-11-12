@@ -1,21 +1,9 @@
-//! Multiplexed encrypted pub/sub demo server for the e2e suite.
-//!
-//! Every connection completes the HPKE handshake (negotiating
-//! multiplexing inside it) and shares one [`TopicRegistry`]. The wire
-//! commands (`sub/`, `unsub/`, and client `pub/` publish) answer through
-//! [`PubsubCommands::serve`], plus one demo command that lets a test
-//! client drive the server side of the contract:
-//!
-//!   - `poke`  push one non-topic stream (id `notice`) back
-//!
-//! The subscribe and publish policies forbid every topic under
-//! `forbidden/`, exercising the `PermissionDenied` answer. Every connection registers
-//! under the peer its handshake proved, so a policy can tell callers apart
-//! by the certificate of a mutual-auth peer.
+//! The multiplexed encrypted pub/sub demo server that the e2e suite drives.
+//! The page `docs/pubsub.md` (Testing) states what it serves.
 //!
 //! Environment:
 //!   - `TBWS_SERVER_CERT`           path to the server certificate DER, beside its key
-//!   - `PUBSUB_WS_PORT`             listen port (default `9110`)
+//!   - `PUBSUB_WS_PORT`             listen port, which the compose file of the stack sets
 //!   - `MUX_STREAMS`                client-initiated concurrency cap (default `8`)
 //!   - `PUBSUB_QUEUE_CAPACITY`      per-subscriber queue bound (default `32`)
 //!   - `PUBSUB_MAX_SUBSCRIPTIONS`   live subscriptions per connection
@@ -24,12 +12,8 @@
 //!     processor servlet at this ws:// URL ([`RelayBackplane`])
 //!   - `PUBSUB_PROCESSOR_CERT`      path to the processor certificate DER the
 //!     relay dial pins (required with the endpoint)
-//!   - the variables of [`DemoConfig`]
-//!
-//! The [`DemoConfig`] decides the [`Security`] of every served connection and
-//! of the relay dial alike. Under mutual auth and under the paywall, the dial
-//! presents the client identity that the processor pins, distinct from the
-//! server identity this process presents to browsers.
+//!   - the variables of [`DemoConfig`], which decide the [`Security`] of every
+//!     served connection and of the relay dial alike
 //!
 //! [`Security`]: tightbeam_ws::testing::Security
 
@@ -43,29 +27,28 @@ use std::path::Path;
 use std::sync::Arc;
 
 use tightbeam::crypto::x509::store::CertificateTrust;
+use tightbeam::marker::MaybeSendFuture;
 use tightbeam::policy::{SessionContext, TransitStatus};
 use tightbeam::prelude::TightBeamSocketAddr;
-use tightbeam::transport::multiplex::{MuxAcceptor, MuxDrivers, MuxHandle, MuxResponder, MuxRole, SpawnedMux};
-use tightbeam::transport::{
-	ClientBuilder, ConnectionBuilder, EncryptedMessageIO, EncryptedProtocol, GenericClient, ResponsePackage,
+use tightbeam::transport::multiplex::{
+	MuxAcceptor, MuxConnector, MuxDrivers, MuxHandle, MuxResponder, MuxRole, MuxTransport, SpawnedMux,
 };
+use tightbeam::transport::{EncryptedMessageIO, EncryptedProtocol, EnvelopeSink, GenericClient, ResponsePackage};
 use tightbeam::{Frame, Opaque, TightBeamError};
-use tightbeam_pubsub::testing::OpaqueFrame;
 use tightbeam_pubsub::{
-	AccessVerdict, AppRoutes, Backplane, BackplaneFault, ConnectionContext, Emitter, LinkLost, Local, NodeSink,
-	PublishError, PublishPolicy, PubsubCommands, RegistryOptions, RegistryView, Settled, SubscribePolicy, Topic,
-	TopicRegistry, Unrouted,
+	AccessVerdict, AppRoutes, Backplane, BackplaneFault, ConnectionContext, EmitDeadline, Emitter, LinkLost, Local,
+	NodeSink, OpaqueFrame, PublishError, PublishPolicy, PubsubCommands, RegistryOptions, RegistryView, Settled,
+	SubscribePolicy, Topic, TopicRegistry, Unrouted,
 };
 use tightbeam_ws::io::WsTransport;
 use tightbeam_ws::protocol::WsListener;
-use tightbeam_ws::serve::AcceptedLink;
-use tightbeam_ws::testing::{DemoConfig, EnvVar, Identity, Pinned};
+use tightbeam_ws::serve::{AcceptedLink, LinkError, RacingClock};
+use tightbeam_ws::testing::{DemoConfig, EnvVar, Identity, Pinned, Security};
 use tokio::net::{lookup_host, TcpStream};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::sync::oneshot;
 use tokio::task::JoinSet;
-use tokio::time::error::Elapsed;
-use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::http::uri::{Authority, InvalidUri, PathAndQuery};
 use tokio_tungstenite::tungstenite::http::Uri;
 use tokio_tungstenite::MaybeTlsStream;
@@ -75,8 +58,8 @@ type BoxError = Box<dyn Error + Send + Sync>;
 /// The transport an accepted WebSocket connection follows.
 type ServerTransport = WsTransport<MaybeTlsStream<TcpStream>>;
 
-/// Frame id that pushes one non-topic stream back at the client, so a
-/// subscriber's fallback routing can be exercised end to end.
+/// The frame id of the demo command that pushes one `notice` stream back to
+/// the client, which reaches the fallback of its manager.
 const POKE: &[u8] = b"poke";
 
 /// The relay worker is gone: its channel closed.
@@ -103,13 +86,29 @@ impl fmt::Display for EmptyAnswer {
 
 impl Error for EmptyAnswer {}
 
-/// Why one relayed publish produced no processed payload.
+/// Why one relayed publish produced no fan-out.
 enum RelayFault {
 	/// The processor refused or spoiled one request, or the session budget
 	/// could not carry it, and the link stays up.
 	Refused(BoxError),
-	/// The processor link stalled, or an emit on it counts as [`LinkLost`].
+	/// An emit on the processor link counts as [`LinkLost`], one past its
+	/// deadline included.
 	LinkLost(BoxError),
+	/// The local sequencer refused the processed payload.
+	Sequencer(PublishError),
+}
+
+impl From<RelayFault> for PublishError {
+	/// A fault of the processor link is a fault of the fabric, and the
+	/// sequencer answers its own refusal.
+	fn from(fault: RelayFault) -> Self {
+		match fault {
+			RelayFault::Refused(cause) | RelayFault::LinkLost(cause) => {
+				Self::Unavailable(BackplaneFault::Failed(cause))
+			}
+			RelayFault::Sequencer(refusal) => refusal,
+		}
+	}
 }
 
 impl From<LinkLost> for RelayFault {
@@ -122,14 +121,6 @@ impl From<TightBeamError> for RelayFault {
 	/// A frame that fails to build or decode spoils one request only.
 	fn from(error: TightBeamError) -> Self {
 		Self::Refused(Box::new(error))
-	}
-}
-
-impl From<Elapsed> for RelayFault {
-	/// An emit on a lost mux link can hang rather than fail, so a stalled
-	/// round-trip means the link is gone.
-	fn from(elapsed: Elapsed) -> Self {
-		Self::LinkLost(Box::new(elapsed))
 	}
 }
 
@@ -202,11 +193,11 @@ impl FromStr for ProcessorEndpoint {
 	///
 	/// # Errors
 	///
-	/// - [`EndpointError::Malformed`]: `endpoint` is not a URI.
-	/// - [`EndpointError::Scheme`]: the scheme is not `ws`.
-	/// - [`EndpointError::Path`]: the URL carries a path or a query.
-	/// - [`EndpointError::NoHost`]: the URL names no host.
-	/// - [`EndpointError::Port`]: the URL declares a port past 65535, or one
+	/// - [`EndpointError::Malformed`] -- `endpoint` is not a URI.
+	/// - [`EndpointError::Scheme`] -- the scheme is not `ws`.
+	/// - [`EndpointError::Path`] -- the URL carries a path or a query.
+	/// - [`EndpointError::NoHost`] -- the URL names no host.
+	/// - [`EndpointError::Port`] -- the URL declares a port past 65535, or one
 	///   that is not a number.
 	fn from_str(endpoint: &str) -> Result<Self, Self::Err> {
 		let url: Uri = endpoint.parse().map_err(EndpointError::Malformed)?;
@@ -237,7 +228,7 @@ impl ProcessorEndpoint {
 	///
 	/// # Errors
 	///
-	/// - [`EndpointError::Port`]: the declared port is past 65535, or it is
+	/// - [`EndpointError::Port`] -- the declared port is past 65535, or it is
 	///   not a number.
 	fn port_in(authority: &str) -> Result<u16, EndpointError> {
 		let after_host = authority.rsplit_once(']').map_or(authority, |(_, rest)| rest);
@@ -252,8 +243,8 @@ impl ProcessorEndpoint {
 	///
 	/// # Errors
 	///
-	/// - The I/O error of the lookup.
-	/// - [`EndpointError::Unresolved`]: the lookup found no address.
+	/// - The [`io::Error`](std::io::Error) of the lookup.
+	/// - [`EndpointError::Unresolved`] -- the lookup found no address.
 	async fn resolve(&self) -> Result<ProcessorAddresses, BoxError> {
 		let target = (self.host.as_str(), self.port);
 		let resolved = lookup_host(target).await?;
@@ -276,7 +267,7 @@ impl TryFrom<Vec<SocketAddr>> for ProcessorAddresses {
 
 	/// # Errors
 	///
-	/// - [`EndpointError::Unresolved`]: `addresses` is empty.
+	/// - [`EndpointError::Unresolved`] -- `addresses` is empty.
 	fn try_from(addresses: Vec<SocketAddr>) -> Result<Self, Self::Error> {
 		let mut wrapped = addresses.into_iter().map(TightBeamSocketAddr);
 		let first = wrapped.next().ok_or(EndpointError::Unresolved)?;
@@ -308,7 +299,7 @@ impl ProcessorAddresses {
 /// identity that the security kind of the demo presents.
 struct RelayDial<'a> {
 	trust: Arc<dyn CertificateTrust>,
-	client: Option<&'a Identity>,
+	security: &'a Security,
 }
 
 impl RelayDial<'_> {
@@ -316,33 +307,27 @@ impl RelayDial<'_> {
 	/// so the socket admits the ceilings of the limits the transport reads
 	/// under.
 	async fn connect(&self, address: TightBeamSocketAddr) -> Result<GenericClient<WsListener>, BoxError> {
-		let mut builder = ClientBuilder::<WsListener>::builder().with_trust_store(Arc::clone(&self.trust));
-		if let Some(client) = self.client {
-			builder = builder.with_client_identity(client.signing_identity()?);
-		}
-
+		let builder = self.security.client_builder::<WsListener>(Arc::clone(&self.trust));
 		let dialed = builder.connect(address).await?;
 		Ok(dialed)
 	}
 }
 
-/// A custom [`Backplane`]: every publish crosses to the processor
-/// servlet over the demo server's own tightbeam mux connection, and the
-/// servlet's answer is what gets sequenced and fanned out. Composes the
-/// stock [`Local`] for sequencing and sink management.
+/// A [`Backplane`] that carries each publish to the processor servlet over a
+/// mux connection of its own, and sequences the answer of the servlet
+/// through a [`Local`].
 ///
-/// This fabric documents **at-most-once** acks. [`Backplane::publish`]
-/// returns once the work is enqueued, not once [`Local`] has stamped and
-/// delivered. The queue is bounded at [`RELAY_DEPTH`]. A saturated relay
-/// answers `Unavailable` instead of growing without limit. A processor
-/// refusal or a spent session budget ends one publish, and a failed processor
-/// link closes the relay so every later publish answers `Unavailable` instead
-/// of silently dropping.
+/// - A publish resolves with the outcome of the local publish once the
+///   processor answered, so each refusal reaches the publisher.
+/// - The queue holds at most [`RELAY_DEPTH`] publishes, and a full queue
+///   answers `Unavailable`.
+/// - A failed processor link closes the relay, so every later publish
+///   answers `Unavailable`.
 struct RelayBackplane {
 	/// Shared with the [`RelayWorker`], which publishes each processed payload
 	/// into it.
 	local: Arc<Local>,
-	requests: Sender<(Topic, Vec<u8>)>,
+	requests: Sender<Relayed>,
 	/// The processor connection and every task that serves it, which end
 	/// when the backplane drops.
 	_link: RelayLink,
@@ -352,35 +337,46 @@ impl RelayBackplane {
 	/// Dial the processor over HPKE, pin `cert_path`, and spawn the relay
 	/// worker.
 	///
-	/// The dial answers a processor of the same [`Security`] kind as `demo`.
-	/// It presents the client identity the processor pins, and under the
-	/// paywall it pays demo invoices so renewals stay live.
+	/// - The dial answers a processor of the same [`Security`] kind as `demo`.
+	/// - It presents the client identity the processor pins.
+	/// - Under the paywall it pays demo invoices, so renewals stay live.
 	///
 	/// [`Security`]: tightbeam_ws::testing::Security
 	async fn connect(endpoint: &ProcessorEndpoint, cert_path: &Path, demo: &DemoConfig) -> Result<Arc<Self>, BoxError> {
 		let trust = Pinned::read(cert_path)?.trust()?;
 		let addresses = endpoint.resolve().await?;
-		let client = demo.security().client_identity();
+		let security = demo.security();
 
-		let dial = RelayDial { trust, client };
+		let dial = RelayDial { trust, security };
 		let dialed = addresses.first_answer(|address| dial.connect(address)).await?;
 		let transport: ServerTransport = dialed.into_transport();
 		let mut transport = demo.meter_dial(transport, RELAY_PAYMENTS);
 		transport.perform_client_handshake().await?;
 
-		let mux = transport.into_mux(MuxRole::Client)?;
-		Ok(Self::spawned(mux.spawn(), Local::default()))
+		/*
+		 * The client half of the upstream mux assembly, with the clock of
+		 * the writer kept for the emit deadline of the relay.
+		 */
+		let settings = transport.negotiated_mux().ok_or(LinkError::NotMultiplexed)?;
+		let rekey = MuxConnector::take_rekey(&mut transport)?;
+		let (reader, writer) = MuxConnector::into_envelope_halves(transport)?;
+		let clock = RacingClock::try_from(writer.clock())?;
+		let mux = match rekey {
+			Some(context) => MuxTransport::with_rekey(reader, writer, context, settings),
+			None => MuxTransport::new(reader, writer, MuxRole::Client, settings),
+		};
+
+		Ok(Self::spawned(mux.spawn(), clock, Arc::new(Local::default())))
 	}
 
-	/// Run the relay worker over the processor connection `mux`, with `local`
-	/// for sequencing.
+	/// Run the relay worker over the processor connection `mux`, whose writer
+	/// runs on `clock`, with `local` for sequencing.
 	///
 	/// One worker drains the queue, so deliveries stay serialized per
 	/// topic: the backplane contract.
-	fn spawned(mux: SpawnedMux, local: Local) -> Arc<Self> {
-		let (requests, queue) = channel::<(Topic, Vec<u8>)>(RELAY_DEPTH);
-		let local = Arc::new(local);
-		let link = RelayLink::serve(mux, Arc::clone(&local), queue);
+	fn spawned(mux: SpawnedMux, clock: RacingClock, local: Arc<Local>) -> Arc<Self> {
+		let (requests, queue) = channel::<Relayed>(RELAY_DEPTH);
+		let link = RelayLink::serve(mux, clock, Arc::clone(&local), queue);
 
 		Arc::new(Self { local, requests, _link: link })
 	}
@@ -401,11 +397,12 @@ impl RelayLink {
 	/// publishes of `queue` through it into `local`.
 	///
 	/// - The responder refuses every peer-initiated stream, so peer-initiated work such as a
-	///   paywall renewal drains instead of filling the inbound queue and stalling every emit.
+	///   paywall renewal drains at once.
 	/// - A keepalive holds a quiet link open through the read deadlines of both ends.
-	fn serve(mux: SpawnedMux, local: Arc<Local>, queue: Receiver<(Topic, Vec<u8>)>) -> Self {
+	/// - Each round trip ends within [`PROCESSOR_DEADLINE`] on `clock`, the clock of the writer.
+	fn serve(mux: SpawnedMux, clock: RacingClock, local: Arc<Local>, queue: Receiver<Relayed>) -> Self {
 		let SpawnedMux { handle, responder, drivers } = mux;
-		let processor = Emitter::from(handle.clone());
+		let processor = Emitter::new(handle.clone(), clock, PROCESSOR_DEADLINE);
 		let worker = RelayWorker { processor, local, queue };
 
 		let mut tasks = JoinSet::new();
@@ -431,6 +428,14 @@ impl RelayLink {
 	}
 }
 
+/// One publish that the relay worker carries to the processor: its topic,
+/// its request frame, and the sender of its outcome.
+struct Relayed {
+	topic: Topic,
+	request: Frame,
+	outcome: oneshot::Sender<Result<(), PublishError>>,
+}
+
 /// The task that drains the queue of a [`RelayBackplane`].
 ///
 /// The worker holds no [`Sender`] of its queue, so the queue closes once the
@@ -439,47 +444,36 @@ struct RelayWorker {
 	/// The emitter of the processor link.
 	processor: Emitter,
 	local: Arc<Local>,
-	queue: Receiver<(Topic, Vec<u8>)>,
+	queue: Receiver<Relayed>,
 }
 
 impl RelayWorker {
-	/// Relay each queued publish through the processor until the queue
-	/// closes or a [`RelayFault::LinkLost`].
+	/// Relay each queued publish through the processor and answer its
+	/// outcome, until the queue closes or the processor link is lost.
 	async fn run(mut self) {
-		while let Some((topic, payload)) = self.queue.recv().await {
-			let relayed = self.relay(&topic, &payload).await;
-			match relayed {
-				Ok(()) => {}
-				Err(RelayFault::Refused(error)) => {
-					eprintln!("[pubsub-demo] the processor refused one publish: {error}");
-				}
-				Err(RelayFault::LinkLost(error)) => {
-					/*
-					 * Stop the worker so the closed queue turns every later
-					 * publish into an Unavailable answer instead of a silent
-					 * drop.
-					 */
-					eprintln!("[pubsub-demo] the processor link failed, closing the relay: {error}");
-					return;
-				}
+		while let Some(Relayed { topic, request, outcome }) = self.queue.recv().await {
+			let relayed = self.relay(&topic, &request).await;
+			let lost = matches!(relayed, Err(RelayFault::LinkLost(_)));
+
+			// A publisher that stopped waiting reads no outcome.
+			let _ = outcome.send(relayed.map_err(PublishError::from));
+			if lost {
+				return;
 			}
 		}
 	}
 
-	/// Relay one publish in one bounded round-trip to the processor, raw
-	/// payload out and processed back, then publish the processed payload
-	/// into the local sequencer.
+	/// Relay one publish in one bounded round trip to the processor, then
+	/// publish the processed payload into the local sequencer.
 	///
 	/// # Errors
 	///
-	/// - [`RelayFault::Refused`]: the processor refused or spoiled the request, or the session
+	/// - [`RelayFault::Refused`] -- the processor refused or spoiled the request, or the session
 	///   budget could not carry it.
-	/// - [`RelayFault::LinkLost`]: the round-trip stalled, or its emit counts as [`LinkLost`].
-	async fn relay(&self, topic: &Topic, payload: &[u8]) -> Result<(), RelayFault> {
-		let frame = OpaqueFrame { id: topic.as_str(), order: 1, payload };
-		let request = frame.build()?;
-		let round_trip = self.processor.until_settled(&request);
-		let settled = timeout(PROCESSOR_TIMEOUT, round_trip).await??;
+	/// - [`RelayFault::LinkLost`] -- the emit counts as [`LinkLost`], one past its deadline included.
+	/// - [`RelayFault::Sequencer`] -- the local sequencer refused the processed payload.
+	async fn relay(&self, topic: &Topic, request: &Frame) -> Result<(), RelayFault> {
+		let settled = self.processor.until_settled(request).await?;
 		let answered = match settled {
 			Settled::Answered(answered) => answered,
 			Settled::Refused(cause) => return Err(RelayFault::Refused(Box::new(cause))),
@@ -487,41 +481,43 @@ impl RelayWorker {
 		let answer = answered.ok_or_else(|| RelayFault::Refused(Box::new(EmptyAnswer)))?;
 		let body = answer.decode_message::<Opaque>()?;
 
-		/*
-		 * A local refusal is the registry quiescing, an orderly end for
-		 * an update enqueued before it, or the topic limit.
-		 */
-		if let Err(error) = self.local.publish(topic, body.as_bytes()) {
-			eprintln!("[pubsub-demo] relay delivery refused: {error}");
-		}
-
-		Ok(())
+		let sequenced = self.local.publish(topic, body.as_bytes()).await;
+		sequenced.map_err(RelayFault::Sequencer)
 	}
 }
 
-/// How long one processor round-trip may take: an emit on a lost mux
-/// link can hang rather than error, so a timeout means the relay link
-/// is dead. Sized for a cold dockerized servlet under parallel e2e load.
-const PROCESSOR_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long one processor round-trip may take before the relay reads its
+/// link as lost. Sized for a cold dockerized servlet under parallel e2e load.
+const PROCESSOR_DEADLINE: EmitDeadline = match EmitDeadline::new(Duration::from_secs(15)) {
+	Some(deadline) => deadline,
+	None => panic!("the processor deadline is above zero"),
+};
 
 impl Backplane for RelayBackplane {
 	fn attach(&self, sink: NodeSink) {
 		self.local.attach(sink);
 	}
 
-	fn publish(&self, topic: &Topic, payload: &[u8]) -> Result<(), PublishError> {
-		let request = (topic.clone(), payload.to_vec());
-		self.requests.try_send(request).map_err(|refusal| {
-			let fault = match refusal {
-				TrySendError::Full(_) => BackplaneFault::Saturated,
-				TrySendError::Closed(_) => BackplaneFault::Failed(Box::new(RelayClosed)),
-			};
+	fn publish<'a>(&'a self, topic: &'a Topic, payload: &'a [u8]) -> MaybeSendFuture<'a, Result<(), PublishError>> {
+		Box::pin(async move {
+			let request = OpaqueFrame { id: topic.as_str(), order: 1, payload }.build()?;
+			let (outcome, answered) = oneshot::channel();
+			let relayed = Relayed { topic: topic.clone(), request, outcome };
+			self.requests.try_send(relayed).map_err(|refusal| {
+				let fault = match refusal {
+					TrySendError::Full(_) => BackplaneFault::Saturated,
+					TrySendError::Closed(_) => BackplaneFault::Failed(Box::new(RelayClosed)),
+				};
 
-			PublishError::Unavailable(fault)
+				PublishError::Unavailable(fault)
+			})?;
+
+			let closed = || PublishError::Unavailable(BackplaneFault::Failed(Box::new(RelayClosed)));
+			answered.await.unwrap_or_else(|_| Err(closed()))
 		})
 	}
 
-	fn last_order(&self, topic: &Topic) -> u64 {
+	fn last_order<'a>(&'a self, topic: &'a Topic) -> MaybeSendFuture<'a, u64> {
 		self.local.last_order(topic)
 	}
 
@@ -531,7 +527,7 @@ impl Backplane for RelayBackplane {
 }
 
 /// Forbid every topic under `forbidden/`, for a subscribe and for a publish,
-/// exercising the `PermissionDenied` answer in the e2e suite.
+/// so the e2e suite reads the `PermissionDenied` answer.
 struct DenyForbidden;
 
 impl DenyForbidden {
@@ -632,7 +628,7 @@ const PROCESSOR_CERT: EnvVar = EnvVar::new("PUBSUB_PROCESSOR_CERT");
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
 	let defaults = RegistryOptions::default();
-	let port = PORT.parsed_or(9110u32)?;
+	let port: u16 = PORT.parsed()?;
 	let queue_capacity = QUEUE_CAPACITY.parsed_or(defaults.queue_capacity)?;
 	let max_subscriptions_per_connection = MAX_SUBSCRIPTIONS.parsed_or(defaults.max_subscriptions_per_connection)?;
 	let bind_addr = TightBeamSocketAddr(format!("0.0.0.0:{port}").parse()?);
@@ -641,7 +637,7 @@ async fn main() -> Result<(), BoxError> {
 	let mut options = RegistryOptions { queue_capacity, max_subscriptions_per_connection, ..defaults };
 	if let Some(endpoint) = PROCESSOR_ENDPOINT.value()? {
 		let processor: ProcessorEndpoint = endpoint.parse()?;
-		let cert_path = PROCESSOR_CERT.path()?;
+		let cert_path = PROCESSOR_CERT.required_path()?;
 		options.backplane = RelayBackplane::connect(&processor, &cert_path, &demo).await?;
 		println!("[pubsub-demo] publishing through the processor at {endpoint}");
 	}
@@ -659,16 +655,7 @@ async fn main() -> Result<(), BoxError> {
 	);
 
 	loop {
-		// A failed accept is the listener's own fault, such as a descriptor
-		// shortage, and it clears on retry.
-		let (transport, peer) = match listener.accept().await {
-			Ok(accepted) => accepted,
-			Err(error) => {
-				eprintln!("[pubsub-demo] accept failed: {error}");
-				continue;
-			}
-		};
-
+		let (transport, peer) = listener.accept().await?;
 		let commands = commands.clone();
 		let connection = PubsubConnection { transport, demo: Arc::clone(&demo) };
 		tokio::spawn(async move {
@@ -681,19 +668,25 @@ async fn main() -> Result<(), BoxError> {
 
 #[cfg(test)]
 mod tests {
+	use core::future::{pending, poll_fn};
 	use core::num::NonZeroUsize;
+	use core::task::Poll;
 	use core::time::Duration;
-	use std::collections::HashSet;
-	use std::sync::{Mutex, MutexGuard, PoisonError, Weak};
 
 	use tightbeam::clock::{Clock, SystemClock};
-	use tightbeam::transport::handshake::negotiation::MuxSettings;
-	use tightbeam_pubsub::testing::MemoryLink;
-	use tightbeam_pubsub::{DeliverError, UpdateSink};
-	use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
-	use tokio::task::yield_now;
+	use tightbeam::transport::multiplex::MuxDispatch;
+	use tightbeam::transport::TransportResult;
+	use tightbeam_pubsub::testing::{BackplaneConformance, Dial, Fabric, Loopback, Peer};
+	use tightbeam_pubsub::AllowAll;
+	use tokio::net::TcpListener;
+	use tokio::sync::OnceCell;
+	use tokio::task::JoinHandle;
+	use tokio::time::timeout;
 
 	use super::*;
+
+	/// Bound every wait on a live link, so a regression fails at the bound.
+	const DEADLINE: Duration = Duration::from_secs(5);
 
 	fn endpoint(url: &str) -> Result<ProcessorEndpoint, EndpointError> {
 		url.parse()
@@ -742,138 +735,254 @@ mod tests {
 		assert!(matches!(addresses, Err(EndpointError::Unresolved)));
 	}
 
-	/// Three loopback addresses on the ports `1`, `2`, and `3`.
-	fn three_addresses() -> ProcessorAddresses {
-		let ports = [1, 2, 3].map(|port| SocketAddr::from(([127, 0, 0, 1], port)));
-		ProcessorAddresses::try_from(ports.to_vec()).expect("three addresses make a set")
-	}
-
-	/// A dial that answers only on port 2 and records each port it tries. A
-	/// processor dial needs a live servlet behind each address, and this test
-	/// reads only the order of the attempts.
-	#[derive(Default)]
-	struct PortTwo(Mutex<Vec<u16>>);
-
-	impl PortTwo {
-		fn lock(&self) -> MutexGuard<'_, Vec<u16>> {
-			self.0.lock().unwrap_or_else(PoisonError::into_inner)
-		}
-
-		async fn dial(&self, address: TightBeamSocketAddr) -> Result<u16, u16> {
-			let port = address.0.port();
-			self.lock().push(port);
-			if port != 2 {
-				return Err(port);
-			}
-
-			Ok(port)
-		}
+	/// A loopback address that no listener holds: one a listener bound and
+	/// let go.
+	async fn closed_address() -> SocketAddr {
+		let probe = TcpListener::bind("127.0.0.1:0").await.expect("loopback binds");
+		probe.local_addr().expect("a bound listener has an address")
 	}
 
 	#[tokio::test]
 	async fn a_dial_tries_each_address_until_one_answers() {
-		let addresses = three_addresses();
-		let dial = PortTwo::default();
+		let listener = TcpListener::bind("127.0.0.1:0").await.expect("loopback binds");
+		let open = listener.local_addr().expect("a bound listener has an address");
+		let addresses = ProcessorAddresses::try_from(vec![closed_address().await, open]);
+		let addresses = addresses.expect("two addresses make a set");
 
-		let answered = addresses.first_answer(|address| dial.dial(address)).await;
-		assert_eq!(answered, Ok(2));
-		assert_eq!(*dial.lock(), [1, 2]);
+		let dial = |address: TightBeamSocketAddr| async move { TcpStream::connect(address.0).await.map(|_| address) };
+		let answered = addresses.first_answer(dial).await;
+		assert_eq!(answered.ok(), Some(TightBeamSocketAddr(open)));
 	}
 
-	/// Holds a live member of each topic in its set, and lets one leave with no
-	/// report. A registry would need a served connection behind each member,
-	/// and this test reads only membership.
-	struct Members(Mutex<HashSet<Topic>>);
+	/// A processor that refuses the payload `bad`, as a servlet refuses a
+	/// malformed note, and echoes every other payload.
+	struct RefusingBad;
 
-	impl Members {
-		fn of(names: &[&str]) -> Arc<Self> {
-			let topics = names.iter().map(|name| Topic::fixture(name));
-			Arc::new(Self(Mutex::new(topics.collect())))
-		}
+	impl MuxDispatch for RefusingBad {
+		async fn unary(&self, frame: Arc<Frame>) -> TransportResult<ResponsePackage> {
+			let Ok(body) = frame.decode_message::<Opaque>() else {
+				return Ok(ResponsePackage::new(TransitStatus::Internal, None));
+			};
+			if body.as_bytes() == b"bad" {
+				return Ok(ResponsePackage::new(TransitStatus::InvalidArgument, None));
+			}
 
-		fn leave(&self, name: &str) {
-			let topic = Topic::fixture(name);
-			self.0.lock().unwrap_or_else(PoisonError::into_inner).remove(&topic);
-		}
-	}
-
-	impl UpdateSink for Members {
-		fn deliver(&self, _topic: &Topic, _order: u64, _payload: &[u8]) -> Result<(), DeliverError> {
-			Ok(())
-		}
-
-		fn has_members(&self, topic: &Topic) -> bool {
-			self.0.lock().unwrap_or_else(PoisonError::into_inner).contains(topic)
+			let frame = OpaqueFrame { id: "processed", order: 1, payload: body.as_bytes() };
+			let answer = frame.build().ok();
+			Ok(ResponsePackage::new(TransitStatus::Ok, answer))
 		}
 	}
 
-	/// A relay over a link whose processor end runs no driver, whose [`Local`]
-	/// counts two topics.
-	fn relay_of_two() -> (Arc<RelayBackplane>, impl Sized) {
-		let (client, server) = MemoryLink::default().mux_pair(MuxSettings::symmetric(4));
-		let two = NonZeroUsize::new(2).expect("two is above zero");
-
-		let backplane = RelayBackplane::spawned(server.spawn(), Local::default().with_max_topics(two));
-		(backplane, client)
+	/// The relay end of one loopback link to a processor, and the processor
+	/// end, accepted and not yet served.
+	async fn processor_link() -> (SpawnedMux, tightbeam_pubsub::testing::ServerEnd) {
+		let opened = Loopback::open(&Dial::default()).await;
+		let Loopback { server, client } = opened.expect("a loopback link opens");
+		(client, server)
 	}
 
-	/// Publish `payload` to `name` through the [`Local`] of `backplane`.
-	fn sequenced(backplane: &RelayBackplane, name: &str) -> Result<(), PublishError> {
-		let topic = Topic::fixture(name);
-		backplane.local.publish(&topic, b"tick")
+	/// A relay over the processor link `mux`, the client end of a loopback
+	/// link, which runs on the system clock, with `local` for sequencing.
+	fn relay_over(mux: SpawnedMux, local: Arc<Local>) -> Arc<RelayBackplane> {
+		let system: Arc<dyn Clock> = Arc::new(SystemClock);
+		let clock = RacingClock::try_from(system).expect("a test link races on a tokio thread");
+		RelayBackplane::spawned(mux, clock, local)
+	}
+
+	/// A relay with `local` for sequencing over a link to [`RefusingBad`],
+	/// and the serve of the processor, which ends with the link.
+	async fn relay_to_processor(local: Arc<Local>) -> (Arc<RelayBackplane>, JoinHandle<TransportResult<()>>) {
+		let (relay, processor) = processor_link().await;
+		let serving = tokio::spawn(processor.spawn().serve_dispatch(RefusingBad, pending()));
+		(relay_over(relay, local), serving)
+	}
+
+	/// The relays of one fabric: each node dials its own processor and
+	/// sequences through the one shared [`Local`].
+	struct Relays(Arc<Local>);
+
+	impl Fabric for Relays {
+		async fn join(&self) -> Arc<dyn Backplane> {
+			let (relay, _serving) = relay_to_processor(Arc::clone(&self.0)).await;
+			relay as Arc<dyn Backplane>
+		}
+	}
+
+	#[tokio::test]
+	async fn the_relay_keeps_the_backplane_contract() {
+		let fresh = |limit: NonZeroUsize| Relays(Arc::new(Local::default().with_max_topics(limit)));
+		let checked = BackplaneConformance::new(fresh).check().await;
+		assert!(checked.is_ok(), "each relay should keep the backplane contract: {checked:?}");
+	}
+
+	/// The fabric of one relay, which every node publishes through.
+	///
+	/// The one worker of the relay carries the publishes of every topic, as
+	/// the single consumer task of `docs/pubsub.md` (Backplane) does.
+	struct SharedRelay {
+		local: Arc<Local>,
+		relay: OnceCell<Arc<RelayBackplane>>,
+	}
+
+	impl Fabric for SharedRelay {
+		async fn join(&self) -> Arc<dyn Backplane> {
+			let dialed = self.relay.get_or_init(|| async {
+				let (relay, _serving) = relay_to_processor(Arc::clone(&self.local)).await;
+				relay
+			});
+			Arc::clone(dialed.await) as Arc<dyn Backplane>
+		}
+	}
+
+	#[tokio::test]
+	async fn a_relay_that_every_node_shares_keeps_the_backplane_contract() {
+		let fresh = |limit: NonZeroUsize| SharedRelay {
+			local: Arc::new(Local::default().with_max_topics(limit)),
+			relay: OnceCell::new(),
+		};
+		let checked = BackplaneConformance::new(fresh).check().await;
+		assert!(checked.is_ok(), "the relay should keep the backplane contract: {checked:?}");
+	}
+
+	/// A registry on `backplane`, and the commands its peers connect through.
+	fn served_on(backplane: &Arc<RelayBackplane>) -> (TopicRegistry, PubsubCommands<AllowAll>) {
+		let shared = Arc::clone(backplane) as Arc<dyn Backplane>;
+		let registry = TopicRegistry::new(RegistryOptions { backplane: shared, ..RegistryOptions::default() });
+		let commands = PubsubCommands::new(registry.clone(), AllowAll);
+		(registry, commands)
+	}
+
+	/// A peer of `commands` subscribed to each of `names`.
+	async fn subscriber(commands: &PubsubCommands<AllowAll>, names: &[&str]) -> Peer {
+		let peer = Peer::connect(commands, &Dial::default())
+			.await
+			.expect("a loopback peer connects");
+		for name in names {
+			peer.subscribe(&name.parse::<Topic>().expect("the name should be a topic"))
+				.await
+				.expect("the subscription is accepted");
+		}
+
+		peer
+	}
+
+	/// Publish to `name` through the [`Local`] of `backplane`.
+	async fn sequenced(backplane: &RelayBackplane, name: &str) -> Result<(), PublishError> {
+		let topic: Topic = name.parse().expect("the name should be a topic");
+		backplane.local.publish(&topic, b"tick").await
 	}
 
 	#[tokio::test]
 	async fn the_relay_passes_each_vacancy_report_to_its_local() {
-		let (backplane, _peer) = relay_of_two();
-		let members = Members::of(&["prices", "chat"]);
+		let two = NonZeroUsize::new(2).expect("two is above zero");
+		let (backplane, _serving) = relay_to_processor(Arc::new(Local::default().with_max_topics(two))).await;
+		let (_registry, commands) = served_on(&backplane);
+		let peer = subscriber(&commands, &["prices", "chat"]).await;
 
-		backplane.attach(NodeSink::from(&members));
+		let filled = [sequenced(&backplane, "prices").await, sequenced(&backplane, "chat").await];
+		let refused = sequenced(&backplane, "news").await;
 
-		let filled = [sequenced(&backplane, "prices"), sequenced(&backplane, "chat")];
-		let refused = sequenced(&backplane, "news");
+		peer.unsubscribe(&"prices".parse::<Topic>().expect("the name should be a topic"))
+			.await
+			.expect("the unsubscribe is accepted");
 
-		members.leave("prices");
-		backplane.vacated(&Topic::fixture("prices"));
-
-		let outcome = sequenced(&backplane, "news");
+		let outcome = sequenced(&backplane, "news").await;
 		assert!(filled.iter().all(Result::is_ok));
 		assert!(matches!(refused, Err(PublishError::TopicLimit)));
 		assert!(outcome.is_ok());
 	}
 
-	/// Yield until the last strong reference behind `clock` is gone, or give
-	/// up.
-	async fn released(clock: &Weak<dyn Clock>) -> bool {
-		for _ in 0..64 {
-			if clock.strong_count() == 0 {
-				return true;
-			}
+	#[tokio::test]
+	async fn a_processor_refusal_leaves_the_relay_running() {
+		let (backplane, _serving) = relay_to_processor(Arc::new(Local::default())).await;
+		let (_registry, commands) = served_on(&backplane);
+		let mut peer = subscriber(&commands, &["prices"]).await;
 
-			yield_now().await;
-		}
+		let refused = backplane
+			.publish(&"prices".parse::<Topic>().expect("the name should be a topic"), b"bad")
+			.await;
+		let accepted = backplane
+			.publish(&"prices".parse::<Topic>().expect("the name should be a topic"), b"good")
+			.await;
 
-		false
+		let update = timeout(DEADLINE, peer.next_update()).await.ok().flatten();
+		let update = update.expect("the processed publish arrives");
+		let body = update.decode_message::<Opaque>().expect("an update carries an opaque body");
+		assert!(matches!(refused, Err(PublishError::Unavailable(BackplaneFault::Failed(_)))));
+		assert!(accepted.is_ok());
+		assert_eq!(update.metadata().order(), 1);
+		assert_eq!(body.as_bytes(), b"good");
 	}
 
-	/// How long the relay waits for the processor to answer its first
-	/// keepalive probe, so the keepalive sleeps out its interval when the
-	/// relay drops.
-	const PROBED: Duration = Duration::from_millis(50);
-
 	#[tokio::test]
-	async fn a_dropped_relay_link_ends_its_tasks() {
-		let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-		let witness = Arc::downgrade(&clock);
-		let (processor, relay) = MemoryLink::new(clock).mux_pair(MuxSettings::symmetric(4));
-		let processor = processor.spawn();
-		let backplane = RelayBackplane::spawned(relay.spawn(), Local::default());
-		tokio::time::sleep(PROBED).await;
+	async fn a_processor_failure_closes_the_relay() {
+		let (relay, processor) = processor_link().await;
 
-		drop(backplane);
+		// A processor that is gone closes the link, so the first request
+		// fails and the relay closes.
 		drop(processor);
 
-		assert!(released(&witness).await);
+		let backplane = relay_over(relay, Arc::new(Local::default()));
+		let first = timeout(
+			DEADLINE,
+			backplane.publish(&"prices".parse::<Topic>().expect("the name should be a topic"), b"tick"),
+		)
+		.await;
+		let closed = timeout(DEADLINE, backplane.requests.closed()).await;
+
+		let after = backplane
+			.publish(&"prices".parse::<Topic>().expect("the name should be a topic"), b"tick")
+			.await;
+		assert!(matches!(first, Ok(Err(PublishError::Unavailable(BackplaneFault::Failed(_))))));
+		assert!(closed.is_ok());
+		assert!(matches!(after, Err(PublishError::Unavailable(BackplaneFault::Failed(_)))));
+	}
+
+	/// Start `attempts` publishes, each polled once and held, and answer the
+	/// outcome of the last, or `None` while it waits.
+	async fn flooded(backplane: &RelayBackplane, attempts: usize, topic: &Topic) -> Option<Result<(), PublishError>> {
+		let mut held = Vec::with_capacity(attempts);
+		let mut last = None;
+		for _ in 0..attempts {
+			let mut publishing = backplane.publish(topic, b"tick");
+			let polled = poll_fn(|context| Poll::Ready(publishing.as_mut().poll(context))).await;
+			last = match polled {
+				Poll::Ready(outcome) => Some(outcome),
+				Poll::Pending => None,
+			};
+			held.push(publishing);
+		}
+
+		last
+	}
+
+	#[tokio::test]
+	async fn a_saturated_relay_refuses_the_publish() {
+		let (relay, processor) = processor_link().await;
+		let backplane = relay_over(relay, Arc::new(Local::default()));
+
+		// The processor end reads nothing, so the worker waits out its first
+		// round trip and the queue only fills. One publish past the queue
+		// depth, and the one the worker holds, is refused.
+		let last = flooded(
+			&backplane,
+			RELAY_DEPTH + 2,
+			&"prices".parse::<Topic>().expect("the name should be a topic"),
+		)
+		.await;
+		assert!(matches!(last, Some(Err(PublishError::Unavailable(BackplaneFault::Saturated)))));
+
+		drop(processor);
+	}
+
+	#[tokio::test]
+	async fn a_dropped_relay_ends_its_processor_link() {
+		let (backplane, serving) = relay_to_processor(Arc::new(Local::default())).await;
+
+		drop(backplane);
+
+		let ended = timeout(DEADLINE, serving).await;
+		assert!(ended.is_ok(), "the processor should read the end of the link");
 	}
 
 	#[test]
@@ -910,130 +1019,5 @@ mod tests {
 	fn an_endpoint_past_the_ws_scheme_is_refused() {
 		let parsed = endpoint("wss://pubsub-processor:9111");
 		assert!(matches!(parsed, Err(EndpointError::Scheme)));
-	}
-
-	/// Publish until the relay refuses with `Unavailable`, or give up:
-	/// the worker observes the processor failure asynchronously, no
-	/// sooner than [`PROCESSOR_TIMEOUT`] on a hung link.
-	async fn relay_refused(backplane: &RelayBackplane, topic: &Topic) -> bool {
-		let deadline = tokio::time::Instant::now() + PROCESSOR_TIMEOUT + Duration::from_secs(2);
-		while tokio::time::Instant::now() < deadline {
-			let outcome = backplane.publish(topic, b"tick");
-			if matches!(outcome, Err(PublishError::Unavailable(_))) {
-				return true;
-			}
-
-			tokio::time::sleep(Duration::from_millis(100)).await;
-		}
-
-		false
-	}
-
-	/// Publish `attempts` times without giving the worker room to
-	/// drain, returning the last outcome.
-	fn flooded(backplane: &RelayBackplane, attempts: usize, topic: &Topic) -> Result<(), PublishError> {
-		let mut last = Ok(());
-		for _ in 0..attempts {
-			last = backplane.publish(topic, b"tick");
-		}
-
-		last
-	}
-
-	#[tokio::test]
-	async fn a_saturated_relay_refuses_the_publish() {
-		let (client, server) = MemoryLink::default().mux_pair(MuxSettings::symmetric(4));
-		let backplane = RelayBackplane::spawned(server.spawn(), Local::default());
-
-		/*
-		 * The processor end runs no driver: the worker stalls inside its
-		 * first round-trip's timeout window, so the queue can only fill.
-		 * One publish past the queue depth (plus the item the worker
-		 * holds) must refuse instead of growing without bound.
-		 */
-		let last = flooded(&backplane, RELAY_DEPTH + 2, &Topic::fixture("prices"));
-		assert!(matches!(last, Err(PublishError::Unavailable(BackplaneFault::Saturated))));
-
-		drop(client);
-	}
-
-	/// Hands every payload the relay delivers locally to the test.
-	struct Delivered(UnboundedSender<Vec<u8>>);
-
-	impl UpdateSink for Delivered {
-		fn deliver(&self, _topic: &Topic, _order: u64, payload: &[u8]) -> Result<(), DeliverError> {
-			let _ = self.0.send(payload.to_vec());
-			Ok(())
-		}
-
-		fn has_members(&self, _topic: &Topic) -> bool {
-			true
-		}
-	}
-
-	/// A processor that refuses the payload `bad`, as a servlet refuses a
-	/// malformed note, and echoes every other payload.
-	async fn refusing_bad(frame: Arc<Frame>) -> ResponsePackage {
-		let Ok(body) = frame.decode_message::<Opaque>() else {
-			return ResponsePackage::new(TransitStatus::Internal, None);
-		};
-		if body.as_bytes() == b"bad" {
-			return ResponsePackage::new(TransitStatus::InvalidArgument, None);
-		}
-
-		let frame = OpaqueFrame { id: "processed", order: 1, payload: body.as_bytes() };
-		let answer = frame.build().ok();
-		ResponsePackage::new(TransitStatus::Ok, answer)
-	}
-
-	/// A relay over a live link under `settings` to [`refusing_bad`], and the
-	/// receiver of every payload it delivers. The returned guard keeps the
-	/// sink alive.
-	fn relaying(settings: MuxSettings) -> (Arc<RelayBackplane>, UnboundedReceiver<Vec<u8>>, impl Sized) {
-		let (client, server) = MemoryLink::default().mux_pair(settings);
-		let SpawnedMux { handle, responder, drivers } = client.spawn();
-		let processor = tokio::spawn(responder.serve(refusing_bad));
-
-		let backplane = RelayBackplane::spawned(server.spawn(), Local::default());
-		let (sender, delivered) = unbounded_channel();
-		let sink = Arc::new(Delivered(sender));
-		backplane.attach(NodeSink::from(&sink));
-		(backplane, delivered, (sink, handle, drivers, processor.abort_handle()))
-	}
-
-	#[tokio::test]
-	async fn a_processor_refusal_leaves_the_relay_running() {
-		let (backplane, mut delivered, _sink) = relaying(MuxSettings::symmetric(4));
-		let refused = backplane.publish(&Topic::fixture("prices"), b"bad");
-		let accepted = backplane.publish(&Topic::fixture("prices"), b"good");
-
-		let processed = timeout(Duration::from_secs(5), delivered.recv()).await;
-		assert!(refused.is_ok());
-		assert!(accepted.is_ok());
-		assert_eq!(processed.ok().flatten(), Some(b"good".to_vec()));
-	}
-
-	#[tokio::test(start_paused = true)]
-	async fn a_budget_refusal_leaves_the_relay_running() {
-		let unfunded = MuxSettings::symmetric(4).with_send_budget(Some(0));
-		let (backplane, _delivered, _sink) = relaying(unfunded);
-
-		let closed = relay_refused(&backplane, &Topic::fixture("prices")).await;
-		assert!(!closed);
-	}
-
-	#[tokio::test]
-	async fn a_processor_failure_closes_the_relay() {
-		let (client, server) = MemoryLink::default().mux_pair(MuxSettings::symmetric(4));
-
-		/*
-		 * A dropped peer closes the link: every processor request fails,
-		 * and the first failure the worker observes must close the
-		 * relay instead of acking publishes into a void.
-		 */
-		drop(client);
-
-		let backplane = RelayBackplane::spawned(server.spawn(), Local::default());
-		assert!(relay_refused(&backplane, &Topic::fixture("prices")).await);
 	}
 }

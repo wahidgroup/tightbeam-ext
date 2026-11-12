@@ -8,7 +8,7 @@ This project is under active development. Public APIs MAY change without notice.
 
 ## Abstract
 
-This crate is the browser counterpart of [tightbeam-ws](../tightbeam-ws). It runs the tightbeam transport over a browser WebSocket under the same envelope rules, and it exposes the frame composer of tightbeam to JavaScript through `wasm-bindgen`. It never reaches crates.io: it ships inside the npm package `@wahidgroup/tightbeam-ws-client` ([client](../client)).
+This crate is the browser counterpart of [tightbeam-ws](../tightbeam-ws). It runs the tightbeam transport over a browser WebSocket under the same envelope rules, and it exposes the frame composer of tightbeam to JavaScript through `wasm-bindgen`.
 
 ## Build
 
@@ -16,11 +16,11 @@ This crate is the browser counterpart of [tightbeam-ws](../tightbeam-ws). It run
 make client   # wasm-pack build + TS workspace build
 ```
 
-The build writes a browser bundle and a Node bundle, and each has a loader of its own, which imports the bundle as `TightbeamWsClient.init` runs. Implementation: [docs/ws-wasm.md](../../docs/ws-wasm.md#build).
+The build writes a browser bundle and a Node bundle, and each has a loader of its own, which imports the bundle once per realm as `Engine.load` runs. Implementation: [docs/ws-wasm.md](../../docs/ws-wasm.md#build).
 
 ## Parse once
 
-Each JavaScript value that the engine owns parses once, in Rust, into a handle such as `Oid` or `DigestInfo`, and every binding refuses a value it cannot read with a code in place of a coercion. Implementation: [docs/ws-wasm.md](../../docs/ws-wasm.md#parse-once).
+Each JavaScript value that the engine owns parses once, in Rust, into a handle such as `Oid` or `DigestInfo`, and every binding refuses a value of another kind with a code, such as `InvalidBytes`, in place of a coercion. Implementation: [docs/ws-wasm.md](../../docs/ws-wasm.md#parse-once).
 
 ## Compression
 

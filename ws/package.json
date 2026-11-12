@@ -2,7 +2,7 @@
 	"name": "@wahidgroup/tightbeam-ws-workspace",
 	"version": "0.0.0",
 	"private": true,
-	"description": "npm workspace for the tightbeam-ws browser stack: hybrid TS/wasm client (with fluent frame builder) and Playwright e2e harness.",
+	"description": "npm workspace for the tightbeam-ws browser stack: the hybrid TS/wasm client and its Playwright e2e suite.",
 	"type": "module",
 	"engines": {
 		"node": ">=24"
@@ -24,6 +24,7 @@
 		"cspell": "10.4.1",
 		"eslint": "9.39.5",
 		"prettier": "3.9.10",
+		"typescript": "6.0.3",
 		"ws": "8.22.1"
 	},
 	"license": "MIT OR Apache-2.0"

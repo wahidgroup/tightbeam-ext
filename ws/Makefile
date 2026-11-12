@@ -7,8 +7,8 @@
 REPO := ..
 CRATES := -p tightbeam-ws -p tightbeam-ws-wasm
 
-# Browser client target: only compiled for wasm32, so the host-target
-# lint/test steps never exercise it. `make wasm` guards it explicitly.
+# The browser client compiles its code for wasm32 alone, so `make wasm` lints
+# and builds it for that target.
 WASM_TARGET := wasm32-unknown-unknown
 WASM_CRATE := tightbeam-ws-wasm
 

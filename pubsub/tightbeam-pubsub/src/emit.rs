@@ -1,63 +1,121 @@
-//! What one emit of a frame settles as.
-//!
-//! [`Emitter`] owns the handle of one link and sorts each failure of
-//! [`MuxHandle::emit_on_stream`] once. The registry and an application that
-//! emits beside it read that one decision: [`Settled`] for a frame the link
-//! answered or refused, and [`LinkLost`] for the end of the link.
+//! The emitter of a link, which bounds each emit by its deadline. The page
+//! `docs/pubsub.md` (Emitter) states what an emit settles as.
 
 use core::error::Error;
 use core::fmt;
+use core::pin::pin;
+use core::time::Duration;
 
-use tightbeam::clock::Lapse;
+use tightbeam::clock::{Lapse, Timer};
+use tightbeam::constants::DEFAULT_OPERATION_TIMEOUT;
 use tightbeam::transport::error::{TransportError, TransportFailure};
 use tightbeam::transport::multiplex::MuxHandle;
 use tightbeam::transport::TransportResult;
 use tightbeam::Frame;
+use tightbeam_ws::serve::{RacingClock, ServedMux};
 
-/// The emitter of one link: the handle each frame leaves on, and the sort of
-/// each failed emit.
+/// How long one emit may take to settle.
+///
+/// The span is above zero, because no emit finishes in zero time. The
+/// default is [`DEFAULT_OPERATION_TIMEOUT`], the deadline of one write on an
+/// established tightbeam session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmitDeadline(Duration);
+
+impl EmitDeadline {
+	/// A deadline of `span`, or `None` for a zero span.
+	#[must_use]
+	pub const fn new(span: Duration) -> Option<Self> {
+		if span.is_zero() {
+			return None;
+		}
+
+		Some(Self(span))
+	}
+}
+
+impl Default for EmitDeadline {
+	fn default() -> Self {
+		Self(DEFAULT_OPERATION_TIMEOUT)
+	}
+}
+
+/// The emitter of one link: the handle each frame leaves on, the clock and
+/// the deadline that bound each emit, and the sort of each failed emit.
+///
+/// A served connection lends it to the application through
+/// [`ConnectionContext::emitter`], under the [`emit_deadline`] of its registry.
+///
+/// [`ConnectionContext::emitter`]: crate::ConnectionContext::emitter
+/// [`emit_deadline`]: crate::RegistryOptions::emit_deadline
 ///
 /// # Examples
 ///
 /// ```
-/// use tightbeam::transport::handshake::negotiation::MuxSettings;
-/// use tightbeam_pubsub::testing::{MemoryLink, OpaqueFrame};
-/// use tightbeam_pubsub::{Emitter, Settled};
+/// use tightbeam_pubsub::{EmitDeadline, Emitter, OpaqueFrame, Settled};
+/// use tightbeam_ws::serve::ServedMux;
 ///
-/// # async fn emit() -> Result<(), Box<dyn std::error::Error>> {
-/// let (_client, server) = MemoryLink::default().mux_pair(MuxSettings::symmetric(4));
-/// let (handle, _reader, _writer, _responder) = server.into_parts();
-/// let emitter = Emitter::from(handle);
-/// let notice = OpaqueFrame { id: "notice", order: 1, payload: b"ping" }.build()?;
+/// /// Emit one notice on `served`, a connection that a server accepted.
+/// async fn notify(served: &ServedMux) -> Result<(), Box<dyn std::error::Error>> {
+/// 	let emitter = Emitter::served(served, EmitDeadline::default());
+/// 	let notice = OpaqueFrame { id: "notice", order: 1, payload: b"ping" }.build()?;
 ///
-/// let settled = emitter.until_settled(&notice).await?;
-/// if let Settled::Refused(cause) = settled {
-///     eprintln!("the peer refused the notice: {cause}");
+/// 	let settled = emitter.until_settled(&notice).await?;
+/// 	if let Settled::Refused(cause) = settled {
+/// 		eprintln!("the peer refused the notice: {cause}");
+/// 	}
+/// 	Ok(())
 /// }
-/// # Ok(())
-/// # }
 /// ```
 #[derive(Clone)]
 pub struct Emitter {
 	handle: MuxHandle,
-}
-
-impl From<MuxHandle> for Emitter {
-	fn from(handle: MuxHandle) -> Self {
-		Self { handle }
-	}
+	clock: RacingClock,
+	deadline: EmitDeadline,
 }
 
 impl Emitter {
-	/// Emit `frame` until the emit settles.
+	/// The emitter of the served connection `served`, whose every emit ends
+	/// within `deadline` on [`ServedMux::clock`], the clock of its writer.
+	#[must_use]
+	pub fn served(served: &ServedMux, deadline: EmitDeadline) -> Self {
+		let handle = served.handle().clone();
+		let clock = served.clock().clone();
+		Self { handle, clock, deadline }
+	}
+
+	/// The emitter of the dialed link that `handle` drives, whose every emit
+	/// ends within `deadline` on `clock`, the clock of the writer half of the
+	/// link.
+	#[must_use]
+	pub fn new(handle: MuxHandle, clock: RacingClock, deadline: EmitDeadline) -> Self {
+		Self { handle, clock, deadline }
+	}
+
+	/// Emit `frame` until the emit settles, within the deadline of this
+	/// emitter.
 	///
 	/// An emit that finds every local stream slot in flight waits for a free
-	/// slot, then emits again.
+	/// slot, then emits again, inside the same deadline.
 	///
 	/// # Errors
 	///
-	/// - [`LinkLost`]: the emit or the wait for a stream slot counts as the end of the link.
+	/// - The [`LinkLost`] of an emit or a wait for a stream slot that counts as the end of the
+	///   link, or of a deadline that passed first.
 	pub async fn until_settled(&self, frame: &Frame) -> Result<Settled, LinkLost> {
+		let mut paced = self.paced();
+		paced.until_settled(frame).await
+	}
+
+	/// This emitter with one timer for every emit of a party that emits many
+	/// times, such as the lane of one subscription.
+	pub(crate) fn paced(&self) -> Paced<'_> {
+		let timer = self.clock.timer();
+		Paced { emitter: self, timer }
+	}
+
+	/// Emit `frame` until the emit settles, with no deadline of its own.
+	async fn attempts(&self, frame: &Frame) -> Result<Settled, LinkLost> {
 		loop {
 			let emitted = self.handle.emit_on_stream(frame).await;
 			let attempt = Attempt::from(emitted);
@@ -70,6 +128,28 @@ impl Emitter {
 			let freed = self.handle.wait_for_stream_slot().await;
 			freed.map_err(LinkLost)?;
 		}
+	}
+}
+
+/// An [`Emitter`] and the one timer that bounds each of its emits, so a
+/// party that emits many times makes its sleep once.
+pub(crate) struct Paced<'e> {
+	emitter: &'e Emitter,
+	timer: Timer,
+}
+
+impl Paced<'_> {
+	/// Emit `frame` until the emit settles, within the deadline of the
+	/// emitter. See [`Emitter::until_settled`].
+	///
+	/// # Errors
+	///
+	/// - The errors of [`Emitter::until_settled`].
+	pub(crate) async fn until_settled(&mut self, frame: &Frame) -> Result<Settled, LinkLost> {
+		let Self { emitter, timer } = self;
+		let attempts = pin!(emitter.attempts(frame));
+		let bounded = timer.within(emitter.deadline.0, attempts).await;
+		bounded.unwrap_or_else(|lapse| Err(LinkLost::lapsed(lapse)))
 	}
 }
 
@@ -94,7 +174,7 @@ pub struct LinkLost(TransportError);
 
 impl LinkLost {
 	/// The loss of an emit that ran past its deadline, as `lapse` reports it.
-	pub(crate) fn lapsed(lapse: Lapse) -> Self {
+	fn lapsed(lapse: Lapse) -> Self {
 		let cause = TransportError::from(lapse);
 		Self(cause)
 	}
@@ -126,10 +206,11 @@ enum Attempt {
 impl From<TransportResult<Option<Frame>>> for Attempt {
 	/// Sort one attempt by what it costs the link.
 	///
-	/// An answer settles the emit. A refusal of the peer
-	/// ([`TransportError::transit_status`]) refuses one frame. Of the local
-	/// failures, an exhausted session budget refuses one frame, an exhausted
-	/// stream cap waits, and every other failure counts as the end of the link.
+	/// - An answer settles the emit.
+	/// - A refusal of the peer ([`TransportError::transit_status`]) refuses one frame.
+	/// - An exhausted session budget refuses one frame.
+	/// - An exhausted stream cap waits.
+	/// - Every other failure counts as the end of the link.
 	fn from(emitted: TransportResult<Option<Frame>>) -> Self {
 		let error = match emitted {
 			Ok(answer) => return Self::Settled(Settled::Answered(answer.map(Box::new))),
@@ -156,21 +237,19 @@ impl Attempt {
 
 #[cfg(test)]
 mod tests {
-	use core::time::Duration;
+	use std::sync::Arc;
 
-	use tightbeam::policy::TransitStatus;
+	use tightbeam::clock::{Clock, ManualClock};
 	use tightbeam::transport::handshake::negotiation::MuxSettings;
 	use tightbeam::transport::multiplex::SpawnedMux;
-	use tightbeam::transport::ResponsePackage;
-	use tokio::task::yield_now;
+	use tightbeam_ws::serve::ServedMux;
+	use tokio::task::JoinHandle;
 	use tokio::time::timeout;
 
 	use super::*;
-	use crate::testing::{MemoryLink, OpaqueFrame};
-
-	/// Bound every wait on a live link, so a regression fails instead of
-	/// hanging.
-	const DEADLINE: Duration = Duration::from_secs(2);
+	use crate::frame::OpaqueFrame;
+	use crate::testing::nodes::{waits, Accepting, SHORT};
+	use crate::testing::{Dial, Loopback, PATIENCE};
 
 	/// The frame every test emits.
 	fn notice() -> Frame {
@@ -178,67 +257,91 @@ mod tests {
 		notice.build().expect("the notice builds")
 	}
 
-	/// The handle of one end of a link under `settings`, whose peer answers
-	/// every stream with `Ok`. The returned guard keeps both ends alive.
-	fn answered(settings: MuxSettings) -> (MuxHandle, impl Sized) {
-		let (peer, local) = MemoryLink::default().mux_pair(settings);
-		let SpawnedMux { handle: peer_handle, responder, drivers: peer_drivers } = peer.spawn();
-		let answer = |_| async { ResponsePackage::new(TransitStatus::Ok, None) };
-		let answering = tokio::spawn(responder.serve(answer));
-
-		let SpawnedMux { handle, responder: unserved, drivers } = local.spawn();
-		let guard = (peer_handle, peer_drivers, answering.abort_handle(), unserved, drivers);
-		(handle, guard)
+	/// The server end of one loopback link under `dial`, spawned, with its
+	/// client end beside it.
+	async fn opened(dial: &Dial) -> (ServedMux, SpawnedMux) {
+		let opened = Loopback::open(dial).await;
+		let Loopback { server, client } = opened.expect("a loopback link opens");
+		(server.spawn(), client)
 	}
 
-	/// The handle of one end of a link whose peer end is gone. The returned
-	/// guard keeps this end alive.
-	fn closed() -> (MuxHandle, impl Sized) {
-		let (peer, local) = MemoryLink::default().mux_pair(MuxSettings::symmetric(4));
-		drop(peer);
+	/// The emitter of the server end of `served` under `deadline`.
+	fn emitter_of(served: &ServedMux, deadline: Duration) -> Emitter {
+		let deadline = EmitDeadline::new(deadline).expect("test deadlines are above zero");
+		Emitter::served(served, deadline)
+	}
 
-		let SpawnedMux { handle, responder, drivers } = local.spawn();
-		(handle, (responder, drivers))
+	/// The emitter of the server end of a link under `settings`, whose client
+	/// answers every stream with `Ok`. The returned guard keeps both ends
+	/// alive.
+	async fn answered(settings: MuxSettings) -> (Emitter, impl Sized) {
+		let dial = Dial { settings, ..Dial::default() };
+		let (served, client) = opened(&dial).await;
+		let SpawnedMux { handle, responder, drivers } = client;
+		let answering: JoinHandle<_> = tokio::spawn(responder.serve_with(Accepting));
+
+		let emitter = emitter_of(&served, DEFAULT_OPERATION_TIMEOUT);
+		(emitter, (served, handle, drivers, answering.abort_handle()))
+	}
+
+	#[test]
+	fn an_emit_deadline_is_above_zero() {
+		assert_eq!(EmitDeadline::new(Duration::ZERO), None);
+	}
+
+	#[tokio::test]
+	async fn an_emit_the_peer_never_answers_ends_at_its_deadline_on_the_clock_of_the_link() {
+		let clock = Arc::new(ManualClock::default());
+		let dial = Dial { clock: Arc::clone(&clock) as Arc<dyn Clock>, ..Dial::default() };
+		let (served, _silent) = opened(&dial).await;
+		let emitter = emitter_of(&served, SHORT);
+		let notice = notice();
+
+		let mut settling = core::pin::pin!(emitter.until_settled(&notice));
+		let parked = waits(settling.as_mut()).await;
+		clock.advance(SHORT + Duration::from_secs(1));
+
+		let settled = timeout(PATIENCE, settling).await;
+		assert!(parked);
+		assert!(matches!(settled, Ok(Err(LinkLost(_)))));
 	}
 
 	#[tokio::test]
 	async fn a_budget_exhausted_emit_settles_as_refused() {
 		let unfunded = MuxSettings::symmetric(4).with_send_budget(Some(0));
-		let (handle, _peer) = answered(unfunded);
-		let emitter = Emitter::from(handle);
+		let (emitter, _peer) = answered(unfunded).await;
 		let notice = notice();
 
 		let settling = emitter.until_settled(&notice);
-		let settled = timeout(DEADLINE, settling).await;
+		let settled = timeout(PATIENCE, settling).await;
 		assert!(matches!(settled, Ok(Ok(Settled::Refused(_)))));
 	}
 
 	#[tokio::test]
 	async fn a_closed_link_emit_returns_link_lost() {
-		let (handle, _end) = closed();
-		let emitter = Emitter::from(handle);
-		let notice = notice();
+		let (served, client) = opened(&Dial::default()).await;
+		let emitter = emitter_of(&served, DEFAULT_OPERATION_TIMEOUT);
+		drop(client);
 
+		let notice = notice();
 		let settling = emitter.until_settled(&notice);
-		let settled = timeout(DEADLINE, settling).await;
+		let settled = timeout(PATIENCE, settling).await;
 		assert!(matches!(settled, Ok(Err(LinkLost(_)))));
 	}
 
 	#[tokio::test]
 	async fn a_full_stream_cap_waits_then_emits() -> Result<(), TransportError> {
-		let (handle, _peer) = answered(MuxSettings::symmetric(1));
-		let held = handle.open_stream()?;
-		let emitter = Emitter::from(handle);
+		let (emitter, _peer) = answered(MuxSettings::symmetric(1)).await;
+		let held = emitter.handle.open_stream()?;
 		let notice = notice();
 
-		let settling = tokio::spawn(async move { emitter.until_settled(&notice).await });
-		yield_now().await;
-
-		let parked = !settling.is_finished();
+		let mut settling = core::pin::pin!(emitter.until_settled(&notice));
+		let parked = waits(settling.as_mut()).await;
 		drop(held);
-		let settled = timeout(DEADLINE, settling).await;
+
+		let settled = timeout(PATIENCE, settling).await;
 		assert!(parked);
-		assert!(matches!(settled, Ok(Ok(Ok(Settled::Answered(None))))));
+		assert!(matches!(settled, Ok(Ok(Settled::Answered(None)))));
 		Ok(())
 	}
 }

@@ -1,13 +1,13 @@
 import { describe, expect, it } from "vitest";
 
-import { TightbeamWsClient } from "./index.js";
+import { Engine } from "./index.js";
 
 /**
  * The engine zstd compression: one frame, with the refusals the engine names,
  * on its own and on the inflate path of a frame.
  */
 
-const engine = await TightbeamWsClient.init();
+const engine = await Engine.load();
 
 const BODY = new Uint8Array([1, 2, 3, 4]);
 
@@ -17,7 +17,7 @@ const BODY = new Uint8Array([1, 2, 3, 4]);
 const PAYLOAD = new Uint8Array(4096).fill(0x61);
 
 /**
- * A ceiling below the 128 KiB window ruzstd 0.9.0 declares, which refuses
+ * A ceiling below the 128 KiB window ruzstd 0.9.1 declares, which refuses
  * every body the engine compressed.
  */
 const SMALL_CEILING = 64;
@@ -64,7 +64,7 @@ const TRUNCATED = PACKED.slice(0, -1);
 const TRAILING = new Uint8Array([...PACKED, 0]);
 
 describe("ZstdCompression", () => {
-	it("two views over one handle each enforce their own ceiling", () => {
+	it("each engine zstd keeps the ceiling it was made with", () => {
 		const lower = engine.zstd(WINDOW_CEILING);
 		const higher = engine.zstd(HOLDING_CEILING);
 
@@ -99,16 +99,12 @@ describe("ZstdCompression", () => {
 			code: "TrailingBytes",
 		},
 	])("refuses $name with $code", ({ data, code }) => {
-		expect(() => zstd.decompress(data)).toThrow(
-			expect.objectContaining({ code }),
-		);
+		expect(() => zstd.decompress(data)).toThrow(expect.objectContaining({ code }));
 	});
 
 	it("refuses a window past the ceiling with WindowTooLarge", () => {
 		const capped = engine.zstd(SMALL_CEILING);
-		expect(() => capped.decompress(PACKED)).toThrow(
-			expect.objectContaining({ code: "WindowTooLarge" }),
-		);
+		expect(() => capped.decompress(PACKED)).toThrow(expect.objectContaining({ code: "WindowTooLarge" }));
 	});
 
 	it("refuses output past the ceiling with OutputLimitExceeded", () => {
@@ -124,9 +120,7 @@ describe("ZstdCompression", () => {
 		{ name: "a negative ceiling", maxOutput: -1 },
 		{ name: "a fraction", maxOutput: 1.5 },
 	])("refuses $name as a ceiling with InvalidMaxOutput", ({ maxOutput }) => {
-		expect(() => engine.zstd(maxOutput)).toThrow(
-			expect.objectContaining({ code: "InvalidMaxOutput" }),
-		);
+		expect(() => engine.zstd(maxOutput)).toThrow(expect.objectContaining({ code: "InvalidMaxOutput" }));
 	});
 });
 
@@ -174,37 +168,27 @@ describe("ZstdCompression.admitsParameters", () => {
 });
 
 describe("profile zstd through the frame pipeline", () => {
-	it("round-trips a compressed frame body", async () => {
-		const builder = engine.frameBuilder(BODY).withCompressor(zstd);
+	it("round-trips a compressed frame body through an inflator", async () => {
+		const builder = engine.frameBuilder(BODY).withId("packed").withCompressor(zstd);
+
 		const built = await builder.build();
 		const algorithm = built.compactnessInfo?.algorithmOid;
-
 		expect(built.compressed).toBe(true);
 		expect(algorithm?.equals(engine.profile.zstd)).toBe(true);
-		await expect(
-			built.inflateMessage(zstd, engine.opaque),
-		).resolves.toEqual(BODY);
-	});
-
-	it("opens a compressed frame body through an inflator", async () => {
-		const builder = engine.frameBuilder(BODY).withCompressor(zstd);
-		const built = await builder.build();
 
 		const opened = built.open(engine.opaque, { inflator: zstd });
 		await expect(opened).resolves.toEqual(BODY);
 	});
 
-	it("a zstd refusal on the frame inflate path carries CompressionError", async () => {
-		const builder = engine.frameBuilder(PAYLOAD).withCompressor(zstd);
+	it("a zstd refusal carries one code on the frame path and the direct path", async () => {
+		const builder = engine.frameBuilder(PAYLOAD).withId("packed").withCompressor(zstd);
+
 		const built = await builder.build();
 		const capped = engine.zstd(SMALL_CEILING);
 
-		const inflated = built.inflateMessage(capped, engine.opaque);
-		await expect(inflated).rejects.toMatchObject({
-			code: "CompressionError",
-		});
-		expect(() => capped.decompress(built.bodyDer)).toThrow(
-			expect.objectContaining({ code: "WindowTooLarge" }),
-		);
+		const refusal = { code: "WindowTooLarge" };
+		const opened = built.open(engine.opaque, { inflator: capped });
+		await expect(opened).rejects.toMatchObject(refusal);
+		expect(() => capped.decompress(built.bodyDer)).toThrow(expect.objectContaining(refusal));
 	});
 });

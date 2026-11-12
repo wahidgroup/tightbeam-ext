@@ -1,14 +1,5 @@
-//! Browser WebSocket stream adapting `gloo-net` to tightbeam's
-//! [`AsyncProtocolStream`]. Compiled only for `wasm32` targets.
-//!
-//! Each DER-encoded tightbeam envelope travels as a single WebSocket message.
-//! [`GlooStream`] also splits into exclusive halves ([`SplittableStream`]) so
-//! a multiplexed connection can read and write concurrently.
-//!
-//! [`GlooReadHalf`] and [`GlooWriteHalf`] are the browser kinds of
-//! [`WireStream`] and [`WireSink`], and [`GlooStream`] holds the
-//! [`WireDuplex`] of the two, so every read and write runs the envelope rules
-//! that the native transport runs.
+//! The `gloo-net` WebSocket as a tightbeam stream, as the browser transport
+//! section of `docs/ws-wasm.md` describes.
 
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
@@ -42,11 +33,14 @@ pub type WsTransport<P = DefaultCryptoProvider> = TcpTransport<GlooStream, P>;
 
 /// The fault class of a `gloo` error.
 ///
-/// A close event is [`WireFault::Closed`]. A lost connection and a refused
-/// send are [`WireFault::Invalid`], because `gloo` reports neither cause.
+/// A close event, a lost connection, and a refused send each meet no peer, so
+/// each is [`WireFault::Closed`]. `gloo` reports no protocol break of its
+/// own, so only an error it adds later is [`WireFault::Invalid`].
 fn fault(error: WebSocketError) -> WireFault {
 	match error {
-		WebSocketError::ConnectionClose(_) => WireFault::Closed,
+		WebSocketError::ConnectionClose(_) | WebSocketError::ConnectionError | WebSocketError::MessageSendError(_) => {
+			WireFault::Closed
+		}
 		_ => WireFault::Invalid,
 	}
 }

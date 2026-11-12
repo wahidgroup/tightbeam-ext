@@ -1,37 +1,18 @@
-# Rustfmt Configuration
-#
-# This configuration file controls the formatting of Rust code in this project.
-# It enforces a consistent style with a focus on readability.
+# The Rust format of the repo, which `make lint` checks.
 
-# Indentation settings
-# --------------------
-# Use tabs instead of spaces for indentation
 hard_tabs = true
-# Set tab width to 4 spaces (for display purposes)
 tab_spaces = 4
-
-# Line width settings
-# ------------------
-# Hard limit: Maximum width of 120 characters (absolute maximum line length)
 max_width = 120
 
-# Soft limit: Encourage keeping lines under 80 characters when possible
+# Max sets each width heuristic to max_width, and the widths below override seven of them.
 use_small_heuristics = "Max"
 
-# Individual element width settings (soft limits of 80 characters)
-# --------------------------------------------------------------
-fn_call_width = 80        # Function call arguments
-array_width = 80          # Array, struct, and enum literals
-attr_fn_like_width = 80   # Attribute-like macros
-struct_lit_width = 80     # Struct definitions
-struct_variant_width = 80 # Struct field initialization
+fn_call_width = 80        # The arguments of a function call
+array_width = 80          # An array literal
+attr_fn_like_width = 80   # The arguments of a function-like attribute
+struct_lit_width = 80     # The body of a struct literal
+struct_variant_width = 80 # The body of a struct variant
+chain_width = 80          # A method chain
 
-# Method chain formatting
-# ----------------------
-# Setting to 80 keeps long method chains readable across multiple lines
-chain_width = 80
-
-# Control flow expression formatting
-# ---------------------------------
-# Force multi-line formatting for if-else and other control flow expressions
+# An if-else expression always breaks over lines.
 single_line_if_else_max_width = 0

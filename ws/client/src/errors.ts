@@ -1,108 +1,70 @@
 /**
- * Error surface for the browser client.
- *
- * Every code a caller branches on has one declaration. The engine declares
- * {@link RefusalCode}, {@link TransportCode}, and {@link TransitCode} in Rust,
- * and the declarations of the wasm build carry each one as a union. This
- * module declares {@link ClientCode}, the codes that the TypeScript client
- * decides itself.
+ * The error surface of the client, as the transport errors section of `docs/ws-client.md` describes.
  */
 
 import type {
-	RefusalCode,
-	TransitCode,
-	TransportCode,
+	BodyLayer,
+	Codes,
+	EngineFault,
+	FaultOf,
+	OpaqueBodyFault,
+	TransitRefusal,
 	TransportErrorName,
 } from "#wasm";
 
 /**
- * The code of an {@link InternalError}: a step of the client that ran out of
- * the order its owner keeps.
- *
- * - `MESSAGE_ARITY`: `withMessage` received a codec without its message.
- * - `COMPOSER_SPENT`: a build step set the composer after it assembled the frame.
- * - `ASSEMBLY_SPENT`: a build step ran after an earlier step consumed the assembly.
- */
-export type InternalCode =
-	"MESSAGE_ARITY" | "COMPOSER_SPENT" | "ASSEMBLY_SPENT";
-
-/**
- * Represents internal client errors, such as protocol violations by the
- * peer. Not safe to display to end users.
- */
-export class InternalError extends Error {
-	/**
-	 * Discriminant for the internal error family.
-	 */
-	readonly kind = "E_INTERNAL";
-
-	/**
-	 * Stable programmatic code for branching on this failure.
-	 */
-	readonly code: InternalCode;
-
-	constructor(code: InternalCode, message: string, cause?: unknown) {
-		super(message, { cause });
-		this.name = this.constructor.name;
-		this.code = code;
-	}
-}
-
-/**
- * The gRPC canonical status (`google.rpc.Code`) that a serve handler refuses
- * a stream with. `Ok` names no refusal: a returned frame or `undefined`
- * already accepts the stream.
- */
-export type RefusalStatus = Exclude<TransitCode, "Ok">;
-
-/**
  * Refuse a server-initiated stream with a chosen status.
  *
- * Thrown (or rejected with) from a `serve` handler, the wasm layer
- * answers the stream with `code` instead of the generic `Unknown`, so
- * the peer receives the application's own refusal semantics.
+ * A `serve` handler throws it, or rejects with it, and the peer receives its
+ * `code` in place of the generic `Unknown`.
  */
 export class StreamRefusal extends Error {
 	override readonly name: string = "StreamRefusal";
 
-	/**
-	 * gRPC canonical status name answered to the peer for this refusal.
-	 */
-	readonly code: RefusalStatus;
+	readonly #code: TransitRefusal;
 
-	constructor(code: RefusalStatus, message: string) {
+	constructor(code: TransitRefusal, message: string) {
 		super(message);
-		this.code = code;
+		this.#code = code;
+	}
+
+	/**
+	 * The status that a served stream answers when its handler throws
+	 * `thrown`: the code of a `StreamRefusal`, and `Unknown` for any other
+	 * value, such as a rethrown transport error or a bare status name.
+	 */
+	static settlement(thrown: unknown): TransitRefusal {
+		const refusal = typeof thrown === "object" && thrown !== null && #code in thrown;
+		if (!refusal) {
+			return "Unknown";
+		}
+
+		return thrown.#code;
+	}
+
+	/**
+	 * The gRPC canonical status that the peer receives for this refusal.
+	 */
+	get code(): TransitRefusal {
+		return this.#code;
 	}
 }
 
 /**
- * The key of the package-internal check whether a code is a code the client
- * decides itself. Only `Engine` imports it.
- */
-export const DECIDES: unique symbol = Symbol("decides");
-
-/**
- * The key of the package-internal read of the code of an error with the name
- * brand of a transport error. Only `Engine` imports it.
- */
-export const BRANDED_CODE: unique symbol = Symbol("brandedCode");
-
-/**
- * Every code of a failure that the TypeScript client decides itself, before
- * a call reaches the engine. {@link ClientCode} reads its members from this
- * one list.
- *
- * - `KeyReleased`: a profile key whose owner released its wasm handle.
- * - `OpeningReleased`: a commitment opening whose owner released its salt.
- * - `CodecReleased`: a held codec whose holder disposed it.
- * - `EngineUnavailable`: the WebAssembly engine did not load.
+ * Every code of a failure that the TypeScript client decides itself, before a
+ * call reaches the engine. {@link ClientCode} reads its members from this one
+ * list, and one static of {@link ClientTransportError} builds each code.
  */
 const CLIENT_CODES = [
 	"KeyReleased",
 	"OpeningReleased",
 	"CodecReleased",
 	"EngineUnavailable",
+	"CompactnessRefused",
+	"EnvelopeSender",
+	"EnvelopeReceiver",
+	"EnvelopeCleartext",
+	"EnvelopeUnsigned",
 ] as const;
 
 /**
@@ -111,78 +73,95 @@ const CLIENT_CODES = [
 export type ClientCode = (typeof CLIENT_CODES)[number];
 
 /**
- * Every code a {@link TransportError} carries: a refusal of the engine, an
- * engine or transport error, a peer refusal by its status, or a failure the
- * client decides itself.
+ * A transport error whose `code` the TypeScript client decides itself.
  */
-export type TransportErrorCode =
-	RefusalCode | TransportCode | RefusalStatus | ClientCode;
+export type ClientFault = FaultOf<ClientCode>;
 
 /**
- * A transport failure thrown from the wasm layer, or decided by the client
- * before a call crosses the boundary.
- *
- * `code` is closed: every value is a member of {@link TransportErrorCode}.
- * The codes callers most often branch on:
- *
- * - `ConnectionClosed`: the connection ended. It outranks `Draining`, so a
- *   finished `shutdown()` reads as closed.
- * - `Draining`: GoAway sent or received on a live connection. No new streams.
- * - `StreamsExhausted`: the local stream cap is full. Retry after a
- *   response frees a slot.
- *
- * Peer refusals carry the gRPC canonical status registry
- * (`google.rpc.Code`) name for their code:
- *
- * - `ResourceExhausted`: the peer refused the stream at capacity. Retry with backoff.
- * - `Unavailable`: the peer is draining or shutting down. Retry with backoff.
- * - `Unimplemented`: nothing serves the requested topic. A retry cannot succeed.
- * - `Unknown`: the peer's handler failed without classification.
- * - `DeadlineExceeded`, `Unauthenticated`, `PermissionDenied`: gate policy rejections.
+ * A structured transport failure, from the wasm layer or from the client. The
+ * type has one member per family of its code, so a check of `code` narrows to
+ * the member that carries its detail. The transport errors section of
+ * `docs/ws-client.md` gives the meaning of each code that callers branch on.
  */
-export interface TransportError extends Error {
-	readonly name: TransportErrorName;
+export type TransportError = EngineFault | ClientFault;
 
-	/**
-	 * The code that names the failure.
-	 */
-	readonly code: TransportErrorCode;
+/**
+ * Every code a {@link TransportError} carries.
+ */
+export type TransportErrorCode = TransportError["code"];
 
-	/**
-	 * The field a refusal concerns, as a TypeScript access such as
-	 * `matrix.n`, when the refusal concerns one.
-	 */
-	readonly path?: string;
+/**
+ * The codes that the client decides before a call crosses the boundary: its
+ * own codes, and the engine codes it raises on a released handle or an
+ * opaque body.
+ */
+type ClientDecided = ClientCode | "ConnectionClosed" | "StreamClosed" | "OpaqueBody";
 
-	/**
-	 * The transit status of a refused work submission, on `WorkRefused`.
-	 */
-	readonly status?: TransitCode;
+/**
+ * The name brand of every structured transport error, which the engine sets
+ * on its own errors too.
+ */
+const TRANSPORT_ERROR_NAME: TransportErrorName = "TightbeamTransportError";
+
+/**
+ * The `code` of `error` when it carries the name brand of a transport error,
+ * before any check of the code's membership.
+ */
+function brandedCode(error: unknown): string | undefined {
+	if (!(error instanceof Error) || error.name !== TRANSPORT_ERROR_NAME) {
+		return undefined;
+	}
+
+	const code: unknown = Reflect.get(error, "code" satisfies keyof FaultOf<string>);
+	if (typeof code !== "string") {
+		return undefined;
+	}
+
+	return code;
 }
 
 /**
  * A {@link TransportError} that the client decides before a call crosses the
- * boundary. The class owns the decisions over the family: one named static
- * builds each code, and the constructor is private.
+ * boundary. One named static builds each code, and the constructor is
+ * private, so only `opaqueBody` pairs a code with a `layer`.
  */
-export class ClientTransportError extends Error implements TransportError {
+export class ClientTransportError
+	extends Error
+	implements Pick<FaultOf<ClientDecided>, "name" | "code" | "path">, Partial<Pick<OpaqueBodyFault, "layer">>
+{
+	override readonly name = TRANSPORT_ERROR_NAME;
+
 	/**
-	 * The `name` of every structured transport error, which the engine sets on
-	 * its own errors too.
+	 * The code that names the failure.
 	 */
-	static readonly NAME: TransportErrorName = "TightbeamTransportError";
+	readonly code: ClientDecided;
 
-	override readonly name = ClientTransportError.NAME;
+	/**
+	 * The field the refusal concerns, when it concerns one.
+	 */
+	readonly path?: string;
 
-	readonly code: TransportErrorCode;
+	/**
+	 * The layer an `OpaqueBody` refusal lacks a capability for.
+	 */
+	readonly layer?: BodyLayer;
 
 	private constructor(
-		code: TransportErrorCode,
+		code: ClientDecided,
 		message: string,
-		options?: ErrorOptions,
+		options?: ErrorOptions & {
+			readonly path?: string;
+			readonly layer?: BodyLayer;
+		},
 	) {
 		super(message, options);
 		this.code = code;
+		if (options?.path !== undefined) {
+			this.path = options.path;
+		}
+		if (options?.layer !== undefined) {
+			this.layer = options.layer;
+		}
 	}
 
 	/**
@@ -205,6 +184,19 @@ export class ClientTransportError extends Error implements TransportError {
 		const message = `Cannot ${operation}: the stream is closed and its wasm handle is released`;
 		const closed = new ClientTransportError("StreamClosed", message);
 		return closed;
+	}
+
+	/**
+	 * The rejection of a read of a body whose `layer` the read holds no
+	 * capability for: the same `OpaqueBody` code that the engine gives a
+	 * commitment over a sealed or compressed body.
+	 */
+	static opaqueBody(layer: BodyLayer): ClientTransportError {
+		const message = `The frame body needs an ${layer} before it decodes`;
+		const opaque = new ClientTransportError("OpaqueBody", message, {
+			layer,
+		});
+		return opaque;
 	}
 
 	/**
@@ -243,53 +235,96 @@ export class ClientTransportError extends Error implements TransportError {
 	 */
 	static engineUnavailable(cause: unknown): ClientTransportError {
 		const message = "The WebAssembly engine did not load";
-		const options = { cause };
-
-		const unavailable = new ClientTransportError(
-			"EngineUnavailable",
-			message,
-			options,
-		);
+		const unavailable = new ClientTransportError("EngineUnavailable", message, { cause });
 		return unavailable;
 	}
 
 	/**
-	 * Whether `code` is a code the client decides itself.
+	 * The refusal of an inflator that names another algorithm than the
+	 * compactness info names, `algorithm`, or that refuses its parameters.
 	 */
-	static [DECIDES](code: string): code is ClientCode {
+	static compactnessRefused(algorithm: string): ClientTransportError {
+		const message = `The inflator does not reverse a body compressed with ${algorithm}`;
+		const refused = new ClientTransportError("CompactnessRefused", message, {
+			path: "compactness",
+		});
+		return refused;
+	}
+
+	/**
+	 * The refusal of an envelope that frames a message while a declared layer
+	 * holds no send half.
+	 */
+	static envelopeSender(): ClientTransportError {
+		const message = "A declared layer holds no send half: name its signer and sealer to build frames";
+		const refused = new ClientTransportError("EnvelopeSender", message);
+		return refused;
+	}
+
+	/**
+	 * The refusal of an envelope that unwraps a frame while a declared layer
+	 * holds no receive half.
+	 */
+	static envelopeReceiver(): ClientTransportError {
+		const message = "A declared layer holds no receive half: name its verifier and opener to unwrap frames";
+		const refused = new ClientTransportError("EnvelopeReceiver", message);
+		return refused;
+	}
+
+	/**
+	 * The refusal of a signed envelope that unwraps an unsigned frame, which
+	 * would downgrade the conversation.
+	 */
+	static envelopeUnsigned(): ClientTransportError {
+		const message = "The envelope declares authenticity but the frame is unsigned: refusing the downgrade";
+		const refused = new ClientTransportError("EnvelopeUnsigned", message);
+		return refused;
+	}
+
+	/**
+	 * The refusal of a sealed envelope that unwraps a cleartext frame, which
+	 * would downgrade the conversation.
+	 */
+	static envelopeCleartext(): ClientTransportError {
+		const message = "The envelope declares confidentiality but the frame body is cleartext: refusing the downgrade";
+		const refused = new ClientTransportError("EnvelopeCleartext", message);
+		return refused;
+	}
+}
+
+/**
+ * The recognizer of the transport error family over the code table of one
+ * loaded engine, which `Engine.isTransportError` holds.
+ */
+export class TransportErrors {
+	readonly #codes: typeof Codes;
+
+	private constructor(codes: typeof Codes) {
+		this.#codes = codes;
+	}
+
+	/**
+	 * The recognizer over `codes`, the code table of the loaded glue.
+	 */
+	static over(codes: typeof Codes): TransportErrors {
+		const errors = new TransportErrors(codes);
+		return errors;
+	}
+
+	/**
+	 * Whether `value` is a structured {@link TransportError}: an `Error` with
+	 * the name brand of a transport error, whose `code` the client declares,
+	 * or whose code and detail the engine declares. A forged error that
+	 * carries the brand and an unknown code is no transport error.
+	 */
+	recognizes(value: unknown): value is TransportError {
+		const code = brandedCode(value);
+		if (code === undefined) {
+			return false;
+		}
+
 		const decided = CLIENT_CODES.some((member) => member === code);
-		return decided;
-	}
-
-	/**
-	 * The `code` of `error` when it carries the name brand of a transport
-	 * error, before any check of the code's membership. `Engine` checks the
-	 * membership against the codes the engine declares.
-	 */
-	static [BRANDED_CODE](error: unknown): string | undefined {
-		if (
-			!(error instanceof Error) ||
-			error.name !== ClientTransportError.NAME
-		) {
-			return undefined;
-		}
-
-		const code: unknown = Reflect.get(error, "code");
-		if (typeof code !== "string") {
-			return undefined;
-		}
-
-		return code;
-	}
-
-	/**
-	 * Whether `error` reports a lost connection: an `Error` with the name
-	 * brand of a transport error whose code is `ConnectionClosed`, a code the
-	 * engine declares.
-	 */
-	static isConnectionClosed(error: unknown): error is TransportError {
-		const code = ClientTransportError[BRANDED_CODE](error);
-		const closed = code === "ConnectionClosed";
-		return closed;
+		const recognized = decided || this.#codes.recognizes(value);
+		return recognized;
 	}
 }

@@ -22,19 +22,9 @@ const ENDED: IteratorResult<Uint8Array> = { value: undefined, done: true };
 
 /**
  * The chunks of a wasm body handle, read until `nextChunk` returns
- * `undefined`.
- *
- * The source owns the handle and frees it on every exit of the iteration:
- *
- * - The read of the peer's `last` frees it, and so does a read that fails.
- * - A `break` or a `return` in a `for await` loop frees it at once, and so does the end of an `await using`
- *   scope. Either one discards the chunks still to come.
- *
- * The body is single-use, as a generator is, and every iteration shares its
- * one generator. Overlapping `for await` loops queue their reads on it, so no
- * two reads reach the handle at once, and a `break` in any loop ends the body
- * for every loop. A `return` ends a read that still waits on the handle at
- * once and quietly, so the loop that waits ends with the loop that returned.
+ * `undefined`. The source owns the handle and frees it on every exit of the
+ * iteration. The body is single-use, and every loop over it shares one
+ * generator, as the progressive bodies section of `docs/ws-client.md` states.
  */
 export class ChunkSource implements StreamBody, AsyncIterator<Uint8Array> {
 	readonly #hold: Owned<ChunkHandle>;
@@ -44,7 +34,7 @@ export class ChunkSource implements StreamBody, AsyncIterator<Uint8Array> {
 	/**
 	 * The end of each read in flight, which {@link return} runs so that a read
 	 * that waits on the handle ends with the loop that returned. A read leaves
-	 * the set as it settles, so the source holds nothing of a settled read.
+	 * the set as it settles, so the set holds the reads in flight alone.
 	 */
 	readonly #waiting = new Set<() => void>();
 
@@ -84,10 +74,7 @@ export class ChunkSource implements StreamBody, AsyncIterator<Uint8Array> {
 	/**
 	 * Take `end` out of the set once `read` settles, either way.
 	 */
-	async #forget(
-		read: Promise<IteratorResult<Uint8Array>>,
-		end: () => void,
-	): Promise<void> {
+	async #forget(read: Promise<IteratorResult<Uint8Array>>, end: () => void): Promise<void> {
 		try {
 			await read;
 		} catch {
@@ -126,11 +113,9 @@ export class ChunkSource implements StreamBody, AsyncIterator<Uint8Array> {
 
 	/**
 	 * Yield the chunks of the handle in order, and free it as the generator
-	 * ends, however it ends.
-	 *
-	 * A read that resumes after a `break` or a disposal ended the hold ends the
-	 * generator without a refusal, so every loop queued on the body ends as
-	 * the loop that broke out did.
+	 * ends. A read that resumes after a `break` or a disposal ended the hold
+	 * finishes the generator, so every loop queued on the body ends with the
+	 * loop that broke out.
 	 */
 	async *#read(): AsyncGenerator<Uint8Array> {
 		try {

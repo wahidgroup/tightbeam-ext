@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Development-environment setup, composed: the shared Rust toolchain here,
-# then each selected project's own scripts/setup.sh. Idempotent. Stamps
-# under .make/ skip unchanged re-runs.
+# The root setup, which installs the pinned Rust toolchain and cargo-audit, then
+# runs the setup of each selected project: docs/development.md (Projects).
 #
 # Usage: setup.sh [project...]   (default: every project)
 
@@ -32,9 +31,10 @@ toolchain_required() {
 }
 
 install_toolchain() {
+	# With no argument, rustup installs the channel, the components, and the
+	# targets that rust-toolchain.toml names.
 	echo "Installing pinned toolchain, components, and targets (rust-toolchain.toml)..."
 	rustup toolchain install
-	rustup component add rustfmt clippy
 
 	if ! command -v cargo-audit >/dev/null 2>&1; then
 		echo "Installing cargo-audit..."

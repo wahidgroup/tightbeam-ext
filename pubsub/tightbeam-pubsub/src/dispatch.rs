@@ -1,14 +1,5 @@
-//! Serve-side command dispatch: the wire's `sub/`, `unsub/`, and
-//! (opt-in) `pub/` prefixes.
-//!
-//! [`PubsubCommands::answer`] answers command frames and leaves everything
-//! else to the application, so pub/sub composes with existing routes instead
-//! of replacing them. [`PubsubCommands::serve`] runs that composition for one
-//! whole connection: the mux drivers, a keepalive, the transport gate,
-//! registration, dispatch, and cleanup.
-//!
-//! Client publish is opt-in: without [`PubsubCommands::with_publish`],
-//! `pub/` frames fall through to the application like any other stream.
+//! The client commands of a served connection, and its serve. The page
+//! `docs/pubsub.md` (Connection serve) states each step.
 
 use core::future::Future;
 use core::marker::PhantomData;
@@ -22,34 +13,75 @@ use tightbeam::transport::{ResponsePackage, TransportResult};
 use tightbeam::{Frame, Opaque};
 use tightbeam_ws::serve::AcceptedLink;
 
+use crate::backplane::PublishError;
 use crate::policy::{AccessVerdict, PublishPolicy, SubscribePolicy};
-use crate::registry::{ConnectionId, PublishError, RegisterError, RegistryView, TopicRegistry};
+use crate::registry::{Member, RegisterError, RegistryView, TopicRegistry};
 use crate::serve::{AppRoutes, ConnectionContext};
-use crate::topic::{Topic, PUB_PREFIX, SUB_PREFIX, UNSUB_PREFIX};
+use crate::topic::{Topic, TopicError, Verb};
 
-/// A wire command, by the prefix of the id of its frame.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Command {
-	/// `sub/<topic>`.
-	Subscribe,
-	/// `unsub/<topic>`.
-	Unsubscribe,
-	/// `pub/<topic>`.
-	Publish,
+/// The topic that a client command names, or the refusal of the name.
+type Named = Result<Topic, TopicError>;
+
+/// The constructor of one kind of client command.
+type Kind = fn(Named) -> ClientCommand;
+
+/// A client command, parsed once from the id of its frame: its kind, and
+/// the topic it names or the refusal of the name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ClientCommand {
+	/// `sub/<topic>`: subscribe.
+	Subscribe(Named),
+	/// `unsub/<topic>`: unsubscribe. The page `docs/pubsub.md` (Command
+	/// convention) states each answer.
+	Unsubscribe(Named),
+	/// `pub/<topic>`: publish the body of the frame.
+	Publish(Named),
 }
 
-impl Command {
-	/// The name that the audit trail tags a refusal of the command with.
-	const fn as_str(self) -> &'static str {
+impl ClientCommand {
+	/// Each kind of client command, with the verb whose prefix names it.
+	const KINDS: [(Verb, Kind); 3] = [
+		(Verb::Subscribe, Self::Subscribe),
+		(Verb::Unsubscribe, Self::Unsubscribe),
+		(Verb::Publish, Self::Publish),
+	];
+
+	/// The command that `id` names, with the verb whose audit record names
+	/// it, or `None` for an id no client command claims.
+	fn parse(id: &[u8]) -> Option<(Verb, Self)> {
+		Self::KINDS.into_iter().find_map(|(verb, command)| {
+			let name = id.strip_prefix(verb.prefix().as_bytes())?;
+			Some((verb, command(Topic::try_from(name))))
+		})
+	}
+
+	/// Run this command of `member`, which `frame` carries, through
+	/// `commands`, and answer whether it took effect. `None` is the answer of
+	/// [`PubsubCommands::publish`] for a `pub/` that it hands on.
+	async fn run<P: SubscribePolicy>(
+		self,
+		commands: &PubsubCommands<P>,
+		member: &Member,
+		frame: &Frame,
+	) -> Option<Result<(), CommandRefusal>> {
 		match self {
-			Self::Subscribe => "sub",
-			Self::Unsubscribe => "unsub",
-			Self::Publish => "pub",
+			Self::Subscribe(named) => Some(commands.subscribe(member, named)),
+			Self::Unsubscribe(named) => {
+				let unsubscribed = match named {
+					Ok(topic) => {
+						member.unsubscribe(&topic).await;
+						Ok(())
+					}
+					Err(refusal) => Err(CommandRefusal::from(refusal)),
+				};
+				Some(unsubscribed)
+			}
+			Self::Publish(named) => commands.publish(member, named, frame).await,
 		}
 	}
 }
 
-/// Why one wire command took no effect.
+/// Why one command took no effect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CommandRefusal {
 	/// The topic name or the publish body does not parse.
@@ -78,13 +110,20 @@ impl CommandRefusal {
 	}
 }
 
+impl From<TopicError> for CommandRefusal {
+	/// The refusal a command meets for a name that is no topic.
+	fn from(_error: TopicError) -> Self {
+		Self::Malformed
+	}
+}
+
 impl From<RegisterError> for CommandRefusal {
 	/// The refusal a `sub/` meets for each registration failure.
 	fn from(error: RegisterError) -> Self {
 		match error {
 			RegisterError::Draining => Self::Unavailable,
 			RegisterError::LimitReached => Self::ResourceExhausted,
-			// The connection dropped between authorization and registration:
+			// The connection left between authorization and registration:
 			// the same no-standing refusal as an unknown caller.
 			RegisterError::UnknownConnection => Self::Forbidden,
 		}
@@ -96,8 +135,8 @@ impl From<PublishError> for CommandRefusal {
 	fn from(error: PublishError) -> Self {
 		match error {
 			PublishError::Draining => Self::Unavailable,
-			// The frame id and payload already validated: a build failure is a
-			// server-side fault, not something the client caused.
+			// The command already validated, so a failed build is a fault of
+			// the server.
 			PublishError::Build(_) => Self::Internal,
 			// The topic limit clears once a topic loses its last member.
 			PublishError::TopicLimit => Self::ResourceExhausted,
@@ -141,42 +180,18 @@ impl<P: SubscribePolicy> PubsubCommands<P> {
 		self
 	}
 
-	/// The registry this dispatcher answers against.
-	pub fn registry(&self) -> &TopicRegistry {
-		&self.registry
-	}
-
-	/// Answer `frame` when it is a pub/sub command. `None` hands the
+	/// Answer `frame` of `member` when it is a pub/sub command, and record
+	/// each refusal on the audit trail of the connection. `None` hands the
 	/// frame to the application's own routes.
-	///
-	/// # Examples
-	///
-	/// ```
-	/// use std::sync::Arc;
-	///
-	/// use tightbeam::policy::TransitStatus;
-	/// use tightbeam::transport::ResponsePackage;
-	/// use tightbeam::Frame;
-	/// use tightbeam_pubsub::{AllowAll, ConnectionContext, PubsubCommands};
-	///
-	/// /// Answer the commands of `context` first, and every other stream
-	/// /// with `NotFound`.
-	/// fn route(
-	///     commands: &PubsubCommands<AllowAll>,
-	///     context: &ConnectionContext,
-	///     frame: &Arc<Frame>,
-	/// ) -> ResponsePackage {
-	///     let answered = commands.answer(context.connection(), frame);
-	///     answered.unwrap_or_else(|| ResponsePackage::new(TransitStatus::NotFound, None))
-	/// }
-	/// ```
-	pub fn answer(&self, connection: ConnectionId, frame: &Frame) -> Option<ResponsePackage> {
-		let (command, outcome) = self.command(connection, frame)?;
+	pub(crate) async fn answer(&self, member: &Member, frame: &Frame) -> Option<ResponsePackage> {
+		let (verb, command) = ClientCommand::parse(frame.metadata().id())?;
+		let outcome = command.run(self, member, frame).await?;
+
 		let status = match outcome {
 			Ok(()) => TransitStatus::Ok,
 			Err(refusal) => {
 				let status = refusal.status();
-				self.registry.audit_of(connection).refused(command.as_str(), status);
+				member.audit().refused(verb.tag(), status);
 				status
 			}
 		};
@@ -185,127 +200,80 @@ impl<P: SubscribePolicy> PubsubCommands<P> {
 		Some(answer)
 	}
 
-	/// Run `frame` when it is a pub/sub command, and return the command and
-	/// whether it took effect. `None` leaves the frame to the application.
-	fn command(&self, connection: ConnectionId, frame: &Frame) -> Option<(Command, Result<(), CommandRefusal>)> {
-		let id = frame.metadata().id();
-		if let Some(name) = id.strip_prefix(SUB_PREFIX.as_bytes()) {
-			let subscribed = self.subscribe(connection, name);
-			return Some((Command::Subscribe, subscribed));
-		}
-		if let Some(name) = id.strip_prefix(UNSUB_PREFIX.as_bytes()) {
-			let unsubscribed = self.unsubscribe(connection, name);
-			return Some((Command::Unsubscribe, unsubscribed));
-		}
-		if let Some(name) = id.strip_prefix(PUB_PREFIX.as_bytes()) {
-			let policy = self.publish.as_deref()?;
-			let published = self.publish(policy, connection, name, frame);
-			return Some((Command::Publish, published));
-		}
-
-		None
-	}
-
-	/// Validate the topic and consult `authorize` for the connection's
-	/// session: the shared preamble of every policy-guarded command.
-	fn authorized_topic(
+	/// Consult `authorize` on `topic` for the session of `member`: the shared
+	/// preamble of every policy-guarded command.
+	fn authorize(
 		&self,
-		connection: ConnectionId,
-		name: &[u8],
+		member: &Member,
+		topic: &Topic,
 		authorize: impl Fn(RegistryView<'_>, &SessionContext, &Topic) -> AccessVerdict,
-	) -> Result<Topic, CommandRefusal> {
-		let Ok(topic) = Topic::try_from(name) else {
-			return Err(CommandRefusal::Malformed);
-		};
-
-		/*
-		 * A dropped (or never-admitted) connection has no standing:
-		 * refusing here keeps revocation authoritative instead of
-		 * degrading the caller to anonymous access.
-		 */
-		let view = self.registry.view();
-		let Some(session) = view.session(connection) else {
+	) -> Result<(), CommandRefusal> {
+		// The policy weighs only a caller whose connection the registry
+		// still holds.
+		let Some(session) = member.session() else {
 			return Err(CommandRefusal::Forbidden);
 		};
 
-		let verdict = authorize(view, &session, &topic);
+		let verdict = authorize(self.registry.view(), &session, topic);
 		if verdict == AccessVerdict::Forbid {
 			return Err(CommandRefusal::Forbidden);
 		}
 
-		Ok(topic)
-	}
-
-	/// Run one `sub/<topic>` command.
-	fn subscribe(&self, connection: ConnectionId, name: &[u8]) -> Result<(), CommandRefusal> {
-		let authorized = self.authorized_topic(connection, name, |view, session, topic| {
-			self.policy.authorize(view, session, topic)
-		});
-		let topic = authorized?;
-
-		self.registry.register(connection, topic)?;
 		Ok(())
 	}
 
-	/// Run one `unsub/<topic>` command.
-	///
-	/// Idempotent like MQTT UNSUBACK: unsubscribing a topic that was never
-	/// subscribed still succeeds.
-	///
-	/// # Sources
-	///
-	/// - MQTT 5.0 § 3.11, UNSUBACK:
-	///   <https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html>
-	fn unsubscribe(&self, connection: ConnectionId, name: &[u8]) -> Result<(), CommandRefusal> {
-		let Ok(topic) = Topic::try_from(name) else {
-			return Err(CommandRefusal::Malformed);
-		};
+	fn subscribe(&self, member: &Member, named: Named) -> Result<(), CommandRefusal> {
+		let topic = named?;
+		self.authorize(member, &topic, |view, session, topic| {
+			self.policy.authorize(view, session, topic)
+		})?;
 
-		self.registry.unregister(connection, &topic);
+		member.subscribe(topic)?;
 		Ok(())
 	}
 
 	/// Run one `pub/<topic>` command: authorize, lift the payload, publish
-	/// through the registry.
-	fn publish(
-		&self,
-		policy: &dyn PublishPolicy,
-		connection: ConnectionId,
-		name: &[u8],
-		frame: &Frame,
-	) -> Result<(), CommandRefusal> {
-		let authorized =
-			self.authorized_topic(connection, name, |view, session, topic| policy.authorize(view, session, topic));
-		let topic = authorized?;
+	/// through the registry. `None` hands the command to the application
+	/// when these commands take no client publish.
+	async fn publish(&self, member: &Member, named: Named, frame: &Frame) -> Option<Result<(), CommandRefusal>> {
+		let policy = self.publish.as_deref()?;
+		let published = async {
+			let topic = named?;
+			self.authorize(member, &topic, |view, session, topic| policy.authorize(view, session, topic))?;
 
-		let Ok(body) = frame.decode_message::<Opaque>() else {
-			return Err(CommandRefusal::Malformed);
+			let Ok(body) = frame.decode_message::<Opaque>() else {
+				return Err(CommandRefusal::Malformed);
+			};
+
+			self.registry.publish(&topic, body.as_bytes()).await?;
+			Ok(())
 		};
 
-		self.registry.publish(&topic, body.as_bytes())?;
-		Ok(())
+		Some(published.await)
 	}
 }
 
 impl<P: SubscribePolicy + 'static> PubsubCommands<P> {
 	/// Serve one multiplexed connection over `link` until it ends.
 	///
-	/// - The mux of the link runs its drivers beside the serve loop, with a keepalive that paces
-	///   its probes to the operation timeout of the link ([`MuxHandle::keep_alive`]).
-	/// - Every stream passes the transport gate of the link first. Wire commands then answer
-	///   through [`answer`](Self::answer), and every other stream goes to `app` with the
-	///   [`ConnectionContext`] of the connection.
-	/// - The connection registers on entry under the peer its handshake proved, so the policies
-	///   authorize the authenticated caller. Every emit deadline of its subscriptions runs on the
-	///   clock of the writer of the link.
-	/// - A connection that the delivery policy votes off drains with an `EnhanceYourCalm` GoAway.
+	/// - The link spawns the drivers of its mux beside the serve loop, with a keepalive of its own
+	///   that paces its probes to the operation timeout of the link ([`AcceptedLink::spawn`]).
+	/// - Every stream passes the transport gate of the link first. The commands then answer, and
+	///   every other unary stream goes to `app` with the [`ConnectionContext`] of the connection.
+	///   A streaming or duplex stream answers `Unimplemented`.
+	/// - The connection registers on entry under the session of the link: the peer that its
+	///   handshake proved, or the empty session of a cleartext link. The policies authorize that
+	///   session. Every emit of the connection runs under the emit deadline of the registry, on
+	///   the clock of the writer of the link.
+	/// - A connection that the delivery policy votes off drains with an `EnhanceYourCalm` GoAway,
+	///   and one that a [`drain`](TopicRegistry::drain) dismisses drains with `Shutdown`.
 	/// - When the future completes or drops, the connection leaves the registry with all its
 	///   subscriptions, and the drivers and the keepalive end.
 	///
 	/// # Errors
 	///
-	/// - [`TransportError`](tightbeam::transport::TransportError): the serve loop of the responder
-	///   failed. The connection leaves the registry before the error returns.
+	/// - The [`TransportError`](tightbeam::transport::TransportError) of a failed serve loop of
+	///   the responder. The connection leaves the registry before the error returns.
 	///
 	/// # Examples
 	///
@@ -317,22 +285,20 @@ impl<P: SubscribePolicy + 'static> PubsubCommands<P> {
 	/// /// Serve `transport` until it ends, once its server handshake
 	/// /// negotiated multiplexing.
 	/// async fn serve<T>(
-	///     commands: &PubsubCommands<AllowAll>,
-	///     mut transport: T,
+	/// 	commands: &PubsubCommands<AllowAll>,
+	/// 	mut transport: T,
 	/// ) -> Result<(), Box<dyn std::error::Error>>
 	/// where
-	///     T: MuxAcceptor,
-	///     T::EnvelopeReader: Send,
-	///     T::EnvelopeWriter: Send,
+	/// 	T: MuxAcceptor,
+	/// 	T::EnvelopeReader: Send,
+	/// 	T::EnvelopeWriter: Send,
 	/// {
-	///     transport.negotiate_mux().await?;
-	///     let link = AcceptedLink::accepted(transport)?;
-	///     commands.serve(link, Unrouted).await?;
-	///     Ok(())
+	/// 	transport.negotiate_mux().await?;
+	/// 	let link = AcceptedLink::accepted(transport)?;
+	/// 	commands.serve(link, Unrouted).await?;
+	/// 	Ok(())
 	/// }
 	/// ```
-	///
-	/// [`MuxHandle::keep_alive`]: tightbeam::transport::multiplex::MuxHandle::keep_alive
 	pub async fn serve<R, W, A, F>(&self, link: AcceptedLink<R, W>, app: A) -> TransportResult<()>
 	where
 		R: EnvelopeSource + Send + 'static,
@@ -342,15 +308,15 @@ impl<P: SubscribePolicy + 'static> PubsubCommands<P> {
 	{
 		let served = link.spawn();
 		let mut membership = self.registry.admit(&served);
-		let context = ConnectionContext::of(&served, membership.connection());
+		let context = membership.context().clone();
 
 		let routes = CommandRoutes { commands: self.clone(), app, context, routed: PhantomData };
 		let expelled = membership.expelled();
-		served.serve(routes, expelled).await
+		served.serve_dispatch(routes, expelled).await
 	}
 }
 
-/// The unary routes of one served connection: the wire commands first, then
+/// The unary routes of one served connection: the commands first, then
 /// the application.
 ///
 /// The responder serves unary streams alone, so a streaming or duplex stream
@@ -374,8 +340,7 @@ where
 		let app = self.app.clone();
 		let context = self.context.clone();
 		async move {
-			let connection = context.connection();
-			if let Some(answer) = commands.answer(connection, &frame) {
+			if let Some(answer) = commands.answer(context.member(), &frame).await {
 				return Ok(answer);
 			}
 
@@ -389,15 +354,16 @@ where
 mod tests {
 	use core::num::NonZeroUsize;
 
-	use tightbeam::transport::handshake::negotiation::MuxSettings;
+	use tightbeam::builder::TypeBuilder;
+	use tightbeam::crypto::key::Aes256GcmKeyProvider;
+	use tightbeam::Version;
 
 	use super::*;
-	use crate::backplane::{Backplane, Local, NodeSink};
+	use crate::backplane::{Backplane, Local};
 	use crate::frame::OpaqueFrame;
 	use crate::policy::AllowAll;
 	use crate::registry::RegistryOptions;
-	use crate::testing::faults::Rejector;
-	use crate::testing::MemoryLink;
+	use crate::testing::nodes::Admitted;
 
 	/// Forbid every topic under `secrets/`.
 	struct DenySecrets;
@@ -431,53 +397,42 @@ mod tests {
 	}
 
 	/// Answer `frame`, expecting the dispatcher to claim it.
-	fn answered<P: SubscribePolicy>(
+	async fn answered<P: SubscribePolicy>(
 		commands: &PubsubCommands<P>,
-		connection: ConnectionId,
+		member: &Member,
 		frame: &Frame,
 	) -> ResponsePackage {
-		commands
-			.answer(connection, frame)
-			.expect("the dispatcher should claim the command")
+		let answer = commands.answer(member, frame).await;
+		answer.expect("the dispatcher should claim the command")
 	}
 
-	/// Quiesce the registry, expecting the signal to succeed.
-	fn drained(registry: &TopicRegistry) {
-		registry.quiesce().expect("quiesce should succeed");
-	}
-
-	/// A dispatcher over one admitted in-memory connection. The guard keeps
-	/// the registration and the peer transport alive, and its drop leaves the
+	/// A dispatcher over one admitted loopback connection. The guard keeps
+	/// the registration and the link alive, and its drop leaves the
 	/// registry.
-	fn dispatcher<P: SubscribePolicy>(policy: P) -> (PubsubCommands<P>, TopicRegistry, ConnectionId, impl Sized) {
-		dispatcher_with(policy, RegistryOptions::default())
+	async fn dispatcher<P: SubscribePolicy>(policy: P) -> (PubsubCommands<P>, TopicRegistry, Member, Admitted) {
+		dispatcher_with(policy, RegistryOptions::default()).await
 	}
 
 	/// As [`dispatcher`], with explicit registry options.
-	fn dispatcher_with<P: SubscribePolicy>(
+	async fn dispatcher_with<P: SubscribePolicy>(
 		policy: P,
 		options: RegistryOptions,
-	) -> (PubsubCommands<P>, TopicRegistry, ConnectionId, impl Sized) {
-		let link = MemoryLink::default();
-		let served = link.served(MuxSettings::symmetric(4));
-		let (client, server) = served.expect("a link on the system clock races on a tokio thread");
-		let served = server.spawn();
-
+	) -> (PubsubCommands<P>, TopicRegistry, Member, Admitted) {
 		let registry = TopicRegistry::new(options);
-		let membership = registry.admit(&served);
-		let connection = membership.connection();
+		let admitted = Admitted::to(&registry).await;
+		let member = admitted.member().clone();
 		let commands = PubsubCommands::new(registry.clone(), policy);
-		(commands, registry, connection, (membership, served, client))
+		(commands, registry, member, admitted)
 	}
 
 	/// A dispatcher with client publish enabled.
-	fn publisher<S, P>(policy: S, publish: P) -> (PubsubCommands<S>, TopicRegistry, ConnectionId, impl Sized)
+	async fn publisher<S, P>(policy: S, publish: P) -> (PubsubCommands<S>, TopicRegistry, Member, Admitted)
 	where
 		S: SubscribePolicy,
 		P: PublishPolicy + 'static,
 	{
-		let (commands, registry, connection, peer) = dispatcher(policy);
-		(commands.with_publish(publish), registry, connection, peer)
+		let (commands, registry, member, peer) = dispatcher(policy).await;
+		(commands.with_publish(publish), registry, member, peer)
 	}
 
 	/// The publish command the publish tests emit.
@@ -486,58 +441,116 @@ mod tests {
 	}
 
 	/// A publish command whose body is sealed to a key the server lacks, so
-	/// it does not decode as an opaque payload.
+	/// the publish refuses it as `CommandRefusal::Malformed`.
 	fn sealed_publish() -> Frame {
 		let frame = OpaqueFrame { id: "pub/prices", order: 1, payload: b"tick" };
-		frame.sealed(&[7; 32], b"absent").expect("sealed command frames should build")
+		let framed = frame.framed(Version::V1).expect("the command body encodes");
+		let sealer = Aes256GcmKeyProvider::new(vec![7; 32], b"absent".to_vec()).expect("the key wraps");
+		framed
+			.with_encryptor(sealer)
+			.build()
+			.expect("sealed command frames should build")
+	}
+
+	#[test]
+	fn an_id_parses_as_the_command_of_its_prefix() {
+		let prices = "prices".parse();
+		let ids = [
+			(
+				b"sub/prices".as_slice(),
+				Verb::Subscribe,
+				ClientCommand::Subscribe(prices.clone()),
+			),
+			(b"unsub/prices", Verb::Unsubscribe, ClientCommand::Unsubscribe(prices.clone())),
+			(b"pub/prices", Verb::Publish, ClientCommand::Publish(prices)),
+		];
+		for (id, verb, command) in ids {
+			assert_eq!(ClientCommand::parse(id), Some((verb, command)));
+		}
+	}
+
+	#[test]
+	fn a_command_whose_name_is_no_topic_holds_the_refusal() {
+		let parsed = ClientCommand::parse(b"sub/");
+		assert_eq!(
+			parsed,
+			Some((Verb::Subscribe, ClientCommand::Subscribe(Err(TopicError::Empty))))
+		);
+	}
+
+	#[test]
+	fn an_end_id_is_no_client_command() {
+		assert_eq!(ClientCommand::parse(b"end/prices"), None);
 	}
 
 	#[tokio::test]
 	async fn subscribe_command_registers_and_accepts() {
-		let (commands, registry, connection, _peer) = dispatcher(AllowAll);
-		let answer = answered(&commands, connection, &command("sub/prices"));
+		let (commands, registry, member, _peer) = dispatcher(AllowAll).await;
+		let answer = answered(&commands, &member, &command("sub/prices")).await;
 		assert_eq!(answer.status(), TransitStatus::Ok);
-		assert_eq!(registry.view().subscriber_count(&Topic::fixture("prices")), 1);
+		assert_eq!(
+			registry
+				.view()
+				.subscriber_count(&"prices".parse::<Topic>().expect("the name should be a topic")),
+			1
+		);
 	}
 
 	#[tokio::test]
 	async fn unsubscribe_command_forgets_and_accepts() {
-		let (commands, registry, connection, _peer) = dispatcher(AllowAll);
-		answered(&commands, connection, &command("sub/prices"));
+		let (commands, registry, member, _peer) = dispatcher(AllowAll).await;
+		answered(&commands, &member, &command("sub/prices")).await;
 
-		let answer = answered(&commands, connection, &command("unsub/prices"));
+		let answer = answered(&commands, &member, &command("unsub/prices")).await;
 		assert_eq!(answer.status(), TransitStatus::Ok);
-		assert_eq!(registry.view().subscriber_count(&Topic::fixture("prices")), 0);
+		assert_eq!(
+			registry
+				.view()
+				.subscriber_count(&"prices".parse::<Topic>().expect("the name should be a topic")),
+			0
+		);
 	}
 
 	#[tokio::test]
 	async fn unsubscribe_of_a_never_subscribed_topic_still_accepts() {
-		let (commands, _registry, connection, _peer) = dispatcher(AllowAll);
-		let answer = answered(&commands, connection, &command("unsub/prices"));
+		let (commands, _registry, member, _peer) = dispatcher(AllowAll).await;
+		let answer = answered(&commands, &member, &command("unsub/prices")).await;
 		assert_eq!(answer.status(), TransitStatus::Ok);
 	}
 
 	#[tokio::test]
-	async fn forbidden_topic_answers_permission_denied() {
-		let (commands, registry, connection, _peer) = dispatcher(DenySecrets);
-		let answer = answered(&commands, connection, &command("sub/secrets/keys"));
-		assert_eq!(answer.status(), TransitStatus::PermissionDenied);
-		assert_eq!(registry.view().subscriber_count(&Topic::fixture("secrets/keys")), 0);
-	}
-
-	#[tokio::test]
-	async fn malformed_topic_answers_invalid_argument() {
-		let (commands, _registry, connection, _peer) = dispatcher(AllowAll);
-		let answer = answered(&commands, connection, &command("sub/"));
+	async fn malformed_unsubscribe_topic_answers_invalid_argument() {
+		let (commands, _registry, member, _peer) = dispatcher(AllowAll).await;
+		let answer = answered(&commands, &member, &command("unsub/")).await;
 		assert_eq!(answer.status(), TransitStatus::InvalidArgument);
 	}
 
 	#[tokio::test]
-	async fn draining_registry_answers_unavailable() {
-		let (commands, registry, connection, _peer) = dispatcher(AllowAll);
-		drained(&registry);
+	async fn forbidden_topic_answers_permission_denied() {
+		let (commands, registry, member, _peer) = dispatcher(DenySecrets).await;
+		let answer = answered(&commands, &member, &command("sub/secrets/keys")).await;
+		assert_eq!(answer.status(), TransitStatus::PermissionDenied);
+		assert_eq!(
+			registry
+				.view()
+				.subscriber_count(&"secrets/keys".parse::<Topic>().expect("the name should be a topic")),
+			0
+		);
+	}
 
-		let answer = answered(&commands, connection, &command("sub/prices"));
+	#[tokio::test]
+	async fn malformed_topic_answers_invalid_argument() {
+		let (commands, _registry, member, _peer) = dispatcher(AllowAll).await;
+		let answer = answered(&commands, &member, &command("sub/")).await;
+		assert_eq!(answer.status(), TransitStatus::InvalidArgument);
+	}
+
+	#[tokio::test]
+	async fn a_draining_registry_answers_unavailable() {
+		let (commands, registry, member, _peer) = dispatcher(AllowAll).await;
+		registry.complete().await.expect("every end frame builds");
+
+		let answer = answered(&commands, &member, &command("sub/prices")).await;
 		assert_eq!(answer.status(), TransitStatus::Unavailable);
 	}
 
@@ -547,67 +560,70 @@ mod tests {
 			max_subscriptions_per_connection: NonZeroUsize::MIN,
 			..RegistryOptions::default()
 		};
-		let (commands, _registry, connection, _peer) = dispatcher_with(AllowAll, options);
-		assert_eq!(
-			answered(&commands, connection, &command("sub/prices")).status(),
-			TransitStatus::Ok
-		);
-		assert_eq!(
-			answered(&commands, connection, &command("sub/chat")).status(),
-			TransitStatus::ResourceExhausted
-		);
+		let (commands, _registry, member, _peer) = dispatcher_with(AllowAll, options).await;
+		let first = answered(&commands, &member, &command("sub/prices")).await;
+		let second = answered(&commands, &member, &command("sub/chat")).await;
+		assert_eq!(first.status(), TransitStatus::Ok);
+		assert_eq!(second.status(), TransitStatus::ResourceExhausted);
 	}
 
 	#[tokio::test]
 	async fn non_command_frames_pass_through() {
-		let (commands, _registry, connection, _peer) = dispatcher(AllowAll);
-		let answer = commands.answer(connection, &command("prices"));
+		let (commands, _registry, member, _peer) = dispatcher(AllowAll).await;
+		let answer = commands.answer(&member, &command("prices")).await;
 		assert!(answer.is_none());
 	}
 
 	#[tokio::test]
 	async fn pub_command_passes_through_until_publish_is_enabled() {
-		let (commands, _registry, connection, _peer) = dispatcher(AllowAll);
-		let answer = commands.answer(connection, &command("pub/prices"));
+		let (commands, _registry, member, _peer) = dispatcher(AllowAll).await;
+		let answer = commands.answer(&member, &command("pub/prices")).await;
+		assert!(answer.is_none());
+	}
+
+	#[tokio::test]
+	async fn malformed_pub_command_passes_through_until_publish_is_enabled() {
+		let (commands, _registry, member, _peer) = dispatcher(AllowAll).await;
+		let answer = commands.answer(&member, &command("pub/")).await;
 		assert!(answer.is_none());
 	}
 
 	#[tokio::test]
 	async fn pub_command_publishes_when_the_policy_allows() {
-		let (commands, _registry, connection, _peer) = publisher(AllowAll, AllowAll);
-		let answer = answered(&commands, connection, &tick_publish());
+		let (commands, _registry, member, _peer) = publisher(AllowAll, AllowAll).await;
+		let answer = answered(&commands, &member, &tick_publish()).await;
 		assert_eq!(answer.status(), TransitStatus::Ok);
 	}
 
 	#[tokio::test]
-	async fn commands_from_a_dropped_connection_answer_permission_denied() {
-		let (commands, _registry, connection, peer) = publisher(AllowAll, AllowAll);
+	async fn commands_from_a_departed_connection_answer_permission_denied() {
+		let (commands, _registry, member, peer) = publisher(AllowAll, AllowAll).await;
 		drop(peer);
 
-		let publish = answered(&commands, connection, &tick_publish());
-		let subscribe = answered(&commands, connection, &command("sub/prices"));
+		let publish = answered(&commands, &member, &tick_publish()).await;
+		let subscribe = answered(&commands, &member, &command("sub/prices")).await;
 		assert_eq!(publish.status(), TransitStatus::PermissionDenied);
 		assert_eq!(subscribe.status(), TransitStatus::PermissionDenied);
 	}
 
 	#[tokio::test]
 	async fn forbidden_publish_answers_permission_denied() {
-		let (commands, _registry, connection, _peer) = publisher(AllowAll, DenyPublish);
-		let answer = answered(&commands, connection, &tick_publish());
+		let (commands, _registry, member, _peer) = publisher(AllowAll, DenyPublish).await;
+		let answer = answered(&commands, &member, &tick_publish()).await;
 		assert_eq!(answer.status(), TransitStatus::PermissionDenied);
 	}
 
 	#[tokio::test]
 	async fn malformed_publish_topic_answers_invalid_argument() {
-		let (commands, _registry, connection, _peer) = publisher(AllowAll, AllowAll);
-		let answer = answered(&commands, connection, &command("pub/"));
+		let (commands, _registry, member, _peer) = publisher(AllowAll, AllowAll).await;
+		let answer = answered(&commands, &member, &command("pub/")).await;
 		assert_eq!(answer.status(), TransitStatus::InvalidArgument);
 	}
 
 	#[tokio::test]
 	async fn a_publish_body_that_does_not_decode_answers_invalid_argument() {
-		let (commands, _registry, connection, _peer) = publisher(AllowAll, AllowAll);
-		let answer = answered(&commands, connection, &sealed_publish());
+		let (commands, _registry, member, _peer) = publisher(AllowAll, AllowAll).await;
+		let answer = answered(&commands, &member, &sealed_publish()).await;
 		assert_eq!(answer.status(), TransitStatus::InvalidArgument);
 	}
 
@@ -615,36 +631,21 @@ mod tests {
 	async fn a_backplane_topic_limit_answers_resource_exhausted() {
 		let backplane: Arc<dyn Backplane> = Arc::new(Local::default().with_max_topics(NonZeroUsize::MIN));
 		let options = RegistryOptions { backplane, ..RegistryOptions::default() };
-		let (commands, _registry, connection, _peer) = dispatcher_with(AllowAll, options);
+		let (commands, _registry, member, _peer) = dispatcher_with(AllowAll, options).await;
 		let commands = commands.with_publish(AllowAll);
-		answered(&commands, connection, &command("sub/prices"));
-		answered(&commands, connection, &tick_publish());
+		answered(&commands, &member, &command("sub/prices")).await;
+		answered(&commands, &member, &tick_publish()).await;
 
-		let answer = answered(&commands, connection, &payload_command("pub/chat", b"tick"));
+		let answer = answered(&commands, &member, &payload_command("pub/chat", b"tick")).await;
 		assert_eq!(answer.status(), TransitStatus::ResourceExhausted);
 	}
 
 	#[tokio::test]
-	async fn a_publish_whose_update_frame_fails_to_build_answers_internal() {
-		let local = Local::default();
-		let rejector = Arc::new(Rejector);
-		local.attach(NodeSink::from(&rejector));
-
-		let backplane: Arc<dyn Backplane> = Arc::new(local);
-		let options = RegistryOptions { backplane, ..RegistryOptions::default() };
-		let (commands, _registry, connection, _peer) = dispatcher_with(AllowAll, options);
-		let commands = commands.with_publish(AllowAll);
-
-		let answer = answered(&commands, connection, &tick_publish());
-		assert_eq!(answer.status(), TransitStatus::Internal);
-	}
-
-	#[tokio::test]
 	async fn publish_to_a_draining_registry_answers_unavailable() {
-		let (commands, registry, connection, _peer) = publisher(AllowAll, AllowAll);
-		drained(&registry);
+		let (commands, registry, member, _peer) = publisher(AllowAll, AllowAll).await;
+		registry.complete().await.expect("every end frame builds");
 
-		let answer = answered(&commands, connection, &tick_publish());
+		let answer = answered(&commands, &member, &tick_publish()).await;
 		assert_eq!(answer.status(), TransitStatus::Unavailable);
 	}
 }

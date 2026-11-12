@@ -1,8 +1,5 @@
-//! Encapsulated tightbeam-profile crypto for the wasm boundary.
-//!
-//! Curve- and algorithm-specific operations live on typed owners
-//! (`Secp256k1SigningKey`, `Aes256Gcm`, …). Module-level free functions do
-//! not take raw key material.
+//! The tightbeam profile keys and ciphers that the bindings expose, as the
+//! modules section of `docs/ws-wasm.md` describes.
 
 use core::future::Future;
 use std::rc::Rc;
@@ -22,7 +19,7 @@ use tightbeam::{TightBeamError, ZeroizingBytes};
 use crate::bindings::Oid;
 use crate::build::{
 	self, Aes256GcmKey, FrameAssembly, HpkeSecp256k1Decryptor as ProfileHpkeDecryptor,
-	HpkeSecp256k1Encryptor as ProfileHpkeEncryptor, SharedKey, SignerKeyId,
+	HpkeSecp256k1Encryptor as ProfileHpkeEncryptor, SignerKeyId,
 };
 use crate::fault::{JsFault, RefusalCode};
 use crate::promise::{JsBytes, Record};
@@ -100,8 +97,8 @@ impl SealedBody {
 }
 
 /// A sealed body as JavaScript hands it over: an object that names its
-/// pieces, so that they cannot swap. A caller's own scheme seals a body of
-/// this shape.
+/// pieces, `envelopeDer` and `ciphertext`, which the read takes by name. A
+/// caller's own scheme seals a body of this shape.
 impl TryFrom<&JsValue> for build::SealedBody {
 	type Error = JsFault;
 
@@ -119,8 +116,8 @@ impl TryFrom<&JsValue> for build::SealedBody {
 	}
 }
 
-/// A promise of the plaintext body DER that `opening`, an open of a sealed
-/// body, recovers.
+/// A promise of the octets that were sealed, which `opening`, an open of a
+/// sealed body, recovers.
 fn plaintext_promise(opening: impl Future<Output = Result<Vec<u8>, TightBeamError>> + 'static) -> Promise {
 	future_to_promise(async move {
 		let plaintext = opening.await.map_err(JsFault::from)?;
@@ -134,7 +131,12 @@ pub struct Sha3_256;
 
 #[wasm_bindgen]
 impl Sha3_256 {
-	/// SHA3-256 digest of `data`.
+	/// The 32 octets that the profile hasher of tightbeam computes over
+	/// `data`.
+	///
+	/// # Errors
+	///
+	/// - `InvalidBytes` -- `data` is not a `Uint8Array`.
 	#[wasm_bindgen]
 	pub fn digest(data: JsBytes) -> Result<Vec<u8>, JsFault> {
 		let data = data.read()?;
@@ -190,7 +192,12 @@ impl Secp256k1SigningKey {
 		self.inner.verifying_key().to_sec1_bytes().into_vec()
 	}
 
-	/// DER SubjectPublicKeyInfo (uncompressed SEC1; profile `EncodePublicKey`).
+	/// The DER SubjectPublicKeyInfo of the key, an uncompressed SEC1 point as
+	/// the profile `EncodePublicKey` writes it.
+	///
+	/// # Errors
+	///
+	/// - `SpkiError` -- the key fails to encode as a `SubjectPublicKeyInfo`.
 	#[wasm_bindgen(js_name = toSpkiDer)]
 	pub fn to_spki_der(&self) -> Result<Vec<u8>, JsFault> {
 		let spki = self.inner.verifying_key().to_public_key_der();
@@ -199,6 +206,10 @@ impl Secp256k1SigningKey {
 	}
 
 	/// Subject-key-identifier octets for `FrameAssembly.signing`.
+	///
+	/// # Errors
+	///
+	/// - `SpkiError` -- the key fails to encode as a `SubjectPublicKeyInfo`.
 	#[wasm_bindgen(js_name = signerId)]
 	pub fn signer_id(&self) -> Result<Vec<u8>, JsFault> {
 		let signer = SignerKeyId::of(self.inner.verifying_key())?;
@@ -228,7 +239,8 @@ pub struct Secp256k1VerifyingKey {
 
 #[wasm_bindgen]
 impl Secp256k1VerifyingKey {
-	/// Construct from a SEC1 point (33-byte compressed or 65-byte uncompressed).
+	/// Construct from a SEC1 point (33-byte compressed or 65-byte
+	/// uncompressed).
 	///
 	/// # Errors
 	///
@@ -249,6 +261,10 @@ impl Secp256k1VerifyingKey {
 	}
 
 	/// Subject-key-identifier octets naming this verifying key.
+	///
+	/// # Errors
+	///
+	/// - `SpkiError` -- the key fails to encode as a `SubjectPublicKeyInfo`.
 	#[wasm_bindgen(js_name = signerId)]
 	pub fn signer_id(&self) -> Result<Vec<u8>, JsFault> {
 		let signer = SignerKeyId::of(&self.inner)?;
@@ -256,6 +272,14 @@ impl Secp256k1VerifyingKey {
 	}
 
 	/// Verify a frame's non-repudiation signature under the profile scheme.
+	///
+	/// # Errors
+	///
+	/// - `InvalidBytes` -- `frameDer` is not a `Uint8Array`.
+	/// - `SerializationError` -- the octets are no frame.
+	/// - `EmptyDigest` -- a digest the frame carries holds no octets.
+	/// - `MissingSignature` -- the frame is unsigned.
+	/// - `SignatureError` -- the signature fails to verify under this key.
 	#[wasm_bindgen(js_name = verifyFrame)]
 	pub fn verify_frame(&self, frame_der: JsBytes) -> Result<(), JsFault> {
 		let assembly = FrameAssembly::decode(frame_der.read()?)?;
@@ -270,6 +294,15 @@ pub struct Aes256Gcm {
 	inner: Rc<Aes256GcmKey>,
 }
 
+/// The members of a `SharedKey` that [`Aes256Gcm::from_key`] reads, each
+/// the path that a refusal of its value names.
+impl Aes256Gcm {
+	/// The member that holds the raw key.
+	pub(crate) const KEY: &'static str = "shared.key";
+	/// The member that holds the identifier of the key.
+	pub(crate) const KEY_ID: &'static str = "shared.keyId";
+}
+
 #[wasm_bindgen]
 impl Aes256Gcm {
 	/// Construct from a shared key and the identifier that names it to every
@@ -282,11 +315,10 @@ impl Aes256Gcm {
 	/// - `KeyError` -- the key is not 32 octets.
 	#[wasm_bindgen(js_name = fromKey)]
 	pub fn from_key(#[wasm_bindgen(unchecked_param_type = "SharedKey")] shared: JsValue) -> Result<Aes256Gcm, JsFault> {
-		let key = ZeroizingBytes::new(JsBytes::read_member(&shared, "shared.key")?);
-		let key_id = JsBytes::read_member(&shared, "shared.keyId")?;
-		let shared = SharedKey::new(key, key_id).map_err(|refusal| JsFault::from(refusal).at("shared.keyId"))?;
+		let key = ZeroizingBytes::new(JsBytes::read_member(&shared, Self::KEY)?);
+		let key_id = JsBytes::read_member(&shared, Self::KEY_ID)?;
 
-		let inner = Aes256GcmKey::new(shared).map_err(|error| JsFault::from(error).at("shared.key"))?;
+		let inner = Aes256GcmKey::new(key, key_id)?;
 		Ok(Aes256Gcm { inner: Rc::new(inner) })
 	}
 
@@ -303,6 +335,18 @@ impl Aes256Gcm {
 	}
 
 	/// Open a sealed body with this key.
+	///
+	/// # Errors
+	///
+	/// The call throws these:
+	///
+	/// - `InvalidBytes` -- `sealed.envelopeDer` or `sealed.ciphertext` is not a `Uint8Array`.
+	/// - `SerializationError` -- `envelopeDer` is no `AuthEnvelopedData`.
+	///
+	/// The promise rejects with these:
+	///
+	/// - The `TightBeamError` of an envelope or a ciphertext that the key refuses, such as an envelope that
+	///   names another key, or a ciphertext that fails its tag.
 	#[wasm_bindgen(unchecked_return_type = "Promise<Uint8Array>")]
 	pub fn open(
 		&self,
@@ -378,6 +422,18 @@ impl HpkeSecp256k1Decryptor {
 	}
 
 	/// Open a body sealed to this recipient.
+	///
+	/// # Errors
+	///
+	/// The call throws these:
+	///
+	/// - `InvalidBytes` -- `sealed.envelopeDer` or `sealed.ciphertext` is not a `Uint8Array`.
+	/// - `SerializationError` -- `envelopeDer` is no `AuthEnvelopedData`.
+	///
+	/// The promise rejects with these:
+	///
+	/// - The `TightBeamError` of an envelope or a ciphertext that the recipient refuses, such as an
+	///   envelope that names another recipient, or a ciphertext that fails its tag.
 	#[wasm_bindgen(unchecked_return_type = "Promise<Uint8Array>")]
 	pub fn open(
 		&self,
@@ -449,7 +505,15 @@ mod tests {
 	#[wasm_bindgen_test]
 	fn a_shared_key_without_an_id_is_refused() {
 		let refused = Aes256Gcm::from_key(shared_key(&[0x42; 32], &[]));
-		assert_eq!(refused.code().as_deref(), Some("EmptyKeyId"));
+		let expected = ("EmptyKeyId".to_owned(), Aes256Gcm::KEY_ID.to_owned());
+		assert_eq!(refused.refusal(), Some(expected));
+	}
+
+	#[wasm_bindgen_test]
+	fn a_short_shared_key_is_refused_at_its_key() {
+		let refused = Aes256Gcm::from_key(shared_key(&[0x42; 16], b"topic"));
+		let expected = ("KeyError".to_owned(), Aes256Gcm::KEY.to_owned());
+		assert_eq!(refused.refusal(), Some(expected));
 	}
 
 	#[wasm_bindgen_test]

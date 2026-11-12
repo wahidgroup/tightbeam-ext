@@ -1,23 +1,5 @@
-//! Multiplexed encrypted echo server for the tightbeam WebSocket transport.
-//!
-//! The server offers multiplexing in the HPKE handshake and serves each client
-//! stream with the [`EchoBody`] that `TBWS_ECHO_BODY` names. In the `streaming`
-//! and `unary` bodies, a frame id can select an [`EchoCommand`] in place of the
-//! echo.
-//!
-//! The [`DemoConfig`] of the environment decides the [`Security`] of every
-//! connection: server-auth, mutual-auth when `TBWS_CLIENT_CERT` names a client
-//! certificate to pin, and the demo session-budget paywall on top of mutual
-//! auth when `TBWS_PAYWALL` is on.
-//!
-//! Environment:
-//!   - `TBWS_SERVER_CERT`  path to the server certificate DER, beside its key
-//!   - `TBWS_ECHO_BODY`    the [`EchoBody`] to serve (default `streaming`)
-//!   - `ECHO_WS_PORT`      listen port (default `9100`)
-//!   - the variables of [`DemoConfig`]
-//!
-//! [`EchoCommand`]: tightbeam_ws::testing::EchoCommand
-//! [`Security`]: tightbeam_ws::testing::Security
+//! The multiplexed encrypted echo server of the e2e stack, as `docs/ws.md`
+//! (Demo servers) states it.
 
 use std::sync::Arc;
 
@@ -33,7 +15,7 @@ use tokio_tungstenite::MaybeTlsStream;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// The transport an accepted WebSocket connection follows.
+/// The transport of an accepted WebSocket connection.
 type ServerTransport = WsTransport<MaybeTlsStream<TcpStream>>;
 
 /// The variable that sets the listen port.
@@ -62,7 +44,7 @@ impl EchoConnection {
 
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
-	let port = PORT.parsed_or(9100u32)?;
+	let port: u16 = PORT.parsed()?;
 	let body = EchoBody::from_env()?;
 	let bind_addr = TightBeamSocketAddr(format!("0.0.0.0:{port}").parse()?);
 	let demo = Arc::new(DemoConfig::from_env()?);
@@ -78,16 +60,7 @@ async fn main() -> Result<(), BoxError> {
 	);
 
 	loop {
-		// A failed accept is the listener's own fault, such as a descriptor
-		// shortage, and it clears on retry.
-		let (transport, peer) = match listener.accept().await {
-			Ok(accepted) => accepted,
-			Err(error) => {
-				eprintln!("[echo-mux] accept failed: {error}");
-				continue;
-			}
-		};
-
+		let (transport, peer) = listener.accept().await?;
 		let connection = EchoConnection { transport, demo: Arc::clone(&demo) };
 		tokio::spawn(async move {
 			if let Err(error) = connection.serve(body).await {

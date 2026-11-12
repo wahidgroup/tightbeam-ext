@@ -28,11 +28,15 @@ build:
 
 # The crate holds no socket kind, so the io tests of tightbeam-ws run its rules
 # against a real peer.
+# libtest passes a filter that matches no test, so the recipe fails unless the
+# filter ran at least one test.
 test: setup
 	@echo "Running wire cargo tests..."
 	cargo test $(CRATES) $(CARGO_FLAGS)
-	@echo "Running the ws io tests, which run the wire rules against a real peer..."
-	cargo test -p tightbeam-ws --lib io::
+	@echo "Running the ws io tests, which run the envelope rules against a real peer..."
+	@report=$$(cargo test -p tightbeam-ws --lib io::); status=$$?; printf '%s\n' "$$report"; \
+		ran=$$(printf '%s\n' "$$report" | sed -n 's/^test result: ok\. \([0-9]*\) passed.*/\1/p'); \
+		test "$$status" -eq 0 && test "$${ran:-0}" -gt 0 || { echo "the io:: tests of tightbeam-ws failed or ran none"; exit 1; }
 
 lint: setup
 	@echo "Linting wire (mode: $(LINT_MODE))..."

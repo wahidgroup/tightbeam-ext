@@ -1,34 +1,21 @@
 /**
- * Detached, hiding message commitments (`tightbeam::crypto::commitment`).
- *
- * A bare `H(body)` digest binds but does not hide: a brute force over
- * candidate preimages recovers a low-entropy body from a published digest. A
- * commitment salts the body with a secret blinding value, so the digest
- * reveals nothing until the opening `(salt, body)` is disclosed.
- *
- * - The commitment covers the same mode-prefixed preimage as the in-frame
- *   message commitment, so a detached commitment and a frame-carried one are
- *   interchangeable.
- * - The engine parses the salt (`Engine.salt`): empty commits in plain-digest
- *   mode, and any other salt carries at least 16 octets.
+ * Detached, hiding message commitments (`tightbeam::crypto::commitment`), as
+ * the detached commitments section of `docs/ws-client.md` describes.
  */
 
-import type { CommitmentSalt, DigestInfo, DigestVerdict, Oid } from "#wasm";
+import type { CommitmentSalt, DigestInfo } from "#wasm";
 
 import type { Hasher } from "./crypto.js";
 import type { EngineParts } from "./engine.js";
 import type { DigestName } from "./views.js";
-import { Lent } from "./views.js";
 import { ClientTransportError } from "./errors.js";
 import { Owned } from "./owned.js";
 
 /**
  * The opening of a message commitment: the secret blinding salt and the
- * committed body DER.
- *
- * Disclosing an `Opening` lets any holder of the commitment verify it via
- * {@link Opening.verify}, realizing a disclose-then-verify proof. The opening
- * owns the salt it took, and its disposal frees it.
+ * committed body DER. A disclosed opening lets any holder of the commitment
+ * verify it through {@link Opening.verify}. The opening owns the salt it took,
+ * and its disposal frees it.
  */
 export class Opening implements Disposable {
 	readonly #parts: EngineParts;
@@ -37,32 +24,23 @@ export class Opening implements Disposable {
 
 	readonly #bodyDer: Uint8Array;
 
-	private constructor(
-		parts: EngineParts,
-		salt: CommitmentSalt,
-		bodyDer: Uint8Array,
-	) {
+	private constructor(parts: EngineParts, salt: CommitmentSalt, bodyDer: Uint8Array) {
 		this.#parts = parts;
 		this.#salt = new Owned(salt, ClientTransportError.openingReleased);
 		this.#bodyDer = bodyDer;
 	}
 
 	/**
-	 * The opening of `bodyDer` under `salt`, through the engine `parts`. The
-	 * opening takes the salt and keeps its own copy of `bodyDer`, so the
-	 * caller's salt keeps an empty shell and a later write to `bodyDer` leaves
-	 * the opening as it was made.
+	 * The opening of `bodyDer` under `salt`, through the engine `parts`. It copies `bodyDer` and then takes the salt,
+	 * so a refused copy leaves the caller its salt, and an opening leaves the caller an empty shell.
 	 *
-	 * @throws TightbeamTransportError `CommitmentSpent` when the salt moved
-	 * out of `salt` already.
+	 * @throws TightbeamTransportError `CommitmentSpent` when the salt moved out of `salt` already.
+	 *
+	 * @internal
 	 */
-	static over(
-		parts: EngineParts,
-		salt: CommitmentSalt,
-		bodyDer: Uint8Array,
-	): Opening {
-		const taken = salt.take();
+	static over(parts: EngineParts, salt: CommitmentSalt, bodyDer: Uint8Array): Opening {
 		const body = new Uint8Array(bodyDer);
+		const taken = salt.take();
 
 		const opening = new Opening(parts, taken, body);
 		return opening;
@@ -70,8 +48,7 @@ export class Opening implements Disposable {
 
 	/**
 	 * The public commitment of this opening under `hasher`: the digest to
-	 * publish. A high-entropy salt of at least 16 octets makes it hiding, and
-	 * an empty salt commits in plain-digest mode (binding only).
+	 * publish, which a high-entropy salt makes hiding.
 	 *
 	 * @throws an error whose `code` is `SerializationError` when the body is
 	 * not one DER value, and `OpeningReleased` after the disposal.
@@ -81,18 +58,15 @@ export class Opening implements Disposable {
 		const preimage = salt.preimage(this.#bodyDer);
 		const digest = await hasher.digest(preimage);
 
-		const digests = this.#parts.glue.DigestInfo;
-		const of = (algorithmOid: Oid): DigestInfo =>
-			digests.of(algorithmOid, digest);
-		const commitment = Lent.oid(hasher.algorithmOid, of);
+		using algorithmOid = hasher.algorithmOid.clone();
+
+		const commitment = this.#parts.glue.DigestInfo.of(algorithmOid, digest);
 		return commitment;
 	}
 
 	/**
-	 * Verify this opening against `commitment` in constant time.
-	 *
-	 * Resolves with `false` when the commitment algorithm does not match
-	 * `hasher` or when the recomputed digest differs.
+	 * Verify this opening against `commitment` in constant time, and resolve
+	 * with `false` on an algorithm or a digest mismatch.
 	 *
 	 * @throws an error whose `code` is `SerializationError` when the disclosed
 	 * body is not one DER value, and `OpeningReleased` after the disposal.
@@ -102,13 +76,10 @@ export class Opening implements Disposable {
 		const preimage = salt.preimage(this.#bodyDer);
 		const recomputed = await hasher.digest(preimage);
 
-		const judge = (digest: DigestInfo): DigestVerdict => {
-			const compare = (algorithmOid: Oid): DigestVerdict =>
-				digest.verdict(algorithmOid, recomputed);
-			return Lent.oid(hasher.algorithmOid, compare);
-		};
+		using carried = commitment.clone();
+		using algorithmOid = hasher.algorithmOid.clone();
 
-		const verdict = Lent.digest(commitment, judge);
+		const verdict = carried.verdict(algorithmOid, recomputed);
 		const verified = verdict === "verified";
 		return verified;
 	}
@@ -123,8 +94,8 @@ export class Opening implements Disposable {
 	}
 
 	/**
-	 * Free the salt this opening took. A later release does nothing, and a
-	 * later `commit` or `verify` refuses with `OpeningReleased`.
+	 * Free the salt this opening took. The release is idempotent, and a later `commit` or `verify` refuses with
+	 * `OpeningReleased`.
 	 */
 	[Symbol.dispose](): void {
 		this.#salt[Symbol.dispose]();

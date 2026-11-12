@@ -1,26 +1,19 @@
-//! The JavaScript values the wasm bindings read and write, and the promise
-//! boundary they share. Compiled only for `wasm32` targets.
-//!
-//! - [`JsBytes`] reads JavaScript bytes, [`Record`] reads and builds plain
-//!   objects, and [`WholeNumber`] reads whole numbers.
-//! - [`Returned`] waits on a return that may be a promise or a thenable.
-//! - [`AbortRace`] races a call against the signal of its caller, and [`Raced`] names the side that won.
-//! - An async binding returns a `js_sys::Promise` from a future that owns its
-//!   state instead of borrowing the wasm object, so `free()` is safe with
-//!   calls in flight.
-//! - A binding reads its arguments before it builds the future, so a caller
-//!   may reuse its buffers as soon as the call returns.
+//! The parses of the JavaScript values the bindings read, and their promise
+//! boundary, as the parse-once section of `docs/ws-wasm.md` describes.
 
-use core::cell::RefCell;
+use core::cell::Cell;
 use core::future::Future;
+use core::pin::Pin;
+use core::task::{Context, Poll, Waker};
 use std::rc::Rc;
 
 use futures_util::future::{select, Either};
-use js_sys::{Function, Object, Promise, Reflect, Symbol, Uint8Array};
+use futures_util::task::noop_waker;
+use js_sys::{Array, Function, Object, Promise, Reflect, Symbol, Uint8Array};
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::prelude::wasm_bindgen;
 use wasm_bindgen::{JsCast, JsValue};
-use wasm_bindgen_futures::JsFuture;
+use wasm_bindgen_futures::{future_to_promise, JsFuture};
 use web_sys::{AbortSignal, AddEventListenerOptions};
 
 use tightbeam::der::Encode;
@@ -39,10 +32,10 @@ extern "C" {
 	/// A byte parameter as JavaScript hands it over: typed `Uint8Array` for
 	/// TypeScript callers, and unread until [`JsBytes::read`].
 	///
-	/// A plain `Vec<u8>` parameter copies any array-like value element by
-	/// element: a number reads as no octets, and a wider view as its elements
-	/// cut to octets. A binding therefore takes each byte parameter as this
-	/// type, and a `JsBytes` reader admits a `Uint8Array` alone.
+	/// - A plain `Vec<u8>` parameter copies any array-like value element by element: a number reads as no
+	///   octets, and a wider view as its elements cut to octets.
+	/// - A binding therefore takes each byte parameter as this type, and a `JsBytes` reader admits a
+	///   `Uint8Array` alone.
 	#[wasm_bindgen(typescript_type = "Uint8Array")]
 	pub type JsBytes;
 }
@@ -60,6 +53,11 @@ thread_local! {
 		let getter = Reflect::get(&descriptor, &JsValue::from_str("get")).unwrap_or(JsValue::UNDEFINED);
 		getter.unchecked_into()
 	};
+
+	/// The `Uint8Array` constructor, which copies the octets of a typed array
+	/// it receives, and throws for one over a detached buffer or past the end
+	/// of a shrunk one.
+	static UINT8_ARRAY_CONSTRUCTOR: Function = Uint8Array::new_with_length(0).constructor();
 }
 
 impl JsBytes {
@@ -67,7 +65,8 @@ impl JsBytes {
 	///
 	/// # Errors
 	///
-	/// - `InvalidBytes` -- the value is not a `Uint8Array`.
+	/// - `InvalidBytes` -- the value is not a `Uint8Array`, or it admits no copy as
+	///   [`Self::recognize`] states.
 	pub(crate) fn read(&self) -> Result<Vec<u8>, JsFault> {
 		let bytes = Self::recognize(self);
 		bytes.ok_or_else(|| RefusalCode::InvalidBytes.because("the value must be a Uint8Array"))
@@ -75,14 +74,12 @@ impl JsBytes {
 
 	/// Copy the octets of `value`, the field at `path`, which a refusal names.
 	///
-	/// A `Uint8Array` of any realm reads as its octets, a Node `Buffer`
-	/// among them. Any other value is refused: a number never reads as that
-	/// many zero octets, an array never reads as its numbers, and a view of
-	/// wider elements never reads as its bytes.
+	/// - A `Uint8Array` of any realm reads as its octets, a Node `Buffer` among them.
+	/// - Every other value refuses, such as a number, an array of numbers, or a view of wider elements.
 	///
 	/// # Errors
 	///
-	/// - `InvalidBytes` -- `value` is not a `Uint8Array`.
+	/// - `InvalidBytes` -- `value` is not a `Uint8Array`, or it admits no copy as [`Self::recognize`] states.
 	pub(crate) fn read_value(value: &JsValue, path: &str) -> Result<Vec<u8>, JsFault> {
 		let bytes = Self::recognize(value);
 		bytes.ok_or_else(|| RefusalCode::InvalidBytes.because("must be a Uint8Array").at(path))
@@ -102,9 +99,11 @@ impl JsBytes {
 	/// The octets of `value` when it is a `Uint8Array`, and `None` for any
 	/// other value.
 	///
-	/// The copy goes through a fresh `Uint8Array` over the same octets, whose
-	/// length the engine reads from the internal slot of `value`. A `length`
-	/// property that the caller redefines therefore never sizes the copy.
+	/// - The copy goes through a fresh `Uint8Array` over the same octets, whose length the engine reads from
+	///   the internal slot of `value`.
+	/// - The internal slot therefore sizes the copy, whatever `length` property the caller defines.
+	/// - A `Uint8Array` over a detached buffer, or past the end of a shrunk one, admits no copy, so it is
+	///   `None` too.
 	pub(crate) fn recognize(value: &JsValue) -> Option<Vec<u8>> {
 		let name = TYPED_ARRAY_NAME.with(|getter| getter.call0(value).ok());
 		let named = name.and_then(|name| name.as_string());
@@ -112,7 +111,9 @@ impl JsBytes {
 			return None;
 		}
 
-		let bytes = Uint8Array::new(value);
+		let source = Array::of1(value);
+		let copied = UINT8_ARRAY_CONSTRUCTOR.with(|constructor| Reflect::construct(constructor, &source));
+		let bytes: Uint8Array = copied.ok()?.dyn_into().ok()?;
 		Some(bytes.to_vec())
 	}
 }
@@ -153,6 +154,56 @@ impl WholeNumber {
 	}
 }
 
+/// An `AbortSignal` that a caller may hand a binding.
+pub(crate) struct Signal;
+
+impl Signal {
+	/// The signal at `value`, the field at `path`, or `None` when it is absent.
+	///
+	/// # Errors
+	///
+	/// - `InvalidSignal` -- `value` is neither absent nor an `AbortSignal`.
+	pub(crate) fn read(value: &JsValue, path: &str) -> Result<Option<AbortSignal>, JsFault> {
+		let Some(present) = Record::present(value.clone()) else {
+			return Ok(None);
+		};
+
+		let signal = present.dyn_into::<AbortSignal>();
+		let refusal = |_| RefusalCode::InvalidSignal.because("must be an AbortSignal").at(path);
+		signal.map(Some).map_err(refusal)
+	}
+}
+
+/// A function that a binding calls back.
+pub(crate) struct Callback;
+
+impl Callback {
+	/// The function at `value`, the field at `path`.
+	///
+	/// # Errors
+	///
+	/// - `InvalidCallback` -- `value` is not a function.
+	pub(crate) fn read(value: &JsValue, path: &str) -> Result<Function, JsFault> {
+		let function = value.dyn_ref::<Function>().cloned();
+		function.ok_or_else(|| RefusalCode::InvalidCallback.because("must be a function").at(path))
+	}
+}
+
+/// A string that a binding reads.
+pub(crate) struct Text;
+
+impl Text {
+	/// The string at `value`, the field at `path`.
+	///
+	/// # Errors
+	///
+	/// - `InvalidText` -- `value` is not a string.
+	pub(crate) fn read(value: &JsValue, path: &str) -> Result<String, JsFault> {
+		let refusal = || RefusalCode::InvalidText.because("must be a string").at(path);
+		value.as_string().ok_or_else(refusal)
+	}
+}
+
 /// A plain JavaScript object: one a binding builds field by field, or one a
 /// caller hands over, read member by member.
 pub(crate) struct Record(Object);
@@ -187,7 +238,7 @@ impl Record {
 		Some(value)
 	}
 
-	/// Set `key` to `value`.
+	/// Write `value` at `key`, in place of any value the key held.
 	pub(crate) fn set(&self, key: &str, value: impl Into<JsValue>) {
 		// `Reflect::set` on a plain object that a record built cannot fail.
 		let _ = Reflect::set(&self.0, &JsValue::from_str(key), &value.into());
@@ -257,27 +308,52 @@ impl TryFrom<JsResponse> for JsValue {
 	}
 }
 
-/// A registered `abort` listener paired with the promise it resolves.
+/// A call whose binding runs its synchronous start before it returns the
+/// promise of its outcome.
 ///
-/// Detaches the listener and releases its closure on drop, so a
-/// registration whose signal never fires does not accumulate on the
-/// signal across repeated waits.
+/// - `future_to_promise` first polls a future on a later microtask, so a reservation such as the slot of a
+///   stream would land only after the next statement of the caller.
+/// - The first poll runs here instead, so the reservation lands before the binding returns.
+pub(crate) trait StartNow: Future<Output = Result<JsValue, JsValue>> + Sized + 'static {
+	/// The promise of this call, after its first poll.
+	fn start_now(self) -> Promise {
+		let mut call = Box::pin(self);
+		let waker = noop_waker();
+		let mut context = Context::from_waker(&waker);
+
+		match call.as_mut().poll(&mut context) {
+			Poll::Ready(Ok(value)) => Promise::resolve(&value),
+			Poll::Ready(Err(error)) => Promise::reject(&error),
+			Poll::Pending => future_to_promise(call),
+		}
+	}
+}
+
+impl<F: Future<Output = Result<JsValue, JsValue>> + 'static> StartNow for F {}
+
+/// A registered `abort` listener, as a future that is ready once the signal
+/// aborts.
+///
+/// - The listener wakes the task that last polled the watch, and the poll reads the aborted state of the
+///   signal itself.
+/// - The watch detaches the listener and releases its closure on drop, so no callback outlives the watch,
+///   and across repeated waits the signal holds the listeners of live watches alone.
 struct AbortWatch {
 	target: AbortSignal,
+	waker: Rc<Cell<Option<Waker>>>,
 	listener: Closure<dyn FnMut(JsValue)>,
 }
 
 impl AbortWatch {
-	/// Attach to `signal`, returning the watch guard and a promise
-	/// resolved (with `undefined`) on the signal's `abort` event.
-	fn attach(signal: &AbortSignal) -> (Self, Promise) {
+	/// Attach to `signal`.
+	fn attach(signal: &AbortSignal) -> Self {
 		let target = signal.clone();
-		let resolver: Rc<RefCell<Option<Function>>> = Rc::default();
+		let waker: Rc<Cell<Option<Waker>>> = Rc::default();
 
-		let slot = Rc::clone(&resolver);
+		let slot = Rc::clone(&waker);
 		let listener = Closure::once(move |_event: JsValue| {
-			if let Some(resolve) = slot.borrow_mut().take() {
-				let _ = resolve.call0(&JsValue::UNDEFINED);
+			if let Some(waker) = slot.take() {
+				waker.wake();
 			}
 		});
 
@@ -289,13 +365,20 @@ impl AbortWatch {
 			&options,
 		);
 
-		// The executor runs synchronously, filling the resolver slot the
-		// listener reads on dispatch.
-		let promise = Promise::new(&mut |resolve: Function, _reject: Function| {
-			resolver.borrow_mut().replace(resolve);
-		});
+		Self { target, waker, listener }
+	}
+}
 
-		(Self { target, listener }, promise)
+impl Future for AbortWatch {
+	type Output = ();
+
+	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+		if self.target.aborted() {
+			return Poll::Ready(());
+		}
+
+		self.waker.set(Some(cx.waker().clone()));
+		Poll::Pending
 	}
 }
 
@@ -339,11 +422,12 @@ pub(crate) trait AbortRace {
 
 	/// Race `future` against the signal, and decide the winner once.
 	///
-	/// The signal wins when it has aborted by the time the race returns:
-	/// before the future is polled, while the future is pending, or in the
-	/// turn the future settles. A win drops the future or the outcome it
-	/// settled with, so the drop path of the future is the cancellation. The
-	/// watch guard detaches the abort listener once the race settles.
+	/// - The signal wins when it has aborted by the time the race returns:
+	///   before the first poll, while the future is pending, or in the turn the
+	///   future settles.
+	/// - A win drops the future or its outcome, so the drop path of the future
+	///   is the cancellation.
+	/// - The abort listener detaches once the race settles.
 	async fn race<F: Future>(&self, future: F) -> Raced<F::Output>;
 }
 
@@ -361,15 +445,12 @@ impl AbortRace for AbortSignal {
 			return Raced::Aborted(reason);
 		}
 
-		let (watch, abort) = AbortWatch::attach(self);
+		let watch = AbortWatch::attach(self);
 		let pending = Box::pin(future);
-		let aborted = Box::pin(JsFuture::from(abort));
 
-		let first = select(pending, aborted).await;
-		drop(watch);
-
+		let first = select(pending, watch).await;
 		let settled = match first {
-			Either::Left((settled, _)) => settled,
+			Either::Left((settled, _watch)) => settled,
 			Either::Right((_, pending)) => {
 				drop(pending);
 				return Raced::Aborted(self.reason());
@@ -399,12 +480,18 @@ impl AbortRace for Option<AbortSignal> {
 
 #[cfg(test)]
 mod tests {
+	use futures_util::future::{join, pending, ready};
 	use js_sys::{Array, Function, Object, Reflect, Uint16Array, Uint8Array};
 	use wasm_bindgen::closure::Closure;
-	use wasm_bindgen::JsValue;
+	use wasm_bindgen::{externref_heap_live_count, JsValue};
 	use wasm_bindgen_test::wasm_bindgen_test;
+	use web_sys::AbortController;
 
-	use super::{JsBytes, Returned};
+	use super::{AbortRace, JsBytes, Raced, Returned};
+	use crate::loopback::settled;
+
+	/// The races that the leak case runs, each of which the call wins.
+	const RACES: u32 = 8;
 
 	/// An object that is no promise, whose `then` resolves with `value`.
 	fn thenable_of(value: JsValue) -> Object {
@@ -441,9 +528,42 @@ mod tests {
 	}
 
 	#[wasm_bindgen_test]
+	fn a_detached_uint8array_is_no_bytes() {
+		let bytes = Uint8Array::from([1u8, 2, 3].as_slice());
+		let transferred = bytes.buffer().transfer();
+		transferred.expect("the host should detach the buffer");
+
+		assert!(JsBytes::recognize(&bytes).is_none());
+	}
+
+	#[wasm_bindgen_test]
+	async fn a_race_that_the_call_wins_leaves_no_javascript_value_held() {
+		let controller = AbortController::new().expect("the host should build an AbortController");
+		let signal = controller.signal();
+
+		let before = externref_heap_live_count();
+		for _ in 0..RACES {
+			let raced = signal.race(ready(())).await;
+			assert!(matches!(raced, Raced::Settled(())));
+		}
+
+		assert_eq!(externref_heap_live_count(), before);
+	}
+
+	#[wasm_bindgen_test]
+	async fn an_abort_while_the_call_waits_wins_the_race() {
+		let controller = AbortController::new().expect("the host should build an AbortController");
+		let signal = controller.signal();
+		let aborting = async { controller.abort() };
+
+		let (raced, ()) = settled(join(signal.race(pending::<()>()), aborting)).await;
+		assert!(matches!(raced, Raced::Aborted(reason) if reason == signal.reason()));
+	}
+
+	#[wasm_bindgen_test]
 	async fn a_thenable_settles_with_its_value() {
 		let thenable: JsValue = thenable_of(JsValue::from_f64(42.0)).into();
-		let settled = Returned::from(thenable).settle().await;
-		assert_eq!(settled.map(|value| value.as_f64()), Ok(Some(42.0)));
+		let answered = settled(Returned::from(thenable).settle()).await;
+		assert_eq!(answered.map(|value| value.as_f64()), Ok(Some(42.0)));
 	}
 }

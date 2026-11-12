@@ -1,10 +1,6 @@
 /**
- * The pull bridge between push delivery and async iteration.
- *
- * The manager delivers updates one at a time and awaits each delivery
- * before acknowledging the stream. `put` resolves only when the
- * consumer takes the item, so an un-iterated subscription back-pressures
- * the server's delivery lane exactly like a slow handler.
+ * The channel that hands each update of an iterating subscription to its
+ * one iterator, whose producer waits for each take.
  */
 
 /**
@@ -41,9 +37,8 @@ export class PullChannel<I> {
 	 * End the stream: queued items still drain, then every `next` call
 	 * resolves done. Idempotent.
 	 *
-	 * Parked producers release immediately - their delivery (and the
-	 * stream acknowledgment behind it) must settle even if nobody ever
-	 * takes the item.
+	 * Parked producers release at once, so their delivery and the stream
+	 * acknowledgment behind it settle even when no consumer takes the item.
 	 */
 	finish(): void {
 		this.done = true;

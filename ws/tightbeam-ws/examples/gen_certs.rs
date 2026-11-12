@@ -1,7 +1,5 @@
-//! Generate X.509 identity fixtures for the encrypted end-to-end stack.
-//!
-//! Creates a server and a client self-signed identity and writes each as
-//! a DER certificate plus a raw 32-byte signing key under `CERT_DIR`.
+//! Write the server and the client identity of the e2e stack under
+//! `CERT_DIR`, as `docs/ws.md` (Demo servers) states it.
 //!
 //! Usage:
 //!

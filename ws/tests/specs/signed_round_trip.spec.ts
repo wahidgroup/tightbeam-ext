@@ -4,23 +4,17 @@ import { expect, test } from "@playwright/test";
 import { STACK } from "../stack.js";
 import { openApp } from "./helpers.js";
 
-test("signs a frame, echoes it, and verifies the round-tripped signature", async ({
-	page,
-}) => {
+test("signs a frame, echoes it, and verifies the round-tripped signature", async ({ page }) => {
 	await openApp(page);
 
-	const result: SignedRoundTripResult = await page.evaluate(
-		({ url }) =>
-			window.tbSignedRoundTrip(
-				url,
-				"cafebabe0042",
-				"e2e-signed",
-				13,
-				"0101010101010101010101010101010101010101010101010101010101010101",
-				"5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
-			),
-		{ url: STACK.muxClearEndpoint },
-	);
+	const result: SignedRoundTripResult = await page.evaluate((echo) => window.tb.signedRoundTrip(echo), {
+		url: STACK.muxClearEndpoint,
+		payloadHex: "cafebabe0042",
+		idText: "e2e-signed",
+		order: 13,
+		signingKeyHex: "01".repeat(32),
+		saltHex: "5a".repeat(16),
+	});
 	expect(result.bodyHex).toBe("cafebabe0042");
 	expect(result.idText).toBe("e2e-signed");
 	expect(result.order).toBe("13");

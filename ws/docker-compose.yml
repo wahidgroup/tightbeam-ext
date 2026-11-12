@@ -1,36 +1,32 @@
-# Self-contained e2e stack: multiplexed tightbeam-ws echo servers
-# (encrypted, cleartext, and mutual-auth encrypted) sharing one image.
-#
-# The image is built by scripts/stack.sh. Identity fixtures are generated on
-# the host (gen_certs) and bind-mounted read-only under /certs. The demo
-# stream cap and paywall facts come from scripts/stack-env.sh, and a missing
-# one refuses to start the stack.
+# The ws services of the e2e stack, as docs/ws.md (Demo servers) states them.
 
 services:
   echo-server-mux:
-    image: ${ECHO_IMAGE:-tightbeam-ws-echo:dev}
+    image: ${ECHO_IMAGE:?}
     environment:
-      ECHO_WS_PORT: "9100"
+      ECHO_WS_PORT: &echo-mux-port 9100
       MUX_STREAMS: "${MUX_STREAMS:?}"
       TBWS_SERVER_CERT: /certs/server.cert.der
     volumes:
       - ${CERT_DIR:?}:/certs:ro
     ports:
-      - "${ECHO_WS_MUX_HOST_PORT:-9100}:9100"
+      - target: *echo-mux-port
+        published: "${ECHO_WS_MUX_HOST_PORT:?}"
 
   echo-server-mux-clear:
-    image: ${ECHO_IMAGE:-tightbeam-ws-echo:dev}
+    image: ${ECHO_IMAGE:?}
     command: ["echo-server-mux-clear"]
     environment:
-      ECHO_WS_PORT: "9101"
+      ECHO_WS_PORT: &echo-mux-clear-port 9101
       MUX_STREAMS: "${MUX_STREAMS:?}"
     ports:
-      - "${ECHO_WS_MUX_CLEAR_HOST_PORT:-9101}:9101"
+      - target: *echo-mux-clear-port
+        published: "${ECHO_WS_MUX_CLEAR_HOST_PORT:?}"
 
   echo-server-mux-mutual:
-    image: ${ECHO_IMAGE:-tightbeam-ws-echo:dev}
+    image: ${ECHO_IMAGE:?}
     environment:
-      ECHO_WS_PORT: "9102"
+      ECHO_WS_PORT: &echo-mux-mutual-port 9102
       MUX_STREAMS: "${MUX_STREAMS:?}"
       TBWS_SERVER_CERT: /certs/server.cert.der
       TBWS_CLIENT_CERT: /certs/client.cert.der
@@ -42,30 +38,34 @@ services:
     volumes:
       - ${CERT_DIR:?}:/certs:ro
     ports:
-      - "${ECHO_WS_MUX_MUTUAL_HOST_PORT:-9102}:9102"
+      - target: *echo-mux-mutual-port
+        published: "${ECHO_WS_MUX_MUTUAL_HOST_PORT:?}"
 
   # Cleartext duplex body echo for openDuplex e2e (TBWS_ECHO_BODY=duplex).
   echo-server-mux-duplex:
-    image: ${ECHO_IMAGE:-tightbeam-ws-echo:dev}
+    image: ${ECHO_IMAGE:?}
     command: ["echo-server-mux-clear"]
     environment:
-      ECHO_WS_PORT: "9103"
+      ECHO_WS_PORT: &echo-mux-duplex-port 9103
       MUX_STREAMS: "${MUX_STREAMS:?}"
       TBWS_ECHO_BODY: duplex
     ports:
-      - "${ECHO_WS_MUX_DUPLEX_HOST_PORT:-9103}:9103"
+      - target: *echo-mux-duplex-port
+        published: "${ECHO_WS_MUX_DUPLEX_HOST_PORT:?}"
 
-  # Cluster work-plane gateway: a real gateway, hive, and work-probe servlet
+  # Cluster work-plane gateway: a real gateway, hive, and probe servlet
   # in one process. The browser pins the server certificate for transport
   # encryption and shares the client identity as the end-to-end work signer.
   work-gateway:
-    image: ${ECHO_IMAGE:-tightbeam-ws-echo:dev}
+    image: ${ECHO_IMAGE:?}
     command: ["work-gateway-server"]
     environment:
-      ECHO_WS_PORT: "9104"
+      ECHO_WS_PORT: &work-gateway-port 9104
       TBWS_SERVER_CERT: /certs/server.cert.der
       TBWS_WORK_CERT: /certs/client.cert.der
+      TBWS_WORK_SERVLET: "${TBWS_WORK_SERVLET:?}"
     volumes:
       - ${CERT_DIR:?}:/certs:ro
     ports:
-      - "${WORK_GATEWAY_WS_HOST_PORT:-9104}:9104"
+      - target: *work-gateway-port
+        published: "${WORK_GATEWAY_WS_HOST_PORT:?}"

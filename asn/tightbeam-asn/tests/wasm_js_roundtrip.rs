@@ -14,7 +14,7 @@ mod fixtures;
 
 use fixtures::{
 	sample_leaf_bundle, sample_nest_bundle, Ack, Doc, Envelope, LeafBundle, ListPad, ListResult, NestBundle, Record,
-	RegisterBody, Request, Status,
+	RegisterBody, Request, Routed, Status,
 };
 
 fn assert_js_round_trip<T>(value: &T)
@@ -52,6 +52,16 @@ fn set_field(object: &JsValue, key: &str, value: &JsValue) {
 	};
 }
 
+/// `sample` with its `field` set to `value` in JavaScript, then read back.
+fn with_field<T: AsnCodec>(sample: &T, field: &str, value: &JsValue) -> Result<T, FieldError> {
+	let Ok(js) = sample.to_js() else {
+		panic!("to_js");
+	};
+
+	set_field(&js, field, value);
+	T::from_js(&js)
+}
+
 #[wasm_bindgen_test]
 fn doc_js_round_trip() {
 	assert_js_round_trip(&Doc { title: "typed-body".into() });
@@ -68,6 +78,11 @@ fn status_js_round_trip() {
 fn request_js_round_trip() {
 	assert_js_round_trip(&Request::Register(RegisterBody { doc: Doc { title: "leaf".into() } }));
 	assert_js_round_trip(&Request::List(ListPad { pad: 0 }));
+}
+
+#[wasm_bindgen_test]
+fn routed_js_round_trip() {
+	assert_js_round_trip(&Routed { r#type: Status::InvalidRequest, request: Request::List(ListPad { pad: 0 }) });
 }
 
 #[wasm_bindgen_test]
@@ -280,52 +295,90 @@ fn leaf_bundle_from_plain_js_object() {
 	assert_eq!(from_der, expected, "LeafBundle der oracle");
 }
 
+/// The refusal of a `u64_value` that is no bigint in the u64 range.
+const U64_REFUSAL: &str = "u64_value: expected a bigint in the u64 range";
+
+/// The refusal of an `i64_value` that is no bigint in the i64 range.
+const I64_REFUSAL: &str = "i64_value: expected a bigint in the i64 range";
+
 #[wasm_bindgen_test]
-fn u64_rejects_js_number_accepts_bigint() {
-	let mut value = sample_leaf_bundle();
-	value.u64_value = 42;
+fn a_u64_refuses_a_number() {
+	let read = with_field(&sample_leaf_bundle(), "u64_value", &JsValue::from(42.0));
 
-	let Ok(js) = value.to_js() else {
-		panic!("to_js");
-	};
-
-	set_field(&js, "u64_value", &JsValue::from(42.0));
-
-	let Err(_) = LeafBundle::from_js(&js) else {
-		panic!("u64 must reject JS number");
-	};
-
-	set_field(&js, "u64_value", &JsValue::from(BigInt::from(42_u64)));
-
-	let Ok(decoded) = LeafBundle::from_js(&js) else {
-		panic!("u64 must accept bigint");
-	};
-
-	assert_eq!(decoded.u64_value, 42, "u64 bigint");
+	let refusal = read.err().map(|error| error.to_string());
+	assert_eq!(refusal.as_deref(), Some(U64_REFUSAL));
 }
 
 #[wasm_bindgen_test]
-fn i64_rejects_js_number_accepts_bigint() {
-	let mut value = sample_leaf_bundle();
-	value.i64_value = -42;
+fn a_u64_refuses_a_bigint_below_zero() {
+	let below = BigInt::from(-1_i64);
+	let read = with_field(&sample_leaf_bundle(), "u64_value", &JsValue::from(below));
 
-	let Ok(js) = value.to_js() else {
-		panic!("to_js");
-	};
+	let refusal = read.err().map(|error| error.to_string());
+	assert_eq!(refusal.as_deref(), Some(U64_REFUSAL));
+}
 
-	set_field(&js, "i64_value", &JsValue::from(-42.0));
+#[wasm_bindgen_test]
+fn a_u64_refuses_a_bigint_past_its_maximum() {
+	let past = BigInt::from(u128::from(u64::MAX) + 1);
+	let read = with_field(&sample_leaf_bundle(), "u64_value", &JsValue::from(past));
 
-	let Err(_) = LeafBundle::from_js(&js) else {
-		panic!("i64 must reject JS number");
-	};
+	let refusal = read.err().map(|error| error.to_string());
+	assert_eq!(refusal.as_deref(), Some(U64_REFUSAL));
+}
 
-	set_field(&js, "i64_value", &JsValue::from(BigInt::from(-42_i64)));
+#[wasm_bindgen_test]
+fn a_u64_takes_zero() {
+	let read = with_field(&sample_leaf_bundle(), "u64_value", &JsValue::from(BigInt::from(0_u64)));
 
-	let Ok(decoded) = LeafBundle::from_js(&js) else {
-		panic!("i64 must accept bigint");
-	};
+	assert_eq!(read.map(|bundle| bundle.u64_value), Ok(0));
+}
 
-	assert_eq!(decoded.i64_value, -42, "i64 bigint");
+#[wasm_bindgen_test]
+fn a_u64_takes_its_maximum() {
+	let read = with_field(&sample_leaf_bundle(), "u64_value", &JsValue::from(BigInt::from(u64::MAX)));
+
+	assert_eq!(read.map(|bundle| bundle.u64_value), Ok(u64::MAX));
+}
+
+#[wasm_bindgen_test]
+fn an_i64_refuses_a_number() {
+	let read = with_field(&sample_leaf_bundle(), "i64_value", &JsValue::from(-42.0));
+
+	let refusal = read.err().map(|error| error.to_string());
+	assert_eq!(refusal.as_deref(), Some(I64_REFUSAL));
+}
+
+#[wasm_bindgen_test]
+fn an_i64_refuses_a_bigint_below_its_minimum() {
+	let below = BigInt::from(i128::from(i64::MIN) - 1);
+	let read = with_field(&sample_leaf_bundle(), "i64_value", &JsValue::from(below));
+
+	let refusal = read.err().map(|error| error.to_string());
+	assert_eq!(refusal.as_deref(), Some(I64_REFUSAL));
+}
+
+#[wasm_bindgen_test]
+fn an_i64_refuses_a_bigint_past_its_maximum() {
+	let past = BigInt::from(i128::from(i64::MAX) + 1);
+	let read = with_field(&sample_leaf_bundle(), "i64_value", &JsValue::from(past));
+
+	let refusal = read.err().map(|error| error.to_string());
+	assert_eq!(refusal.as_deref(), Some(I64_REFUSAL));
+}
+
+#[wasm_bindgen_test]
+fn an_i64_takes_its_minimum() {
+	let read = with_field(&sample_leaf_bundle(), "i64_value", &JsValue::from(BigInt::from(i64::MIN)));
+
+	assert_eq!(read.map(|bundle| bundle.i64_value), Ok(i64::MIN));
+}
+
+#[wasm_bindgen_test]
+fn an_i64_takes_its_maximum() {
+	let read = with_field(&sample_leaf_bundle(), "i64_value", &JsValue::from(BigInt::from(i64::MAX)));
+
+	assert_eq!(read.map(|bundle| bundle.i64_value), Ok(i64::MAX));
 }
 
 #[wasm_bindgen_test]
@@ -359,12 +412,7 @@ fn integers(length: u8) -> JsValue {
 
 /// A `NestBundle` whose `field` holds the integers from 1 to `length`.
 fn bundle_with(field: &str, length: u8) -> Result<NestBundle, FieldError> {
-	let Ok(js) = sample_nest_bundle().to_js() else {
-		panic!("to_js");
-	};
-
-	set_field(&js, field, &integers(length));
-	NestBundle::from_js(&js)
+	with_field(&sample_nest_bundle(), field, &integers(length))
 }
 
 /// `field` takes `length` elements and round-trips them.
@@ -497,6 +545,18 @@ fn an_object_without_a_prototype_is_an_object() {
 		panic!("a null-prototype object carries fields");
 	};
 	assert_eq!(doc.title, "bare");
+}
+
+#[wasm_bindgen_test]
+fn a_key_of_the_prototype_is_no_field() {
+	let prototype = Object::new();
+	set_field(&prototype, "error", &JsValue::from(1.0));
+	let inherited = Object::create(&prototype);
+
+	let Ok(ack) = Ack::from_js(&inherited) else {
+		panic!("an inherited error is an absent OPTIONAL");
+	};
+	assert_eq!(ack, Ack { error: None });
 }
 
 #[wasm_bindgen_test]

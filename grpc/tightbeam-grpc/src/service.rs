@@ -3,6 +3,7 @@
 
 use core::convert::Infallible;
 use core::marker::PhantomData;
+use core::num::NonZeroU32;
 use core::task::{Context, Poll};
 
 #[cfg(feature = "couple")]
@@ -13,25 +14,18 @@ use http::request::Parts;
 use http::{HeaderValue, Method, Request as HttpRequest, Response as HttpResponse};
 use tonic::body::Body;
 use tonic::metadata::GRPC_CONTENT_TYPE;
-use tonic::server::{Grpc, UnaryService};
-use tonic::{Request, Response, Status};
 use tower_service::Service;
 
 use tightbeam::transport::handshake::HandshakeProvider;
 
-use crate::health::{HealthStatus, HEALTH_CHECK_PATH};
-use crate::tunnel::{BoxFuture, Refusal, RefusalAudit, TunnelCall, TunnelCodec, TunnelService, TUNNEL_PATH};
+#[cfg(feature = "couple")]
+use tokio::sync::Semaphore;
+
+use crate::health::{HealthStatus, WatchTerms, HEALTH_CHECK_PATH, HEALTH_WATCH_PATH};
+use crate::tunnel::{BoxFuture, CallRefusal, EdgeAudit, HeadRefusal, TunnelCall, TunnelService, TUNNEL_PATH};
 
 #[cfg(feature = "couple")]
-use crate::couple::{CallFault, LiveCoupler};
-#[cfg(feature = "couple")]
-use crate::incoming::GrpcConnectInfo;
-#[cfg(feature = "couple")]
-use tokio::time::timeout_at;
-
-/// The largest health check request an edge decodes: the request names a
-/// service, and the edge answers for the empty one alone.
-const HEALTH_CEILING: usize = 1024;
+use crate::couple::{LiveCoupler, WebCall};
 
 /// Whether `content_type` is `application/grpc`, in any case, alone, with a
 /// `+` subtype, or with `;` parameters after optional whitespace (RFC 9110
@@ -48,6 +42,71 @@ fn is_grpc(content_type: &[u8]) -> bool {
 
 	let parameters = rest.trim_ascii_start();
 	rest.starts_with(b"+") || parameters.is_empty() || parameters.starts_with(b";")
+}
+
+/// A path that the edge serves ahead of the routes of its coupler, so no
+/// route takes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EdgePath {
+	/// The tunnel.
+	Tunnel,
+	/// The health check.
+	HealthCheck,
+	/// The health watch.
+	HealthWatch,
+	/// A method of server reflection, which a coupled edge serves when it is
+	/// configured.
+	Reflection(ReflectionVersion),
+}
+
+/// The version of server reflection that a path calls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReflectionVersion {
+	/// Version 1.
+	V1,
+	/// Version 1alpha, which older clients call.
+	V1Alpha,
+}
+
+/// One value for each version of server reflection.
+#[cfg(feature = "couple")]
+#[derive(Clone)]
+pub(crate) struct Versions<T> {
+	/// The value of version 1.
+	pub(crate) v1: T,
+	/// The value of version 1alpha.
+	pub(crate) v1alpha: T,
+}
+
+impl ReflectionVersion {
+	/// The value of `versions` that this version calls.
+	#[cfg(feature = "couple")]
+	pub(crate) fn of<T>(self, versions: &Versions<T>) -> &T {
+		match self {
+			Self::V1 => &versions.v1,
+			Self::V1Alpha => &versions.v1alpha,
+		}
+	}
+}
+
+impl EdgePath {
+	/// The path prefix of server reflection, version 1.
+	const REFLECTION_V1: &'static str = "/grpc.reflection.v1.ServerReflection/";
+
+	/// The path prefix of server reflection, version 1alpha.
+	const REFLECTION_V1ALPHA: &'static str = "/grpc.reflection.v1alpha.ServerReflection/";
+
+	/// The edge path of `path`, or `None` for a path that a route may take.
+	pub(crate) fn of(path: &str) -> Option<Self> {
+		match path {
+			TUNNEL_PATH => Some(Self::Tunnel),
+			HEALTH_CHECK_PATH => Some(Self::HealthCheck),
+			HEALTH_WATCH_PATH => Some(Self::HealthWatch),
+			_ if path.starts_with(Self::REFLECTION_V1) => Some(Self::Reflection(ReflectionVersion::V1)),
+			_ if path.starts_with(Self::REFLECTION_V1ALPHA) => Some(Self::Reflection(ReflectionVersion::V1Alpha)),
+			_ => None,
+		}
+	}
 }
 
 /// What an edge serves beside its tunnel.
@@ -73,28 +132,68 @@ impl<P: HandshakeProvider + Send + Sync + 'static> Clone for Served<P> {
 enum Arm {
 	Tunnel(TunnelCall),
 	Health(HealthStatus),
-	/// A path other than the tunnel and the health check, which the coupler
-	/// of a coupled edge serves.
-	Routed,
-	Refused(Refusal),
+	Watch(WatchTerms),
+	/// A path other than the tunnel and the two health calls, which the coupler
+	/// of a coupled edge serves, with the version of server reflection that
+	/// the path calls.
+	Routed(Option<ReflectionVersion>),
+	/// A request that is no gRPC call.
+	Head(HeadRefusal),
+	/// A tunnel call that the edge refuses.
+	Refused(CallRefusal),
 }
 
 impl<P: HandshakeProvider + Send + Sync + 'static> Served<P> {
 	/// The one parse of `head`.
 	fn arm(&self, head: &Parts) -> Arm {
 		if head.method != Method::POST {
-			return Arm::Refused(Refusal::Method);
+			return Arm::Head(HeadRefusal::Method);
 		}
 
 		let content_type = head.headers.get(CONTENT_TYPE).map(HeaderValue::as_bytes);
 		if !content_type.is_some_and(is_grpc) {
-			return Arm::Refused(Refusal::MediaType);
+			return Arm::Head(HeadRefusal::MediaType);
 		}
 
-		match head.uri.path() {
-			TUNNEL_PATH => TunnelCall::claim(head).map_or_else(Arm::Refused, Arm::Tunnel),
-			HEALTH_CHECK_PATH => Arm::Health(self.health()),
-			_ => Arm::Routed,
+		match EdgePath::of(head.uri.path()) {
+			Some(EdgePath::Tunnel) => TunnelCall::claim(head).map_or_else(Arm::Refused, Arm::Tunnel),
+			Some(EdgePath::HealthCheck) => Arm::Health(self.health()),
+			Some(EdgePath::HealthWatch) => Arm::Watch(self.watch(head)),
+			Some(EdgePath::Reflection(version)) => Arm::Routed(Some(version)),
+			None => Arm::Routed(None),
+		}
+	}
+
+	/// The terms of a health watch on the connection of `head`: the status of
+	/// a tunnel edge, which stays fixed, or the serving state of a coupled
+	/// edge.
+	#[cfg_attr(not(feature = "couple"), allow(unused_variables))]
+	fn watch(&self, head: &Parts) -> WatchTerms {
+		match self {
+			Self::Tunnel(_) => WatchTerms::steady(HealthStatus::Serving),
+			#[cfg(feature = "couple")]
+			Self::Coupled(coupler) => coupler.watch(head),
+		}
+	}
+
+	/// The HTTP/2 streams that a connection of the edge admits at once: one
+	/// for a tunnel edge, which carries one tunnel per connection, and the
+	/// stream limit of the coupler for a coupled edge.
+	pub(crate) fn streams(&self) -> NonZeroU32 {
+		match self {
+			Self::Tunnel(_) => NonZeroU32::MIN,
+			#[cfg(feature = "couple")]
+			Self::Coupled(coupler) => coupler.streams(),
+		}
+	}
+
+	/// The permits of the coupled connections of the edge, which only a
+	/// coupled edge holds.
+	#[cfg(feature = "couple")]
+	pub(crate) fn lanes(&self) -> Option<Arc<Semaphore>> {
+		match self {
+			Self::Tunnel(_) => None,
+			Self::Coupled(coupler) => Some(coupler.lanes()),
 		}
 	}
 
@@ -108,54 +207,38 @@ impl<P: HandshakeProvider + Send + Sync + 'static> Served<P> {
 		}
 	}
 
-	/// Serve a call on a routed path: steps 1 and 2 of the coupler, then its
-	/// unary call, on a coupled edge, and a refusal of the path otherwise.
+	/// Serve a call on a routed path, which calls the version `reflection` of
+	/// server reflection when it is `Some`: the coupler on a coupled edge, and
+	/// a refusal of the path otherwise, which `audit` records.
 	#[cfg_attr(not(feature = "couple"), allow(unused_variables))]
-	async fn route(&self, refusals: &RefusalAudit, request: HttpRequest<Body>) -> HttpResponse<Body> {
+	async fn route(
+		&self,
+		audit: &EdgeAudit,
+		reflection: Option<ReflectionVersion>,
+		request: HttpRequest<Body>,
+	) -> HttpResponse<Body> {
 		match self {
-			Self::Tunnel(_) => {
-				refusals.refused(&Refusal::Path);
-				Refusal::Path.into()
-			}
+			Self::Tunnel(_) => audit.status(CallRefusal::Path).into_http(),
 			#[cfg(feature = "couple")]
-			Self::Coupled(coupler) => Self::couple(Arc::clone(coupler), request).await,
+			Self::Coupled(coupler) => Arc::clone(coupler).route(reflection, request).await,
 		}
 	}
 
-	/// Steps 1 and 2 of the coupler on `request`, then the unary call that
-	/// runs the rest of its saga once tonic decodes the body. The deadline of
-	/// the call bounds both, so a caller that withholds its body holds its
-	/// lane no longer than its deadline.
+	/// What `request` is to the gRPC-Web arm of the edge: every call of an
+	/// edge with no gRPC-Web is native.
 	#[cfg(feature = "couple")]
-	async fn couple(coupler: Arc<LiveCoupler<P>>, request: HttpRequest<Body>) -> HttpResponse<Body> {
-		let (head, body) = request.into_parts();
-		let parsed = match coupler.head(&head) {
-			Ok(parsed) => parsed,
-			Err(fault) => return coupler.refused(fault).into_http(),
-		};
-
-		let lane = head.extensions.get::<GrpcConnectInfo>().map(|connection| &connection.lane);
-		let Some(slot) = lane.and_then(crate::incoming::Lane::open_coupled) else {
-			return coupler.refused(CallFault::Unavailable).into_http();
-		};
-
-		let expires = parsed.expires();
-		let opened = parsed.opened(slot);
-		let request = HttpRequest::from_parts(head, body);
-		let ceiling = coupler.ceiling();
-
-		let grpc = Grpc::new(TunnelCodec).max_decoding_message_size(ceiling);
-		let mut grpc = grpc.max_encoding_message_size(ceiling);
-		let call = CoupledCall { coupler: Arc::clone(&coupler), opened: Some(opened) };
-		let answered = timeout_at(expires, grpc.unary(call, request)).await;
-		answered.unwrap_or_else(|_| coupler.refused(CallFault::Deadline).into_http())
+	fn web_call(&self, request: &HttpRequest<Body>) -> WebCall {
+		match self {
+			Self::Tunnel(_) => WebCall::Native,
+			Self::Coupled(coupler) => coupler.web_call(request.method(), request.headers()),
+		}
 	}
 }
 
 /// The service of an edge server.
 pub(crate) struct EdgeService<P: HandshakeProvider + Send + Sync + 'static> {
 	tunnel: TunnelService,
-	refusals: RefusalAudit,
+	audit: EdgeAudit,
 	served: Served<P>,
 }
 
@@ -163,7 +246,7 @@ impl<P: HandshakeProvider + Send + Sync + 'static> Clone for EdgeService<P> {
 	fn clone(&self) -> Self {
 		Self {
 			tunnel: self.tunnel.clone(),
-			refusals: self.refusals.clone(),
+			audit: self.audit.clone(),
 			served: self.served.clone(),
 		}
 	}
@@ -171,9 +254,49 @@ impl<P: HandshakeProvider + Send + Sync + 'static> Clone for EdgeService<P> {
 
 impl<P: HandshakeProvider + Send + Sync + 'static> EdgeService<P> {
 	/// The service that serves `tunnel` and what `served` names, and records
-	/// each refusal of a head on `refusals`.
-	pub(crate) fn new(tunnel: TunnelService, refusals: RefusalAudit, served: Served<P>) -> Self {
-		Self { tunnel, refusals, served }
+	/// each refusal of a head on `audit`.
+	pub(crate) fn new(tunnel: TunnelService, audit: EdgeAudit, served: Served<P>) -> Self {
+		Self { tunnel, audit, served }
+	}
+}
+
+impl<P: HandshakeProvider + Send + Sync + 'static> EdgeService<P> {
+	/// Serve `request` by the arm that the one parse of its head picks.
+	async fn serve(self, request: HttpRequest<Body>) -> Result<HttpResponse<Body>, Infallible> {
+		let (head, body) = request.into_parts();
+		let arm = self.served.arm(&head);
+		let request = HttpRequest::from_parts(head, body);
+
+		let response = match arm {
+			Arm::Tunnel(call) => self.tunnel.serve(call, request).await,
+			Arm::Health(status) => status.serve(request).await,
+			Arm::Watch(terms) => terms.serve(request).await,
+			Arm::Routed(reflection) => self.served.route(&self.audit, reflection, request).await,
+			Arm::Head(refusal) => self.audit.answer(refusal),
+			Arm::Refused(refusal) => self.audit.status(refusal).into_http(),
+		};
+		Ok(response)
+	}
+}
+
+/// The native arm of an edge, which a gRPC-Web call reaches once tonic-web
+/// translates it. It serves each call as native, so each call translates
+/// once.
+#[cfg(feature = "couple")]
+struct NativeEdge<P: HandshakeProvider + Send + Sync + 'static>(EdgeService<P>);
+
+#[cfg(feature = "couple")]
+impl<P: HandshakeProvider + Send + Sync + 'static> Service<HttpRequest<Body>> for NativeEdge<P> {
+	type Response = HttpResponse<Body>;
+	type Error = Infallible;
+	type Future = BoxFuture<Result<Self::Response, Infallible>>;
+
+	fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Infallible>> {
+		Poll::Ready(Ok(()))
+	}
+
+	fn call(&mut self, request: HttpRequest<Body>) -> Self::Future {
+		Box::pin(self.0.clone().serve(request))
 	}
 }
 
@@ -189,65 +312,14 @@ impl<P: HandshakeProvider + Send + Sync + 'static> Service<HttpRequest<Body>> fo
 	fn call(&mut self, request: HttpRequest<Body>) -> Self::Future {
 		let service = self.clone();
 
-		Box::pin(async move {
-			let (head, body) = request.into_parts();
-			let arm = service.served.arm(&head);
-			let request = HttpRequest::from_parts(head, body);
+		#[cfg(feature = "couple")]
+		{
+			let call = service.served.web_call(&request);
+			call.serve(request, NativeEdge(service))
+		}
 
-			let response = match arm {
-				Arm::Tunnel(call) => service.tunnel.serve(call, request).await,
-				Arm::Health(status) => {
-					let mut grpc = Grpc::new(TunnelCodec).max_decoding_message_size(HEALTH_CEILING);
-					grpc.unary(HealthCall(status), request).await
-				}
-				Arm::Routed => service.served.route(&service.refusals, request).await,
-				Arm::Refused(refusal) => {
-					service.refusals.refused(&refusal);
-					refusal.into()
-				}
-			};
-			Ok(response)
-		})
-	}
-}
-
-/// The unary health check of one call.
-struct HealthCall(HealthStatus);
-
-impl UnaryService<Vec<u8>> for HealthCall {
-	type Response = Vec<u8>;
-	type Future = core::future::Ready<Result<Response<Vec<u8>>, Status>>;
-
-	fn call(&mut self, request: Request<Vec<u8>>) -> Self::Future {
-		let answer = self.0.answer(request.get_ref());
-		core::future::ready(answer)
-	}
-}
-
-/// The unary call that the coupler serves: steps 3 to 9 of its saga, once
-/// tonic decodes the body.
-#[cfg(feature = "couple")]
-struct CoupledCall<P: HandshakeProvider + Send + Sync + 'static> {
-	coupler: Arc<LiveCoupler<P>>,
-	/// tonic calls the service once, but its trait takes `&mut self`, so the
-	/// call moves out of an option.
-	opened: Option<crate::couple::Opened>,
-}
-
-#[cfg(feature = "couple")]
-impl<P: HandshakeProvider + Send + Sync + 'static> UnaryService<Vec<u8>> for CoupledCall<P> {
-	type Response = Vec<u8>;
-	type Future = BoxFuture<Result<Response<Vec<u8>>, Status>>;
-
-	fn call(&mut self, request: Request<Vec<u8>>) -> Self::Future {
-		let coupler = Arc::clone(&self.coupler);
-		let opened = self.opened.take();
-
-		Box::pin(async move {
-			let opened = opened.ok_or_else(|| Status::internal("the coupler serves one call"))?;
-			let served = coupler.serve(opened, request.into_inner()).await;
-			served.map_err(|fault| fault.status())?.into_response()
-		})
+		#[cfg(not(feature = "couple"))]
+		Box::pin(service.serve(request))
 	}
 }
 
@@ -278,10 +350,10 @@ mod tests {
 		assert!(!refused.into_iter().any(is_grpc));
 	}
 
-	/// The head of a call with `method`, on `path`, under `content_type`.
-	fn head(method: Method, path: &str, content_type: &str) -> Result<Parts, http::Error> {
+	/// The head of a call with `method`, on `path`, under `application/grpc`.
+	fn head(method: Method, path: &str) -> Result<Parts, http::Error> {
 		let request = HttpRequest::builder().method(method).uri(path);
-		let request = request.header(CONTENT_TYPE, content_type).body(())?;
+		let request = request.header(CONTENT_TYPE, "application/grpc").body(())?;
 		let (head, ()) = request.into_parts();
 		Ok(head)
 	}
@@ -290,30 +362,48 @@ mod tests {
 	fn a_head_the_edge_cannot_carry_is_refused_before_it_claims_a_lane() -> Result<(), http::Error> {
 		type Default = tightbeam::crypto::profiles::DefaultCryptoProvider;
 		let served = Served::<Default>::Tunnel(PhantomData);
+		let mut text = head(Method::POST, TUNNEL_PATH)?;
+		text.headers.insert(CONTENT_TYPE, http::HeaderValue::from_static("text/plain"));
 		let cases = [
-			(head(Method::GET, TUNNEL_PATH, "application/grpc")?, Refusal::Method),
-			(head(Method::POST, TUNNEL_PATH, "text/plain")?, Refusal::MediaType),
-			(head(Method::POST, TUNNEL_PATH, "application/grpc")?, Refusal::Unconnected),
+			(head(Method::GET, TUNNEL_PATH)?, HeadRefusal::Method),
+			(text, HeadRefusal::MediaType),
 		];
 
 		for (head, expected) in cases {
 			let refused = match served.arm(&head) {
-				Arm::Refused(refusal) => Some(refusal),
+				Arm::Head(refusal) => Some(refusal),
 				_ => None,
 			};
 			assert_eq!(refused, Some(expected));
 		}
 
-		let other = head(Method::POST, "/other.v1.Service/Call", "application/grpc")?;
-		assert!(matches!(served.arm(&other), Arm::Routed));
+		let unconnected = head(Method::POST, TUNNEL_PATH)?;
+		assert!(matches!(served.arm(&unconnected), Arm::Refused(CallRefusal::Unconnected)));
+
+		let other = head(Method::POST, "/other.v1.Service/Call")?;
+		assert!(matches!(served.arm(&other), Arm::Routed(None)));
 		Ok(())
+	}
+
+	tightbeam::tb_cases! {
+		fn a_reflection_path_routes_with_its_version((path, version): (&'static str, ReflectionVersion)) {
+			type Default = tightbeam::crypto::profiles::DefaultCryptoProvider;
+			let served = Served::<Default>::Tunnel(PhantomData);
+			let reflected = head(Method::POST, path).expect("a head builds");
+			assert!(matches!(served.arm(&reflected), Arm::Routed(Some(routed)) if routed == version));
+		}
+
+		cases {
+			version_one => ("/grpc.reflection.v1.ServerReflection/ServerReflectionInfo", ReflectionVersion::V1),
+			version_one_alpha => ("/grpc.reflection.v1alpha.ServerReflection/ServerReflectionInfo", ReflectionVersion::V1Alpha),
+		}
 	}
 
 	#[test]
 	fn a_tunnel_edge_answers_its_health_check() -> Result<(), http::Error> {
 		type Default = tightbeam::crypto::profiles::DefaultCryptoProvider;
 		let served = Served::<Default>::Tunnel(PhantomData);
-		let check = head(Method::POST, HEALTH_CHECK_PATH, "application/grpc")?;
+		let check = head(Method::POST, HEALTH_CHECK_PATH)?;
 		assert!(matches!(served.arm(&check), Arm::Health(HealthStatus::Serving)));
 		Ok(())
 	}

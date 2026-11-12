@@ -14,8 +14,8 @@ WORKDIR /src/tightbeam-ext
 RUN cargo build --example echo_server_mux -p tightbeam-ws --features testing \
 	&& cargo build --example echo_server_mux_clear -p tightbeam-ws --features testing \
 	&& cargo build --example work_gateway_server -p tightbeam-ws --features colony \
-	&& cargo build --example pubsub_demo_server -p tightbeam-pubsub --features testing \
-	&& cargo build --example pubsub_processor_server -p tightbeam-pubsub --features testing \
+	&& cargo build --example pubsub_demo_server -p tightbeam-pubsub \
+	&& cargo build --example pubsub_processor_server -p tightbeam-pubsub \
 	&& cargo build --example grpc_work_gateway_server -p tightbeam-grpc \
 	&& cargo build --example grpc_coupled_gateway_server -p tightbeam-grpc --features couple,testing
 
@@ -36,13 +36,11 @@ COPY --from=build /src/tightbeam-ext/target/debug/examples/grpc_coupled_gateway_
 
 USER echo
 
-ENV ECHO_WS_PORT=9100
-EXPOSE 9100
-
-# The transport speaks no HTTP, and a bare TCP connect would fail the WebSocket
-# handshake, so liveness is a passive LISTEN-state probe that never opens
-# a connection.
+# A probe that connects would hold an accept slot of the server until its
+# handshake deadline, so liveness reads the LISTEN state of the port instead.
+# The compose file of each service sets the listen port, and a service that
+# sets none fails the probe.
 HEALTHCHECK --interval=3s --timeout=2s --start-period=3s --retries=30 \
-	CMD ss -ltn "sport = :${ECHO_WS_PORT:-9100}" | grep -q LISTEN || exit 1
+	CMD ss -ltn "sport = :${ECHO_WS_PORT:?}" | grep -q LISTEN || exit 1
 
 CMD ["echo-server-mux"]

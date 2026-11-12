@@ -1,56 +1,34 @@
 /**
- * Minimal, headless example app for the generic tightbeam-ws client.
- *
- * Builds frames with the fluent builder of its engine, ships them over the
- * socket, and surfaces the decoded response so the Playwright spec can assert
- * the body and metadata survived the round-trip.
- *
- * The query string carries the dial facts of the stack under their own
- * names, which {@link readDialFacts} parses once at load. The page loads the
- * engine once, before it reports ready.
+ * The round-trip page of the e2e app, whose round trips the specs reach as
+ * `window.tb`, as `docs/ws.md` (Test support) states it.
  */
 
 import type {
+	Engine,
 	Frame,
 	MutualIdentity,
 	Secp256k1SigningKey,
-} from "@wahidgroup/tightbeam-ws-client";
-import {
-	StreamRefusal,
 	TightbeamWsClient,
 } from "@wahidgroup/tightbeam-ws-client";
+import { Engine as Engines, StreamRefusal } from "@wahidgroup/tightbeam-ws-client";
 
-import type { EmitClient, Note } from "../fixtures.js";
-import {
-	NotePayload,
-	SEAL_SECRET,
-	base64ToBytes,
-	bytesToHex,
-	emitOrFail,
-	hexToBytes,
-	mutualSessionOptions,
-	queryFacts,
-	readDialFacts,
-	withClient,
-} from "../fixtures.js";
+import type { EmitClient, Note, StackPaywall } from "../fixtures.js";
+import { DialFacts, EchoDials, NotePayload, SEAL_SECRET, bytesToHex, hexToBytes } from "../fixtures.js";
 import { NobleTransportSigner } from "../signer.js";
+import { base64ToBytes } from "../util.js";
 
 const TEXT = new TextDecoder();
 
 /**
- * The stack facts in the query string that the spec opened the page with.
+ * The stream cap and the demo paywall of the stack, from the query string
+ * that the spec opened the page with.
  */
-const PAGE_FACTS = queryFacts(window.location.search);
-
-/**
- * The stream cap and the demo paywall of the stack.
- */
-const DIAL = readDialFacts(PAGE_FACTS);
+const DIAL = DialFacts.fromQuery(window.location.search);
 
 /**
  * The engine every round-trip of the page builds, parses, and dials with.
  */
-const ENGINE = await TightbeamWsClient.init();
+const ENGINE = await Engines.load();
 
 /**
  * The typed body codec for a note: JSON in the profile opaque wrapper.
@@ -62,18 +40,117 @@ const NOTES = ENGINE.wrapping(NotePayload);
  * (no `bigint`) so it crosses the Playwright `page.evaluate` boundary.
  */
 export interface RoundTripResult {
+	/**
+	 * The opened body of the response, in hex.
+	 */
 	readonly bodyHex: string;
+
+	/**
+	 * The protocol version of the response frame.
+	 */
 	readonly version: number;
+
+	/**
+	 * The id of the response frame, as text.
+	 */
 	readonly idText: string;
+
+	/**
+	 * The order of the response frame, in decimal, because a `bigint` cannot
+	 * cross the boundary.
+	 */
 	readonly order: string;
+
+	/**
+	 * Whether the response frame carries a signature.
+	 */
 	readonly signed: boolean;
+
+	/**
+	 * Whether the response frame carries a message commitment.
+	 */
 	readonly messageIntegrity: boolean;
+
+	/**
+	 * Whether the response frame carries a frame witness.
+	 */
 	readonly frameIntegrity: boolean;
 }
 
-function toResult(response: Frame): RoundTripResult {
+/**
+ * The endpoint of one page round trip.
+ */
+export interface SessionOptions {
+	/**
+	 * The endpoint of the server that the page dials.
+	 */
+	readonly url: string;
+}
+
+/**
+ * A session that pins the certificate of its server.
+ */
+export interface PinnedSessionOptions extends SessionOptions {
+	/**
+	 * The DER certificate of the server, in base64.
+	 */
+	readonly serverCertB64: string;
+}
+
+/**
+ * A round trip of one opaque payload.
+ */
+export interface PayloadOptions extends SessionOptions {
+	/**
+	 * The payload of each frame, in hex.
+	 */
+	readonly payloadHex: string;
+}
+
+/**
+ * A round trip of one opaque payload over a pinned session.
+ */
+export interface PinnedPayloadOptions extends PinnedSessionOptions, PayloadOptions {}
+
+/**
+ * The one opaque frame of a round trip.
+ */
+export interface EchoOptions extends PayloadOptions {
+	/**
+	 * The id of the frame, as text.
+	 */
+	readonly idText: string;
+
+	/**
+	 * The order of the frame.
+	 */
+	readonly order: number;
+}
+
+/**
+ * The one opaque frame of a round trip over a pinned session.
+ */
+export interface PinnedEchoOptions extends EchoOptions, PinnedSessionOptions {}
+
+/**
+ * The one opaque frame of a round trip over a mutually authenticated session.
+ */
+export interface MutualEchoOptions extends PinnedEchoOptions {
+	/**
+	 * The DER certificate of the client, in base64.
+	 */
+	readonly clientCertB64: string;
+
+	/**
+	 * The raw signing key of the client, in base64.
+	 */
+	readonly clientKeyB64: string;
+}
+
+async function toResult(response: Frame): Promise<RoundTripResult> {
+	const body = await response.open(ENGINE.opaque);
 	return {
-		bodyHex: bytesToHex(response.message(ENGINE.opaque)),
+		bodyHex: bytesToHex(body),
 		version: response.version,
 		idText: TEXT.decode(response.id),
 		order: response.order.toString(),
@@ -84,158 +161,174 @@ function toResult(response: Frame): RoundTripResult {
 }
 
 /**
- * How a page dials the stack: in cleartext when absent, pinning a base64
- * server certificate, or presenting a mutual identity as well.
+ * How a page dials the stack: each kind connects its own way.
  */
-type PageCredentials = string | MutualIdentity | undefined;
-
-/**
- * The one opaque frame a round-trip emits.
- */
-interface EchoFields {
-	readonly payloadHex: string;
-	readonly idText: string;
-	readonly order: number;
+interface PageDial {
+	/**
+	 * Open a multiplexed client to `url` through `engine`.
+	 */
+	connect(engine: Engine, url: string): Promise<TightbeamWsClient>;
 }
 
 /**
- * Dial `url` with `credentials`. A cleartext dial passes the stream cap of
- * the stack, and a mutual dial requests the ceiling of its paywall and pays
- * its invoice.
+ * A cleartext dial under the stream cap of the stack.
  */
-function dial(
-	url: string,
-	credentials: PageCredentials,
-): Promise<TightbeamWsClient> {
-	if (credentials === undefined) {
-		const options = { streams: DIAL.streams };
-		const cleartext = ENGINE.connectCleartext(url, options);
+class CleartextDial implements PageDial {
+	readonly #facts: DialFacts;
+
+	private constructor(facts: DialFacts) {
+		this.#facts = facts;
+	}
+
+	/**
+	 * The cleartext dial under the stream cap of `facts`.
+	 */
+	static of(facts: DialFacts): CleartextDial {
+		const dial = new CleartextDial(facts);
+		return dial;
+	}
+
+	connect(engine: Engine, url: string): Promise<TightbeamWsClient> {
+		const cleartext = engine.connectCleartext(url, this.#facts.cleartext);
 		return cleartext;
 	}
-	if (typeof credentials === "string") {
-		const serverCert = base64ToBytes(credentials);
-		const pinned = ENGINE.connect(url, serverCert);
-		return pinned;
-	}
-
-	const options = mutualSessionOptions(DIAL.paywall);
-	const mutual = ENGINE.connectMutual(url, credentials, options);
-	return mutual;
 }
 
 /**
- * Open a multiplexed client to `url` under `credentials`, run the exchange
- * body, and always release the socket.
+ * A server-authenticated dial, which pins the server certificate.
+ */
+class PinnedDial implements PageDial {
+	readonly #serverCert: Uint8Array;
+
+	private constructor(serverCert: Uint8Array) {
+		this.#serverCert = serverCert;
+	}
+
+	/**
+	 * The dial that pins the certificate `serverCertB64` encodes.
+	 */
+	static of(serverCertB64: string): PinnedDial {
+		const dial = new PinnedDial(base64ToBytes(serverCertB64));
+		return dial;
+	}
+
+	connect(engine: Engine, url: string): Promise<TightbeamWsClient> {
+		const pinned = engine.connect(url, this.#serverCert);
+		return pinned;
+	}
+}
+
+/**
+ * A mutually authenticated dial, which requests the ceiling of the paywall
+ * and pays its invoice.
+ */
+class MutualDial implements PageDial {
+	readonly #identity: MutualIdentity;
+
+	readonly #paywall: StackPaywall;
+
+	private constructor(identity: MutualIdentity, paywall: StackPaywall) {
+		this.#identity = identity;
+		this.#paywall = paywall;
+	}
+
+	/**
+	 * The dial that presents `identity` under the paywall of `facts`.
+	 */
+	static of(identity: MutualIdentity, facts: DialFacts): MutualDial {
+		const dial = new MutualDial(identity, facts.paywall);
+		return dial;
+	}
+
+	connect(engine: Engine, url: string): Promise<TightbeamWsClient> {
+		const options = this.#paywall.sessionOptions();
+		const mutual = engine.connectMutual(url, this.#identity, options);
+		return mutual;
+	}
+}
+
+/**
+ * Open a multiplexed client to `url` through `dial`, run `run`, and release
+ * the socket on every exit.
  */
 async function withMuxClient<T>(
 	url: string,
-	credentials: PageCredentials,
+	dial: PageDial,
 	run: (client: TightbeamWsClient) => Promise<T>,
 ): Promise<T> {
-	const connect = (): Promise<TightbeamWsClient> => dial(url, credentials);
-
-	const result = await withClient(connect, run);
+	await using client = await dial.connect(ENGINE, url);
+	const result = await run(client);
 	return result;
 }
 
 /**
- * Open a client to `url` under `credentials`, emit the one opaque frame
- * `echo` names, release the socket, and decode the echo.
+ * Emit the one opaque frame of `echo` over a client that `dial` opens, and
+ * decode the echo.
  */
-async function emitAndDecode(
-	url: string,
-	credentials: PageCredentials,
-	echo: EchoFields,
-): Promise<RoundTripResult> {
+async function emitAndDecode(dial: PageDial, echo: EchoOptions): Promise<RoundTripResult> {
 	const exchange = async (client: EmitClient): Promise<Frame> => {
 		const built = await ENGINE.frameBuilder(hexToBytes(echo.payloadHex))
 			.withId(echo.idText)
 			.withOrder(echo.order)
 			.build();
 
-		const reply = await emitOrFail(client, built);
+		const reply = await EchoDials.emitOrFail(client, built);
 		return reply;
 	};
 
-	const response = await withMuxClient(url, credentials, exchange);
-	const result = toResult(response);
-	return result;
-}
-
-export async function roundTrip(
-	url: string,
-	payloadHex: string,
-	idText: string,
-	order: number,
-): Promise<RoundTripResult> {
-	const echo = { payloadHex, idText, order };
-
-	const result = await emitAndDecode(url, undefined, echo);
-	return result;
-}
-
-export async function secureRoundTrip(
-	url: string,
-	serverCertB64: string,
-	payloadHex: string,
-	idText: string,
-	order: number,
-): Promise<RoundTripResult> {
-	const echo = { payloadHex, idText, order };
-
-	const result = await emitAndDecode(url, serverCertB64, echo);
-	return result;
-}
-
-export async function mutualRoundTrip(
-	url: string,
-	serverCertB64: string,
-	clientCertB64: string,
-	clientKeyB64: string,
-	payloadHex: string,
-	idText: string,
-	order: number,
-): Promise<RoundTripResult> {
-	const identity = {
-		serverCertDer: base64ToBytes(serverCertB64),
-		clientCertDer: base64ToBytes(clientCertB64),
-		clientKey: base64ToBytes(clientKeyB64),
-	};
-
-	const echo = { payloadHex, idText, order };
-	const result = await emitAndDecode(url, identity, echo);
+	const response = await withMuxClient(echo.url, dial, exchange);
+	const result = await toResult(response);
 	return result;
 }
 
 /**
- * The mutual round-trip outcome plus how many prehashes the external
- * signer answered, proving the handshake used it.
+ * The echo of one opaque frame over a cleartext session.
  */
-export interface SignerRoundTripResult extends RoundTripResult {
-	readonly signatures: number;
+async function roundTrip(echo: EchoOptions): Promise<RoundTripResult> {
+	const result = await emitAndDecode(CleartextDial.of(DIAL), echo);
+	return result;
 }
 
-export async function mutualSignerRoundTrip(
-	url: string,
-	serverCertB64: string,
-	clientCertB64: string,
-	clientKeyB64: string,
-	payloadHex: string,
-	idText: string,
-	order: number,
-): Promise<SignerRoundTripResult> {
-	const clientKey = base64ToBytes(clientKeyB64);
+/**
+ * The echo of one opaque frame over an encrypted session.
+ */
+async function secureRoundTrip(echo: PinnedEchoOptions): Promise<RoundTripResult> {
+	const dial = PinnedDial.of(echo.serverCertB64);
+	const result = await emitAndDecode(dial, echo);
+	return result;
+}
+
+/**
+ * The echo of one opaque frame over a mutually authenticated session.
+ */
+async function mutualRoundTrip(echo: MutualEchoOptions): Promise<RoundTripResult> {
+	const identity = {
+		serverCertDer: base64ToBytes(echo.serverCertB64),
+		clientCertDer: base64ToBytes(echo.clientCertB64),
+		clientKey: base64ToBytes(echo.clientKeyB64),
+	};
+
+	const dial = MutualDial.of(identity, DIAL);
+	const result = await emitAndDecode(dial, echo);
+	return result;
+}
+
+/**
+ * The mutual round trip whose client key stays in an external signer. The
+ * server pins the client certificate and settles the paywall, so a completed
+ * round trip proves the handshake signed through the signer.
+ */
+async function mutualSignerRoundTrip(echo: MutualEchoOptions): Promise<RoundTripResult> {
+	const clientKey = base64ToBytes(echo.clientKeyB64);
 	const signer = new NobleTransportSigner(ENGINE, clientKey);
 	const identity = {
-		serverCertDer: base64ToBytes(serverCertB64),
-		clientCertDer: base64ToBytes(clientCertB64),
+		serverCertDer: base64ToBytes(echo.serverCertB64),
+		clientCertDer: base64ToBytes(echo.clientCertB64),
 		clientKey: signer,
 	};
 
-	const echo = { payloadHex, idText, order };
-
-	const decoded = await emitAndDecode(url, identity, echo);
-	const result = { ...decoded, signatures: signer.signatures };
+	const dial = MutualDial.of(identity, DIAL);
+	const result = await emitAndDecode(dial, echo);
 	return result;
 }
 
@@ -244,49 +337,76 @@ export async function mutualSignerRoundTrip(
  * verification verdicts recomputed on the echoed bytes.
  */
 export interface SignedRoundTripResult extends RoundTripResult {
+	/**
+	 * Whether the signature of the echo verifies under the signing key.
+	 */
 	readonly signatureValid: boolean;
+
+	/**
+	 * The verdict of the frame witness of the echo.
+	 */
 	readonly frameVerdict: string;
+
+	/**
+	 * The verdict of the message commitment under the salt of the frame.
+	 */
 	readonly messageVerdict: string;
+
+	/**
+	 * The verdict of the message commitment under another salt.
+	 */
 	readonly wrongSaltVerdict: string;
 }
 
-export async function signedRoundTrip(
-	url: string,
-	payloadHex: string,
-	idText: string,
-	order: number,
-	signingKeyHex: string,
-	saltHex: string,
-): Promise<SignedRoundTripResult> {
-	const signingKey = ENGINE.signingKey(hexToBytes(signingKeyHex));
-	const committed = ENGINE.salt(hexToBytes(saltHex));
-	const salt = ENGINE.salt(hexToBytes(saltHex));
+/**
+ * The one opaque frame of a signed, committed round trip.
+ */
+export interface SignedEchoOptions extends EchoOptions {
+	/**
+	 * The raw signing key of the frame, in hex.
+	 */
+	readonly signingKeyHex: string;
+
+	/**
+	 * The salt that hides the message commitment, in hex.
+	 */
+	readonly saltHex: string;
+}
+
+/**
+ * The echo of one signed, committed frame over a cleartext session, with the
+ * verdicts that the page recomputes on it.
+ */
+async function signedRoundTrip(echo: SignedEchoOptions): Promise<SignedRoundTripResult> {
+	const signingKey = ENGINE.signingKey(hexToBytes(echo.signingKeyHex));
+	const committed = ENGINE.salt(hexToBytes(echo.saltHex));
+	const salt = ENGINE.salt(hexToBytes(echo.saltHex));
 	const wrongSalt = ENGINE.salt(hexToBytes("deadbeef".repeat(4)));
 
-	const response = await withMuxClient(url, undefined, async (client) => {
-		const built = await ENGINE.frameBuilder(hexToBytes(payloadHex))
-			.withId(idText)
-			.withOrder(order)
-			.withMessageHasher(ENGINE.sha3_256)
-			.withCommitment(committed)
+	const dial = CleartextDial.of(DIAL);
+	const response = await withMuxClient(echo.url, dial, async (client) => {
+		const built = await ENGINE.frameBuilder(hexToBytes(echo.payloadHex))
+			.withId(echo.idText)
+			.withOrder(echo.order)
+			.withMessageHasher(ENGINE.sha3_256, committed)
 			.withWitnessHasher(ENGINE.sha3_256)
 			.withSigner(signingKey)
 			.build();
 
-		const reply = await emitOrFail(client, built);
+		const reply = await EchoDials.emitOrFail(client, built);
 		return reply;
 	});
 
 	let signatureValid = false;
 	try {
-		response.verify(signingKey.verifyingKey());
+		await response.verify(signingKey.verifyingKey());
 		signatureValid = true;
 	} catch {
 		signatureValid = false;
 	}
 
 	return {
-		...toResult(response),
+		...(await toResult(response)),
 		signatureValid,
 		frameVerdict: await response.frameIntegrityVerdict(),
 		messageVerdict: await response.messageCommitmentVerdict(salt),
@@ -299,38 +419,52 @@ export async function signedRoundTrip(
  * plaintext recovered with the key.
  */
 export interface SealedRoundTripResult {
+	/**
+	 * Whether the echo carries a sealed body.
+	 */
 	readonly confidential: boolean;
+
+	/**
+	 * The dotted OID of the cipher that sealed the body.
+	 */
 	readonly confidentialityOid: string;
+
+	/**
+	 * Whether the sealed body differs from the payload.
+	 */
 	readonly ciphertextDiffers: boolean;
+
+	/**
+	 * The body that the key opens, in hex.
+	 */
 	readonly decryptedHex: string;
 }
 
-export async function sealedRoundTrip(
-	url: string,
-	payloadHex: string,
-	idText: string,
-	order: number,
-): Promise<SealedRoundTripResult> {
-	const payload = hexToBytes(payloadHex);
+/**
+ * The echo of one AES-256-GCM sealed frame over a cleartext session.
+ */
+async function sealedRoundTrip(echo: EchoOptions): Promise<SealedRoundTripResult> {
+	const payload = hexToBytes(echo.payloadHex);
 	const cipher = ENGINE.aes256Gcm(SEAL_SECRET);
 
-	const response = await withMuxClient(url, undefined, async (client) => {
+	const dial = CleartextDial.of(DIAL);
+	const response = await withMuxClient(echo.url, dial, async (client) => {
 		const built = await ENGINE.frameBuilder(payload)
-			.withId(idText)
-			.withOrder(order)
+			.withId(echo.idText)
+			.withOrder(echo.order)
 			.withEncryptor(cipher)
 			.build();
 
-		const reply = await emitOrFail(client, built);
+		const reply = await EchoDials.emitOrFail(client, built);
 		return reply;
 	});
 
 	const algorithm = response.confidentialityInfo?.algorithmOid;
-	const decrypted = await response.decryptMessage(cipher, ENGINE.opaque);
+	const decrypted = await response.open(ENGINE.opaque, { opener: cipher });
 	return {
 		confidential: response.confidential,
 		confidentialityOid: algorithm?.toString() ?? "",
-		ciphertextDiffers: bytesToHex(response.bodyDer) !== payloadHex,
+		ciphertextDiffers: bytesToHex(response.bodyDer) !== echo.payloadHex,
 		decryptedHex: bytesToHex(decrypted),
 	};
 }
@@ -340,31 +474,41 @@ export async function sealedRoundTrip(
  * body recovered with the profile zstd inflator.
  */
 export interface CompressedRoundTripResult {
+	/**
+	 * Whether the echo carries a compressed body.
+	 */
 	readonly compressed: boolean;
+
+	/**
+	 * The dotted OID of the compression of the body.
+	 */
 	readonly compactnessOid: string;
+
+	/**
+	 * The body that the inflator recovers, in hex.
+	 */
 	readonly inflatedHex: string;
 }
 
-export async function compressedRoundTrip(
-	url: string,
-	payloadHex: string,
-	idText: string,
-	order: number,
-): Promise<CompressedRoundTripResult> {
+/**
+ * The echo of one zstd-compressed frame over a cleartext session.
+ */
+async function compressedRoundTrip(echo: EchoOptions): Promise<CompressedRoundTripResult> {
 	const zstd = ENGINE.zstd();
 
-	const response = await withMuxClient(url, undefined, async (client) => {
-		const built = await ENGINE.frameBuilder(hexToBytes(payloadHex))
-			.withId(idText)
-			.withOrder(order)
+	const dial = CleartextDial.of(DIAL);
+	const response = await withMuxClient(echo.url, dial, async (client) => {
+		const built = await ENGINE.frameBuilder(hexToBytes(echo.payloadHex))
+			.withId(echo.idText)
+			.withOrder(echo.order)
 			.withCompressor(zstd)
 			.build();
 
-		const reply = await emitOrFail(client, built);
+		const reply = await EchoDials.emitOrFail(client, built);
 		return reply;
 	});
 
-	const inflated = await response.inflateMessage(zstd, ENGINE.opaque);
+	const inflated = await response.open(ENGINE.opaque, { inflator: zstd });
 	return {
 		compressed: response.compressed,
 		compactnessOid: response.compactnessInfo?.algorithmOid.toString() ?? "",
@@ -372,28 +516,30 @@ export async function compressedRoundTrip(
 	};
 }
 
-export async function compressedSealedRoundTrip(
-	url: string,
-	payloadHex: string,
-	idText: string,
-	order: number,
-): Promise<CompressedRoundTripResult> {
+/**
+ * The echo of one compressed, then sealed, frame over a cleartext session.
+ */
+async function compressedSealedRoundTrip(echo: EchoOptions): Promise<CompressedRoundTripResult> {
 	const zstd = ENGINE.zstd();
 	const cipher = ENGINE.aes256Gcm(SEAL_SECRET);
 
-	const response = await withMuxClient(url, undefined, async (client) => {
-		const built = await ENGINE.frameBuilder(hexToBytes(payloadHex))
-			.withId(idText)
-			.withOrder(order)
+	const dial = CleartextDial.of(DIAL);
+	const response = await withMuxClient(echo.url, dial, async (client) => {
+		const built = await ENGINE.frameBuilder(hexToBytes(echo.payloadHex))
+			.withId(echo.idText)
+			.withOrder(echo.order)
 			.withCompressor(zstd)
 			.withEncryptor(cipher)
 			.build();
 
-		const reply = await emitOrFail(client, built);
+		const reply = await EchoDials.emitOrFail(client, built);
 		return reply;
 	});
 
-	const inflated = await response.decryptMessage(cipher, ENGINE.opaque, zstd);
+	const inflated = await response.open(ENGINE.opaque, {
+		opener: cipher,
+		inflator: zstd,
+	});
 	return {
 		compressed: response.compressed,
 		compactnessOid: response.compactnessInfo?.algorithmOid.toString() ?? "",
@@ -407,25 +553,40 @@ export async function compressedSealedRoundTrip(
  */
 export type TypedRoundTripResult = Note;
 
-export async function typedRoundTrip(
-	url: string,
-	idText: string,
-	order: number,
-	author: string,
-	text: string,
-): Promise<TypedRoundTripResult> {
-	const response = await withMuxClient(url, undefined, async (client) => {
-		const built = await ENGINE.frameBuilder()
-			.withId(idText)
-			.withOrder(order)
-			.withMessage(NOTES, { author, text })
-			.build();
+/**
+ * The one typed frame of a round trip.
+ */
+export interface TypedEchoOptions extends SessionOptions {
+	/**
+	 * The id of the frame, as text.
+	 */
+	readonly idText: string;
 
-		const reply = await emitOrFail(client, built);
+	/**
+	 * The order of the frame.
+	 */
+	readonly order: number;
+
+	/**
+	 * The note that the frame carries.
+	 */
+	readonly note: Note;
+}
+
+/**
+ * The echo of one note under a wrapped payload codec over a cleartext
+ * session.
+ */
+async function typedRoundTrip(echo: TypedEchoOptions): Promise<TypedRoundTripResult> {
+	const dial = CleartextDial.of(DIAL);
+	const response = await withMuxClient(echo.url, dial, async (client) => {
+		const built = await ENGINE.messageBuilder(NOTES, echo.note).withId(echo.idText).withOrder(echo.order).build();
+
+		const reply = await EchoDials.emitOrFail(client, built);
 		return reply;
 	});
 
-	const message = response.message(NOTES);
+	const message = await response.open(NOTES);
 	return message;
 }
 
@@ -434,13 +595,19 @@ export async function typedRoundTrip(
  * ids and bodies in emit order, proving per-stream correlation.
  */
 export interface MuxConcurrentResult {
+	/**
+	 * The ids of the echoes, in emit order.
+	 */
 	readonly echoedIds: string[];
+
+	/**
+	 * The opened bodies of the echoes, in hex, in emit order.
+	 */
 	readonly echoedBodiesHex: string[];
 }
 
 /**
- * `payload` suffixed with the emit index so concurrent responses cannot be
- * confused with each other.
+ * `payload` suffixed with the emit index, so each concurrent response names the emit it answers.
  */
 function indexedBody(payload: Uint8Array, index: number): Uint8Array {
 	const body = new Uint8Array(payload.length + 1);
@@ -449,34 +616,44 @@ function indexedBody(payload: Uint8Array, index: number): Uint8Array {
 	return body;
 }
 
-export async function muxConcurrentRoundTrip(
-	url: string,
-	serverCertB64: string | undefined,
-	payloadHex: string,
-): Promise<MuxConcurrentResult> {
-	const payload = hexToBytes(payloadHex);
+/**
+ * Emit three indexed frames of `options` concurrently on one session that
+ * `dial` opens.
+ */
+async function concurrentRoundTrip(dial: PageDial, options: PayloadOptions): Promise<MuxConcurrentResult> {
+	const payload = hexToBytes(options.payloadHex);
 	const labels = ["mux-browser-1", "mux-browser-2", "mux-browser-3"];
 
-	const result = await withMuxClient(url, serverCertB64, async (client) => {
+	const result = await withMuxClient(options.url, dial, async (client) => {
 		const emits = labels.map(async (label, index) => {
 			const built = await ENGINE.frameBuilder(indexedBody(payload, index))
 				.withId(label)
 				.withOrder(index + 1)
 				.build();
 
-			const response = await emitOrFail(client, built);
+			const response = await EchoDials.emitOrFail(client, built);
 			return response;
 		});
 
 		const echoed = await Promise.all(emits);
+		const bodies = await Promise.all(echoed.map((response) => response.open(ENGINE.opaque)));
+
 		const result = {
 			echoedIds: echoed.map((response) => TEXT.decode(response.id)),
-			echoedBodiesHex: echoed.map((response) =>
-				bytesToHex(response.message(ENGINE.opaque)),
-			),
+			echoedBodiesHex: bodies.map((body) => bytesToHex(body)),
 		};
 		return result;
 	});
+	return result;
+}
+
+/**
+ * The concurrent round-trip over the encrypted mux lane, pinned to the
+ * server certificate.
+ */
+async function muxConcurrentRoundTrip(options: PinnedPayloadOptions): Promise<MuxConcurrentResult> {
+	const dial = PinnedDial.of(options.serverCertB64);
+	const result = await concurrentRoundTrip(dial, options);
 	return result;
 }
 
@@ -486,23 +663,45 @@ export async function muxConcurrentRoundTrip(
  * stream.
  */
 export interface MuxCallbackResult {
+	/**
+	 * The ids of the requests that the page handler served.
+	 */
 	readonly servedIds: string[];
+
+	/**
+	 * The id of the reply that the server relayed, as text.
+	 */
 	readonly relayedIdText: string;
+
+	/**
+	 * The opened body of the relayed reply, in hex.
+	 */
 	readonly relayedBodyHex: string;
 }
 
-export async function muxCallbackRoundTrip(
-	url: string,
-	serverCertB64: string,
-	payloadHex: string,
-	replyHex: string,
-): Promise<MuxCallbackResult> {
-	const result = await withMuxClient(url, serverCertB64, async (client) => {
+/**
+ * A call-back round trip: the trigger payload, and the reply that the page
+ * handler answers the call-back with.
+ */
+export interface CallbackOptions extends PinnedPayloadOptions {
+	/**
+	 * The body of the reply of the page handler, in hex.
+	 */
+	readonly replyHex: string;
+}
+
+/**
+ * The call-back round trip, whose server-initiated stream the page handler
+ * answers.
+ */
+async function muxCallbackRoundTrip(options: CallbackOptions): Promise<MuxCallbackResult> {
+	const dial = PinnedDial.of(options.serverCertB64);
+	const result = await withMuxClient(options.url, dial, async (client) => {
 		const servedIds: string[] = [];
 		client.serve(async (request) => {
 			servedIds.push(TEXT.decode(request.id));
 
-			const reply = await ENGINE.frameBuilder(hexToBytes(replyHex))
+			const reply = await ENGINE.frameBuilder(hexToBytes(options.replyHex))
 				.withId("browser-reply")
 				.withOrder(9)
 				.build();
@@ -513,16 +712,17 @@ export async function muxCallbackRoundTrip(
 		 * The `call-me` id makes the server open its own stream back to
 		 * this page. The handler's reply follows the original stream.
 		 */
-		const callMe = await ENGINE.frameBuilder(hexToBytes(payloadHex))
+		const callMe = await ENGINE.frameBuilder(hexToBytes(options.payloadHex))
 			.withId("call-me-browser")
 			.withOrder(4)
 			.build();
 
-		const relayed = await emitOrFail(client, callMe);
+		const relayed = await EchoDials.emitOrFail(client, callMe);
+		const body = await relayed.open(ENGINE.opaque);
 		const result = {
 			servedIds,
 			relayedIdText: TEXT.decode(relayed.id),
-			relayedBodyHex: bytesToHex(relayed.message(ENGINE.opaque)),
+			relayedBodyHex: bytesToHex(body),
 		};
 		return result;
 	});
@@ -536,19 +736,43 @@ export async function muxCallbackRoundTrip(
  * `shutdownWith`.
  */
 export interface MuxLifecycleResult {
+	/**
+	 * Whether the healthy session had a free stream slot.
+	 */
 	readonly headroom: boolean;
+
+	/**
+	 * Whether the healthy session held no pending stream.
+	 */
 	readonly pendingIdle: boolean;
+
+	/**
+	 * Whether the healthy session held no GoAway reason.
+	 */
 	readonly liveReasonEmpty: boolean;
+
+	/**
+	 * The message of the rejection of a ping whose signal was aborted.
+	 */
 	readonly abandonedPingRejection: string;
+
+	/**
+	 * The code of the refusal of an emit after the local drain.
+	 */
 	readonly drainCode: string;
+
+	/**
+	 * Whether the locally drained session held no GoAway reason.
+	 */
 	readonly localReasonEmpty: boolean;
 }
 
-export async function muxLifecycleProbe(
-	url: string,
-	serverCertB64: string,
-): Promise<MuxLifecycleResult> {
-	const result = await withMuxClient(url, serverCertB64, async (client) => {
+/**
+ * The lifecycle probe of one pinned session, whose drain the page starts.
+ */
+async function muxLifecycleProbe(options: PinnedSessionOptions): Promise<MuxLifecycleResult> {
+	const dial = PinnedDial.of(options.serverCertB64);
+	const result = await withMuxClient(options.url, dial, async (client) => {
 		await client.ping();
 		await client.waitForStreamSlot();
 
@@ -572,9 +796,7 @@ export async function muxLifecycleProbe(
 
 		let drainCode = "";
 		try {
-			const after = await ENGINE.frameBuilder(
-				new Uint8Array([0xb0, 0x1f]),
-			)
+			const after = await ENGINE.frameBuilder(new Uint8Array([0xb0, 0x1f]))
 				.withId("browser-after-calm")
 				.withOrder(1)
 				.build();
@@ -600,37 +822,67 @@ export async function muxLifecycleProbe(
 }
 
 /**
- * The markers left by a peer-initiated drain: the GoAway reason and code
- * the client recorded, plus how the never-answered emit settled.
+ * The markers left by a peer-initiated drain: the code the stream slot wait
+ * refused with once the GoAway landed, the GoAway reason the client recorded,
+ * and how the never-answered emit settled.
  */
 export interface MuxDrainResult {
+	/**
+	 * The code that the parked stream slot wait refused with.
+	 */
+	readonly slotCode: string;
+
+	/**
+	 * The GoAway reason that the client recorded.
+	 */
 	readonly reason: string;
-	readonly code: number;
+
+	/**
+	 * The message of the rejection of the emit that the server never answered.
+	 */
 	readonly emitRejection: string;
 }
 
-export async function muxDrainReason(
-	url: string,
-	serverCertB64: string,
-): Promise<MuxDrainResult> {
-	const result = await withMuxClient(url, serverCertB64, async (client) => {
+/**
+ * The drain that the server starts on one pinned session, as the page reads
+ * it.
+ */
+async function muxDrainReason(options: PinnedSessionOptions): Promise<MuxDrainResult> {
+	const dial = PinnedDial.of(options.serverCertB64);
+	const result = await withMuxClient(options.url, dial, async (client) => {
 		/*
-		 * The `drain-calm` id makes the server drain the session with an
-		 * EnhanceYourCalm GoAway instead of echoing. The drain stops the
-		 * server's writer before the response, so the emit never settles
-		 * on its own and is aborted once the reason surfaces.
+		 * Parked call-backs hold every slot but the one that the `drain-calm`
+		 * id takes, and its EnhanceYourCalm GoAway wakes the parked slot wait
+		 * with `Draining`.
 		 */
+		client.serve(() => new Promise(() => undefined));
+
+		const holds = await Promise.all(
+			Array.from({ length: client.maxConcurrentStreams - 1 }, (_, index) =>
+				ENGINE.frameBuilder(new Uint8Array([0xb0, 0x1e]))
+					.withId(`call-me-hold-browser-${index}`)
+					.withOrder(index + 1)
+					.build(),
+			),
+		);
 		const drain = await ENGINE.frameBuilder(new Uint8Array([0xb0, 0x1d]))
 			.withId("drain-calm-browser")
 			.withOrder(1)
 			.build();
 
 		const controller = new AbortController();
-		const pending = client.emit(drain, { signal: controller.signal });
+		const signal = controller.signal;
+		const held = holds.map((frame) => client.emit(frame, { signal }).catch((error: unknown) => error));
 
-		// The Playwright test timeout bounds this poll.
-		while (client.goawayReason === undefined) {
-			await new Promise((resolve) => setTimeout(resolve, 25));
+		const pending = client.emit(drain, { signal });
+
+		let slotCode = "";
+		try {
+			await client.waitForStreamSlot();
+		} catch (error) {
+			if (ENGINE.isTransportError(error)) {
+				slotCode = error.code;
+			}
 		}
 
 		controller.abort(new Error("drain observed"));
@@ -644,9 +896,10 @@ export async function muxDrainReason(
 			}
 		}
 
+		await Promise.all(held);
 		const result = {
+			slotCode,
 			reason: client.goawayReason ?? "",
-			code: client.goawayCode ?? -1,
 			emitRejection,
 		};
 		return result;
@@ -659,40 +912,28 @@ export async function muxDrainReason(
  * before any handler registers, proving early server streams wait for
  * `serve` instead of being dropped.
  */
-export async function muxParkedCallbackRoundTrip(
-	url: string,
-	serverCertB64: string,
-	payloadHex: string,
-	replyHex: string,
-): Promise<MuxCallbackResult> {
-	const result = await withMuxClient(url, serverCertB64, async (client) => {
-		/*
-		 * Fire the call-back with no handler, then wait until the local
-		 * emit occupies a stream slot so serve registers only after the
-		 * request left the client.
-		 */
-		const callMe = await ENGINE.frameBuilder(hexToBytes(payloadHex))
+async function muxParkedCallbackRoundTrip(options: CallbackOptions): Promise<MuxCallbackResult> {
+	const dial = PinnedDial.of(options.serverCertB64);
+	const result = await withMuxClient(options.url, dial, async (client) => {
+		const callMe = await ENGINE.frameBuilder(hexToBytes(options.payloadHex))
 			.withId("call-me-parked-browser")
 			.withOrder(4)
 			.build();
 
-		const pending = emitOrFail(client, callMe);
-		const deadline = Date.now() + 10_000;
-		while (!client.hasPendingStreams) {
-			if (Date.now() > deadline) {
-				throw new Error("timed out waiting for pending call-back emit");
-			}
-
-			await new Promise<void>((resolve) => {
-				setTimeout(resolve, 0);
-			});
+		/*
+		 * The emit takes its stream slot before it returns, so the request
+		 * left the client before serve registers.
+		 */
+		const pending = EchoDials.emitOrFail(client, callMe);
+		if (!client.hasPendingStreams) {
+			throw new Error("the call-back emit holds no stream slot");
 		}
 
 		const servedIds: string[] = [];
 		client.serve(async (request) => {
 			servedIds.push(TEXT.decode(request.id));
 
-			const reply = await ENGINE.frameBuilder(hexToBytes(replyHex))
+			const reply = await ENGINE.frameBuilder(hexToBytes(options.replyHex))
 				.withId("late-browser-reply")
 				.withOrder(9)
 				.build();
@@ -700,10 +941,11 @@ export async function muxParkedCallbackRoundTrip(
 		});
 
 		const relayed = await pending;
+		const body = await relayed.open(ENGINE.opaque);
 		const result = {
 			servedIds,
 			relayedIdText: TEXT.decode(relayed.id),
-			relayedBodyHex: bytesToHex(relayed.message(ENGINE.opaque)),
+			relayedBodyHex: bytesToHex(body),
 		};
 		return result;
 	});
@@ -715,7 +957,14 @@ export async function muxParkedCallbackRoundTrip(
  * rejection's name and its relayed gRPC status code.
  */
 export interface MuxRefusalResult {
+	/**
+	 * The name of the error that the emit rejected with.
+	 */
 	readonly rejectionName: string;
+
+	/**
+	 * The code of the error that the emit rejected with.
+	 */
 	readonly rejectionCode: string;
 }
 
@@ -724,23 +973,20 @@ export interface MuxRefusalResult {
  * stream with a chosen gRPC status, and the echo server relays that
  * failure as the answer on the original stream.
  */
-export async function muxRefusalRoundTrip(
-	url: string,
-	serverCertB64: string,
-	payloadHex: string,
-): Promise<MuxRefusalResult> {
-	const result = await withMuxClient(url, serverCertB64, async (client) => {
+async function muxRefusalRoundTrip(options: PinnedPayloadOptions): Promise<MuxRefusalResult> {
+	const dial = PinnedDial.of(options.serverCertB64);
+	const result = await withMuxClient(options.url, dial, async (client) => {
 		client.serve(() => {
 			throw new StreamRefusal("NotFound", "nothing here");
 		});
 
-		const callMe = await ENGINE.frameBuilder(hexToBytes(payloadHex))
+		const callMe = await ENGINE.frameBuilder(hexToBytes(options.payloadHex))
 			.withId("call-me-refused-browser")
 			.withOrder(4)
 			.build();
 
 		try {
-			await emitOrFail(client, callMe);
+			await EchoDials.emitOrFail(client, callMe);
 		} catch (error) {
 			if (ENGINE.isTransportError(error)) {
 				return { rejectionName: error.name, rejectionCode: error.code };
@@ -760,8 +1006,19 @@ export async function muxRefusalRoundTrip(
  * in the browser.
  */
 export interface WorkRoundTripResult {
+	/**
+	 * The opened body of the answer of the servlet, as text.
+	 */
 	readonly bodyText: string;
+
+	/**
+	 * The id of the answer, as text.
+	 */
 	readonly idText: string;
+
+	/**
+	 * Whether the signature of the answer verifies under the work key.
+	 */
 	readonly signatureValid: boolean;
 }
 
@@ -770,70 +1027,87 @@ export interface WorkRoundTripResult {
  * rejection's name, its `code`, and the transit status it carried.
  */
 export interface WorkRefusalResult {
+	/**
+	 * The name of the error that the submission rejected with.
+	 */
 	readonly rejectionName: string;
+
+	/**
+	 * The code of the error that the submission rejected with.
+	 */
 	readonly rejectionCode: string;
+
+	/**
+	 * The transit status that the refusal carried.
+	 */
 	readonly rejectionStatus: string;
 }
 
 /**
- * Build and sign the end-to-end work frame the gateway must forward to
- * the servlet byte-for-byte.
+ * A work submission through the cluster gateway.
  */
-async function signedWorkFrame(
-	payloadHex: string,
-	idText: string,
-	order: number,
-	workKey: Secp256k1SigningKey,
-): Promise<Frame> {
-	const built = await ENGINE.frameBuilder(hexToBytes(payloadHex))
-		.withId(idText)
-		.withOrder(order)
+export interface WorkRefusalOptions extends PinnedPayloadOptions {
+	/**
+	 * The servlet type that the work names.
+	 */
+	readonly target: string;
+
+	/**
+	 * The raw end-to-end work signing key, in base64.
+	 */
+	readonly workKeyB64: string;
+}
+
+/**
+ * A work submission whose answer the page verifies.
+ */
+export interface WorkRoundTripOptions extends WorkRefusalOptions {
+	/**
+	 * The id of the work frame, as text.
+	 */
+	readonly idText: string;
+
+	/**
+	 * The order of the work frame.
+	 */
+	readonly order: number;
+}
+
+/**
+ * The end-to-end work frame of `work`, signed by `workKey`, which the gateway
+ * MUST forward to the servlet unchanged.
+ */
+async function signedWorkFrame(work: WorkRoundTripOptions, workKey: Secp256k1SigningKey): Promise<Frame> {
+	const built = await ENGINE.frameBuilder(hexToBytes(work.payloadHex))
+		.withId(work.idText)
+		.withOrder(work.order)
 		.withSigner(workKey)
 		.build();
 	return built;
 }
 
 /**
- * Inputs for a work submission through the cluster gateway: the endpoint
- * and pinned certificate, the servlet target, the signed-frame fields,
- * and the base64 end-to-end work signing key.
+ * The submission of one signed work frame, whose answer the page verifies.
  */
-export interface WorkRoundTripOptions {
-	readonly url: string;
-	readonly serverCertB64: string;
-	readonly target: string;
-	readonly payloadHex: string;
-	readonly idText: string;
-	readonly order: number;
-	readonly workKeyB64: string;
-}
+async function workRoundTrip(options: WorkRoundTripOptions): Promise<WorkRoundTripResult> {
+	const workKey = ENGINE.signingKey(base64ToBytes(options.workKeyB64));
 
-export async function workRoundTrip(
-	options: WorkRoundTripOptions,
-): Promise<WorkRoundTripResult> {
-	const { url, serverCertB64, workKeyB64 } = options;
-	const workKeyBytes = base64ToBytes(workKeyB64);
-	const workKey = ENGINE.signingKey(workKeyBytes);
-
-	const result = await withMuxClient(url, serverCertB64, async (client) => {
-		const built = await signedWorkFrame(
-			options.payloadHex,
-			options.idText,
-			options.order,
-			workKey,
-		);
+	const dial = PinnedDial.of(options.serverCertB64);
+	const result = await withMuxClient(options.url, dial, async (client) => {
+		const built = await signedWorkFrame(options, workKey);
 		const response = await client.submitWork(options.target, built);
 
 		let signatureValid = false;
 		try {
-			response.verify(workKey.verifyingKey());
+			await response.verify(workKey.verifyingKey());
 			signatureValid = true;
 		} catch {
 			signatureValid = false;
 		}
 
+		const body = await response.open(ENGINE.opaque);
 		return {
-			bodyText: TEXT.decode(response.message(ENGINE.opaque)),
+			bodyText: TEXT.decode(body),
 			idText: TEXT.decode(response.id),
 			signatureValid,
 		};
@@ -841,31 +1115,30 @@ export async function workRoundTrip(
 	return result;
 }
 
-export async function workRefusal(
-	url: string,
-	serverCertB64: string,
-	target: string,
-	payloadHex: string,
-	workKeyB64: string,
-): Promise<WorkRefusalResult> {
-	const workKey = ENGINE.signingKey(base64ToBytes(workKeyB64));
+/**
+ * The submission of one signed work frame that the gateway refuses.
+ */
+async function workRefusal(options: WorkRefusalOptions): Promise<WorkRefusalResult> {
+	const workKey = ENGINE.signingKey(base64ToBytes(options.workKeyB64));
+	const work = { ...options, idText: "e2e-work-refused", order: 1 };
 
-	const result = await withMuxClient(url, serverCertB64, async (client) => {
-		const built = await signedWorkFrame(
-			payloadHex,
-			"e2e-work-refused",
-			1,
-			workKey,
-		);
+	const dial = PinnedDial.of(options.serverCertB64);
+	const result = await withMuxClient(options.url, dial, async (client) => {
+		const built = await signedWorkFrame(work, workKey);
 
 		try {
-			await client.submitWork(target, built);
+			await client.submitWork(options.target, built);
 		} catch (error) {
 			if (ENGINE.isTransportError(error)) {
+				let rejectionStatus = "";
+				if (error.code === "WorkRefused") {
+					rejectionStatus = error.status;
+				}
+
 				return {
 					rejectionName: error.name,
 					rejectionCode: error.code,
-					rejectionStatus: error.status ?? "",
+					rejectionStatus,
 				};
 			}
 
@@ -881,39 +1154,35 @@ export async function workRefusal(
 	return result;
 }
 
-window.tbRoundTrip = roundTrip;
-window.tbSecureRoundTrip = secureRoundTrip;
-window.tbMutualRoundTrip = mutualRoundTrip;
-window.tbMutualSignerRoundTrip = mutualSignerRoundTrip;
-window.tbSignedRoundTrip = signedRoundTrip;
-window.tbSealedRoundTrip = sealedRoundTrip;
-window.tbCompressedRoundTrip = compressedRoundTrip;
-window.tbCompressedSealedRoundTrip = compressedSealedRoundTrip;
-window.tbTypedRoundTrip = typedRoundTrip;
 /**
  * The concurrent round-trip over the cleartext mux lane: no certificate,
  * symmetric stream cap in place of negotiation.
  */
-export async function muxClearConcurrentRoundTrip(
-	url: string,
-	payloadHex: string,
-): Promise<MuxConcurrentResult> {
-	const result = await muxConcurrentRoundTrip(url, undefined, payloadHex);
+async function muxClearConcurrentRoundTrip(options: PayloadOptions): Promise<MuxConcurrentResult> {
+	const dial = CleartextDial.of(DIAL);
+	const result = await concurrentRoundTrip(dial, options);
 	return result;
 }
 
 /**
- * Progressive openStream round-trip: split the Frame DER, push, close.
+ * The one frame of a progressive round trip over a pinned session.
  */
-export async function streamingRoundTrip(
-	url: string,
-	serverCertB64: string,
-	payloadHex: string,
-	idText: string,
-): Promise<RoundTripResult> {
-	const result = await withMuxClient(url, serverCertB64, async (client) => {
-		const built = await ENGINE.frameBuilder(hexToBytes(payloadHex))
-			.withId(idText)
+export interface StreamingOptions extends PinnedPayloadOptions {
+	/**
+	 * The id of the frame, as text.
+	 */
+	readonly idText: string;
+}
+
+/**
+ * The echo of one frame whose DER the page pushes as a progressive body in
+ * two chunks.
+ */
+async function streamingRoundTrip(options: StreamingOptions): Promise<RoundTripResult> {
+	const dial = PinnedDial.of(options.serverCertB64);
+	const result = await withMuxClient(options.url, dial, async (client) => {
+		const built = await ENGINE.frameBuilder(hexToBytes(options.payloadHex))
+			.withId(options.idText)
 			.withOrder(1)
 			.build();
 
@@ -929,22 +1198,43 @@ export async function streamingRoundTrip(
 			throw new Error("streaming peer returned no response frame");
 		}
 
-		const outcome = toResult(response);
+		const outcome = await toResult(response);
 		return outcome;
 	});
 	return result;
 }
 
-window.tbMuxConcurrentRoundTrip = muxConcurrentRoundTrip;
-window.tbMuxCallbackRoundTrip = muxCallbackRoundTrip;
-window.tbMuxClearConcurrentRoundTrip = muxClearConcurrentRoundTrip;
-window.tbMuxLifecycleProbe = muxLifecycleProbe;
-window.tbMuxDrainReason = muxDrainReason;
-window.tbStreamingRoundTrip = streamingRoundTrip;
-window.tbMuxParkedCallbackRoundTrip = muxParkedCallbackRoundTrip;
-window.tbMuxRefusalRoundTrip = muxRefusalRoundTrip;
-window.tbWorkRoundTrip = workRoundTrip;
-window.tbWorkRefusal = workRefusal;
+/**
+ * Every round trip of the page, which the specs reach as `window.tb`.
+ */
+const api = {
+	roundTrip,
+	secureRoundTrip,
+	mutualRoundTrip,
+	mutualSignerRoundTrip,
+	signedRoundTrip,
+	sealedRoundTrip,
+	compressedRoundTrip,
+	compressedSealedRoundTrip,
+	typedRoundTrip,
+	muxConcurrentRoundTrip,
+	muxCallbackRoundTrip,
+	muxClearConcurrentRoundTrip,
+	muxLifecycleProbe,
+	muxDrainReason,
+	streamingRoundTrip,
+	muxParkedCallbackRoundTrip,
+	muxRefusalRoundTrip,
+	workRoundTrip,
+	workRefusal,
+} as const;
+
+/**
+ * The round trips of the page, as `window.tb` holds them.
+ */
+export type PageApi = typeof api;
+
+window.tb = api;
 
 const status = document.querySelector("#status");
 if (status) {

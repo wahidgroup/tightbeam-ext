@@ -1,13 +1,5 @@
-//! Browser WebSocket construction with lifecycle observation. Compiled
-//! only for `wasm32` targets.
-//!
-//! Every client opens its socket through [`OpeningSocket::open`], which
-//! attaches a `close` listener before any traffic flows. The opening socket
-//! owns the open and close events of the socket, and runs each step that
-//! opens or handshakes it [`within`](OpeningSocket::within) the abort signal
-//! of the caller. The [`SocketMonitor`] it then hands over backs the `closed`
-//! promise and `readyState` getters the bindings expose, so callers learn
-//! about connection loss without waiting for the next emit to fail.
+//! The browser WebSocket and the observer of its open and close, as the
+//! browser transport section of `docs/ws-wasm.md` describes.
 
 use core::cell::RefCell;
 use core::future::Future;
@@ -74,7 +66,7 @@ impl SocketMonitor {
 	}
 
 	/// Close the underlying socket. The `closed` promise resolves once the
-	/// close completes. Does nothing on an already-closed socket.
+	/// close completes, and a socket that already closed stays closed.
 	pub(crate) fn close(&self) {
 		let _ = self.raw.close();
 	}
@@ -83,25 +75,40 @@ impl SocketMonitor {
 /// A browser WebSocket from its construction until its session is
 /// established.
 ///
-/// The socket owns its open and close events. Each step that opens or
-/// handshakes it runs [`within`](Self::within) the abort signal of the
-/// caller, which hands over the [`SocketMonitor`] once the step settles while
-/// the signal stands.
+/// - The socket owns its open and close events.
+/// - Each step that opens or handshakes it runs [`within`](Self::within) the abort signal of the caller.
+/// - [`within`](Self::within) hands over the [`SocketMonitor`] once the step settles while the signal
+///   stands.
 pub(crate) struct OpeningSocket {
 	/// The lifecycle surface the established connection keeps.
 	monitor: SocketMonitor,
 }
 
+/// A socket that [`OpeningSocket::open`] opened, in its two parts.
+pub(crate) struct SocketParts {
+	/// The socket until its session is established.
+	pub(crate) opening: OpeningSocket,
+	/// The `gloo` carrier of the same socket, which a transport reads and
+	/// writes envelopes on.
+	pub(crate) carrier: WebSocket,
+}
+
+/// The outcome of a step that settled within the abort signal, and the
+/// monitor of the socket it ran over.
+pub(crate) struct Opened<T> {
+	/// The value the step settled with.
+	pub(crate) value: T,
+	/// The monitor of the socket, which the established connection keeps.
+	pub(crate) monitor: SocketMonitor,
+}
+
 impl OpeningSocket {
 	/// Open `url`, and attach the close observer before any traffic flows.
-	///
-	/// Returns the opening socket and the `gloo` carrier of the same socket,
-	/// which a transport reads and writes envelopes on.
 	///
 	/// # Errors
 	///
 	/// - `InvalidUrl` -- the WebSocket refuses `url`.
-	pub(crate) fn open(url: &str) -> Result<(Self, WebSocket), JsFault> {
+	pub(crate) fn open(url: &str) -> Result<SocketParts, JsFault> {
 		let raw = web_sys::WebSocket::new(url);
 		let raw = raw.map_err(|_| RefusalCode::InvalidUrl.because(format!("the WebSocket refuses the URL {url}")))?;
 		let closed = Self::close_promise(&raw);
@@ -111,23 +118,20 @@ impl OpeningSocket {
 		let monitor = SocketMonitor { raw, closed };
 
 		let opening = Self { monitor };
-		Ok((opening, carrier))
+		Ok(SocketParts { opening, carrier })
 	}
 
 	/// Settle once the socket is open, or reject with a structured
 	/// `ConnectionClosed` error when it closes first: a failed dial.
 	///
-	/// The open promise is built on demand, so only a session that waits on
-	/// the open holds a promise that can reject, and that session handles the
-	/// rejection.
+	/// - The open promise is built on demand, so only a session that waits on the open holds a promise that
+	///   can reject.
+	/// - That session handles the rejection.
 	pub(crate) fn opened(&self) -> impl Future<Output = Result<(), JsValue>> {
-		const CONNECTING: u16 = 0;
-		const OPEN: u16 = 1;
-
 		let state = self.monitor.ready_state();
 		let open = match state {
-			OPEN => Promise::resolve(&JsValue::UNDEFINED),
-			CONNECTING => self.open_promise(),
+			web_sys::WebSocket::OPEN => Promise::resolve(&JsValue::UNDEFINED),
+			web_sys::WebSocket::CONNECTING => self.open_promise(),
 			_ => {
 				let closed = TransportCode::ConnectionClosed.because("the socket closed before it opened");
 				Promise::reject(&closed.into())
@@ -151,15 +155,15 @@ impl OpeningSocket {
 	///
 	/// - The error `step` settles with.
 	/// - The abort reason of `signal`.
-	pub(crate) async fn within<F, T>(self, signal: &impl AbortRace, step: F) -> Result<(T, SocketMonitor), JsValue>
+	pub(crate) async fn within<F, T>(self, signal: &impl AbortRace, step: F) -> Result<Opened<T>, JsValue>
 	where
 		F: Future<Output = Result<T, JsValue>>,
 	{
 		let raced = signal.race(step).await;
 		match raced {
 			Raced::Settled(outcome) => {
-				let settled = outcome?;
-				Ok((settled, self.monitor))
+				let value = outcome?;
+				Ok(Opened { value, monitor: self.monitor })
 			}
 			Raced::Aborted(reason) => {
 				self.monitor.close();
@@ -209,9 +213,11 @@ impl OpeningSocket {
 	/// - The synthetic one that `gloo` dispatches when the socket wrapper drops.
 	///
 	/// The listener registers with `once`, so the platform detaches it after
-	/// the first dispatch, which also drains its own closure from the shared
-	/// slot to free it. [`open`](Self::open) attaches it before the opening
-	/// socket exists, so it takes the raw socket.
+	/// the first dispatch:
+	///
+	/// - That dispatch also drains its own closure from the shared slot to free it.
+	/// - [`open`](Self::open) attaches the listener before the opening socket exists, so it takes the raw
+	///   socket.
 	fn close_promise(raw: &web_sys::WebSocket) -> Promise {
 		let target = raw.clone();
 		Promise::new(&mut move |resolve: Function, _reject: Function| {
@@ -302,42 +308,37 @@ impl From<CloseInfo<'_>> for JsValue {
 
 #[cfg(test)]
 pub(crate) mod tests {
-	use core::future::Future;
-
 	use gloo_net::websocket::futures::WebSocket;
+	use wasm_bindgen::closure::Closure;
 	use wasm_bindgen::JsValue;
 	use wasm_bindgen_test::wasm_bindgen_test;
-	use web_sys::{AbortController, Event};
+	use web_sys::AbortController;
 
-	use super::OpeningSocket;
+	use super::{OpeningSocket, SocketParts};
+	use crate::loopback::{settled, Served};
 
 	/// A port that nothing listens on and that no browser blocks, so a dial to
 	/// it stays in progress for the length of a test that yields to microtasks
 	/// alone.
 	pub(crate) const UNREACHED_URL: &str = "ws://127.0.0.1:3/";
 
-	/// A socket that is still connecting, the carrier that keeps it, and a
-	/// controller whose signal stands.
-	fn connecting() -> (OpeningSocket, WebSocket, AbortController) {
-		let opened = OpeningSocket::open(UNREACHED_URL);
-		let (opening, carrier) = opened.expect("the socket should construct");
+	/// A socket to `url` that is still connecting, the carrier that keeps it,
+	/// and a controller whose signal stands.
+	fn connecting(url: &str) -> (OpeningSocket, WebSocket, AbortController) {
+		let opened = OpeningSocket::open(url);
+		let SocketParts { opening, carrier } = opened.expect("the socket should construct");
 		let controller = AbortController::new().expect("an abort controller should construct");
 
 		(opening, carrier, controller)
 	}
 
-	/// Fire the `open` event of `socket` and abort `controller` in one turn,
-	/// then wait on `opened`: an open that lands with its abort.
-	async fn open_landing(
-		socket: &web_sys::WebSocket,
-		controller: &AbortController,
-		opened: impl Future<Output = Result<(), JsValue>>,
-	) -> Result<(), JsValue> {
-		let open = Event::new("open").expect("an open event should construct");
-		socket.dispatch_event(&open).expect("the socket should dispatch the open event");
-		controller.abort();
-
-		opened.await
+	/// Abort `controller` from a listener on the `open` event of `socket`, so
+	/// the abort lands in the turn of the open. The listener lives as long as
+	/// the closure it answers.
+	fn abort_on_open(socket: &web_sys::WebSocket, controller: AbortController) -> Closure<dyn FnMut(JsValue)> {
+		let on_open = Closure::<dyn FnMut(JsValue)>::new(move |_event: JsValue| controller.abort());
+		OpeningSocket::listen_once(socket, "open", &on_open);
+		on_open
 	}
 
 	/// Abort `controller`, and settle in the same turn: a handshake that lands
@@ -349,25 +350,26 @@ pub(crate) mod tests {
 
 	#[wasm_bindgen_test]
 	async fn an_abort_that_lands_with_the_open_closes_the_socket() {
-		let (opening, _carrier, controller) = connecting();
+		let served = Served::listening().await;
+		let (opening, _carrier, controller) = connecting(&served.url());
 		let signal = controller.signal();
 		let probe = opening.monitor.clone();
 		let opened = opening.opened();
-		let landing = open_landing(&probe.raw, &controller, opened);
+		let _on_open = abort_on_open(&probe.raw, controller);
 
-		let raced = opening.within(&signal, landing).await;
+		let raced = settled(opening.within(&signal, opened)).await;
 		assert_eq!(raced.err(), Some(signal.reason()));
 		assert_eq!(probe.ready_state(), web_sys::WebSocket::CLOSING);
 	}
 
 	#[wasm_bindgen_test]
 	async fn an_abort_that_lands_with_the_handshake_closes_the_socket() {
-		let (opening, _carrier, controller) = connecting();
+		let (opening, _carrier, controller) = connecting(UNREACHED_URL);
 		let signal = controller.signal();
 		let probe = opening.monitor.clone();
 		let landing = handshake_landing(&controller);
 
-		let raced = opening.within(&signal, landing).await;
+		let raced = settled(opening.within(&signal, landing)).await;
 		assert_eq!(raced.err(), Some(signal.reason()));
 		assert_eq!(probe.ready_state(), web_sys::WebSocket::CLOSING);
 	}

@@ -1,45 +1,17 @@
-//! End-to-end round trips over the tunnel, as tightbeam scenarios.
-//!
-//! Each scenario serves the shared echo through `server!`, which records the
-//! session of every accepted tunnel on the trace of the scenario, and the
-//! shared spec of its suite grades that trace:
-//!
-//! - The cleartext case drives the `client!` macro, which takes no trace, so
-//!   its spec grades the one connection the server accepts and the one
-//!   request its gate admits.
-//! - The encrypted case sends its frame on a dialed transport that records on
-//!   the trace, so its spec grades one HPKE handshake at each end through the
-//!   `Protocol` / `EncryptedProtocol` / `AsyncListenerTrait` implementations.
+//! Round trips over the tunnel, through the shared echo of `server!`, graded
+//! by the shared specs of `tightbeam-ws`.
 
-use std::time::Duration;
+mod support;
 
-use tightbeam::crypto::profiles::DefaultCryptoProvider;
-use tightbeam::prelude::TightBeamSocketAddr;
 use tightbeam::testing::{ClientEnv, SetupEnv, TestFrame};
-use tightbeam::trace::TraceCollector;
 use tightbeam::transport::policy::RestartLinearBackoff;
-use tightbeam::transport::EncryptedProtocol;
-use tightbeam::{client, tb_scenario, TightBeamError};
+use tightbeam::{client, tb_scenario};
+use tightbeam_grpc::edge::H2c;
 use tightbeam_grpc::protocol::{GrpcAddr, GrpcListener};
 use tightbeam_ws::testing::specs::{CleartextRoundTripSpec, EncryptedRoundTripSpec};
-use tightbeam_ws::testing::{EchoService, Identity};
-use tokio::task::JoinHandle;
+use tightbeam_ws::testing::EchoService;
 
-/// The server of a scenario, and the socket address it bound.
-type Served = Result<(JoinHandle<()>, TightBeamSocketAddr), TightBeamError>;
-
-/// The shared echo on `listener`, which offers no multiplexing and records
-/// each session on `trace`.
-fn echo(listener: GrpcListener, trace: &TraceCollector) -> Served {
-	let addr = TightBeamSocketAddr(listener.local_addr());
-	Ok((EchoService::serve(listener, None, trace), addr))
-}
-
-/// The identity of the encrypted server, which its client pins.
-fn server_identity() -> Identity {
-	let minted = Identity::mint("CN=tunnel echo,O=tightbeam-grpc,C=US", 1, Duration::from_secs(3600));
-	minted.expect("a test identity mints")
-}
+use support::{server_identity, EchoServer};
 
 // tightbeam's `server!` and `client!` macros drive a cleartext tunnel: the
 // server accepts the one connection, and its gate admits the one request.
@@ -47,10 +19,7 @@ tb_scenario! {
 	name: cleartext_round_trip_drives_grpc_macros,
 	spec: CleartextRoundTripSpec,
 	environment ServiceClient {
-		server: |SetupEnv { trace, .. }| async move {
-			let listener = GrpcListener::<DefaultCryptoProvider>::bind_cleartext("127.0.0.1:0").await?;
-			echo(listener, &trace)
-		},
+		server: |SetupEnv { trace, .. }| async move { EchoServer::cleartext::<H2c>(&trace).await },
 		client: |ClientEnv { addr, .. }| async move {
 			let mut client = client! {
 				connect GrpcListener: GrpcAddr::from(addr.0),
@@ -74,12 +43,8 @@ tb_scenario! {
 	name: encrypted_round_trip_over_grpc,
 	spec: EncryptedRoundTripSpec,
 	environment ServiceClient {
-		context: server_identity(),
-		server: |SetupEnv { trace, context }| async move {
-			let bind: GrpcAddr = "127.0.0.1:0".parse()?;
-			let (listener, _bound) = <GrpcListener as EncryptedProtocol>::bind_with(bind, context.server_config()?).await?;
-			echo(listener, &trace)
-		},
+		context: server_identity("CN=tunnel echo,O=tightbeam-grpc,C=US"),
+		server: |SetupEnv { trace, context }| async move { EchoServer::encrypted::<H2c>(context.server_config(), None, &trace).await },
 		client: |ClientEnv { trace, addr, context }| async move {
 			let expected = TestFrame::v0(None, None);
 			let exchanged = EchoService::exchange::<GrpcListener, _, _>(GrpcAddr::from(addr.0), context.trust_anchor()?, expected.clone(), &trace);

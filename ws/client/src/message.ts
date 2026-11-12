@@ -1,18 +1,6 @@
 /**
- * Typed message bodies.
- *
- * The protocol treats the frame body as opaque DER: what it encodes is the
- * implementor's contract with the peer. A {@link MessageCodec} pairs a
- * TypeScript type with that contract - `encode` produces the body DER,
- * `decode` parses and runtime-validates it.
- *
- * Two styles:
- *
- * - **Wrapped payload** (`Engine.wrapping`): serialize `T` to bytes however
- *   you like (JSON, CBOR, protobuf) and let the engine wrap them in the
- *   profile opaque body.
- * - **Full DER**: implement {@link MessageCodec} directly with an ASN.1
- *   library to match a peer's typed `Message` schema.
+ * Typed message bodies, as the typed messages section of `docs/ws-client.md`
+ * describes.
  */
 
 import type { Oid, OpaqueCodec } from "#wasm";
@@ -35,15 +23,17 @@ export interface MessageCodec<T> {
 
 	/**
 	 * Encode `message` as the body DER installed in the frame.
+	 *
+	 * @throws any error of the implementation, which rejects the build.
 	 */
-	encode(message: T): Uint8Array;
+	readonly encode: (message: T) => Uint8Array;
 
 	/**
 	 * Decode and runtime-validate a body DER.
 	 *
 	 * @throws when the bytes do not satisfy the schema.
 	 */
-	decode(bodyDer: Uint8Array): T;
+	readonly decode: (bodyDer: Uint8Array) => T;
 }
 
 /**
@@ -60,15 +50,17 @@ export interface PayloadCodec<T> {
 
 	/**
 	 * Serialize `message` to payload bytes.
+	 *
+	 * @throws any error of the implementation, which rejects the build.
 	 */
-	encode(message: T): Uint8Array;
+	readonly encode: (message: T) => Uint8Array;
 
 	/**
 	 * Parse and runtime-validate payload bytes.
 	 *
 	 * @throws when the bytes do not satisfy the schema.
 	 */
-	decode(payload: Uint8Array): T;
+	readonly decode: (payload: Uint8Array) => T;
 }
 
 /**
@@ -82,12 +74,9 @@ interface HeldContentOid {
 
 /**
  * A codec held past the call that received it: the caller's codec, under a
- * copy of the content type it declares, lent as a view. A free of the
- * caller's handle leaves the holder its own.
- *
- * A holder with a release disposes the codec as it ends, which frees the
- * copy. A holder with no release leaves the copy to the glue, which reclaims
- * it with the holder.
+ * copy of the content type it declares, lent as a view. A holder with a
+ * release frees the copy as it disposes the codec, and the glue reclaims the
+ * copy of any other holder with that holder.
  */
 export class HeldCodec<T> implements MessageCodec<T>, Disposable {
 	readonly #codec: MessageCodec<T>;
@@ -122,10 +111,9 @@ export class HeldCodec<T> implements MessageCodec<T>, Disposable {
 	/**
 	 * The copy of the content type the codec declares, lent as a view that
 	 * reads through the hold, or `undefined` for a codec that declares none.
-	 * A view read after the disposal refuses with `CodecReleased` too.
 	 *
-	 * @throws TightbeamTransportError `CodecReleased` once the holder
-	 * disposed the codec.
+	 * @throws TightbeamTransportError `CodecReleased` from this read, or from a
+	 * read of the view, once the holder disposed the codec.
 	 */
 	get contentOid(): OidView | undefined {
 		const copy = this.#copy;
@@ -148,8 +136,7 @@ export class HeldCodec<T> implements MessageCodec<T>, Disposable {
 	}
 
 	/**
-	 * Free the copy. A later disposal does nothing, and a later read of
-	 * {@link contentOid} refuses with `CodecReleased`.
+	 * Free the copy. The disposal is idempotent, and a later read of {@link contentOid} refuses with `CodecReleased`.
 	 */
 	[Symbol.dispose](): void {
 		this.#copy?.hold[Symbol.dispose]();
@@ -177,7 +164,7 @@ export class Codecs {
 
 	/**
 	 * The profile codec: raw bytes in the opaque body wrapper.
-	 * `FrameBuilder.withMessage(bytes)` is sugar over it.
+	 * `Engine.frameBuilder(bytes)` is sugar over it.
 	 */
 	get opaque(): MessageCodec<Uint8Array> {
 		const opaque = this.wrapping({
@@ -188,9 +175,9 @@ export class Codecs {
 	}
 
 	/**
-	 * Lift a payload-level codec into a {@link MessageCodec} by wrapping its
-	 * bytes in the profile opaque body. The wire stays valid ASN.1 without the
-	 * implementor touching DER.
+	 * Lift a payload codec into a {@link MessageCodec} that wraps its bytes in
+	 * the profile opaque body, so the encoded body stays valid ASN.1 and the
+	 * payload codec writes no DER.
 	 */
 	wrapping<T>(inner: PayloadCodec<T>): MessageCodec<T> {
 		const opaqueBody = this.#opaqueBody;

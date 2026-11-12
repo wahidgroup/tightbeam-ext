@@ -8,7 +8,7 @@ This project is under active development. Public APIs MAY change without notice.
 
 ## Abstract
 
-This crate adds topic membership and publish fan-out to the tightbeam mux. A subscription is an ordinary command stream that the client opens, and an update is a push that the server initiates. The crate therefore adds no wire protocol and no broker, and any carrier of the mux carries it, WebSocket or raw TCP. Topic names follow the exact-match model of [MQTT 5.0](https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html) § 4.7, with no wildcards.
+This crate adds topic membership and publish fan-out to the tightbeam mux. A subscription is an ordinary command stream that the client opens, and an update is a push that the server initiates. The crate therefore adds no transport protocol and no broker, and any carrier of the mux carries it, WebSocket or raw TCP. Topic names follow the exact-match model of [MQTT 5.0](https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html) § 4.7, with no wildcards.
 
 ## Install
 
@@ -16,61 +16,44 @@ This crate adds topic membership and publish fan-out to the tightbeam mux. A sub
 cargo add tightbeam-pubsub
 ```
 
-## Quick start
+## Publishing
 
-```rust
-# use tightbeam::Frame;
-# use tightbeam_pubsub::{Topic, TopicRegistry};
-# fn publish(registry: &TopicRegistry, payload: &[u8], signed_frame: Frame) -> Result<(), Box<dyn std::error::Error>> {
-let topic: Topic = "prices/spot".parse()?;
-
-// Bytes: the registry wraps them in an update frame, stamping the topic
-// into `metadata.id` and a dense per-topic sequence into `metadata.order`.
-registry.publish(&topic, payload)?;
-
-// Frame in frame: a full tightbeam frame relays byte-for-byte as the
-// payload. Publisher-applied signatures, commitments, encryption, and
-// compression survive end to end (the TS client decodes with `Framed`),
-// and the registry never reads the inner frame.
-registry.publish_frame(&topic, &signed_frame)?;
-# Ok(())
-# }
-```
+`TopicRegistry::publish` wraps a payload in an update frame, and `publish_frame` relays a whole tightbeam frame as the payload, so the signatures and the seal of its publisher hold end to end. Implementation: [docs/pubsub.md](https://github.com/wahidgroup/tightbeam-ext/blob/master/docs/pubsub.md#registry).
 
 ## Topics and delivery
 
-`TopicRegistry` owns membership, stamps each update with a dense sequence for its topic, and bounds what each connection queues. A delivery policy decides what a full queue drops, so a slow client never stalls the fan-out. Implementation: [docs/pubsub.md](../../docs/pubsub.md#registry).
+`TopicRegistry` owns membership, stamps each update with a dense sequence for its topic, and bounds what each connection queues. A [delivery policy](https://github.com/wahidgroup/tightbeam-ext/blob/master/docs/pubsub.md#delivery-policy) decides what a full queue drops. Implementation: [docs/pubsub.md](https://github.com/wahidgroup/tightbeam-ext/blob/master/docs/pubsub.md#registry).
 
 ## Authorization
 
-A subscribe policy and an optional publish policy decide each topic against the peer that the handshake proved. Client publish stays off until a publish policy is installed. Implementation: [docs/pubsub.md](../../docs/pubsub.md#access-policies).
+A subscribe policy and an optional publish policy decide each topic against the peer that the handshake proved. Client publish stays off until a publish policy is installed. Implementation: [docs/pubsub.md](https://github.com/wahidgroup/tightbeam-ext/blob/master/docs/pubsub.md#access-policies).
 
 ## Serving connections
 
-`PubsubCommands::serve` runs the whole life of one accepted connection, and it hands every stream that no command claims to the routes of the application. Implementation: [docs/pubsub.md](../../docs/pubsub.md#connection-serve).
+`PubsubCommands::serve` runs the whole life of one accepted connection, and it hands every unary stream that no command claims to the routes of the application. Implementation: [docs/pubsub.md](https://github.com/wahidgroup/tightbeam-ext/blob/master/docs/pubsub.md#connection-serve).
 
 ## Drain
 
-A quiesce completes every subscription before the connections shut down, and it keeps each sequence dense. Implementation: [docs/pubsub.md](../../docs/pubsub.md#drain).
+A drain completes every subscription, waits for each completion to leave, and then dismisses every connection with a GoAway. It keeps each sequence dense. Implementation: [docs/pubsub.md](https://github.com/wahidgroup/tightbeam-ext/blob/master/docs/pubsub.md#drain).
 
 ## Scaling out
 
-A backplane assigns the sequence of each topic and carries a publish to every node. The in-process `Local` backplane is the default, and an implementation over Redis, Postgres, or NATS meets the same contract. Implementation: [docs/pubsub.md](../../docs/pubsub.md#backplane).
+A backplane assigns the sequence of each topic and carries a publish to every node. The in-process `Local` backplane is the default, and an implementation over Redis, Postgres, or NATS meets the same contract. `testing::BackplaneConformance` checks the clauses of the contract that the implementation page names for it. Implementation: [docs/pubsub.md](https://github.com/wahidgroup/tightbeam-ext/blob/master/docs/pubsub.md#backplane).
 
-## Wire convention
+## Command convention
 
-Topic names travel in the frame id behind the command prefixes `sub/`, `unsub/`, `pub/`, and `end/`, and every answer is a gRPC canonical status. Implementation: [docs/pubsub.md](../../docs/pubsub.md#wire-convention).
+Topic names travel in the frame id behind the command prefixes `sub/`, `unsub/`, `pub/`, and `end/`, and every answer is a gRPC canonical status. Implementation: [docs/pubsub.md](https://github.com/wahidgroup/tightbeam-ext/blob/master/docs/pubsub.md#command-convention).
 
 ## Features
 
-`instrument` records the audit trail of each served connection: its admission, departure, and expulsion, its refused commands, and its dropped updates. Implementation: [docs/pubsub.md](../../docs/pubsub.md#connection-serve).
+`instrument` records the audit trail of each served connection: its admission, departure, and expulsion, its refused commands, and its dropped updates. Implementation: [docs/pubsub.md](https://github.com/wahidgroup/tightbeam-ext/blob/master/docs/pubsub.md#connection-serve).
 
-`testing` adds in-memory links and frame builders for tests without sockets. Implementation: [docs/pubsub.md](../../docs/pubsub.md#testing).
+`testing` adds loopback WebSocket links and peers for tests, and the backplane contract suite. Implementation: [docs/pubsub.md](https://github.com/wahidgroup/tightbeam-ext/blob/master/docs/pubsub.md#testing).
 
 ## Related
 
-The TypeScript counterpart is `@wahidgroup/tightbeam-pubsub-client` ([client](../client)), which consumes these conventions over `@wahidgroup/tightbeam-ws-client`. A runnable server is [examples/pubsub_demo_server.rs](examples/pubsub_demo_server.rs), the same binary the dockerized e2e suite drives. See the [repository README](../../README.md) for development and release workflows.
+The TypeScript counterpart is `@wahidgroup/tightbeam-pubsub-client` ([client](https://github.com/wahidgroup/tightbeam-ext/tree/master/pubsub/client)), which consumes these conventions over `@wahidgroup/tightbeam-ws-client`. A runnable server is [examples/pubsub_demo_server.rs](https://github.com/wahidgroup/tightbeam-ext/blob/master/pubsub/tightbeam-pubsub/examples/pubsub_demo_server.rs), the same binary the dockerized e2e suite drives. See the [repository README](https://github.com/wahidgroup/tightbeam-ext/blob/master/README.md) for development and release workflows.
 
 ## License
 
-Licensed under either of [MIT](./LICENSE-MIT) or [Apache-2.0](./LICENSE-APACHE) at your option.
+Licensed under either of [MIT](https://github.com/wahidgroup/tightbeam-ext/blob/master/pubsub/tightbeam-pubsub/LICENSE-MIT) or [Apache-2.0](https://github.com/wahidgroup/tightbeam-ext/blob/master/pubsub/tightbeam-pubsub/LICENSE-APACHE) at your option.

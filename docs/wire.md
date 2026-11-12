@@ -1,4 +1,4 @@
-# The Envelope Wire Rules
+# The Envelope Rules of Message Sockets
 
 This page specifies `tightbeam-wire`, the envelope rules that every message-oriented socket transport of tightbeam shares:
 
@@ -28,14 +28,14 @@ A socket kind implements two traits over the halves of its socket:
 - `WireStream::next_wire` classifies each received message as a `Wire` value.
 - `WireSink::send_envelope` sends one envelope as one message.
 
-| `Wire`     | The message                                                     |
-| ---------- | --------------------------------------------------------------- |
-| `Envelope` | Carries one envelope                                            |
-| `Skip`     | Lies outside the tightbeam wire format, such as text or control |
-| `Closed`   | Is a close, or the message stream ended                         |
-| `Failed`   | Is an error of the socket, as a `WireFault` class               |
+| `Wire`     | The message                                            |
+| ---------- | ------------------------------------------------------ |
+| `Envelope` | Carries one envelope                                   |
+| `Skip`     | Carries no tightbeam envelope, such as text or control |
+| `Closed`   | Is a close, or the message stream ended                |
+| `Failed`   | Is an error of the socket, as a `WireFault` class      |
 
-A kind whose socket has a message ceiling refuses a message past it before it sizes a buffer for it, and reports `Failed(WireFault::Oversize)`. A reader sees only whole messages, so it cannot refuse one any earlier. A socket without a message ceiling delivers every message whole, and [Limitations](#limitations) states what that leaves open.
+A kind whose socket has a message ceiling refuses a message past it before it sizes a buffer for it, and reports `Failed(WireFault::Oversize)`. A reader sees only whole messages, so that refusal is the earliest one. A socket without a message ceiling delivers every message whole, and [Limitations](#limitations) states what that leaves open.
 
 ## Reads and writes
 
@@ -48,12 +48,14 @@ A kind whose socket has a message ceiling refuses a message past it before it si
 
 ## Faults
 
-| `WireFault` | Cause                                                                 | `TransportError`                |
-| ----------- | --------------------------------------------------------------------- | ------------------------------- |
-| `Closed`    | The connection closed before the operation finished                   | `ConnectionClosed`              |
-| `Io`        | The byte stream under the socket failed                               | `IoError`                       |
-| `Oversize`  | A message passed the ceiling of the socket, or the cap of a read      | `OperationFailed(SizeExceeded)` |
-| `Invalid`   | The socket broke its protocol, lost its connection, or refused a send | `InvalidMessage`                |
+| `WireFault` | Cause                                                            | `TransportError`                |
+| ----------- | ---------------------------------------------------------------- | ------------------------------- |
+| `Closed`    | The connection closed before the operation finished              | `ConnectionClosed`              |
+| `Io`        | The byte stream under the socket failed                          | `IoError`                       |
+| `Oversize`  | A message passed the ceiling of the socket, or the cap of a read | `OperationFailed(SizeExceeded)` |
+| `Invalid`   | The socket or its peer broke the protocol of the socket          | `InvalidMessage`                |
+
+A kind maps the loss of a connection to `Closed` or to `Io`, because tightbeam reads `InvalidMessage` as a refusal of what the peer sent, and reads `ConnectionClosed` and `IoError` as the end of the connection.
 
 Each kind maps the errors of its own socket library into these classes in a private item of its module, because the orphan rule keeps a `From` impl between two foreign types out of every kind's crate.
 
@@ -85,4 +87,5 @@ The crate names no socket and depends on tightbeam alone. A `wasm32` build of it
 ## Sources
 
 - The Rust Reference, Implementations, Orphan rules: <https://doc.rust-lang.org/reference/items/implementations.html#orphan-rules>
-- tightbeam-rs 0.18.0, `transport::AsyncProtocolStream` and `transport::AsyncByteStream`: <https://docs.rs/tightbeam-rs/0.18.0/tightbeam/transport/index.html>
+- tightbeam-rs 0.19.0, `transport::AsyncProtocolStream` and `transport::AsyncByteStream`: <https://docs.rs/tightbeam-rs/0.19.0/tightbeam/transport/index.html>
+- tightbeam-rs 0.19.0, `TransportError::peer_refusal`, which names the refusal of each error: `src/transport/error.rs` lines 641 to 683

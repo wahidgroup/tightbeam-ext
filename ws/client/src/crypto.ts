@@ -7,17 +7,15 @@ import type {
 	EncryptedBody,
 	HpkeSecp256k1Decryptor as WasmHpkeDecryptor,
 	HpkeSecp256k1Encryptor as WasmHpkeEncryptor,
-	Oid,
-	SealedBody,
 	Secp256k1SigningKey as WasmSecp256k1SigningKey,
 	Secp256k1VerifyingKey as WasmSecp256k1VerifyingKey,
 	SharedKey,
 } from "#wasm";
 
-import type { EngineModule } from "./engine.js";
+import type { EngineModule, EngineParts } from "./engine.js";
 import type { SignatureInfo } from "./frame.js";
 import type { OidName } from "./views.js";
-import { Lent, OidView } from "./views.js";
+import { OidView } from "./views.js";
 import { ClientTransportError } from "./errors.js";
 import { Owned } from "./owned.js";
 
@@ -34,39 +32,46 @@ export interface Hasher {
 
 	/**
 	 * Digest `data`, resolving with the raw digest octets.
+	 *
+	 * @throws any error of the implementation, as a throw or a rejection. It rejects the build, the verdict or the
+	 * opening that asked for the digest.
 	 */
-	digest(data: Uint8Array): Promise<Uint8Array>;
+	readonly digest: (data: Uint8Array) => Promise<Uint8Array>;
 }
 
 /**
- * A body-encryption capability. It receives the body DER (the profile opaque
- * body for a raw message) and returns the sealed pieces.
+ * A body-encryption capability. It receives the body that the frame holds at the seal step and returns the sealed
+ * pieces. That body is the body DER (the profile opaque body for a raw message), or its compressed octets when the
+ * build compresses.
  */
 export interface BodyEncryptor {
 	/**
 	 * Seal `bodyDer`, resolving with its envelope and ciphertext.
 	 *
-	 * @param contentOid - The content type the envelope authenticates:
-	 * `id-data` unless the codec or the builder names another.
+	 * @param contentOid - The content type the envelope authenticates: `id-data` unless the codec or the builder names
+	 * another.
+	 * @throws any error of the implementation, as a throw or a rejection. It rejects the build.
 	 */
-	encrypt(bodyDer: Uint8Array, contentOid: OidName): Promise<EncryptedBody>;
+	readonly encrypt: (bodyDer: Uint8Array, contentOid: OidName) => Promise<EncryptedBody>;
 }
 
 /**
- * The matching body-decryption capability for `Frame.open`. It receives the
- * sealed pieces carried by the frame and resolves with the plaintext body
- * DER.
+ * The matching body-decryption capability for `Frame.open`. It receives the sealed pieces carried by the frame and
+ * resolves with the octets that were sealed: the body DER, or its compressed octets when the frame is compressed.
  */
 export interface BodyDecryptor {
 	/**
-	 * Open `sealed`, resolving with the plaintext body DER.
+	 * Open `sealed`, resolving with the octets that were sealed.
+	 *
+	 * @throws any error of the implementation, as a throw or a rejection. It rejects the `Frame.open` that asked for
+	 * the plaintext.
 	 */
-	decrypt(sealed: EncryptedBody): Promise<Uint8Array>;
+	readonly decrypt: (sealed: EncryptedBody) => Promise<Uint8Array>;
 }
 
 /**
- * Minimum frame surface a {@link FrameVerifier} needs. Kept structural so
- * crypto does not import {@link Frame} (avoids a crypto↔frame cycle).
+ * The frame surface a {@link FrameVerifier} reads, which a frame of the
+ * client and a frame of any other implementation both offer.
  */
 export interface VerifiableFrame {
 	/**
@@ -92,51 +97,44 @@ export interface VerifiableFrame {
 }
 
 /**
- * Unwrap/verify half of authenticity. Algorithm lives in the
- * implementation (profile secp256k1, BYO ed25519, …).
+ * The verify half of authenticity. The implementation owns the algorithm,
+ * such as the profile secp256k1 or an ed25519 key the caller brings, and may
+ * verify asynchronously, as WebCrypto does.
  */
 export interface FrameVerifier {
 	/**
-	 * Verify this frame's non-repudiation signature.
+	 * Verify the non-repudiation signature of `frame`.
 	 *
 	 * @throws when the frame is unsigned, the algorithm differs, or the
-	 * signature does not verify.
+	 * signature does not verify, as a throw or as a rejection.
 	 */
-	verifyFrame(frame: VerifiableFrame): void;
+	readonly verifyFrame: (frame: VerifiableFrame) => void | Promise<void>;
 }
 
 /**
- * A frame signer: a local {@link Secp256k1SigningKey}, a wallet, a passkey,
- * an HSM, or a remote KMS backend. An external signer's private key never
- * enters wasm memory.
- *
- * - The engine owns the signature profile: a frame carries a CMS `SignerInfo`
- *   whose form the wasm profile fixes.
- * - A signer therefore signs ECDSA over secp256k1 with SHA3-256. A signature
- *   under any other scheme fails verification at the peer.
+ * A frame signer: a local {@link Secp256k1SigningKey}, or a wallet, a passkey,
+ * an HSM, or a remote KMS backend that keeps its private key outside wasm. The
+ * wasm profile fixes the signature, so a signer signs ECDSA over secp256k1
+ * with SHA3-256, and the peer refuses a signature under any other scheme.
  */
 export interface Signatory {
 	/**
-	 * Present when this signer can derive its verify half (local keys).
-	 * Envelope `signed(signatory)` uses it for `unwrap()` without a
-	 * separate `verified()` declaration.
-	 */
-	readonly verifier?: FrameVerifier;
-
-	/**
-	 * The subject-key-identifier octets naming this signer's certificate in
-	 * the frame (RFC 7093 § 2 method 1 for a profile key).
-	 */
-	signerId(): Uint8Array;
-
-	/**
-	 * Sign `prehash` directly, with no rehash, resolving with a DER
-	 * `ECDSA-Sig-Value` (RFC 3279 § 2.2.3).
+	 * The subject-key-identifier octets naming this signer's certificate in the frame (RFC 7093 § 2 method 1 for a
+	 * profile key).
 	 *
-	 * The prehash is the digest of the frame's CMS signed attributes, which
-	 * bind its to-be-signed bytes (RFC 5652 § 5.4).
+	 * @throws any error of the implementation, which rejects the build.
 	 */
-	signPrehash(prehash: Uint8Array): Promise<Uint8Array>;
+	readonly signerId: () => Uint8Array;
+
+	/**
+	 * Sign `prehash` directly, with no rehash, resolving with a DER `ECDSA-Sig-Value` (RFC 3279 § 2.2.3).
+	 *
+	 * The prehash is the digest of the frame's CMS signed attributes, which bind its to-be-signed bytes
+	 * (RFC 5652 § 5.4).
+	 *
+	 * @throws any error of the implementation, as a throw or a rejection. It rejects the build.
+	 */
+	readonly signPrehash: (prehash: Uint8Array) => Promise<Uint8Array>;
 }
 
 /**
@@ -172,43 +170,39 @@ export class Sha3_256 implements Hasher {
 
 	readonly #hasher: EngineModule["Sha3_256"];
 
-	private constructor(
-		hasher: EngineModule["Sha3_256"],
-		algorithmOid: OidView,
-	) {
+	private constructor(hasher: EngineModule["Sha3_256"], algorithmOid: OidView) {
 		this.algorithmOid = algorithmOid;
 		this.#hasher = hasher;
 	}
 
 	/**
 	 * The profile hasher of `hasher`, the glue class, which names its digest
-	 * by `algorithmOid`.
+	 * by `algorithmOid`. The engine builds the one hasher of its realm.
+	 *
+	 * @internal
 	 */
-	static over(
-		hasher: EngineModule["Sha3_256"],
-		algorithmOid: OidView,
-	): Sha3_256 {
+	static over(hasher: EngineParts["glue"]["Sha3_256"], algorithmOid: OidView): Sha3_256 {
 		const profile = new Sha3_256(hasher, algorithmOid);
 		return profile;
 	}
 
 	/**
 	 * Digest `data` with SHA3-256.
+	 *
+	 * @throws TightbeamTransportError `InvalidBytes`, as a rejection, when
+	 * `data` is not a `Uint8Array`.
 	 */
-	digest(data: Uint8Array): Promise<Uint8Array> {
+	async digest(data: Uint8Array): Promise<Uint8Array> {
 		const digest = this.#hasher.digest(data);
-		const result = Promise.resolve(digest);
-		return result;
+		return digest;
 	}
 }
 
 /**
  * The verify half of a secp256k1 ECDSA key, read through the hold of the key
- * that owns its wasm handle.
- *
- * A {@link Secp256k1VerifyingKey} owns its own hold and releases it. The view
- * that {@link Secp256k1SigningKey.verifyingKey} lends reads the hold of that
- * signing key, which frees it with itself, so the view has no release.
+ * that owns its wasm handle. A {@link Secp256k1VerifyingKey} owns its hold,
+ * and the view that {@link Secp256k1SigningKey.verifyingKey} lends reads the
+ * hold of that signing key, which frees the view with itself.
  */
 export class VerifyingKeyView implements FrameVerifier {
 	/**
@@ -262,26 +256,22 @@ export class VerifyingKeyView implements FrameVerifier {
  * A secp256k1 ECDSA verifying (public) key, for `Frame.verify`, which owns
  * its wasm handle.
  */
-export class Secp256k1VerifyingKey
-	extends VerifyingKeyView
-	implements Disposable
-{
+export class Secp256k1VerifyingKey extends VerifyingKeyView implements Disposable {
 	private constructor(hold: Owned<WasmSecp256k1VerifyingKey>) {
 		super(hold);
 	}
 
 	/**
 	 * Wrap a SEC1-encoded point (33-byte compressed or 65-byte uncompressed)
-	 * in the module `glue`.
+	 * through the engine `parts`.
 	 *
 	 * @throws TightbeamTransportError `InvalidVerifyingKey` when the octets
 	 * name no secp256k1 point.
+	 *
+	 * @internal
 	 */
-	static fromSec1Bytes(
-		glue: EngineModule,
-		sec1: Uint8Array,
-	): Secp256k1VerifyingKey {
-		const inner = glue.Secp256k1VerifyingKey.fromSec1Bytes(sec1);
+	static fromSec1Bytes(parts: EngineParts, sec1: Uint8Array): Secp256k1VerifyingKey {
+		const inner = parts.glue.Secp256k1VerifyingKey.fromSec1Bytes(sec1);
 
 		const hold = new Owned(inner, ClientTransportError.keyReleased);
 		const key = new Secp256k1VerifyingKey(hold);
@@ -289,8 +279,8 @@ export class Secp256k1VerifyingKey
 	}
 
 	/**
-	 * Free the wasm handle of the key. A later release does nothing, and
-	 * every later call on the key refuses with `KeyReleased`.
+	 * Free the wasm handle of the key. The release is idempotent, and every later call on the key refuses with
+	 * `KeyReleased`.
 	 */
 	[Symbol.dispose](): void {
 		this.hold[Symbol.dispose]();
@@ -323,24 +313,21 @@ export class Secp256k1SigningKey implements Signatory, Disposable {
 	 */
 	#verifying: LentVerifyingKey | undefined;
 
-	private constructor(
-		hold: Owned<WasmSecp256k1SigningKey>,
-		verifyingKeys: EngineModule["Secp256k1VerifyingKey"],
-	) {
+	private constructor(hold: Owned<WasmSecp256k1SigningKey>, verifyingKeys: EngineModule["Secp256k1VerifyingKey"]) {
 		this.#hold = hold;
 		this.#verifyingKeys = verifyingKeys;
 	}
 
 	/**
-	 * Wrap a raw 32-byte secp256k1 scalar in the module `glue`.
+	 * Wrap a raw 32-byte secp256k1 scalar through the engine `parts`.
 	 *
 	 * @throws TightbeamTransportError `InvalidSigningKey` when the scalar is
 	 * not 32 octets, or names no key.
+	 *
+	 * @internal
 	 */
-	static fromBytes(
-		glue: EngineModule,
-		bytes: Uint8Array,
-	): Secp256k1SigningKey {
+	static fromBytes(parts: EngineParts, bytes: Uint8Array): Secp256k1SigningKey {
+		const glue = parts.glue;
 		const inner = glue.Secp256k1SigningKey.fromBytes(bytes);
 		const hold = new Owned(inner, ClientTransportError.keyReleased);
 
@@ -349,35 +336,26 @@ export class Secp256k1SigningKey implements Signatory, Disposable {
 	}
 
 	/**
-	 * The verifying key, derived on the first call and lent by this key,
-	 * which frees it with itself. Every call answers the same view, and the
-	 * view has no release of its own.
+	 * The verifying key, derived on the first call and lent by this key, which
+	 * frees it with itself. Every call answers the same view.
 	 *
-	 * @throws TightbeamTransportError `KeyReleased` when this key was
-	 * released before the first call.
+	 * @throws TightbeamTransportError `KeyReleased` when this key was released.
 	 */
 	verifyingKey(): VerifyingKeyView {
+		const signing = this.#hold.use("verifyingKey");
 		const lent = this.#verifying;
 		if (lent !== undefined) {
 			return lent.view;
 		}
 
-		const signing = this.#hold.use("verifyingKey");
 		const sec1 = signing.derivePublicKey();
 		const inner = this.#verifyingKeys.fromSec1Bytes(sec1);
 
 		const hold = new Owned(inner, ClientTransportError.keyReleased);
 		const view = new VerifyingKeyView(hold);
 		this.#verifying = { hold, view };
-		return view;
-	}
 
-	/**
-	 * Verify half for envelope `signed(this)` / `Frame.verify`: the one
-	 * verifying key of {@link verifyingKey}.
-	 */
-	get verifier(): FrameVerifier {
-		return this.verifyingKey();
+		return view;
 	}
 
 	/**
@@ -404,19 +382,19 @@ export class Secp256k1SigningKey implements Signatory, Disposable {
 	/**
 	 * Sign `prehash` in the wasm module, with no rehash, resolving with a
 	 * DER `ECDSA-Sig-Value`.
+	 *
+	 * @throws TightbeamTransportError, as a rejection, `KeyReleased` once the
+	 * key is released and `InvalidPrehash` when the key cannot sign `prehash`.
 	 */
-	signPrehash(prehash: Uint8Array): Promise<Uint8Array> {
+	async signPrehash(prehash: Uint8Array): Promise<Uint8Array> {
 		const signing = this.#hold.use("signPrehash");
 		const signature = signing.signPrehash(prehash);
-
-		const result = Promise.resolve(signature);
-		return result;
+		return signature;
 	}
 
 	/**
-	 * Release the scalar and the verifying key: the wasm copy of the scalar
-	 * wipes now. A later release does nothing, and every later call on this
-	 * key, or on the verifying key it lent, refuses with `KeyReleased`.
+	 * Release the scalar and the verifying key: the wasm copy of the scalar wipes now. The release is idempotent, and
+	 * every later call on this key, or on the verifying key it lent, refuses with `KeyReleased`.
 	 */
 	[Symbol.dispose](): void {
 		this.#verifying?.hold[Symbol.dispose]();
@@ -438,18 +416,16 @@ export class Aes256Gcm implements BodyEncryptor, BodyDecryptor, Disposable {
 	}
 
 	/**
-	 * Wrap a raw 32-byte key and the identifier that names it, each in a field
-	 * of its own name, in the module `glue`. An envelope carries `keyId` in the
-	 * clear, and an open refuses an envelope that names another key.
+	 * Wrap a raw 32-byte key and the `keyId` that names it, which an envelope
+	 * carries in the clear, through the engine `parts`.
 	 *
-	 * @throws TightbeamTransportError, with the field on `path`:
+	 * @throws TightbeamTransportError at the field it names on `path`:
+	 * `EmptyKeyId`, `KeyError` for a key of another length, or `InvalidBytes`.
 	 *
-	 * - `EmptyKeyId` at `shared.keyId` when `keyId` is empty.
-	 * - `KeyError` at `shared.key` when the key is not 32 octets.
-	 * - `InvalidBytes` when a member is no `Uint8Array`.
+	 * @internal
 	 */
-	static fromKey(glue: EngineModule, shared: SharedKey): Aes256Gcm {
-		const inner = glue.Aes256Gcm.fromKey(shared);
+	static fromKey(parts: EngineParts, shared: SharedKey): Aes256Gcm {
+		const inner = parts.glue.Aes256Gcm.fromKey(shared);
 		const hold = new Owned(inner, ClientTransportError.keyReleased);
 
 		const aes256Gcm = new Aes256Gcm(hold);
@@ -458,22 +434,25 @@ export class Aes256Gcm implements BodyEncryptor, BodyDecryptor, Disposable {
 
 	/**
 	 * Seal `bodyDer` under a fresh content key.
+	 *
+	 * @throws TightbeamTransportError `KeyReleased`, as a rejection, once the
+	 * key is released.
 	 */
-	encrypt(bodyDer: Uint8Array, contentOid: OidName): Promise<EncryptedBody> {
+	async encrypt(bodyDer: Uint8Array, contentOid: OidName): Promise<EncryptedBody> {
 		const cipher = this.#hold.use("encrypt");
-		const seal = (content: Oid): SealedBody =>
-			cipher.seal(bodyDer, content);
-		const sealed = Lent.oid(contentOid, seal);
-		const encryptedBody = sealed.takePieces();
+		using content = contentOid.clone();
 
-		const result = Promise.resolve(encryptedBody);
-		return result;
+		const sealed = cipher.seal(bodyDer, content);
+		const encryptedBody = sealed.takePieces();
+		return encryptedBody;
 	}
 
 	/**
-	 * Open a body sealed with this key. The engine reads the algorithm and
-	 * the key the envelope names, and refuses an envelope this key does not
-	 * open.
+	 * Open a body sealed with this key, under the algorithm and the key that
+	 * its envelope names.
+	 *
+	 * @throws TightbeamTransportError, as a rejection, `KeyReleased` once the
+	 * key is released, and the refusal of the engine otherwise.
 	 */
 	async decrypt(sealed: EncryptedBody): Promise<Uint8Array> {
 		const cipher = this.#hold.use("decrypt");
@@ -482,9 +461,8 @@ export class Aes256Gcm implements BodyEncryptor, BodyDecryptor, Disposable {
 	}
 
 	/**
-	 * Release the shared key. The wasm copy wipes at once, or when an open
-	 * already in flight settles. A later release does nothing, and every
-	 * later call on this cipher refuses with `KeyReleased`.
+	 * Release the shared key. The wasm copy wipes at once, or when an open already in flight settles. The release is
+	 * idempotent, and every later call on this cipher refuses with `KeyReleased`.
 	 */
 	[Symbol.dispose](): void {
 		this.#hold[Symbol.dispose]();
@@ -492,17 +470,10 @@ export class Aes256Gcm implements BodyEncryptor, BodyDecryptor, Disposable {
 }
 
 /**
- * The profile asymmetric {@link BodyEncryptor}: HPKE to a recipient public
- * key (DHKEM over secp256k1 with an AES-256-GCM content key, in a CMS
- * `KEMRecipientInfo`). Only the holder of the matching secret key can open
- * the body.
- *
- * # Sources
- *
- * - RFC 9180, Hybrid Public Key Encryption:
- *   {@link https://datatracker.ietf.org/doc/html/rfc9180 RFC 9180}
- * - RFC 9629, Using Key Encapsulation Mechanism (KEM) Algorithms in CMS:
- *   {@link https://datatracker.ietf.org/doc/html/rfc9629 RFC 9629}
+ * The profile asymmetric {@link BodyEncryptor}: HPKE (RFC 9180) to a recipient
+ * public key, with DHKEM over secp256k1 and an AES-256-GCM content key in a
+ * CMS `KEMRecipientInfo` (RFC 9629). The holder of the matching secret key
+ * alone opens the body.
  */
 export class HpkeEncryptor implements BodyEncryptor, Disposable {
 	readonly #hold: Owned<WasmHpkeEncryptor>;
@@ -513,16 +484,16 @@ export class HpkeEncryptor implements BodyEncryptor, Disposable {
 
 	/**
 	 * Wrap the recipient's SEC1-encoded public key (33-byte compressed or
-	 * 65-byte uncompressed) in the module `glue`.
+	 * 65-byte uncompressed) through the engine `parts`.
 	 *
 	 * @throws TightbeamTransportError `InvalidVerifyingKey` when the octets
 	 * name no secp256k1 point.
+	 *
+	 * @internal
 	 */
-	static fromBytes(
-		glue: EngineModule,
-		recipientPublicKey: Uint8Array,
-	): HpkeEncryptor {
-		const inner = glue.HpkeSecp256k1Encryptor.fromBytes(recipientPublicKey);
+	static fromBytes(parts: EngineParts, recipientPublicKey: Uint8Array): HpkeEncryptor {
+		const encryptors = parts.glue.HpkeSecp256k1Encryptor;
+		const inner = encryptors.fromBytes(recipientPublicKey);
 		const hold = new Owned(inner, ClientTransportError.keyReleased);
 
 		const encryptor = new HpkeEncryptor(hold);
@@ -531,22 +502,22 @@ export class HpkeEncryptor implements BodyEncryptor, Disposable {
 
 	/**
 	 * Seal `bodyDer` to the recipient under a fresh ephemeral key.
+	 *
+	 * @throws TightbeamTransportError `KeyReleased`, as a rejection, once the
+	 * key is released.
 	 */
-	encrypt(bodyDer: Uint8Array, contentOid: OidName): Promise<EncryptedBody> {
+	async encrypt(bodyDer: Uint8Array, contentOid: OidName): Promise<EncryptedBody> {
 		const recipient = this.#hold.use("encrypt");
-		const seal = (content: Oid): SealedBody =>
-			recipient.seal(bodyDer, content);
-		const sealed = Lent.oid(contentOid, seal);
-		const encryptedBody = sealed.takePieces();
+		using content = contentOid.clone();
 
-		const result = Promise.resolve(encryptedBody);
-		return result;
+		const sealed = recipient.seal(bodyDer, content);
+		const encryptedBody = sealed.takePieces();
+		return encryptedBody;
 	}
 
 	/**
-	 * Free the wasm handle of the recipient key. A later release does
-	 * nothing, and every later call on this encryptor refuses with
-	 * `KeyReleased`.
+	 * Free the wasm handle of the recipient key. The release is idempotent, and every later call on this encryptor
+	 * refuses with `KeyReleased`.
 	 */
 	[Symbol.dispose](): void {
 		this.#hold[Symbol.dispose]();
@@ -565,13 +536,15 @@ export class HpkeDecryptor implements BodyDecryptor, Disposable {
 	}
 
 	/**
-	 * Wrap the raw 32-byte recipient secret key in the module `glue`.
+	 * Wrap the raw 32-byte recipient secret key through the engine `parts`.
 	 *
 	 * @throws TightbeamTransportError `InvalidSigningKey` when the secret is
 	 * not 32 octets, or names no key.
+	 *
+	 * @internal
 	 */
-	static fromBytes(glue: EngineModule, secretKey: Uint8Array): HpkeDecryptor {
-		const inner = glue.HpkeSecp256k1Decryptor.fromBytes(secretKey);
+	static fromBytes(parts: EngineParts, secretKey: Uint8Array): HpkeDecryptor {
+		const inner = parts.glue.HpkeSecp256k1Decryptor.fromBytes(secretKey);
 		const hold = new Owned(inner, ClientTransportError.keyReleased);
 
 		const decryptor = new HpkeDecryptor(hold);
@@ -579,9 +552,11 @@ export class HpkeDecryptor implements BodyDecryptor, Disposable {
 	}
 
 	/**
-	 * Open a body sealed to this recipient. The engine reads the algorithm
-	 * and the recipient the envelope names, and refuses an envelope this key
-	 * does not open.
+	 * Open a body sealed to this recipient, under the algorithm and the
+	 * recipient that its envelope names.
+	 *
+	 * @throws TightbeamTransportError, as a rejection, `KeyReleased` once the
+	 * key is released, and the refusal of the engine otherwise.
 	 */
 	async decrypt(sealed: EncryptedBody): Promise<Uint8Array> {
 		const recipient = this.#hold.use("decrypt");
@@ -590,9 +565,8 @@ export class HpkeDecryptor implements BodyDecryptor, Disposable {
 	}
 
 	/**
-	 * Release the recipient secret. The wasm copy wipes at once, or when an
-	 * open already in flight settles. A later release does nothing, and every
-	 * later call on this decryptor refuses with `KeyReleased`.
+	 * Release the recipient secret. The wasm copy wipes at once, or when an open already in flight settles. The release
+	 * is idempotent, and every later call on this decryptor refuses with `KeyReleased`.
 	 */
 	[Symbol.dispose](): void {
 		this.#hold[Symbol.dispose]();

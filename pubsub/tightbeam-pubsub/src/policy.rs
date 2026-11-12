@@ -1,7 +1,5 @@
-//! Behavioral seams for delivery saturation and topic access authorization.
-//!
-//! Every trait follows the core hook style: a small object the application
-//! installs once, consulted at the relevant decision point.
+//! The policies that a registry and its commands consult. The page
+//! `docs/pubsub.md` (Delivery policy, Access policies) states each one.
 
 use tightbeam::policy::SessionContext;
 
@@ -19,33 +17,19 @@ pub enum DeliveryVerdict {
 	Disconnect,
 }
 
-/// Decides the fate of an update when a subscriber queue is full.
+/// Decides the fate of an update that finds the queue of its subscriber, or
+/// the byte budget of its connection, full.
 ///
-/// This crate has no per-subscription credit, so a full queue, or a full
-/// byte budget of the connection, is the only backpressure signal. Every
-/// drop is a guaranteed gap at the client's gate.
-///
-/// The registry asks with no registry lock held, and lends a
-/// [`RegistryView`] for the reads a verdict weighs. The backplane may still
-/// hold its own lock, as [`Local`](crate::Local) does while it delivers, so a
-/// policy MUST NOT publish, quiesce, or make any other call that reaches the
-/// backplane.
+/// The registry asks with no registry lock held, during a delivery of its
+/// backplane, and lends a [`RegistryView`] for the reads a verdict weighs.
 pub trait DeliveryPolicy: Send + Sync {
 	/// One update does not fit `topic`'s queue for a subscriber that has
 	/// already dropped `dropped_so_far` updates. Return the verdict.
 	fn on_full(&self, registry: RegistryView<'_>, topic: &Topic, dropped_so_far: u64) -> DeliveryVerdict;
 }
 
-/// The default policy: always drop the oldest queued update.
-///
-/// Bounded-queue drop-oldest matches common broker practice: the newest
-/// state wins, and the client's gap detection reports what was lost.
-///
-/// # Sources
-///
-/// - MQTT 5.0, broker queueing practice (topic vocabulary and delivery):
-///   <https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html>
-///
+/// The default policy: always drop the oldest queued update, so the newest
+/// state wins and the gate of the client reports the loss.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DropOldest;
 
@@ -66,12 +50,10 @@ pub enum AccessVerdict {
 
 /// Owns the `PermissionDenied` decision for `sub/` commands.
 ///
-/// `session` names the peer that the handshake of the connection proved. A
-/// mutual-auth peer carries its validated certificate
-/// ([`SessionContext::peer_certificate`]), and an anonymous peer carries none.
-/// Without this hook the wire's `PermissionDenied` answer has no author.
-///
-/// The dispatcher lends a [`RegistryView`] for the reads a verdict weighs.
+/// - `session` names the peer that the handshake of the connection proved. A mutual-auth peer
+///   carries its validated certificate ([`SessionContext::peer_certificate`]), and an anonymous
+///   peer carries none.
+/// - The dispatcher lends a [`RegistryView`] for the reads a verdict weighs.
 pub trait SubscribePolicy: Send + Sync {
 	/// May the peer of `session` subscribe to `topic`?
 	fn authorize(&self, registry: RegistryView<'_>, session: &SessionContext, topic: &Topic) -> AccessVerdict;
@@ -79,11 +61,9 @@ pub trait SubscribePolicy: Send + Sync {
 
 /// Owns the `PermissionDenied` decision for `pub/` commands.
 ///
-/// Client publish is opt-in: [`PubsubCommands`](crate::PubsubCommands)
-/// only answers `pub/` frames once a publish policy is installed with
-/// [`with_publish`](crate::PubsubCommands::with_publish). `session` names the
-/// peer as it does for a [`SubscribePolicy`], and the dispatcher lends a
-/// [`RegistryView`] for the reads a verdict weighs.
+/// - [`PubsubCommands`](crate::PubsubCommands) answers `pub/` frames once
+///   [`with_publish`](crate::PubsubCommands::with_publish) installs a publish policy.
+/// - `session` and the [`RegistryView`] read as they do for a [`SubscribePolicy`].
 pub trait PublishPolicy: Send + Sync {
 	/// May the peer of `session` publish to `topic`?
 	fn authorize(&self, registry: RegistryView<'_>, session: &SessionContext, topic: &Topic) -> AccessVerdict;
@@ -116,7 +96,11 @@ mod tests {
 		let policy = DropOldest;
 		let registry = TopicRegistry::default();
 
-		let verdict = policy.on_full(registry.view(), &Topic::fixture("prices"), 7);
+		let verdict = policy.on_full(
+			registry.view(),
+			&"prices".parse::<Topic>().expect("the name should be a topic"),
+			7,
+		);
 		assert_eq!(verdict, DeliveryVerdict::DropOldest);
 	}
 
@@ -126,7 +110,12 @@ mod tests {
 		let registry = TopicRegistry::default();
 		let anonymous = SessionContext::default();
 
-		let verdict = SubscribePolicy::authorize(&policy, registry.view(), &anonymous, &Topic::fixture("prices"));
+		let verdict = SubscribePolicy::authorize(
+			&policy,
+			registry.view(),
+			&anonymous,
+			&"prices".parse::<Topic>().expect("the name should be a topic"),
+		);
 		assert_eq!(verdict, AccessVerdict::Allow);
 	}
 
@@ -136,7 +125,12 @@ mod tests {
 		let registry = TopicRegistry::default();
 		let anonymous = SessionContext::default();
 
-		let verdict = PublishPolicy::authorize(&policy, registry.view(), &anonymous, &Topic::fixture("prices"));
+		let verdict = PublishPolicy::authorize(
+			&policy,
+			registry.view(),
+			&anonymous,
+			&"prices".parse::<Topic>().expect("the name should be a topic"),
+		);
 		assert_eq!(verdict, AccessVerdict::Allow);
 	}
 }

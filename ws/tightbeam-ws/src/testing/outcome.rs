@@ -1,9 +1,5 @@
 //! How the read of a dialing transport ended, as the spec of a scenario
 //! grades it.
-//!
-//! The emit path of tightbeam files no refusal event for an answer that its
-//! read refuses before the decode, so a scenario that dials a hostile peer
-//! records the outcome of the read itself, and its spec grades the name.
 
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::error::{TransportError, TransportFailure};
@@ -11,6 +7,10 @@ use tightbeam::urn::Urn;
 use tightbeam::{urn, TightBeamError};
 
 /// How the read of a dialing transport ended.
+///
+/// The emit path of tightbeam files no event for an answer that its read
+/// refuses before the decode, so a scenario that dials a hostile peer records
+/// this outcome itself.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReadOutcome {
 	/// The read delivered a message.
@@ -57,7 +57,7 @@ impl ReadOutcome {
 	///
 	/// # Errors
 	///
-	/// - [`TightBeamError`] -- the trace refused the event.
+	/// - The [`TightBeamError`] of a trace that refused the event.
 	pub fn record<T>(read: &Result<T, TransportError>, trace: &TraceCollector) -> Result<(), TightBeamError> {
 		let outcome = Self::of(read);
 		trace.event_with(Self::EVENT, &[], outcome.as_str())?;

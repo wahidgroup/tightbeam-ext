@@ -8,15 +8,7 @@
 		"skipLibCheck": true,
 		"esModuleInterop": true,
 		"types": ["@playwright/test", "node"],
-		"lib": ["ES2022", "DOM", "DOM.Iterable"]
+		"lib": ["ES2022", "ESNext.Array", "ESNext.Disposable", "DOM", "DOM.Iterable"]
 	},
-	"include": [
-		"app",
-		"specs",
-		"node",
-		"global.d.ts",
-		"vite.config.ts",
-		"vitest.config.ts",
-		"playwright.config.ts"
-	]
+	"include": ["app", "specs", "node", "global.d.ts", "vite.config.ts", "vitest.config.ts", "playwright.config.ts"]
 }

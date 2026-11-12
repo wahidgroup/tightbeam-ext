@@ -2,18 +2,18 @@ import { describe, expect, expectTypeOf, it } from "vitest";
 
 import type { RefusalCode, TransitCode, TransportCode } from "#wasm";
 
-import type { ClientCode, TransportErrorCode } from "./errors.js";
+import type { ClientCode, TransportError } from "./errors.js";
 import { ClientTransportError, StreamRefusal } from "./errors.js";
-import { TightbeamWsClient } from "./index.js";
+import { Engine } from "./index.js";
 
-const engine = await TightbeamWsClient.init();
+const engine = await Engine.load();
 
 /**
  * A rejection shaped like the wasm layer's structured transport errors.
  */
 function structuredError(code: string): Error {
 	const error = new Error("connection draining after GoAway");
-	error.name = ClientTransportError.NAME;
+	error.name = "TightbeamTransportError";
 	Object.assign(error, { code });
 	return error;
 }
@@ -30,7 +30,7 @@ const FOREIGN_REJECTIONS = [
 
 function structuredWithoutCode(): Error {
 	const error = new Error("no code property");
-	error.name = ClientTransportError.NAME;
+	error.name = "TightbeamTransportError";
 	return error;
 }
 
@@ -63,41 +63,24 @@ describe("Engine.isTransportError", () => {
 		expect(engine.isTransportError(forged)).toBe(false);
 	});
 
+	it.each(["WorkRefused", "OpaqueBody"])("does not narrow a forged %s that carries no detail", (code) => {
+		const forged = structuredError(code);
+		expect(engine.isTransportError(forged)).toBe(false);
+	});
+
+	it("does not narrow a forged refusal named Ok, which names no refusal", () => {
+		const forged = structuredError("Ok");
+		expect(engine.isTransportError(forged)).toBe(false);
+	});
+
+	it("narrows the opaque body the client decided, with the layer it lacks", () => {
+		const opaque = ClientTransportError.opaqueBody("opener");
+		expect(engine.isTransportError(opaque)).toBe(true);
+		expect(opaque).toMatchObject({ code: "OpaqueBody", layer: "opener" });
+	});
+
 	it.each(FOREIGN_REJECTIONS)("rejects $label", ({ value }) => {
 		expect(engine.isTransportError(value)).toBe(false);
-	});
-});
-
-describe("ClientTransportError.isConnectionClosed", () => {
-	it("recognizes a structured ConnectionClosed rejection", () => {
-		const rejection = structuredError("ConnectionClosed");
-		expect(ClientTransportError.isConnectionClosed(rejection)).toBe(true);
-	});
-
-	it("recognizes the refusal of an operation on a released client", () => {
-		const refusal = ClientTransportError.closed("emit");
-		expect(ClientTransportError.isConnectionClosed(refusal)).toBe(true);
-	});
-
-	it.each(["Draining", "StreamsExhausted"])(
-		"refuses a structured rejection whose code is %s",
-		(code) => {
-			const rejection = structuredError(code);
-			expect(ClientTransportError.isConnectionClosed(rejection)).toBe(
-				false,
-			);
-		},
-	);
-
-	it("refuses a plain Error that only carries the code", () => {
-		const imitation = Object.assign(new Error("closed"), {
-			code: "ConnectionClosed",
-		});
-		expect(ClientTransportError.isConnectionClosed(imitation)).toBe(false);
-	});
-
-	it.each(FOREIGN_REJECTIONS)("refuses $label", ({ value }) => {
-		expect(ClientTransportError.isConnectionClosed(value)).toBe(false);
 	});
 });
 
@@ -111,27 +94,39 @@ describe("StreamRefusal", () => {
 			message: "no such order",
 		});
 	});
+
+	it("settles a served stream with the code of a StreamRefusal", () => {
+		const refusal = new StreamRefusal("PermissionDenied", "not yours");
+		expect(StreamRefusal.settlement(refusal)).toBe("PermissionDenied");
+	});
+
+	it.each([
+		{ label: "a rethrown engine error", thrown: thrownBy(() => engine.oid("not-an-oid")) },
+		{ label: "an error the client decided", thrown: ClientTransportError.closed("emit") },
+		{ label: "a bare status name", thrown: "NotFound" },
+		{ label: "an object that names a status", thrown: { code: "Unavailable" } },
+		{ label: "undefined", thrown: undefined },
+	])("settles a served stream with Unknown for $label", ({ thrown }) => {
+		expect(StreamRefusal.settlement(thrown)).toBe("Unknown");
+	});
 });
 
-describe("TransportErrorCode", () => {
+describe("TransportError", () => {
 	it("each code family declares codes no other family declares", () => {
 		type EngineCodes = RefusalCode | TransportCode;
 
 		expectTypeOf<Extract<RefusalCode, TransportCode>>().toBeNever();
 		expectTypeOf<Extract<EngineCodes, TransitCode>>().toBeNever();
-		expectTypeOf<
-			Extract<EngineCodes | TransitCode, ClientCode>
-		>().toBeNever();
+		expectTypeOf<Extract<EngineCodes | TransitCode, ClientCode>>().toBeNever();
 	});
 
-	it("a transport error carries a closed code, and only the class builds one", () => {
-		const build = (): unknown =>
-			// @ts-expect-error The constructor is private: a named static builds each code.
-			new ClientTransportError("ConnectionClosed", "closed");
-		expectTypeOf(build).toBeFunction();
-		expectTypeOf<
-			ClientTransportError["code"]
-		>().toEqualTypeOf<TransportErrorCode>();
-		expectTypeOf<string>().not.toExtend<TransportErrorCode>();
+	it("a check of the code narrows to the member that carries its detail", () => {
+		type WorkRefused = Extract<TransportError, { readonly code: "WorkRefused" }>;
+		type OpaqueBody = Extract<TransportError, { readonly code: "OpaqueBody" }>;
+		type Draining = TransportError & { readonly code: "Draining" };
+
+		expectTypeOf<WorkRefused["status"]>().toEqualTypeOf<TransitCode>();
+		expectTypeOf<OpaqueBody["layer"]>().toEqualTypeOf<"opener" | "inflator">();
+		expectTypeOf<"status" extends keyof Draining ? true : false>().toEqualTypeOf<false>();
 	});
 });

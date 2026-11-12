@@ -1,6 +1,4 @@
 //! The environment variables that provision the demo stack.
-//!
-//! Compiled only under the `testing` feature.
 
 use core::error::Error;
 use core::fmt;
@@ -33,7 +31,7 @@ impl EnvVar {
 	///
 	/// # Errors
 	///
-	/// - [`EnvError::Unparsed`]: the value is not UTF-8.
+	/// - [`EnvError::Unparsed`] -- the value is not UTF-8.
 	pub fn value(self) -> Result<Option<String>, EnvError> {
 		match env::var(self.0) {
 			Ok(value) => Ok(Some(value)),
@@ -46,8 +44,7 @@ impl EnvVar {
 	///
 	/// # Errors
 	///
-	/// - [`EnvError::Unparsed`]: the variable is set, and its value does not
-	///   parse as `T`.
+	/// - [`EnvError::Unparsed`] -- the variable is set, and its value does not parse as `T`.
 	pub fn parsed_or<T: FromStr>(self, default: T) -> Result<T, EnvError> {
 		let Some(value) = self.value()? else {
 			return Ok(default);
@@ -60,8 +57,8 @@ impl EnvVar {
 	///
 	/// # Errors
 	///
-	/// - [`EnvError::Unset`]: the variable is unset.
-	/// - [`EnvError::Unparsed`]: the value does not parse as `T`.
+	/// - [`EnvError::Unset`] -- the variable is unset.
+	/// - [`EnvError::Unparsed`] -- the value does not parse as `T`.
 	pub fn parsed<T: FromStr>(self) -> Result<T, EnvError> {
 		let Some(value) = self.value()? else {
 			return Err(EnvError::Unset(self.0));
@@ -78,7 +75,7 @@ impl EnvVar {
 	///
 	/// # Errors
 	///
-	/// - [`EnvError::Unparsed`]: the value is no flag word.
+	/// - [`EnvError::Unparsed`] -- the value is no flag word.
 	///
 	/// # Examples
 	///
@@ -102,14 +99,20 @@ impl EnvVar {
 		}
 	}
 
-	/// The path the variable names.
+	/// The path the variable names, or `None` when it is unset.
+	#[must_use]
+	pub fn path(self) -> Option<PathBuf> {
+		env::var_os(self.0).map(PathBuf::from)
+	}
+
+	/// The path the variable names, for a variable that the stack always
+	/// sets.
 	///
 	/// # Errors
 	///
-	/// - [`EnvError::Unset`]: the variable is unset.
-	pub fn path(self) -> Result<PathBuf, EnvError> {
-		let value = env::var_os(self.0).ok_or(EnvError::Unset(self.0))?;
-		Ok(PathBuf::from(value))
+	/// - [`EnvError::Unset`] -- the variable is unset.
+	pub fn required_path(self) -> Result<PathBuf, EnvError> {
+		self.path().ok_or(EnvError::Unset(self.0))
 	}
 
 	fn unparsed(self, value: String) -> EnvError {
@@ -124,7 +127,7 @@ impl EnvVar {
 /// ```
 /// use tightbeam_ws::testing::{EnvError, EnvVar};
 ///
-/// let path = EnvVar::new("TBWS_DOC_EXAMPLE_UNSET_PATH").path();
+/// let path = EnvVar::new("TBWS_DOC_EXAMPLE_UNSET_PATH").required_path();
 /// assert_eq!(path, Err(EnvError::Unset("TBWS_DOC_EXAMPLE_UNSET_PATH")));
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -184,7 +187,6 @@ mod tests {
 	fn a_flag_reads_off_and_no_as_off() {
 		let off = set("TBWS_TEST_FLAG_OFF", "off");
 		let no = set("TBWS_TEST_FLAG_NO", " No ");
-
 		assert_eq!(off.flag(), Ok(false));
 		assert_eq!(no.flag(), Ok(false));
 	}
@@ -192,13 +194,17 @@ mod tests {
 	#[test]
 	fn a_flag_refuses_an_unknown_word() {
 		let flag = set("TBWS_TEST_FLAG_UNKNOWN", "enabled");
-
 		let refused = EnvError::Unparsed { name: "TBWS_TEST_FLAG_UNKNOWN", value: "enabled".to_owned() };
 		assert_eq!(flag.flag(), Err(refused));
 	}
 
 	#[test]
-	fn an_unset_path_is_refused() {
-		assert_eq!(UNSET.path(), Err(EnvError::Unset("TBWS_TEST_NEVER_SET")));
+	fn an_unset_path_is_none() {
+		assert_eq!(UNSET.path(), None);
+	}
+
+	#[test]
+	fn an_unset_required_path_is_refused() {
+		assert_eq!(UNSET.required_path(), Err(EnvError::Unset("TBWS_TEST_NEVER_SET")));
 	}
 }

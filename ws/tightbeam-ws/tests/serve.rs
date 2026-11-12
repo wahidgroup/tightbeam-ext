@@ -1,27 +1,17 @@
-//! The gated push-serve of [`ServedMux::serve`] beside upstream
-//! [`MuxAcceptor::serve`], over loopback handshakes, as tightbeam scenarios.
-//!
-//! The differential cases install one gate verdict on a server of each plane,
-//! dial it, and compare what a client observes of a unary, a streaming, and a
-//! duplex stream. Both planes run the same echo, so every difference is a
-//! difference of the gate. The renewal case meters a session tight enough to
-//! renew in band, and keeps serving behind a gate that reads the peer. The
-//! cleartext case refuses an encrypted transport as a cleartext link.
-//!
-//! Every transport records on the trace of its scenario, and both planes
-//! record the verdict of their gate for each stream, so a differential spec
-//! counts the verdicts of both.
-//!
-//! [`MuxAcceptor::serve`]: tightbeam::transport::multiplex::MuxAcceptor::serve
-//! [`ServedMux::serve`]: tightbeam_ws::serve::ServedMux::serve
+//! Tightbeam scenarios of the served plane and of links past their read
+//! deadline, as `docs/ws.md` (Test support) states.
 
 #![cfg(feature = "testing")]
+
+pub mod support;
 
 use core::future::pending;
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
+use tightbeam::clock::ManualClock;
+use tightbeam::constants::KEEPALIVE_PROBES_PER_DEADLINE;
 use tightbeam::instrumentation::events;
 use tightbeam::policy::{GatePolicy, SessionContext, TransitStatus};
 use tightbeam::prelude::TightBeamSocketAddr;
@@ -30,23 +20,24 @@ use tightbeam::testing::{ClientEnv, FaultModel, ScenarioConfig, SetupEnv, TestFr
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::handshake::negotiation::{MuxBudgets, MuxSettings};
 use tightbeam::transport::multiplex::{
-	MuxAcceptor, MuxDispatch, MuxHandle, MuxRole, ReplySink, SpawnedMux, StreamBody, StreamRoute,
+	CallContext, MuxAcceptor, MuxHandle, MuxRole, MuxService, ReplySink, SpawnedMux, StreamBody,
 };
 use tightbeam::transport::policy::CollectorGateConfig;
 use tightbeam::transport::{
-	ClientBuilder, ConnectionBuilder, EncryptedMessageIO, EncryptedProtocol, ResponsePackage, TransportResult,
+	ClientBuilder, EncryptedMessageIO, EncryptedProtocol, EndpointConfig, TransportError, TransportLimits,
 };
 use tightbeam::urn::Urn;
-use tightbeam::{bps, encode, exactly, tb_assert_spec, tb_process_spec, tb_scenario, urn, Frame, TightBeamError};
+use tightbeam::{bps, exactly, tb_assert_spec, tb_process_spec, tb_scenario, urn, Frame, TightBeamError};
 use tightbeam_ws::io::WsTransport;
 use tightbeam_ws::protocol::WsListener;
-use tightbeam_ws::serve::{AcceptedLink, LinkError};
-use tightbeam_ws::testing::{DemoPaywall, EchoService, Identity, Security};
+use tightbeam_ws::serve::{AcceptedLink, LinkError, KEEPALIVE_ANSWERED};
+use tightbeam_ws::testing::{DemoPaywall, DemoSettlement, EchoService, EventWatch, Identity, Security};
 use tokio::net::TcpStream;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
-use tokio::time::timeout;
 use tokio_tungstenite::MaybeTlsStream;
+
+use support::{bounded, Answers};
 
 /// Whether the served plane answered each stream kind as upstream did.
 const MATCHES_UPSTREAM: Urn<'static> = urn!("test", "event:served-mux/matches-upstream");
@@ -57,6 +48,13 @@ const SERVES_AFTER_RENEWAL: Urn<'static> = urn!("test", "event:served-mux/serves
 /// Whether a cleartext link refused an encrypted transport as encrypted.
 const REFUSED_AS_ENCRYPTED: Urn<'static> = urn!("test", "event:served-mux/refused-as-encrypted");
 
+/// Whether an emit after a silence past the read deadline echoed its frame.
+const SERVES_AFTER_SILENCE: Urn<'static> = urn!("test", "event:served-mux/serves-after-silence");
+
+/// Whether the probe after a silence past the read deadline found the link
+/// closed.
+const CLOSED_AFTER_SILENCE: Urn<'static> = urn!("test", "event:served-mux/closed-after-silence");
+
 /// The transport an accepted WebSocket connection follows.
 type ServerTransport = WsTransport<MaybeTlsStream<TcpStream>>;
 
@@ -66,19 +64,8 @@ type Served = Result<(JoinHandle<Result<(), TightBeamError>>, TightBeamSocketAdd
 /// The stream cap that both ends of a differential case offer.
 const STREAMS: u32 = 4;
 
-/// How long one stream may take before a case fails instead of hanging.
-const DEADLINE: Duration = Duration::from_secs(5);
-
 /// How long each identity stays valid.
 const VALIDITY: Duration = Duration::from_secs(3600);
-
-/// The duplex chunk a client sends.
-const CHUNK: &[u8] = b"differential-duplex";
-
-/// A deadline that passed, as the failure of the exchange it bounded.
-fn late(elapsed: tokio::time::error::Elapsed) -> TightBeamError {
-	TightBeamError::IoError(elapsed.into())
-}
 
 /// An outcome that the case did not expect.
 fn unexpected(what: &'static str) -> TightBeamError {
@@ -94,74 +81,71 @@ impl GatePolicy for Verdict {
 	}
 }
 
-/// The echo of [`EchoService`], as the [`MuxDispatch`] a served mux takes.
-struct EchoDispatch;
+/// A service whose every handler fails with an error of its own: one that
+/// carries a transit status, or one that carries none.
+#[derive(Clone, Copy)]
+enum Failing {
+	Carried(TransitStatus),
+	Bare,
+}
 
-impl MuxDispatch for EchoDispatch {
-	async fn unary(&self, frame: Arc<Frame>) -> TransportResult<ResponsePackage> {
-		let echoed = Frame::clone(&frame);
-		Ok(ResponsePackage::new(TransitStatus::Ok, Some(echoed)))
-	}
-
-	async fn streaming(&self, body: StreamBody, _route: StreamRoute) -> TransportResult<ResponsePackage> {
-		let frame = body.into_frame().await?;
-		Ok(ResponsePackage::new(TransitStatus::Ok, Some(frame)))
-	}
-
-	async fn duplex(
-		&self,
-		mut body: StreamBody,
-		mut reply: ReplySink,
-		_route: StreamRoute,
-	) -> TransportResult<TransitStatus> {
-		while let Some(chunk) = body.chunk().await? {
-			reply.push(&chunk).await?;
+impl Failing {
+	fn failure(self) -> TightBeamError {
+		match self {
+			Self::Carried(status) => TightBeamError::TransportError(TransportError::from(status)),
+			Self::Bare => TightBeamError::InvalidBody,
 		}
-
-		Ok(TransitStatus::Ok)
 	}
 }
+
+impl MuxService for Failing {
+	async fn unary(&self, _frame: Frame, _cx: CallContext) -> Result<Option<Frame>, TightBeamError> {
+		Err(self.failure())
+	}
+
+	async fn streaming(&self, _body: StreamBody, _cx: CallContext) -> Result<Option<Frame>, TightBeamError> {
+		Err(self.failure())
+	}
+
+	async fn duplex(&self, _body: StreamBody, _reply: ReplySink, _cx: CallContext) -> Result<(), TightBeamError> {
+		Err(self.failure())
+	}
+}
+
+/// A service that leaves every kind to the defaults of the trait.
+#[derive(Clone, Copy)]
+struct Unserved;
+
+impl MuxService for Unserved {}
 
 /// The serve a server runs over its accepted transport.
 #[derive(Clone, Copy)]
 enum Plane {
-	/// Upstream [`MuxAcceptor::serve`] over [`EchoService`].
+	/// Upstream [`MuxAcceptor::serve`].
 	Upstream,
-	/// [`ServedMux::serve`](tightbeam_ws::serve::ServedMux::serve) over
-	/// [`EchoDispatch`].
+	/// [`ServedMux::serve`](tightbeam_ws::serve::ServedMux::serve).
 	Served,
 }
 
 impl Plane {
-	/// Serve `transport`, which negotiated `settings`, until it ends.
-	async fn serve(self, transport: ServerTransport, settings: MuxSettings) -> Result<(), TightBeamError> {
+	/// Serve `transport`, which negotiated `settings`, with `service` until it
+	/// ends.
+	async fn serve<S: MuxService>(
+		self,
+		transport: ServerTransport,
+		settings: MuxSettings,
+		service: S,
+	) -> Result<(), TightBeamError> {
 		match self {
-			Self::Upstream => transport.serve(settings, EchoService, None).await?,
+			Self::Upstream => transport.serve(settings, service, None).await?,
 			Self::Served => {
 				let link = AcceptedLink::accepted(transport).map_err(io::Error::other)?;
-				link.spawn().serve(EchoDispatch, pending()).await?;
+				link.spawn().serve(service, pending()).await?;
 			}
 		}
 
 		Ok(())
 	}
-}
-
-/// What a client observes of a stream: its answer, or the debug form of the
-/// error it failed with.
-type Observed<T> = Result<T, String>;
-
-/// What a client observes of one stream of each kind.
-#[derive(Debug, PartialEq)]
-struct Answers {
-	unary: Observed<Option<Frame>>,
-	streaming: Observed<Option<Frame>>,
-	duplex: Observed<Vec<Vec<u8>>>,
-}
-
-/// The debug form of `outcome`'s error, which a case compares across planes.
-fn observed<T>(outcome: TransportResult<T>) -> Observed<T> {
-	outcome.map_err(|error| format!("{error:?}"))
 }
 
 /// One dialed client mux: the handle a case emits on, and the tasks it holds.
@@ -179,10 +163,7 @@ impl Client {
 		trace: &TraceCollector,
 	) -> Result<Self, TightBeamError> {
 		let trust = server.trust_anchor()?;
-		let mut builder = ClientBuilder::<WsListener>::builder().with_trust_store(trust);
-		if let Some(client) = security.client_identity() {
-			builder = builder.with_client_identity(client.signing_identity()?);
-		}
+		let builder = security.client_builder::<WsListener>(trust);
 
 		let dialed = builder.connect(addr).await?;
 		let traced = dialed.into_transport().with_trace(trace.share());
@@ -196,40 +177,12 @@ impl Client {
 	fn handle(&self) -> &MuxHandle {
 		&self.0.handle
 	}
-
-	/// Open one stream of each kind, and observe how each ends.
-	async fn answers(&self) -> Result<Answers, TightBeamError> {
-		let frame = TestFrame::v0(None, None);
-		let der = encode(&frame)?;
-
-		let unary = timeout(DEADLINE, self.handle().emit_on_stream(&frame)).await.map_err(late)?;
-
-		let (sink, response) = self.handle().open_stream()?;
-		let _closed = sink.close_with(&der).await;
-		let streaming = timeout(DEADLINE, response).await.map_err(late)?;
-
-		let (sink, body) = self.handle().open_duplex()?;
-		let _closed = sink.close_with(CHUNK).await;
-		let duplex = timeout(DEADLINE, Self::chunks(body)).await.map_err(late)?;
-
-		Ok(Answers { unary: observed(unary), streaming: observed(streaming), duplex: observed(duplex) })
-	}
-
-	/// Every chunk of `body` until it ends.
-	async fn chunks(mut body: StreamBody) -> TransportResult<Vec<Vec<u8>>> {
-		let mut chunks = Vec::new();
-		while let Some(chunk) = body.chunk().await? {
-			chunks.push(chunk);
-		}
-
-		Ok(chunks)
-	}
 }
 
 /// The identity of a server or a client.
 fn identity(subject: &str, serial: u32) -> Identity {
-	let minted = Identity::mint(subject, serial, VALIDITY);
-	minted.expect("the identity mints")
+	let issued = Identity::mint(subject, serial, VALIDITY);
+	issued.expect("the identity issues")
 }
 
 /// A listener of `security` on loopback that presents `server`.
@@ -243,11 +196,11 @@ async fn listen(server: &Identity, security: &Security) -> Result<(WsListener, T
 
 /// Accept one dial on `listener` under `security` on a transport that
 /// records on `trace`, install `gate`, and serve it on `plane` until it ends.
-async fn serve_one(
+async fn serve_one<S: MuxService>(
 	listener: WsListener,
 	security: Arc<Security>,
 	streams: u32,
-	gate: impl GatePolicy + 'static,
+	(gate, service): (impl GatePolicy + 'static, S),
 	(plane, trace): (Plane, TraceCollector),
 ) -> Result<(), TightBeamError> {
 	let (transport, _peer) = listener.accept().await?;
@@ -256,12 +209,16 @@ async fn serve_one(
 	let negotiated = gated.negotiate_mux().await?;
 	let settings = negotiated.ok_or_else(|| unexpected("the peer negotiated no multiplexing"))?;
 
-	plane.serve(gated, settings).await
+	plane.serve(gated, settings, service).await
 }
 
 /// What a client observes of each stream kind on a server of `plane` whose
 /// gate answers `verdict`, with both ends recording on `trace`.
-async fn answers_on(plane: Plane, verdict: TransitStatus, trace: &TraceCollector) -> Result<Answers, TightBeamError> {
+async fn answers_on<S: MuxService>(
+	plane: Plane,
+	(verdict, service): (TransitStatus, S),
+	trace: &TraceCollector,
+) -> Result<Answers, TightBeamError> {
 	let server = identity("CN=differential server,O=tightbeam-ws,C=US", 1);
 	let security = Arc::new(Security::ServerAuth);
 	let (listener, addr) = listen(&server, &security).await?;
@@ -269,13 +226,13 @@ async fn answers_on(plane: Plane, verdict: TransitStatus, trace: &TraceCollector
 		listener,
 		Arc::clone(&security),
 		STREAMS,
-		Verdict(verdict),
+		(Verdict(verdict), service),
 		(plane, trace.share()),
 	);
 
 	let serving = tokio::spawn(serve);
 	let client = Client::dial(addr, &server, &security, (STREAMS, 1), trace).await?;
-	let answers = client.answers().await;
+	let answers = Answers::of(client.handle()).await;
 	serving.abort();
 
 	answers
@@ -284,8 +241,8 @@ async fn answers_on(plane: Plane, verdict: TransitStatus, trace: &TraceCollector
 /// Record on `trace` whether a served mux answers every stream kind under
 /// `verdict` as upstream `MuxAcceptor::serve` answers it.
 async fn differential(verdict: TransitStatus, trace: &TraceCollector) -> Result<(), TightBeamError> {
-	let upstream = answers_on(Plane::Upstream, verdict, trace).await?;
-	let served = answers_on(Plane::Served, verdict, trace).await?;
+	let upstream = answers_on(Plane::Upstream, (verdict, EchoService), trace).await?;
+	let served = answers_on(Plane::Served, (verdict, EchoService), trace).await?;
 
 	trace.event_with(MATCHES_UPSTREAM, &[], served == upstream)?;
 	Ok(())
@@ -364,6 +321,58 @@ differential! {
 	served_mux_answers_unauthenticated_as_upstream_serve: TransitStatus::Unauthenticated => UnauthenticatedVerdictSpec, refuses(TransitStatus::Unauthenticated);
 }
 
+/// Record on `trace` whether a served mux answers every stream kind of
+/// `service`, behind a gate that admits each call, as upstream
+/// `MuxAcceptor::serve` answers it.
+async fn settles_as_upstream<S: MuxService + Copy>(service: S, trace: &TraceCollector) -> Result<(), TightBeamError> {
+	let upstream = answers_on(Plane::Upstream, (TransitStatus::Ok, service), trace).await?;
+	let served = answers_on(Plane::Served, (TransitStatus::Ok, service), trace).await?;
+
+	trace.event_with(MATCHES_UPSTREAM, &[], served == upstream)?;
+	Ok(())
+}
+
+/// One scenario per handler outcome, and the spec that grades it: the served
+/// plane answers each stream kind as upstream does, and both planes record
+/// the failure of each of their three handlers with the status it answers.
+macro_rules! settled {
+	($($name:ident: $service:expr => $spec:ident, $failed:expr, $refused:expr $(, ($answered:expr))?;)*) => {
+		$(
+			tb_assert_spec! {
+				pub $spec,
+				V(1,0,0): {
+					mode: Accept,
+					assertions: [
+						(MATCHES_UPSTREAM, exactly!(1), equals!(true)),
+						(events::GATE_ACCEPT, exactly!(6), equals!(TransitStatus::Ok)),
+						(events::HANDLER_FAILED, exactly!($failed) $(, equals!($answered))?),
+						(events::MUX_STREAM_REFUSED, exactly!($refused))
+					]
+				}
+			}
+
+			tb_scenario! {
+				name: $name,
+				spec: $spec,
+				environment Bare {
+					exec: |SetupEnv { trace, .. }| async move { settles_as_upstream($service, &trace).await }
+				}
+			}
+		)*
+	};
+}
+
+// A handler that fails with an error of its own answers the status of the
+// failure on a served mux as on upstream `MuxAcceptor::serve`, and both planes
+// record the failure. A kind that the service leaves out answers
+// `Unimplemented` on both, as a refused stream and not a failure.
+settled! {
+	a_carried_status_answers_as_upstream: Failing::Carried(TransitStatus::PermissionDenied) => CarriedFailureSpec, 6, 0, (TransitStatus::PermissionDenied);
+	a_carried_unavailable_answers_unknown_as_upstream: Failing::Carried(TransitStatus::Unavailable) => UnavailableFailureSpec, 6, 0, (TransitStatus::Unknown);
+	a_failure_with_no_status_answers_internal_as_upstream: Failing::Bare => BareFailureSpec, 6, 0, (TransitStatus::Internal);
+	an_unserved_kind_answers_unimplemented_as_upstream: Unserved => UnservedKindSpec, 0, 6;
+}
+
 /// A trace whose fault model refuses every record of an admitted verdict, as
 /// a sink that fails does.
 fn refusing_admissions() -> TraceCollector {
@@ -391,11 +400,11 @@ tb_scenario! {
 	config: ScenarioConfig::builder().with_spec(RefusedRecordSpec::latest()).with_trace(refusing_admissions()).build(),
 	environment Bare {
 		exec: |SetupEnv { trace, .. }| async move {
-			let upstream = answers_on(Plane::Upstream, TransitStatus::Ok, &trace).await?;
-			let served = answers_on(Plane::Served, TransitStatus::Ok, &trace).await?;
+			let upstream = answers_on(Plane::Upstream, (TransitStatus::Ok, EchoService), &trace).await?;
+			let served = answers_on(Plane::Served, (TransitStatus::Ok, EchoService), &trace).await?;
 
-			let failed = served.unary.is_err() && served.streaming.is_err() && served.duplex.is_err();
-			assert!(failed, "a call whose verdict the trace refuses MUST fail, got {served:?}");
+			let answered = served.answered();
+			assert!(answered.is_empty(), "a call whose verdict the trace refuses MUST fail, got {served:?}");
 			trace.event_with(MATCHES_UPSTREAM, &[], served == upstream)?;
 			Ok(())
 		}
@@ -442,7 +451,8 @@ impl Metered {
 	fn generate() -> Self {
 		let server = identity("CN=renewal server,O=tightbeam-ws,C=US", 1);
 		let client = identity("CN=renewal client,O=tightbeam-ws,C=US", 2);
-		let paywall = DemoPaywall::new(b"serve-test-invoice", b"serve-test-payment", METERED_CEILING);
+		let settlement = DemoSettlement { invoice: b"serve-test-invoice", payment: b"serve-test-payment" };
+		let paywall = DemoPaywall::new(settlement, METERED_CEILING);
 		let paywall = paywall.expect("the invoice and the payment encode");
 
 		let security = Security::Paywalled { pinned: client, paywall: Arc::new(paywall) };
@@ -465,7 +475,7 @@ fn receipt_of(handle: &MuxHandle) -> Result<Option<Vec<u8>>, TightBeamError> {
 async fn emit_until_renewed(handle: &MuxHandle, frame: &Frame) -> Result<(), TightBeamError> {
 	let first = receipt_of(handle)?;
 	for _ in 0..RENEWAL_BOUND {
-		let echoed = timeout(DEADLINE, handle.emit_on_stream(frame)).await.map_err(late)??;
+		let echoed = bounded(handle.emit_on_stream(frame)).await??;
 		if echoed.as_ref() != Some(frame) {
 			return Err(unexpected("an emit answered no echo"));
 		}
@@ -525,13 +535,10 @@ tb_process_spec! {
 	terminal { Renewed }
 }
 
-// A metered session renews in band, and the served plane keeps serving it
-// behind a gate that reads the peer, because a renewal keeps the peer of the
-// session:
-// - The spec counts each step of the renewal once, and the process grades
-//   their order.
-// - The gate reads the peer, and it refuses no call before or after the
-//   renewal.
+// A metered session renews in band, and a gate that reads the peer admits each
+// call after the renewal, because a renewal keeps the peer of the session.
+// The spec counts each step of the renewal once, and the process grades their
+// order.
 tb_scenario! {
 	name: a_metered_session_keeps_serving_after_a_renewal,
 	config: ScenarioConfig::builder().with_spec(RenewalSpec::latest()).with_csp(RenewalProcess).build(),
@@ -541,7 +548,8 @@ tb_scenario! {
 		server: |SetupEnv { trace, context }| async move {
 			let (listener, addr) = listen(&context.server, &context.security).await?;
 			let plane = (Plane::Served, trace.share());
-			let serve = serve_one(listener, Arc::clone(&context.security), METERED_STREAMS, PeerRequired, plane);
+			let served = (PeerRequired, EchoService);
+			let serve = serve_one(listener, Arc::clone(&context.security), METERED_STREAMS, served, plane);
 			Ok((tokio::spawn(serve), addr))
 		},
 		client: |ClientEnv { trace, context, addr }| async move {
@@ -551,7 +559,7 @@ tb_scenario! {
 
 			emit_until_renewed(client.handle(), &frame).await?;
 
-			let after = timeout(DEADLINE, client.handle().emit_on_stream(&frame)).await.map_err(late)??;
+			let after = bounded(client.handle().emit_on_stream(&frame)).await??;
 			trace.event_with(SERVES_AFTER_RENEWAL, &[], after == Some(frame))?;
 			Ok(())
 		}
@@ -604,7 +612,7 @@ impl SingleFlight {
 
 		let mut transport = dialed.into_transport().with_trace(trace.share());
 		transport.perform_client_handshake().await?;
-		timeout(DEADLINE, self.refused.notified()).await.map_err(late)
+		bounded(self.refused.notified()).await
 	}
 }
 
@@ -628,5 +636,144 @@ tb_scenario! {
 		context: SingleFlight::generate(),
 		server: |SetupEnv { trace, context }| SingleFlight::serve(context, trace),
 		client: |ClientEnv { trace, context, addr }| async move { context.dial(addr, &trace).await }
+	}
+}
+
+/// The identity of a server whose listener measures each deadline of its
+/// endpoint on a clock that the case moves, and the limits of that endpoint.
+struct Clocked {
+	server: Identity,
+	clock: Arc<ManualClock>,
+	limits: TransportLimits,
+}
+
+impl Clocked {
+	/// The read deadline of the endpoint. A third of it outlasts the patience
+	/// of [`EventWatch`], so a deadline or a keepalive on the system clock
+	/// fails the case.
+	const READ_DEADLINE: Duration = Duration::from_secs(60);
+
+	fn generate() -> Self {
+		let server = identity("CN=clocked server,O=tightbeam-ws,C=US", 1);
+		let limits = TransportLimits { operation_timeout: Self::READ_DEADLINE, ..TransportLimits::default() };
+		Self { server, clock: Arc::default(), limits }
+	}
+
+	/// The read deadline of the endpoint that the case binds.
+	fn deadline(&self) -> Duration {
+		self.limits.operation_timeout
+	}
+
+	/// Serve one dial on `plane` behind a gate that admits each call, on a
+	/// listener whose endpoint runs on the clock of the case, with the server
+	/// recording on `trace`.
+	async fn serve(case: Arc<Self>, plane: Plane, trace: TraceCollector) -> Served {
+		let config = Security::ServerAuth.server_config(&case.server)?;
+		let endpoint = EndpointConfig::try_from(config)?.with_limits(case.limits)?;
+		let listener = WsListener::bind("127.0.0.1:0", endpoint, case.clock.clone()).await?;
+		let addr = TightBeamSocketAddr(listener.local_addr());
+
+		let security = Arc::new(Security::ServerAuth);
+		let served = (Verdict(TransitStatus::Ok), EchoService);
+		let serve = serve_one(listener, security, STREAMS, served, (plane, trace));
+		Ok((tokio::spawn(serve), addr))
+	}
+
+	/// Dial the server at `addr` on a transport that records on `trace`, and
+	/// probe it once, so its link reads under its deadline before the clock
+	/// moves.
+	async fn dial(&self, addr: TightBeamSocketAddr, trace: &TraceCollector) -> Result<Client, TightBeamError> {
+		let client = Client::dial(addr, &self.server, &Security::ServerAuth, (STREAMS, 1), trace).await?;
+		bounded(client.handle().ping()).await??;
+		Ok(client)
+	}
+}
+
+/// The probes of a served session that its silent client answers until one
+/// interval past the read deadline: the first probe, and one at the end of
+/// each of the [`KEEPALIVE_PROBES_PER_DEADLINE`] intervals of the deadline and
+/// of the interval past it.
+const SILENCE_PROBES: u32 = KEEPALIVE_PROBES_PER_DEADLINE + 2;
+
+/// The events of the scenario of a served session whose client stays silent,
+/// which the case waits on.
+static SERVED_EVENTS: EventWatch = EventWatch::new();
+
+tb_assert_spec! {
+	pub SilenceSpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(KEEPALIVE_ANSWERED, exactly!(SILENCE_PROBES)),
+			(events::GATE_ACCEPT, exactly!(1), equals!(TransitStatus::Ok)),
+			(SERVES_AFTER_SILENCE, exactly!(1), equals!(true))
+		]
+	}
+}
+
+// A served session whose client stays silent outlives a silence past the read
+// deadline of the server through the keepalive of its link, on the clock of
+// its endpoint. The case moves the clock one interval after each probe that
+// the trace records as answered.
+tb_scenario! {
+	name: a_served_session_outlives_a_silence_of_its_client_past_the_read_deadline,
+	config: ScenarioConfig::builder().with_spec(SilenceSpec::latest()).with_trace(SERVED_EVENTS.trace()).build(),
+	environment ServiceClient {
+		worker_threads: 2,
+		context: Clocked::generate(),
+		server: |SetupEnv { trace, context }| Clocked::serve(context, Plane::Served, trace),
+		client: |ClientEnv { trace, context, addr }| async move {
+			let client = Client::dial(addr, &context.server, &Security::ServerAuth, (STREAMS, 1), &trace).await?;
+			let interval = context.deadline() / KEEPALIVE_PROBES_PER_DEADLINE;
+
+			let mut answered = 1;
+			SERVED_EVENTS.recorded(KEEPALIVE_ANSWERED, answered).await?;
+			for _ in 1..SILENCE_PROBES {
+				context.clock.advance(interval);
+				answered += 1;
+				SERVED_EVENTS.recorded(KEEPALIVE_ANSWERED, answered).await?;
+			}
+
+			let frame = TestFrame::v0(None, None);
+			let after = bounded(client.handle().emit_on_stream(&frame)).await??;
+			trace.event_with(SERVES_AFTER_SILENCE, &[], after == Some(frame))?;
+			Ok(())
+		}
+	}
+}
+
+/// The events of the scenario of a silent session, which the case waits on.
+static SILENT_EVENTS: EventWatch = EventWatch::new();
+
+tb_assert_spec! {
+	pub SilentEndSpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(CLOSED_AFTER_SILENCE, exactly!(1), equals!(true))
+		]
+	}
+}
+
+// A session that no probe keeps inside the read deadline of the server ends
+// once a silence passes that deadline, on the clock of its endpoint. The
+// upstream plane runs no keepalive, so the probe of the dial is the last read
+// of the server before the clock moves.
+tb_scenario! {
+	name: a_silent_session_ends_at_the_read_deadline,
+	config: ScenarioConfig::builder().with_spec(SilentEndSpec::latest()).with_trace(SILENT_EVENTS.trace()).build(),
+	environment ServiceClient {
+		worker_threads: 2,
+		context: Clocked::generate(),
+		server: |SetupEnv { trace, context }| Clocked::serve(context, Plane::Upstream, trace),
+		client: |ClientEnv { trace, context, addr }| async move {
+			let client = context.dial(addr, &trace).await?;
+			context.clock.advance(context.deadline());
+			SILENT_EVENTS.recorded(events::CONNECTION_CLOSED, 1).await?;
+
+			let probed = bounded(client.handle().ping()).await?;
+			trace.event_with(CLOSED_AFTER_SILENCE, &[], matches!(probed, Err(TransportError::ConnectionClosed)))?;
+			Ok(())
+		}
 	}
 }

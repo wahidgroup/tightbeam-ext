@@ -1,14 +1,8 @@
-# Pubsub extension services, composed on top of ws/docker-compose.yml by
-# scripts/stack.sh. The demo server shares the echo image and the command
-# selects the pubsub binary. Every service presents the stack's shared
-# server identity (gen_certs, bind-mounted under /certs), so every hop is
-# HPKE encrypted: browser to demo server, and the processed demo server's
-# relay dial to the processor.
+# Pubsub services, layered on ws/docker-compose.yml by scripts/stack.sh.
+# Every service runs the echo image under the shared certificates in /certs.
 
-# The demo stream cap and paywall facts of ws/scripts/stack-env.sh, shared by
-# every service. The processor and the processed demo server read the same
-# values, so the relay dial meets the cap and pays the paywall it dials. A
-# missing fact refuses to start the stack.
+# The stream cap and paywall of ws/scripts/stack-env.sh, which the relay dial
+# and the processor share.
 x-demo-config: &demo-config
   MUX_STREAMS: "${MUX_STREAMS:?}"
   TBWS_PAYWALL: "${TBWS_PAYWALL:?}"
@@ -19,10 +13,10 @@ x-demo-config: &demo-config
 
 services:
   pubsub-demo:
-    image: ${ECHO_IMAGE:-tightbeam-ws-echo:dev}
+    image: ${ECHO_IMAGE:?}
     command: ["pubsub-demo-server"]
     environment:
-      PUBSUB_WS_PORT: "9110"
+      PUBSUB_WS_PORT: "${PUBSUB_WS_PORT:?}"
       PUBSUB_QUEUE_CAPACITY: "${PUBSUB_QUEUE_CAPACITY:?}"
       TBWS_SERVER_CERT: /certs/server.cert.der
       TBWS_CLIENT_CERT: /certs/client.cert.der
@@ -30,22 +24,24 @@ services:
     volumes:
       - ${CERT_DIR:?}:/certs:ro
     ports:
-      - "${PUBSUB_WS_HOST_PORT:-9110}:9110"
-    # The image healthcheck probes the echo port.
+      - target: ${PUBSUB_WS_PORT:?}
+        published: "${PUBSUB_WS_HOST_PORT:?}"
+    # The image healthcheck probes the echo port, so each service probes its
+    # own port.
     healthcheck:
-      test: ["CMD-SHELL", "ss -ltn 'sport = :9110' | grep -q LISTEN || exit 1"]
+      test: ["CMD-SHELL", "ss -ltn \"sport = :$${PUBSUB_WS_PORT}\" | grep -q LISTEN || exit 1"]
       interval: 3s
       timeout: 2s
       start_period: 3s
       retries: 30
 
-  # Backend-only payload processor: no host port, only the processed demo
-  # server dials it (over encrypted tightbeam ws mux on the compose network).
+  # The payload processor servlet. It publishes no host port, and only the
+  # processed demo server dials it, over the compose network.
   pubsub-processor:
-    image: ${ECHO_IMAGE:-tightbeam-ws-echo:dev}
+    image: ${ECHO_IMAGE:?}
     command: ["pubsub-processor-server"]
     environment:
-      PUBSUB_PROCESSOR_PORT: "9111"
+      PUBSUB_PROCESSOR_PORT: "${PUBSUB_PROCESSOR_PORT:?}"
       PUBSUB_TOPIC_KEY: "${PUBSUB_TOPIC_KEY:?}"
       PUBSUB_TOPIC_KEY_ID: "${PUBSUB_TOPIC_KEY_ID:?}"
       TBWS_SERVER_CERT: /certs/server.cert.der
@@ -54,22 +50,21 @@ services:
     volumes:
       - ${CERT_DIR:?}:/certs:ro
     healthcheck:
-      test: ["CMD-SHELL", "ss -ltn 'sport = :9111' | grep -q LISTEN || exit 1"]
+      test: ["CMD-SHELL", "ss -ltn \"sport = :$${PUBSUB_PROCESSOR_PORT}\" | grep -q LISTEN || exit 1"]
       interval: 3s
       timeout: 2s
       start_period: 3s
       retries: 30
 
-  # A second demo instance whose RelayBackplane routes every publish
-  # through the processor servlet before fan-out, pinning the processor's
-  # certificate for its own encrypted dial.
+  # A second demo server, which relays every publish through the processor
+  # servlet.
   pubsub-demo-processed:
-    image: ${ECHO_IMAGE:-tightbeam-ws-echo:dev}
+    image: ${ECHO_IMAGE:?}
     command: ["pubsub-demo-server"]
     environment:
-      PUBSUB_WS_PORT: "9110"
+      PUBSUB_WS_PORT: "${PUBSUB_WS_PORT:?}"
       PUBSUB_QUEUE_CAPACITY: "${PUBSUB_QUEUE_CAPACITY:?}"
-      PUBSUB_PROCESSOR_ENDPOINT: "ws://pubsub-processor:9111"
+      PUBSUB_PROCESSOR_ENDPOINT: "ws://pubsub-processor:${PUBSUB_PROCESSOR_PORT:?}"
       PUBSUB_PROCESSOR_CERT: /certs/server.cert.der
       TBWS_SERVER_CERT: /certs/server.cert.der
       TBWS_CLIENT_CERT: /certs/client.cert.der
@@ -80,9 +75,10 @@ services:
       pubsub-processor:
         condition: service_healthy
     ports:
-      - "${PUBSUB_PROCESSED_WS_HOST_PORT:-9112}:9110"
+      - target: ${PUBSUB_WS_PORT:?}
+        published: "${PUBSUB_PROCESSED_WS_HOST_PORT:?}"
     healthcheck:
-      test: ["CMD-SHELL", "ss -ltn 'sport = :9110' | grep -q LISTEN || exit 1"]
+      test: ["CMD-SHELL", "ss -ltn \"sport = :$${PUBSUB_WS_PORT}\" | grep -q LISTEN || exit 1"]
       interval: 3s
       timeout: 2s
       start_period: 3s
