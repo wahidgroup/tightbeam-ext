@@ -1,19 +1,7 @@
 <!--
-PR Title MUST follow Conventional Commits:
-  <type>[optional scope]: <Subject>
-
-Types: feat | fix | docs | style | refactor | perf | test | build | ci | chore
-Rules:
-  - Subject MUST NOT end with a period
-  - Append "!" after type/scope for breaking changes (e.g. feat!: Drop Node 22)
-
-Examples:
-  feat(components): Add Button
-  fix(utils): Correct class merge order
-  chore(deps): Bump typescript
-  refactor!: Rename exported helper
-
-See CONTRIBUTING.md for the full specification.
+The title follows the commit header rule of .husky/commit-msg, which the
+Title job of PR Checks runs on it. Every "## " heading below is required,
+with content. See CONTRIBUTING.md.
 -->
 
 ## Summary

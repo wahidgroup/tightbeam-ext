@@ -1,34 +1,5 @@
-//! The body compression the engine owns: zstd over the pure-Rust `ruzstd`
-//! decoder and encoder.
-//!
-//! [`ZstdCompression`] implements tightbeam's [`Inflator`] and [`Compressor`]
-//! with the clauses of upstream's `tightbeam::compress::ZstdCompression`.
-//! Upstream links libzstd through `zstd-sys`, which needs a C compiler for
-//! `wasm32-unknown-unknown`, and the build host has none. The engine therefore
-//! copies the clauses (`tb:src/compress/mod.rs:116-121`, `:150-157`,
-//! `:159-214`) and names its own refusals in [`ZstdRefusal`], because every
-//! upstream refusal variant exists only under the `zstd` feature
-//! (`tb:src/error.rs:47-86`).
-//!
-//! - The engine admits one frame: a zstd frame, or a skippable frame that
-//!   inflates to no octets. An octet after it is refused.
-//! - The output never grows past the ceiling of the compressor, and the window
-//!   a frame declares is held to that ceiling, rounded up to a power of two.
-//! - The level range of [`ZSTD_MIN_LEVEL`] and [`ZSTD_MAX_LEVEL`] is a fact
-//!   copied from libzstd, because upstream reads it from libzstd at runtime.
-//!
-//! The host-only interop tests compare each clause with upstream, which the
-//! native build links.
-//!
-//! # Sources
-//!
-//! - RFC 8878, Zstandard Compression and the `application/zstd` Media Type,
-//!   section 3.1.1 (the frame layout and `Window_Descriptor`) and section
-//!   3.1.2 (skippable frames): <https://datatracker.ietf.org/doc/html/rfc8878>
-//! - CWE-409, Improper Handling of Highly Compressed Data:
-//!   <https://cwe.mitre.org/data/definitions/409.html>
-//! - CWE-770, Allocation of Resources Without Limits or Throttling:
-//!   <https://cwe.mitre.org/data/definitions/770.html>
+//! The engine zstd over the pure-Rust `ruzstd`, as the compression section
+//! of `docs/ws-wasm.md` describes.
 
 use std::io::{self, Read, Write};
 
@@ -64,27 +35,29 @@ use crate::promise::{JsBytes, Record, WholeNumber};
 
 /// The lowest compression level libzstd accepts, `ZSTD_minCLevel`.
 ///
-/// The value is a fact copied from zstd 1.5.7, because upstream reads the
-/// range from libzstd at runtime (`tb:src/compress/mod.rs:155`), which this
-/// crate cannot link for wasm32. zstd-sys 2.1.2 defines it as
-/// `-ZSTD_TARGETLENGTH_MAX` (`zstd/lib/compress/zstd_compress.c:7674`), which
-/// is `ZSTD_BLOCKSIZE_MAX` (`zstd/lib/zstd.h:1277`), `1 << 17`
-/// (`zstd/lib/zstd.h:147-148`). The bound cases of the host tests pin it
-/// against upstream.
+/// # Properties
+///
+/// - The value is copied from zstd 1.5.7, because upstream reads the range
+///   from libzstd at runtime, and this crate builds for wasm32 without libzstd.
+/// - zstd-sys 2.1.2 defines it as `-ZSTD_TARGETLENGTH_MAX`, which is
+///   `ZSTD_BLOCKSIZE_MAX`, `1 << 17`.
+/// - The bound cases of the host tests pin it against upstream.
 pub const ZSTD_MIN_LEVEL: i32 = -131_072;
 
 /// The highest compression level libzstd accepts, `ZSTD_maxCLevel`.
 ///
-/// The value is a fact copied from zstd 1.5.7, as [`ZSTD_MIN_LEVEL`] is.
-/// zstd-sys 2.1.2 returns `ZSTD_MAX_CLEVEL`
-/// (`zstd/lib/compress/zstd_compress.c:7673`), which
-/// `zstd/lib/compress/clevels.h:19` defines.
+/// # Properties
+///
+/// - The value is a fact copied from zstd 1.5.7, as [`ZSTD_MIN_LEVEL`] is.
+/// - zstd-sys 2.1.2 returns `ZSTD_MAX_CLEVEL` (`zstd/lib/compress/zstd_compress.c:7673`), which
+///   `zstd/lib/compress/clevels.h:19` defines.
 pub const ZSTD_MAX_LEVEL: i32 = 22;
 
 /// The growth step of the output buffer, as upstream's `RESERVE_HINT`.
 ///
-/// The output starts small and grows toward the ceiling, so a frame that
-/// declares a large content size cannot make the first allocation the attack.
+/// The output starts at most this step long and grows toward the ceiling, so
+/// the first allocation stays within this step whatever content size a frame
+/// declares.
 const RESERVE_HINT: usize = 64 * 1024;
 
 /// The smallest window log zstd accepts, `ZSTD_WINDOWLOG_ABSOLUTEMIN`, as
@@ -111,12 +84,16 @@ const DESCRIPTOR_AT: usize = 4;
 /// `Frame_Size` (RFC 8878 section 3.1.2).
 const SKIPPABLE_HEADER: u64 = 8;
 
+/// The ceiling on `Block_Maximum_Size`, 128 KiB, which the window further
+/// lowers (RFC 8878 section 3.1.1.2.4).
+const MAX_BLOCK_SIZE: u64 = 128 * 1024;
+
 /// A zstd body the engine refuses to inflate.
 ///
-/// Each variant has the `RefusalCode` of the same name, the `code` that a
-/// JavaScript caller of `ZstdCompression.decompress` reads. On the frame inflate path the refusal
-/// travels inside upstream's `CompressionError::IO`, as
-/// [`ZstdCompression`]'s [`Inflator`] implementation states.
+/// - Each variant has the `RefusalCode` of the same name, the `code` that a JavaScript caller of
+///   `ZstdCompression.decompress` reads.
+/// - On the frame inflate path the refusal travels inside upstream's `CompressionError::IO`, as
+///   [`ZstdCompression`]'s [`Inflator`] implementation states.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Errorizable)]
 pub enum ZstdRefusal {
 	/// The frame declares a window past the ceiling of the decoder, so the
@@ -142,8 +119,8 @@ pub enum ZstdRefusal {
 	#[error("the zstd decoder stalled without consuming input")]
 	Stalled,
 	/// The octets are no zstd frame: a bad magic number, a reserved field,
-	/// a corrupt block, a wrong checksum, or a content size the blocks do not
-	/// fill.
+	/// a corrupt block, a block past its Block_Maximum_Size, a wrong checksum,
+	/// or a content size the blocks do not fill.
 	#[error("the octets are no well-formed zstd frame")]
 	Malformed,
 }
@@ -156,12 +133,22 @@ pub enum ZstdRefusal {
 /// - Output past the ceiling is refused with
 ///   [`ZstdRefusal::OutputLimitExceeded`] (CWE-409).
 /// - The window a frame declares is held to the ceiling rounded up to a power
-///   of two, so a short header cannot make the decoder reserve more memory
-///   than the output may fill (CWE-770).
+///   of two, so the decoder reserves a window of at most that size whatever
+///   a short header declares (CWE-770).
+/// - A block that states a size, or carries literals or sequences, past its
+///   Block_Maximum_Size, the smaller of the window and 128 KiB (RFC 8878
+///   section 3.1.1.2.4), is refused as [`ZstdRefusal::Malformed`], or as
+///   [`ZstdRefusal::Truncated`] when it is an RLE block whose octet has not
+///   arrived. The engine checks a compressed block's size
+///   and, once the block is in the input, its literals. ruzstd 0.9.1 checks a
+///   raw or RLE size (`src/decoding/block_decoder.rs:56`) and the sequence
+///   expansion of RUSTSEC-2026-0344 (`src/decoding/sequence_execution.rs:43-48`).
+///   The literals left after the sequences bring a block to at most twice its
+///   maximum, under the ceiling (`src/decoding/sequence_execution.rs:50-54`).
 /// - The compressor writes at the `Fastest` level of ruzstd and records no
-///   parameters, because ruzstd 0.9.0 implements no higher level
+///   parameters, because ruzstd 0.9.1 implements no higher level
 ///   (`src/encoding/mod.rs:47-67`).
-/// - The compressor declares the 128 KiB window that ruzstd 0.9.0 always
+/// - The compressor declares the 128 KiB window that ruzstd 0.9.1 always
 ///   writes (`src/encoding/frame_compressor.rs:83`, `:149`), so a peer admits
 ///   its bodies once the ceiling of that peer exceeds 64 KiB.
 ///
@@ -199,20 +186,6 @@ impl ZstdCompression {
 		Self { max_output }
 	}
 
-	/// Whether `parameters`, the parameters of a `compressionAlgorithm` that
-	/// names zstd, take the form upstream admits: absent, or an `INTEGER`
-	/// level from [`ZSTD_MIN_LEVEL`] to [`ZSTD_MAX_LEVEL`]
-	/// (`tb:src/compress/mod.rs:150-157`).
-	#[must_use]
-	pub fn admits_parameters(&self, parameters: Option<&Any>) -> bool {
-		let Some(parameters) = parameters else {
-			return true;
-		};
-
-		let levels = ZSTD_MIN_LEVEL..=ZSTD_MAX_LEVEL;
-		parameters.decode_as::<i32>().is_ok_and(|level| levels.contains(&level))
-	}
-
 	/// Inflate `data`, which holds exactly one frame, within the ceiling.
 	///
 	/// A skippable frame carries no content, so it inflates to no octets, as
@@ -243,10 +216,13 @@ impl ZstdCompression {
 
 		// Every frame holds at least one block, so the loop runs, and the drain
 		// of the step that finishes the frame releases the window too.
-		let header = Descriptor::of(data)?;
+		let header = Descriptor::of(data, &decoder)?;
 		let mut sink = Ceiling::new(self.max_output);
 		while !decoder.is_finished() {
 			let consumed = decoder.bytes_read_from_source();
+			source
+				.next_block()
+				.map_or(Ok(()), |block| block.check(header.block_maximum()))?;
 			let decoded = decoder.decode_blocks(&mut source, BlockDecodingStrategy::UptoBlocks(1));
 			decoded.map_err(|error| source.refusal(&error, max_window))?;
 			sink.drain(&mut decoder)?;
@@ -279,8 +255,8 @@ impl ZstdCompression {
 }
 
 impl Compressor for ZstdCompression {
-	/// Compress `data` at the `Fastest` level of ruzstd, and describe it with the
-	/// `CompressedData` upstream emits (`tb:src/compress/mod.rs:124-139`):
+	/// Compress `data` at the `Fastest` level of ruzstd, and describe it with
+	/// the `CompressedData` upstream emits (`tb:src/compress/mod.rs:124-139`):
 	/// version 0, zstd with no parameters, and the content type `id-data`
 	/// when `content_info` names none (RFC 3274 section 1.1).
 	fn compress(
@@ -289,7 +265,6 @@ impl Compressor for ZstdCompression {
 		content_info: Option<EncapsulatedContentInfo>,
 	) -> CompressionResult<(Vec<u8>, CompressedData)> {
 		let output = compress_to_vec(data, CompressionLevel::Fastest);
-
 		let compression_alg = AlgorithmIdentifierOwned { oid: self.algorithm_oid(), parameters: None };
 		let encap_content_info =
 			content_info.unwrap_or(EncapsulatedContentInfo { econtent_type: DATA, econtent: None });
@@ -299,23 +274,28 @@ impl Compressor for ZstdCompression {
 	}
 }
 
-/// The engine inflator on upstream's frame paths, such as
-/// `Frame::inflate_in_place` (`tb:src/frame/compress.rs:128`) and
-/// `CleartextFrame::inflate` (`tb:src/router.rs:170`).
+/// The engine inflator on the frame paths of upstream, such as
+/// `Frame::inflate_in_place` and `CleartextFrame::inflate`.
 ///
-/// `Inflator::decompress` returns upstream's error type
-/// (`tb:src/core.rs:81-82`), and every upstream refusal variant exists only
-/// under the `zstd` feature. The implementation therefore carries a
-/// [`ZstdRefusal`] inside `CompressionError::IO`, the one variant that exists
-/// without `zstd`, and a caller of the frame path reads `CompressionError`.
-/// The engine never recovers the variant from the `io::Error`.
+/// - Every refusal variant of upstream exists only under its `zstd` feature.
+/// - The implementation therefore carries a [`ZstdRefusal`] inside `CompressionError::IO`, the one variant
+///   that exists without `zstd`.
 impl Inflator for ZstdCompression {
 	fn algorithm_oid(&self) -> ObjectIdentifier {
 		COMPRESSION_ZSTD
 	}
 
+	/// Whether `parameters`, the parameters of a `compressionAlgorithm` that
+	/// names zstd, take the form upstream admits: absent, or an `INTEGER`
+	/// level from [`ZSTD_MIN_LEVEL`] to [`ZSTD_MAX_LEVEL`]
+	/// (`tb:src/compress/mod.rs:150-157`).
 	fn admits_parameters(&self, parameters: Option<&Any>) -> bool {
-		ZstdCompression::admits_parameters(self, parameters)
+		let Some(parameters) = parameters else {
+			return true;
+		};
+
+		let levels = ZSTD_MIN_LEVEL..=ZSTD_MAX_LEVEL;
+		parameters.decode_as::<i32>().is_ok_and(|level| levels.contains(&level))
 	}
 
 	fn decompress(&self, data: &[u8]) -> tightbeam::error::Result<Vec<u8>> {
@@ -327,15 +307,13 @@ impl Inflator for ZstdCompression {
 #[cfg(target_arch = "wasm32")]
 impl ZstdCompression {
 	/// The compression capped at `max_output`, the ceiling as JavaScript
-	/// passes it: `undefined` for 16 MiB, or a whole number of octets. The
-	/// value is `Copy` and holds only the ceiling, so a call that reads a
-	/// ceiling makes no handle.
+	/// passes it: `undefined` for 16 MiB, or a whole number of octets.
 	///
 	/// # Errors
 	///
 	/// - `InvalidMaxOutput` -- `max_output` is no whole, non-negative number that the target
 	///   holds, such as `NaN`, `-1`, or `0.5`.
-	pub(crate) fn within(max_output: &JsValue) -> Result<Self, JsFault> {
+	fn within(max_output: &JsValue) -> Result<Self, JsFault> {
 		let Some(ceiling) = Record::present(max_output.clone()) else {
 			return Ok(Self::default());
 		};
@@ -355,18 +333,16 @@ impl ZstdCompression {
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 impl ZstdCompression {
-	/// The engine zstd compression of the realm. The handle holds no ceiling
-	/// that JavaScript chose: each [`decompress`](Self::decompress_js) takes
-	/// its ceiling as an argument, so no ceiling leaves state behind.
+	/// The engine zstd compression of the realm, at the default ceiling of
+	/// 16 MiB.
 	#[wasm_bindgen(constructor)]
 	#[must_use]
 	pub fn realm() -> ZstdCompression {
 		Self::default()
 	}
 
-	/// The ceiling `maxOutput` names, parsed once into a whole number of
-	/// octets: 16 MiB for `undefined`. A holder passes the answer to each
-	/// inflate, so one handle serves every ceiling.
+	/// The zstd compression whose inflate stops at `maxOutput` octets, parsed
+	/// once: 16 MiB for `undefined`.
 	///
 	/// # Errors
 	///
@@ -374,11 +350,9 @@ impl ZstdCompression {
 	///   holds.
 	#[wasm_bindgen(js_name = ceiling)]
 	pub fn ceiling_js(
-		&self,
 		#[wasm_bindgen(unchecked_param_type = "number | undefined")] max_output: JsValue,
-	) -> Result<usize, JsFault> {
-		let within = Self::within(&max_output)?;
-		Ok(within.max_output)
+	) -> Result<ZstdCompression, JsFault> {
+		Self::within(&max_output)
 	}
 
 	/// Whether `parametersDer`, the DER parameters a compactness info names,
@@ -425,43 +399,33 @@ impl ZstdCompression {
 		Ok(record.into())
 	}
 
-	/// Inflate `data`, which holds exactly one frame, within the ceiling
-	/// `maxOutput` that [`ceiling`](Self::ceiling_js) answered.
+	/// Inflate `data`, which holds exactly one frame, within the ceiling of
+	/// this compression.
 	///
 	/// # Errors
 	///
 	/// - `InvalidBytes` -- `data` is not a `Uint8Array`.
-	/// - The errors of the ceiling parse.
-	/// - The variant name of each [`ZstdRefusal`] of [`Self::inflate`]: `WindowTooLarge`,
-	///   `OutputLimitExceeded`, `Truncated`, `TrailingBytes`, `Stalled`, `Malformed`.
+	/// - `WindowTooLarge` -- the frame declares a window past the ceiling of the decoder.
+	/// - `OutputLimitExceeded` -- the output grows past the ceiling of this compression.
+	/// - `Truncated` -- `data` ends before the frame it opens completes.
+	/// - `TrailingBytes` -- octets follow the one frame of `data`.
+	/// - `Stalled` -- the decoder consumed no input and produced no output.
+	/// - `Malformed` -- `data` is no well-formed zstd frame.
 	#[wasm_bindgen(js_name = decompress)]
-	pub fn decompress_js(
-		&self,
-		data: JsBytes,
-		#[wasm_bindgen(unchecked_param_type = "number")] max_output: JsValue,
-	) -> Result<Vec<u8>, JsFault> {
-		let within = Self::within(&max_output)?;
+	pub fn decompress_js(&self, data: JsBytes) -> Result<Vec<u8>, JsFault> {
 		let data = data.read()?;
-
-		let inflated = within.inflate(&data)?;
+		let inflated = self.inflate(&data)?;
 		Ok(inflated)
-	}
-}
-
-#[cfg(target_arch = "wasm32")]
-impl From<ZstdRefusal> for JsFault {
-	fn from(refusal: ZstdRefusal) -> Self {
-		let code = RefusalCode::from(&refusal);
-		code.because(refusal)
 	}
 }
 
 /// The input of one inflate: a reader over the octets that records whether a
 /// read asked for more octets than remained.
 ///
-/// ruzstd reads its source with `read_exact` alone, so a short read means the
-/// frame continues past the input, which libzstd reports as more input to
-/// wait for, and upstream as [`ZstdRefusal::Truncated`].
+/// - ruzstd reads its source with `read_exact` alone, so a short read means the frame continues past the
+///   input.
+/// - libzstd reports that frame as more input to wait for, and upstream as `CompressionError::Truncated`,
+///   which the engine answers as [`ZstdRefusal::Truncated`].
 struct Source<'a> {
 	rest: &'a [u8],
 	starved: bool,
@@ -494,6 +458,23 @@ impl<'a> Source<'a> {
 		}
 
 		Err(ZstdRefusal::TrailingBytes(self.rest.len()))
+	}
+
+	/// The block the decoder reads next, parsed from the head of `rest`, which
+	/// sits on the next `Block_Header` once the blocks before it are read (RFC
+	/// 8878 section 3.1.1.2). `None` for a raw block, an RLE block with its
+	/// octet, or an incomplete header, which ruzstd 0.9.1 checks or starves on.
+	fn next_block(&self) -> Option<NextBlock> {
+		let header = self.rest.get(..3)?;
+		let header = u32::from_le_bytes([header[0], header[1], header[2], 0]);
+		let size = header >> 3;
+		let body = &self.rest[3..];
+
+		match (header >> 1) & 0b11 {
+			1 if body.is_empty() => Some(NextBlock::Rle { size }),
+			2 => Some(NextBlock::compressed(size, body)),
+			_ => None,
+		}
 	}
 }
 
@@ -544,10 +525,13 @@ impl Skippable {
 }
 
 /// The `Frame_Header_Descriptor` of a zstd frame (RFC 8878 section 3.1.1.1.1),
-/// for the two clauses libzstd checks that ruzstd 0.9.0 reads but neither
-/// checks nor exposes: the reserved bit, and whether the frame declares its
-/// content size (`src/decoding/frame.rs:200-260`).
-struct Descriptor(u8);
+/// for the reserved bit and content size ruzstd 0.9.1 leaves to its caller,
+/// and the `Block_Maximum_Size` it neither exposes nor applies to a compressed
+/// block's size or literals (`src/decoding/frame.rs:116-138`, `:173`, `:180`).
+struct Descriptor {
+	byte: u8,
+	block_maximum: u64,
+}
 
 impl Descriptor {
 	/// The bit RFC 8878 reserves, which a valid frame clears.
@@ -557,30 +541,54 @@ impl Descriptor {
 	/// The shift of `Frame_Content_Size_flag`.
 	const CONTENT_SIZE_SHIFT: u32 = 6;
 
-	/// The descriptor of the zstd frame that opens `data`.
+	/// The descriptor of the zstd frame that opens `data`, read after
+	/// `decoder` reset over it, so a single-segment window is its content size.
 	///
 	/// # Errors
 	///
-	/// - [`ZstdRefusal::Truncated`] -- `data` ends before the descriptor.
+	/// - [`ZstdRefusal::Truncated`] -- `data` ends before the descriptor or its window.
 	/// - [`ZstdRefusal::Malformed`] -- the descriptor sets the reserved bit.
-	fn of(data: &[u8]) -> Result<Self, ZstdRefusal> {
-		let descriptor = data.get(DESCRIPTOR_AT).copied().ok_or(ZstdRefusal::Truncated)?;
-		if descriptor & Self::RESERVED != 0 {
+	fn of(data: &[u8], decoder: &FrameDecoder) -> Result<Self, ZstdRefusal> {
+		let byte = data.get(DESCRIPTOR_AT).copied().ok_or(ZstdRefusal::Truncated)?;
+		if byte & Self::RESERVED != 0 {
 			return Err(ZstdRefusal::Malformed);
 		}
 
-		Ok(Self(descriptor))
+		let window = if byte & Self::SINGLE_SEGMENT != 0 {
+			decoder.content_size()
+		} else {
+			let octet = data.get(DESCRIPTOR_AT + 1).copied().ok_or(ZstdRefusal::Truncated)?;
+			Self::window_of(octet)
+		};
+
+		Ok(Self { byte, block_maximum: window.min(MAX_BLOCK_SIZE) })
+	}
+
+	/// The window a `Window_Descriptor` octet declares (RFC 8878 section
+	/// 3.1.1.1.2), as ruzstd reads it (`src/decoding/frame.rs:116-138`).
+	fn window_of(octet: u8) -> u64 {
+		let exponent = u64::from(octet >> 3);
+		let mantissa = u64::from(octet & 0x7);
+		let base = 1u64 << (10 + exponent);
+
+		base + (base / 8) * mantissa
+	}
+
+	/// The largest size a block of this frame may state or decompress to,
+	/// `Block_Maximum_Size` (RFC 8878 section 3.1.1.2.4).
+	fn block_maximum(&self) -> u64 {
+		self.block_maximum
 	}
 
 	/// Whether the frame declares its content size.
 	fn declares_size(&self) -> bool {
-		let flagged = self.0 >> Self::CONTENT_SIZE_SHIFT != 0;
-		flagged || self.0 & Self::SINGLE_SEGMENT != 0
+		let flagged = self.byte >> Self::CONTENT_SIZE_SHIFT != 0;
+		flagged || self.byte & Self::SINGLE_SEGMENT != 0
 	}
 
-	/// Refuse a frame whose content checksum or declared content size the
-	/// `inflated` octets that `decoder` produced do not match, as libzstd
-	/// refuses it.
+	/// Refuse with [`ZstdRefusal::Malformed`] a frame whose content checksum or
+	/// declared content size differs from the `inflated` octets that `decoder`
+	/// produced, as libzstd refuses it.
 	///
 	/// # Errors
 	///
@@ -597,6 +605,68 @@ impl Descriptor {
 		}
 
 		Ok(())
+	}
+}
+
+/// The facts of the block the decoder reads next that the engine checks
+/// against `Block_Maximum_Size` before decode, where ruzstd 0.9.1 checks none
+/// or answers another code than libzstd (RFC 8878 section 3.1.1.2.4).
+enum NextBlock {
+	/// An RLE block whose one content octet the input has yet to reach.
+	Rle { size: u32 },
+	/// A compressed block of `size` content octets, with the
+	/// `Regenerated_Size` of its literals once the whole block is in the input.
+	Compressed { size: u32, literals: Option<u32> },
+}
+
+impl NextBlock {
+	/// The compressed block of `size` content octets that opens `body`.
+	fn compressed(size: u32, body: &[u8]) -> Self {
+		let block = usize::try_from(size).ok().and_then(|end| body.get(..end));
+		let literals = block.and_then(Self::regenerated);
+
+		Self::Compressed { size, literals }
+	}
+
+	/// The `Regenerated_Size` of the `Literals_Section_Header` that opens
+	/// `block`, or `None` while that header is incomplete (RFC 8878 section
+	/// 3.1.1.3.1.1), as ruzstd reads it
+	/// (`src/blocks/literals_section.rs:117-223`).
+	fn regenerated(block: &[u8]) -> Option<u32> {
+		let first = u32::from(*block.first()?);
+		let byte = |at: usize| block.get(at).copied().map(u32::from);
+
+		let literals = match (first & 0b11, (first >> 2) & 0b11) {
+			(0 | 1, 0 | 2) => first >> 3,
+			(0 | 1, 1) => (first >> 4) + (byte(1)? << 4),
+			(0 | 1, _) => (first >> 4) + (byte(1)? << 4) + (byte(2)? << 12),
+			(_, 0 | 1) => (first >> 4) + ((byte(1)? & 0x3f) << 4),
+			(_, 2) => (first >> 4) + (byte(1)? << 4) + ((byte(2)? & 0x3) << 12),
+			(_, _) => (first >> 4) + (byte(1)? << 4) + ((byte(2)? & 0x3f) << 12),
+		};
+
+		Some(literals)
+	}
+
+	/// Refuse a block past `block_maximum`, in the order libzstd takes
+	/// (`zstd/lib/decompress/zstd_decompress.c:1315`, `:1316`, and
+	/// `zstd/lib/decompress/zstd_decompress_block.c:186`, `:272`, `:320`).
+	///
+	/// # Errors
+	///
+	/// - [`ZstdRefusal::Truncated`] -- an RLE block past the bound whose one
+	///   content octet the input has yet to reach, which the decoder waits for.
+	/// - [`ZstdRefusal::Malformed`] -- a compressed block whose size or literals
+	///   pass the bound.
+	fn check(&self, block_maximum: u64) -> Result<(), ZstdRefusal> {
+		match self {
+			Self::Rle { size } if u64::from(*size) > block_maximum => Err(ZstdRefusal::Truncated),
+			Self::Compressed { size, .. } if u64::from(*size) > block_maximum => Err(ZstdRefusal::Malformed),
+			Self::Compressed { literals: Some(literals), .. } if u64::from(*literals) > block_maximum => {
+				Err(ZstdRefusal::Malformed)
+			}
+			_ => Ok(()),
+		}
 	}
 }
 
@@ -668,8 +738,8 @@ mod fixtures {
 	/// whose one RLE block emits a single octet, as upstream's
 	/// `frame_declaring_window` builds it (`tb:src/compress/mod.rs:336-346`).
 	///
-	/// The window descriptor holds the window log less 10 in its top five
-	/// bits (RFC 8878 section 3.1.1.1.2).
+	/// - The window descriptor holds the window log less 10 in its top five bits (RFC 8878 section
+	///   3.1.1.1.2).
 	pub(super) fn frame_declaring_window(window_log: u8) -> Vec<u8> {
 		let window_descriptor = (window_log - 10) << 3;
 		vec![0x28, 0xb5, 0x2f, 0xfd, 0x00, window_descriptor, 0x0b, 0x00, 0x00, 0x41]
@@ -971,6 +1041,121 @@ mod tests {
 		assert_eq!(ZstdCompression::default().inflate(&frame), Err(ZstdRefusal::Malformed));
 	}
 
+	/// A frame whose one RLE block declares a decompressed size past the
+	/// Block_Maximum_Size of its window is malformed, as libzstd refuses it
+	/// and ruzstd 0.9.1 refuses it by its header size (RUSTSEC-2026-0344, RFC
+	/// 8878 section 3.1.1.2.4).
+	#[test]
+	fn the_engine_refuses_an_rle_block_past_the_block_maximum_size() {
+		// A 1 KiB window carries a Block_Maximum_Size of 1024 octets. The one
+		// RLE block declares 2000 octets, past the bound but under the ceiling.
+		let frame = [0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x00, 0x83, 0x3e, 0x00, 0x41];
+
+		assert!(Upstream::default().decompress(&frame).is_err());
+		assert_eq!(ZstdCompression::default().inflate(&frame), Err(ZstdRefusal::Malformed));
+	}
+
+	/// A frame whose one raw block declares a size past the Block_Maximum_Size
+	/// of its window is malformed, as libzstd refuses it and ruzstd 0.9.1
+	/// refuses it by its header size (RFC 8878 section 3.1.1.2.4).
+	#[test]
+	fn the_engine_refuses_a_raw_block_past_the_block_maximum_size() {
+		// A 1 KiB window, a raw block declaring 2000 octets.
+		let frame = [0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x00, 0x81, 0x3e, 0x00];
+
+		assert!(Upstream::default().decompress(&frame).is_err());
+		assert_eq!(ZstdCompression::default().inflate(&frame), Err(ZstdRefusal::Malformed));
+	}
+
+	/// An RLE block past the bound whose one content octet the input has yet to
+	/// carry is truncated, not malformed, on both sides: the frame ends inside
+	/// its block and the decoder waits for the octet.
+	#[test]
+	fn the_engine_and_upstream_truncate_an_rle_block_past_the_bound() {
+		// The RLE block of `the_engine_refuses_an_rle_block_...`, cut before
+		// its content octet.
+		let frame = [0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x00, 0x83, 0x3e, 0x00];
+
+		assert!(matches!(
+			Upstream::default().decompress(&frame),
+			Err(TightBeamError::CompressionError(CompressionError::Truncated))
+		));
+		assert_eq!(ZstdCompression::default().inflate(&frame), Err(ZstdRefusal::Truncated));
+	}
+
+	/// A frame whose one compressed block regenerates literals past the
+	/// Block_Maximum_Size of its window is malformed, the literals member of
+	/// RUSTSEC-2026-0344 that the engine bounds and ruzstd 0.9.1 leaves open
+	/// (RFC 8878 section 3.1.1.3.1.1).
+	#[test]
+	fn the_engine_refuses_compressed_literals_past_the_block_maximum_size() {
+		// A 1 KiB window whose RLE literals regenerate 2000 octets, and a 1 MiB
+		// window whose RLE literals regenerate 1,000,000.
+		let small = [
+			0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x00, 0x2d, 0x00, 0x00, 0x0d, 0x7d, 0x00, 0x41, 0x00,
+		];
+		let wide = [
+			0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x50, 0x2d, 0x00, 0x00, 0x0d, 0x24, 0xf4, 0x41, 0x00,
+		];
+
+		for frame in [small, wide] {
+			assert!(Upstream::default().decompress(&frame).is_err());
+			assert_eq!(ZstdCompression::default().inflate(&frame), Err(ZstdRefusal::Malformed));
+		}
+	}
+
+	/// A frame whose one compressed block holds more content octets than the
+	/// Block_Maximum_Size of its window is malformed, as libzstd refuses it at
+	/// the block header (RFC 8878 section 3.1.1.2.4).
+	#[test]
+	fn the_engine_refuses_a_compressed_block_size_past_the_block_maximum_size() {
+		// A 1 KiB window and a compressed block of 1025 octets: a raw literals
+		// header for 1022 octets, the literals, and no sequences.
+		let mut frame = vec![0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x00, 0x0d, 0x20, 0x00, 0xe4, 0x3f];
+		frame.extend_from_slice(&[0x41; 1022]);
+		frame.push(0x00);
+
+		assert!(Upstream::default().decompress(&frame).is_err());
+		assert_eq!(ZstdCompression::default().inflate(&frame), Err(ZstdRefusal::Malformed));
+	}
+
+	/// A compressed block cut inside its content is truncated on both sides,
+	/// whatever its literals header states, because libzstd waits for the
+	/// whole block before it reads the literals.
+	#[test]
+	fn the_engine_and_upstream_truncate_a_cut_compressed_block() {
+		// The 2000-octet literals block of
+		// `the_engine_refuses_compressed_literals_...`, cut after its literals
+		// header.
+		let frame = [0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x00, 0x2d, 0x00, 0x00, 0x0d, 0x7d, 0x00];
+
+		assert!(matches!(
+			Upstream::default().decompress(&frame),
+			Err(TightBeamError::CompressionError(CompressionError::Truncated))
+		));
+		assert_eq!(ZstdCompression::default().inflate(&frame), Err(ZstdRefusal::Truncated));
+	}
+
+	/// A frame whose one compressed block expands its sequences past the
+	/// Block_Maximum_Size of its window is malformed, the decompression bomb
+	/// of RUSTSEC-2026-0344 that ruzstd 0.9.1 refuses as its sequences
+	/// execute (RFC 8878 section 3.1.1.2.4).
+	#[test]
+	fn the_engine_refuses_a_compressed_block_whose_sequences_pass_the_bound() -> TestResult {
+		let body = b"tightbeam".repeat(256);
+		let (mut frame, _) = ZstdCompression::default().compress(&body, None)?;
+
+		// The encoder writes a 128 KiB window. Retargeting it to 1 KiB leaves
+		// the one block regenerating 2304 octets, past a Block_Maximum_Size of
+		// 1024 but under the ceiling.
+		assert_eq!(frame[5], 0x38);
+		frame[5] = 0x00;
+
+		assert!(Upstream::default().decompress(&frame).is_err());
+		assert_eq!(ZstdCompression::default().inflate(&frame), Err(ZstdRefusal::Malformed));
+		Ok(())
+	}
+
 	// The engine admits the parameters upstream admits at each bound of the
 	// level range, and refuses the level one past each bound.
 	tb_cases! {
@@ -1019,10 +1204,9 @@ mod wasm_tests {
 
 	#[wasm_bindgen_test]
 	fn a_ceiling_that_is_nan_negative_or_a_fraction_is_refused() {
-		let realm = ZstdCompression::realm();
-		let nan = realm.ceiling_js(JsValue::from_f64(f64::NAN)).code();
-		let negative = realm.ceiling_js(JsValue::from_f64(-1.0)).code();
-		let fraction = realm.ceiling_js(JsValue::from_f64(0.5)).code();
+		let nan = ZstdCompression::ceiling_js(JsValue::from_f64(f64::NAN)).code();
+		let negative = ZstdCompression::ceiling_js(JsValue::from_f64(-1.0)).code();
+		let fraction = ZstdCompression::ceiling_js(JsValue::from_f64(0.5)).code();
 
 		let codes = [nan.as_deref(), negative.as_deref(), fraction.as_deref()];
 		assert_eq!(codes, [Some("InvalidMaxOutput"); 3]);

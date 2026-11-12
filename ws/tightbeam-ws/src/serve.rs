@@ -1,54 +1,16 @@
-//! The owner of one accepted multiplexed connection: its transport gate, its
-//! tasks, and the handle that a push-capable service emits on.
-//!
-//! Upstream [`MuxAcceptor::serve`] serves a connection behind its transport
-//! gate, and lends its service no [`MuxHandle`]. A server that pushes streams
-//! of its own serves through this module instead, in three steps:
-//!
-//! 1. [`AcceptedLink::accepted`] consumes a transport whose server handshake
-//!    completed. It keeps the multiplexing settings, the rekey context, the
-//!    peer, the gate, and the writer clock. A cleartext endpoint runs no
-//!    handshake, so [`AcceptedLink::cleartext`] takes the settings that
-//!    both ends agreed on, and refuses an endpoint provisioned for encryption.
-//! 2. [`AcceptedLink::spawn`] spawns the mux drivers and a keepalive into the [`ServedMux`] that owns them.
-//! 3. [`ServedMux::serve`] runs the responder until the connection ends, and every call passes the gate first.
-//!
-//! A server that pushes nothing serves through upstream [`MuxAcceptor::serve`],
-//! which also keeps the gate spans of the audit trail.
-//!
-//! # Gate
-//!
-//! Each call evaluates the gate against the session that the handshake proved,
-//! as upstream does for every gate that reads the peer. A renewal of a metered
-//! session keeps that peer, so the call keeps serving in the same session.
-//! Upstream also hands each call the receipt of the latest renewal, through a
-//! crate-private constructor of [`SessionContext`]. A gate here therefore
-//! reads the receipt of the handshake.
-//!
-//! The gate answers each call with the status upstream answers. Under the
-//! `instrument` feature, each call records the verdict on the trace that the
-//! mux of the link records on, as upstream records it: `GATE_ACCEPT` with
-//! `Ok`, or `GATE_REJECT` with the status that the refused call answers, as
-//! its label and its value.
-//!
-//! Upstream also names the peer key of the session as the evidence of each
-//! verdict, injects trace faults at handler entry, and labels a handler
-//! failure `HANDLER_FAILED`, all through crate-private traits. A verdict
-//! recorded here therefore names its status alone, and a call served here
-//! records none of the rest.
+//! The owner of one accepted multiplexed connection, as `docs/ws.md`
+//! (Accepted links) states it.
 
 use core::convert::Infallible;
 use core::future::{pending, poll_fn, Future};
 use core::pin::pin;
+use core::time::Duration;
 use std::sync::Arc;
 
-use tightbeam::clock::{Clock, Timer, Timing};
-#[cfg(feature = "instrument")]
-use tightbeam::instrumentation::events;
+use tightbeam::clock::{Clock, Lapse, Timer, Timing};
+use tightbeam::constants::KEEPALIVE_PROBES_PER_DEADLINE;
 use tightbeam::marker::MaybeSend;
 use tightbeam::policy::{GatePolicy, SessionContext, TransitStatus};
-#[cfg(feature = "instrument")]
-use tightbeam::trace::TraceCollector;
 use tightbeam::transport::envelopes::GoAwayReason;
 use tightbeam::transport::error::TransportError;
 use tightbeam::transport::handshake::negotiation::MuxSettings;
@@ -57,13 +19,23 @@ use tightbeam::transport::multiplex::{
 	SpawnedMux, StreamBody, StreamRoute,
 };
 use tightbeam::transport::state::EncryptedProtocolState;
-#[cfg(feature = "instrument")]
-use tightbeam::transport::GateAudit;
-use tightbeam::transport::{EnvelopeSink, EnvelopeSource, ResponsePackage, TransportResult};
-#[cfg(feature = "instrument")]
-use tightbeam::urn::Urn;
+use tightbeam::transport::{CheckedLimits, EnvelopeSink, EnvelopeSource, ResponsePackage, TransportResult};
 use tightbeam::{Errorizable, Frame, TightBeamError};
 use tokio::task::JoinSet;
+
+#[cfg(feature = "instrument")]
+use tightbeam::instrumentation::events;
+#[cfg(feature = "instrument")]
+use tightbeam::trace::TraceCollector;
+#[cfg(feature = "instrument")]
+use tightbeam::transport::GateAudit;
+#[cfg(feature = "instrument")]
+use tightbeam::urn::Urn;
+
+/// The event that the audit trail of a served link records once per probe of
+/// its keepalive that the peer answered.
+#[cfg(feature = "instrument")]
+pub const KEEPALIVE_ANSWERED: Urn<'static> = tightbeam::urn!("tightbeam-ws", "event:keepalive/answered");
 
 /// Why a transport cannot become an [`AcceptedLink`].
 ///
@@ -96,12 +68,14 @@ pub enum LinkError {
 	Transport(TransportError),
 }
 
-/// A clock whose waits race the work beside them on the thread that proved
-/// it ([`Timing::Races`]).
+/// A clock whose waits race the work beside them ([`Timing::Races`]) on the
+/// thread that built the value.
 ///
-/// An emit deadline and the keepalive each race a wait on the clock of their
-/// link. A clock that parks, or one that has no timer on the thread, would
-/// leave every deadline unbounded, so the link refuses it.
+/// - The check on the building thread is an early refusal. A clock that parks
+///   parks on every thread, so that refusal holds everywhere.
+/// - A [`Timer`] of this clock reads the timing again at the first wait of
+///   each bound, on the thread that polls it. It refuses a thread with no
+///   timer with `Lapse::NoTimer`.
 ///
 /// # Examples
 ///
@@ -126,7 +100,7 @@ impl TryFrom<Arc<dyn Clock>> for RacingClock {
 	///
 	/// # Errors
 	///
-	/// - [`LinkError::ClockCannotRace`]: the clock parks the thread, or the thread has no timer for it.
+	/// - [`LinkError::ClockCannotRace`] -- the clock parks the thread, or the thread has no timer for it.
 	fn try_from(clock: Arc<dyn Clock>) -> Result<Self, Self::Error> {
 		let timing = clock.timing();
 		if timing != Timing::Races {
@@ -146,13 +120,9 @@ impl RacingClock {
 	}
 }
 
-/// What one served connection is built from: the halves of its transport,
-/// its multiplexing settings, its rekey context, the transport gate, the peer
-/// the handshake proved, and the clock of its writer.
-///
-/// Every field is private and a constructor sets each one from the transport
-/// it consumes, so a link always carries its real gate, its real peer, and a
-/// [`RacingClock`].
+/// One accepted connection before its tasks spawn: the halves of its
+/// transport, and the settings, rekey context, gate, peer, and writer clock
+/// that a transport constructor reads from the transport it consumes.
 ///
 /// # Examples
 ///
@@ -163,11 +133,11 @@ impl RacingClock {
 /// /// The link of `transport`, once its server handshake negotiated
 /// /// multiplexing.
 /// async fn link<T: MuxAcceptor>(
-///     mut transport: T,
+/// 	mut transport: T,
 /// ) -> Result<AcceptedLink<T::EnvelopeReader, T::EnvelopeWriter>, Box<dyn std::error::Error>> {
-///     transport.negotiate_mux().await?;
-///     let link = AcceptedLink::accepted(transport)?;
-///     Ok(link)
+/// 	transport.negotiate_mux().await?;
+/// 	let link = AcceptedLink::accepted(transport)?;
+/// 	Ok(link)
 /// }
 /// ```
 pub struct AcceptedLink<R, W> {
@@ -181,9 +151,8 @@ pub struct AcceptedLink<R, W> {
 }
 
 /// The audit trail of one served link: the trace that its mux records on,
-/// under the `instrument` feature. A link with no trace, or a build without
-/// the feature, records nothing.
-struct Audit {
+/// under the `instrument` feature.
+pub(crate) struct Audit {
 	#[cfg(feature = "instrument")]
 	trace: Option<TraceCollector>,
 }
@@ -203,12 +172,22 @@ impl Audit {
 		audit
 	}
 
+	/// Another handle on this trail, which records on the same trace.
+	fn share(&self) -> Self {
+		#[cfg(feature = "instrument")]
+		let audit = Self { trace: self.trace() };
+		#[cfg(not(feature = "instrument"))]
+		let audit = Self {};
+
+		audit
+	}
+
 	/// Record `verdict` on the trail.
 	///
 	/// # Errors
 	///
-	/// - [`TightBeamError`] -- the trace refused the event, the fault that the
-	///   `testing-fault` feature of tightbeam injects.
+	/// - The [`TightBeamError`] of a trace that refused the event, the fault
+	///   that the `testing-fault` feature of tightbeam injects.
 	fn verdict(&self, verdict: &GateVerdict) -> Result<(), TightBeamError> {
 		#[cfg(feature = "instrument")]
 		if let Some(trace) = &self.trace {
@@ -218,6 +197,37 @@ impl Audit {
 
 		#[cfg(not(feature = "instrument"))]
 		let _ = verdict;
+
+		Ok(())
+	}
+
+	/// Record on the trail that the peer answered a probe of the keepalive.
+	///
+	/// # Errors
+	///
+	/// - The [`TightBeamError`] of a trace that refused the event, the fault
+	///   that the `testing-fault` feature of tightbeam injects.
+	fn probe_answered(&self) -> Result<(), TightBeamError> {
+		#[cfg(feature = "instrument")]
+		if let Some(trace) = &self.trace {
+			trace.emit_event(KEEPALIVE_ANSWERED)?;
+		}
+
+		Ok(())
+	}
+
+	/// Record on the trail that a handler failed with an error of its own,
+	/// and that its stream answers `status`.
+	///
+	/// # Errors
+	///
+	/// - The [`TightBeamError`] of a trace that refused the event, the fault
+	///   that the `testing-fault` feature of tightbeam injects.
+	#[cfg(feature = "testing")]
+	pub(crate) fn failed(&self, status: TransitStatus) -> Result<(), TightBeamError> {
+		if let Some(trace) = &self.trace {
+			trace.emit_event_with_value(events::HANDLER_FAILED, status.as_str(), status)?;
+		}
 
 		Ok(())
 	}
@@ -233,18 +243,16 @@ impl<R: EnvelopeSource, W: EnvelopeSink> AcceptedLink<R, W> {
 	/// The link of `transport`, whose server handshake negotiated
 	/// multiplexing.
 	///
-	/// The link keeps the settings the handshake negotiated, the in-band rekey
-	/// context of a metered session, the peer of
-	/// [`MuxAcceptor::session_context`], and the transport gate. The writer
-	/// keeps its clock across the split, and the link proves that it races on
-	/// the calling thread.
+	/// - The link keeps the negotiated settings, the in-band rekey context of a
+	///   metered session, and the gate.
+	/// - The peer is the one of [`MuxAcceptor::session_context`].
 	///
 	/// # Errors
 	///
-	/// - [`LinkError::NotMultiplexed`]: the handshake negotiated no multiplexing.
-	/// - [`LinkError::ClockCannotRace`]: the writer clock cannot race a wait on the calling thread.
-	/// - [`LinkError::Transport`]: the errors of [`MuxAcceptor::take_rekey`] and
-	///   [`MuxAcceptor::into_gated_halves`].
+	/// - [`LinkError::NotMultiplexed`] -- the handshake negotiated no multiplexing.
+	/// - [`LinkError::ClockCannotRace`] -- the writer clock cannot race a wait on the calling thread.
+	/// - [`LinkError::Transport`] -- the errors of [`MuxAcceptor::take_rekey`]
+	///   and [`MuxAcceptor::into_gated_halves`].
 	pub fn accepted<T>(mut transport: T) -> Result<Self, LinkError>
 	where
 		T: MuxAcceptor<EnvelopeReader = R, EnvelopeWriter = W>,
@@ -254,29 +262,21 @@ impl<R: EnvelopeSource, W: EnvelopeSink> AcceptedLink<R, W> {
 		let session = transport.session_context();
 		let (gate, (reader, writer)) = transport.into_gated_halves()?;
 		let clock = RacingClock::try_from(writer.clock())?;
-
 		Ok(Self { reader, writer, settings, rekey, gate, session, clock })
 	}
 
 	/// The link of `transport`, a cleartext transport whose two ends agreed on
-	/// `settings` out of band.
+	/// `settings` out of band, such as [`MuxSettings::symmetric`].
 	///
-	/// A cleartext transport has no handshake to negotiate in, so both ends
-	/// configure the same settings ([`MuxSettings::symmetric`]). The link keeps
-	/// the transport gate and the empty session of a cleartext peer, and proves
-	/// the writer clock as [`accepted`](Self::accepted) does.
-	///
-	/// The link proves that the endpoint of `transport` holds no encryption
-	/// provisioning ([`EncryptionConfig::is_provisioned`]), the rule by which
-	/// the transport skips its handshake. An encrypted transport is refused
-	/// whether its handshake negotiated multiplexing, negotiated a
-	/// single-flight session, or has not run.
+	/// - The link keeps the gate and the empty session of a cleartext peer.
+	/// - The endpoint MUST hold no encryption provisioning ([`EncryptionConfig::is_provisioned`]),
+	///   whatever its handshake negotiated.
 	///
 	/// # Errors
 	///
-	/// - [`LinkError::Encrypted`]: the endpoint is provisioned for encryption.
-	/// - [`LinkError::ClockCannotRace`]: the writer clock cannot race a wait on the calling thread.
-	/// - [`LinkError::Transport`]: the errors of [`MuxAcceptor::into_gated_halves`].
+	/// - [`LinkError::Encrypted`] -- the endpoint is provisioned for encryption.
+	/// - [`LinkError::ClockCannotRace`] -- the writer clock cannot race a wait on the calling thread.
+	/// - [`LinkError::Transport`] -- the errors of [`MuxAcceptor::into_gated_halves`].
 	///
 	/// [`EncryptionConfig::is_provisioned`]: tightbeam::transport::state::EncryptionConfig::is_provisioned
 	pub fn cleartext<T>(transport: T, settings: MuxSettings) -> Result<Self, LinkError>
@@ -291,15 +291,7 @@ impl<R: EnvelopeSource, W: EnvelopeSink> AcceptedLink<R, W> {
 		let session = transport.session_context();
 		let (gate, (reader, writer)) = transport.into_gated_halves()?;
 		let clock = RacingClock::try_from(writer.clock())?;
-
 		Ok(Self { reader, writer, settings, rekey: None, gate, session, clock })
-	}
-
-	/// The peer that the handshake proved. A cleartext or server-auth
-	/// connection proves no peer.
-	#[must_use]
-	pub fn session(&self) -> &SessionContext {
-		&self.session
 	}
 }
 
@@ -308,16 +300,19 @@ where
 	R: EnvelopeSource + Send + 'static,
 	W: EnvelopeSink + Send + 'static,
 {
-	/// Spawn the mux of this link in the server role, and a keepalive that
-	/// paces its probes to the operation timeout of the link
-	/// ([`MuxHandle::keep_alive`]).
+	/// Spawn the mux of this link in the server role, with a keepalive, into
+	/// the [`ServedMux`] that owns them.
 	///
-	/// A metered session assembles with its rekey context, so it renews in
-	/// band as the mux of the transport does. The [`ServedMux`] owns both
-	/// drivers and the keepalive, and its drop ends them.
+	/// - A metered session assembles with its rekey context, so it renews in band.
+	/// - The keepalive probes the peer through [`MuxHandle::ping`]
+	///   [`KEEPALIVE_PROBES_PER_DEADLINE`] times per read deadline of the link,
+	///   on the writer clock. Under the `instrument` feature, the trail of the
+	///   link records each answered probe as `KEEPALIVE_ANSWERED`.
+	/// - The drop of the [`ServedMux`] ends both drivers and the keepalive.
 	#[must_use]
 	pub fn spawn(self) -> ServedMux {
 		let Self { reader, writer, settings, rekey, gate, session, clock } = self;
+		let interval = Keepalive::interval(&reader.limits());
 
 		let mux = match rekey {
 			Some(context) => MuxTransport::with_rekey(reader, writer, context, settings),
@@ -326,61 +321,65 @@ where
 
 		let SpawnedMux { handle, responder, drivers } = mux.spawn();
 		let audit = Audit::of(&handle);
+		let probes = Keepalive { handle: handle.clone(), timer: clock.timer(), interval, audit: audit.share() };
 		let mut keepalive = JoinSet::new();
-		let probes = handle.clone().keep_alive();
 
-		keepalive.spawn(probes);
+		keepalive.spawn(probes.run());
 
 		ServedMux { handle, responder, drivers, keepalive, gate, session, clock, audit }
 	}
 }
 
-/// The parts of a link that runs no handshake, such as an in-memory test link.
-///
-/// The parts name any gate and any session, so a link built from them proves
-/// neither. Only test support enables the `link-parts` feature, and a server
-/// builds its links with [`AcceptedLink::accepted`].
-///
-/// # Examples
-///
-/// ```
-/// use tightbeam::policy::{AcceptAllGate, SessionContext};
-/// use tightbeam::transport::handshake::negotiation::MuxSettings;
-/// use tightbeam_ws::serve::LinkParts;
-///
-/// /// The parts of a link over `reader` and `writer` that admits every call
-/// /// from an anonymous peer.
-/// fn parts<R, W>(reader: R, writer: W) -> LinkParts<R, W> {
-///     let gate = Box::new(AcceptAllGate);
-///     let settings = MuxSettings::symmetric(4);
-///     LinkParts { reader, writer, settings, gate, session: SessionContext::default() }
-/// }
-/// ```
-#[cfg(feature = "link-parts")]
-pub struct LinkParts<R, W> {
-	/// The read half of the link.
-	pub reader: R,
-	/// The write half of the link, whose clock runs every deadline.
-	pub writer: W,
-	/// The multiplexing settings that both ends configure.
-	pub settings: MuxSettings,
-	/// The gate that every call passes.
-	pub gate: Box<dyn GatePolicy>,
-	/// The peer that the policies of a served call read.
-	pub session: SessionContext,
+/// The keepalive of a served link, which probes the peer on the writer clock
+/// and records each answered probe on the trail of the link.
+struct Keepalive {
+	handle: MuxHandle,
+	timer: Timer,
+	/// The span from one probe to the next.
+	interval: Duration,
+	audit: Audit,
 }
 
-#[cfg(feature = "link-parts")]
-impl<R: EnvelopeSource, W: EnvelopeSink> AcceptedLink<R, W> {
-	/// The link of `parts`, with no rekey context.
+impl Keepalive {
+	/// The interval of a link whose reader reads under `limits`: the share of
+	/// its read deadline, which [`CheckedLimits`] keeps above zero, that
+	/// [`KEEPALIVE_PROBES_PER_DEADLINE`] divides out. A deadline with no whole
+	/// share in nanoseconds paces by the whole deadline.
+	fn interval(limits: &CheckedLimits) -> Duration {
+		let deadline = limits.operation_timeout;
+		let share = deadline.checked_div(KEEPALIVE_PROBES_PER_DEADLINE);
+		share.filter(|share| !share.is_zero()).unwrap_or(deadline)
+	}
+
+	/// Probe the peer at once, and again one interval after each probe, until
+	/// a probe fails, the polling thread has no timer for the clock, or the
+	/// trail refuses a record. The answer is the error that ended the loop.
 	///
-	/// # Errors
-	///
-	/// - [`LinkError::ClockCannotRace`]: the writer clock cannot race a wait on the calling thread.
-	pub fn from_parts(parts: LinkParts<R, W>) -> Result<Self, LinkError> {
-		let LinkParts { reader, writer, settings, gate, session } = parts;
-		let clock = RacingClock::try_from(writer.clock())?;
-		Ok(Self { reader, writer, settings, rekey: None, gate, session, clock })
+	/// - A probe waits at most one interval for its answer. The keepalive then
+	///   forgets the probe and sends the next one at once.
+	/// - The wait for the next probe is armed before the trail records the
+	///   answer, so a reader of the record that moves the clock moves it past
+	///   an armed wait.
+	async fn run(self) -> TightBeamError {
+		let Self { handle, mut timer, interval, audit } = self;
+		loop {
+			let sent = timer.clock().monotonic();
+
+			match timer.within(interval, pin!(handle.ping())).await {
+				Ok(Ok(())) => {}
+				Ok(Err(refusal)) => return refusal.into(),
+				Err(Lapse::Passed) => continue,
+				Err(lapse @ Lapse::NoTimer) => return TransportError::from(lapse).into(),
+			}
+
+			let waited = timer.clock().monotonic().saturating_duration_since(sent);
+			let next = timer.sleep(interval.saturating_sub(waited));
+			if let Err(refused) = audit.probe_answered() {
+				return refused;
+			}
+
+			next.await;
+		}
 	}
 }
 
@@ -388,7 +387,7 @@ impl<R: EnvelopeSource, W: EnvelopeSink> AcceptedLink<R, W> {
 /// spawned.
 ///
 /// The value owns every task of the connection, so the drop of the value, or
-/// of the future of [`serve`](Self::serve), ends them all.
+/// of the future of a serve, ends them all.
 ///
 /// # Examples
 ///
@@ -406,14 +405,14 @@ impl<R: EnvelopeSource, W: EnvelopeSink> AcceptedLink<R, W> {
 ///
 /// /// Serve `served` until the connection ends, with no expulsion.
 /// async fn serve(served: ServedMux) -> TransportResult<()> {
-///     served.serve(Closed, pending()).await
+/// 	served.serve_dispatch(Closed, pending()).await
 /// }
 /// ```
 pub struct ServedMux {
 	handle: MuxHandle,
 	responder: MuxResponder,
 	drivers: MuxDrivers,
-	keepalive: JoinSet<TransportError>,
+	keepalive: JoinSet<TightBeamError>,
 	gate: Box<dyn GatePolicy>,
 	session: SessionContext,
 	clock: RacingClock,
@@ -440,35 +439,43 @@ impl ServedMux {
 		&self.clock
 	}
 
-	/// A share of the trace that the mux of the link records on, which is the
-	/// trace of the transport that the link was accepted on. The service
-	/// records its own audit trail there. `None` names a transport that
-	/// records on no trace.
+	/// A share of the trace of the transport that the link was accepted on,
+	/// where the service records its own audit trail. `None` names a
+	/// transport that records on no trace.
 	#[cfg(feature = "instrument")]
 	#[must_use]
 	pub fn trace(&self) -> Option<TraceCollector> {
 		self.audit.trace()
 	}
 
+	/// A share of the audit trail of the link, which the `MuxService` path
+	/// records each handler failure on.
+	#[cfg(feature = "testing")]
+	pub(crate) fn audit(&self) -> Audit {
+		self.audit.share()
+	}
+
 	/// Serve every peer stream with `dispatch` behind the transport gate,
-	/// until the connection ends.
+	/// until the connection ends. A dispatch answers each call with a status
+	/// of its own, so the trail records no handler failure for it.
 	///
-	/// - Each call evaluates the gate before `dispatch` sees it, as upstream
-	///   [`MuxAcceptor::serve`] does. A gate that answers `Unknown` answers
-	///   `Internal`, and any other refusal answers its own status. Under the
-	///   `instrument` feature, the call records the verdict on the trace of
-	///   the link first ([`trace`](Self::trace)).
+	/// - Each call evaluates the gate before `dispatch` sees it. A gate that
+	///   answers `Unknown` answers `Internal`, and any other refusal answers its
+	///   own status. Under the `instrument` feature, the call records the verdict
+	///   on the trace of the link first ([`trace`](Self::trace)).
 	/// - When `expulsion` yields a reason, the connection drains with a GoAway
 	///   of that reason ([`MuxHandle::shutdown_with`]) while the responder
 	///   serves the streams in flight. A connection with no expulsion passes
 	///   [`pending`].
 	/// - The call returns when the responder ends, and ends the drivers and
-	///   the keepalive. A dropped future ends them as well.
+	///   the keepalive. A dropped future ends them as well. The writer stops
+	///   at once, so envelopes that the responder queued last drop
+	///   (`docs/ws.md`, Accepted links).
 	///
 	/// # Errors
 	///
-	/// - The terminal responder failures of [`MuxResponder::serve_with`].
-	pub async fn serve<D, E>(self, dispatch: D, expulsion: E) -> TransportResult<()>
+	/// - The errors of [`MuxResponder::serve_with`].
+	pub async fn serve_dispatch<D, E>(self, dispatch: D, expulsion: E) -> TransportResult<()>
 	where
 		D: MuxDispatch + Send + Sync + 'static,
 		E: Future<Output = GoAwayReason>,
@@ -500,7 +507,7 @@ impl ServedMux {
 	}
 }
 
-/// What a transport gate decides for one call, normalized for the wire.
+/// What a transport gate decides for one call, as the peer reads it.
 enum GateVerdict {
 	/// The gate admits the call.
 	Admitted,
@@ -514,14 +521,30 @@ impl GateVerdict {
 	///
 	/// A gate that answers [`TransitStatus::Unknown`] reports a local bug, so
 	/// the call answers [`TransitStatus::Internal`], which the peer reads as a
-	/// server fault. This is the normalization of upstream
-	/// `TransitStatus::normalized_verdict`, which is crate-private.
+	/// server fault. Upstream normalizes a verdict by the same rule.
 	fn of(gate: &dyn GatePolicy, frame: Option<&Frame>, session: &SessionContext) -> Self {
 		let status = gate.evaluate(frame, session);
 		match status {
 			TransitStatus::Ok => Self::Admitted,
 			TransitStatus::Unknown => Self::Refused(TransitStatus::Internal),
 			refused => Self::Refused(refused),
+		}
+	}
+
+	/// The answer of the call: the answer of `admitted` when the gate admits
+	/// the call, which runs only then, or the refusal of its status.
+	///
+	/// # Errors
+	///
+	/// - The [`TransportError`] of `admitted`.
+	async fn answer<A, F>(self, admitted: impl FnOnce() -> F) -> TransportResult<A>
+	where
+		A: Answer,
+		F: Future<Output = TransportResult<A>>,
+	{
+		match self {
+			Self::Admitted => admitted().await,
+			Self::Refused(status) => Ok(A::refused(status)),
 		}
 	}
 
@@ -537,12 +560,31 @@ impl GateVerdict {
 	}
 }
 
+/// The answer of one stream kind, as a refused call of that kind answers.
+trait Answer {
+	/// The answer of a call that the gate refused with `status`.
+	fn refused(status: TransitStatus) -> Self;
+}
+
+/// A unary or streaming call answers its status with no reply frame.
+impl Answer for ResponsePackage {
+	fn refused(status: TransitStatus) -> Self {
+		Self::new(status, None)
+	}
+}
+
+/// A duplex call answers its status on the trailer of the stream.
+impl Answer for TransitStatus {
+	fn refused(status: TransitStatus) -> Self {
+		status
+	}
+}
+
 /// A [`MuxDispatch`] behind the transport gate of its connection.
 ///
-/// Each call evaluates the gate at dispatch against the handshake session,
-/// and records the verdict on the audit trail of its link. A refused call
-/// answers the status of its verdict and never reaches the dispatch. Upstream
-/// `GatedService` holds the same rule and is crate-private.
+/// Each call evaluates the gate against the handshake session and records
+/// the verdict on the audit trail of its link, and only an admitted call
+/// reaches the dispatch.
 struct GatedDispatch<D> {
 	dispatch: D,
 	gate: Box<dyn GatePolicy>,
@@ -556,8 +598,8 @@ impl<D> GatedDispatch<D> {
 	///
 	/// # Errors
 	///
-	/// - [`TightBeamError`] -- the trace refused the verdict, so the call fails
-	///   as an upstream call does.
+	/// - The [`TightBeamError`] of a trace that refused the verdict, so the
+	///   call fails as an upstream call does.
 	fn verdict(&self, frame: Option<&Frame>) -> Result<GateVerdict, TightBeamError> {
 		let verdict = GateVerdict::of(self.gate.as_ref(), frame, &self.session);
 		self.audit.verdict(&verdict)?;
@@ -568,12 +610,7 @@ impl<D> GatedDispatch<D> {
 impl<D: MuxDispatch + Sync> MuxDispatch for GatedDispatch<D> {
 	fn unary(&self, frame: Arc<Frame>) -> impl Future<Output = TransportResult<ResponsePackage>> + MaybeSend {
 		let verdict = self.verdict(Some(&frame));
-		async move {
-			match verdict? {
-				GateVerdict::Admitted => self.dispatch.unary(frame).await,
-				GateVerdict::Refused(status) => Ok(ResponsePackage::new(status, None)),
-			}
-		}
+		async move { verdict?.answer(|| self.dispatch.unary(frame)).await }
 	}
 
 	fn streaming(
@@ -582,12 +619,7 @@ impl<D: MuxDispatch + Sync> MuxDispatch for GatedDispatch<D> {
 		route: StreamRoute,
 	) -> impl Future<Output = TransportResult<ResponsePackage>> + MaybeSend {
 		let verdict = self.verdict(None);
-		async move {
-			match verdict? {
-				GateVerdict::Admitted => self.dispatch.streaming(body, route).await,
-				GateVerdict::Refused(status) => Ok(ResponsePackage::new(status, None)),
-			}
-		}
+		async move { verdict?.answer(|| self.dispatch.streaming(body, route)).await }
 	}
 
 	fn duplex(
@@ -597,11 +629,27 @@ impl<D: MuxDispatch + Sync> MuxDispatch for GatedDispatch<D> {
 		route: StreamRoute,
 	) -> impl Future<Output = TransportResult<TransitStatus>> + MaybeSend {
 		let verdict = self.verdict(None);
-		async move {
-			match verdict? {
-				GateVerdict::Admitted => self.dispatch.duplex(body, reply, route).await,
-				GateVerdict::Refused(status) => Ok(status),
-			}
-		}
+		async move { verdict?.answer(|| self.dispatch.duplex(body, reply, route)).await }
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	use tightbeam::transport::TransportLimits;
+
+	#[test]
+	fn a_read_deadline_of_three_shares_paces_one_share() -> TransportResult<()> {
+		let limits = TransportLimits { operation_timeout: Duration::from_secs(30), ..TransportLimits::default() };
+		assert_eq!(Keepalive::interval(&limits.checked()?), Duration::from_secs(10));
+		Ok(())
+	}
+
+	#[test]
+	fn a_read_deadline_with_no_whole_share_paces_the_whole_deadline() -> TransportResult<()> {
+		let limits = TransportLimits { operation_timeout: Duration::from_nanos(2), ..TransportLimits::default() };
+		assert_eq!(Keepalive::interval(&limits.checked()?), Duration::from_nanos(2));
+		Ok(())
 	}
 }

@@ -1,43 +1,31 @@
-//! The topic registry: subscription bookkeeping, publish fan-out, and
-//! per-subscriber delivery.
-//!
-//! One registry serves a whole process. Connections register with their
-//! [`Emitter`], topics map to member subscribers, and every subscriber owns
-//! one bounded queue drained by one task, so one slow client never stalls
-//! another.
-//!
-//! Each connection also holds a byte budget that every queued update of its
-//! subscriptions draws from ([`RegistryOptions::connection_queue_bytes`]),
-//! and each update has a deadline to leave
-//! ([`RegistryOptions::emit_deadline`]). A peer that never answers therefore
-//! holds bounded memory for bounded time.
+//! The topic registry: membership, publish fan-out, and the delivery lane of
+//! each subscription. The page `docs/pubsub.md` (Registry) states its bounds.
 
 use core::error::Error;
 use core::fmt;
 use core::future::pending;
 use core::mem;
 use core::num::NonZeroUsize;
-use core::pin::pin;
-use core::time::Duration;
+use core::ops::{Deref, DerefMut};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 use der::Encode;
-use tightbeam::clock::Timer;
-use tightbeam::constants::{DEFAULT_OPERATION_TIMEOUT, MAX_MUX_CONNECTION_REASSEMBLY_BYTES};
+use tightbeam::constants::MAX_MUX_CONNECTION_REASSEMBLY_BYTES;
 use tightbeam::policy::SessionContext;
 use tightbeam::transport::envelopes::GoAwayReason;
 use tightbeam::{Frame, TightBeamError};
-use tightbeam_ws::serve::{RacingClock, ServedMux};
+use tightbeam_ws::serve::ServedMux;
 use tokio::sync::oneshot::{self, Receiver, Sender};
-use tokio::sync::Notify;
-use tokio::task::AbortHandle;
+use tokio::sync::{watch, Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard, Notify};
+use tokio::task::JoinHandle;
 
-use crate::audit::ConnectionAudit;
-use crate::backplane::{Backplane, BackplaneFault, DeliverError, Local, NodeSink, UpdateSink};
-use crate::emit::{Emitter, LinkLost, Settled};
+use crate::audit::{ConnectionAudit, Departure};
+use crate::backplane::{Backplane, DeliverError, Local, PublishError};
+use crate::emit::{EmitDeadline, Emitter, LinkLost, Paced, Settled};
 use crate::policy::{DeliveryPolicy, DeliveryVerdict, DropOldest};
+use crate::serve::ConnectionContext;
 use crate::topic::Topic;
 
 /// Updates one subscriber queue holds before the delivery policy decides.
@@ -60,41 +48,13 @@ const DEFAULT_CONNECTION_QUEUE_BYTES: NonZeroUsize = match NonZeroUsize::new(MAX
 	None => panic!("the default byte budget holds one octet or more"),
 };
 
-/// One registered connection, allocated when
-/// [`PubsubCommands::serve`](crate::PubsubCommands::serve) admits a served
-/// connection.
+/// One connection that a registry admitted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct ConnectionId(u64);
+pub(crate) struct ConnectionId(u64);
 
-/// One live subscription, allocated by [`TopicRegistry::register`].
+/// One live subscription.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct SubscriberId(u64);
-
-/// How long one update may take to leave for its subscriber.
-///
-/// The span is above zero, because no emit finishes in zero time. The
-/// default is [`DEFAULT_OPERATION_TIMEOUT`], the deadline of one write on an
-/// established tightbeam session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct EmitDeadline(Duration);
-
-impl EmitDeadline {
-	/// A deadline of `span`, or `None` for a zero span.
-	#[must_use]
-	pub const fn new(span: Duration) -> Option<Self> {
-		if span.is_zero() {
-			return None;
-		}
-
-		Some(Self(span))
-	}
-}
-
-impl Default for EmitDeadline {
-	fn default() -> Self {
-		Self(DEFAULT_OPERATION_TIMEOUT)
-	}
-}
+pub(crate) struct SubscriberId(u64);
 
 /// Registry construction knobs.
 pub struct RegistryOptions {
@@ -104,18 +64,19 @@ pub struct RegistryOptions {
 	///
 	/// A new `sub/` for a topic the connection does not already hold is
 	/// refused once this many subscriptions are live. Re-subscribe of an
-	/// existing topic stays idempotent and does not count again.
+	/// existing topic stays idempotent and keeps its one count.
 	pub max_subscriptions_per_connection: NonZeroUsize,
 	/// Payload octets one connection may hold queued or in flight, across
 	/// every subscription it holds.
 	///
-	/// An update that does not fit counts as a full queue, so the delivery
-	/// policy decides its fate. The default is
-	/// [`MAX_MUX_CONNECTION_REASSEMBLY_BYTES`], the reassembly ceiling of one
-	/// tightbeam connection.
+	/// - An update that does not fit counts as a full queue, so the delivery policy decides its fate.
+	/// - The default is [`MAX_MUX_CONNECTION_REASSEMBLY_BYTES`], the reassembly ceiling of one
+	///   tightbeam connection.
 	pub connection_queue_bytes: NonZeroUsize,
-	/// How long one update may take to leave. An emit past the deadline ends
-	/// the delivery of its subscription.
+	/// How long one emit of a served connection may take: each update, and
+	/// each emit of the application through
+	/// [`ConnectionContext::emitter`]. An update past the deadline expels its
+	/// connection.
 	pub emit_deadline: EmitDeadline,
 	/// Consulted when a subscriber queue is full.
 	pub delivery: Arc<dyn DeliveryPolicy>,
@@ -138,10 +99,10 @@ impl Default for RegistryOptions {
 
 /// Why a subscription was not registered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RegisterError {
-	/// The connection id was never registered or already dropped.
+pub(crate) enum RegisterError {
+	/// The connection left the registry, or the registry is gone.
 	UnknownConnection,
-	/// The registry is quiescing: no new subscriptions.
+	/// The registry is draining: no new subscriptions.
 	Draining,
 	/// The connection already holds
 	/// [`RegistryOptions::max_subscriptions_per_connection`] subscriptions.
@@ -159,50 +120,6 @@ impl fmt::Display for RegisterError {
 }
 
 impl Error for RegisterError {}
-
-/// Why a publish produced no fan-out.
-///
-/// The registry and every [`Backplane`] answer a publish with this one set,
-/// whichever node refused it.
-#[derive(Debug)]
-pub enum PublishError {
-	/// The registry is quiescing, or every node that answered drains.
-	Draining,
-	/// The update frame failed to encode for delivery.
-	Build(TightBeamError),
-	/// The backplane counts its limit of topics, and every counted topic has
-	/// a live member, so no counter can leave to make room for a new topic.
-	TopicLimit,
-	/// The distribution fabric of a multi-node backplane failed.
-	Unavailable(BackplaneFault),
-}
-
-impl From<TightBeamError> for PublishError {
-	fn from(cause: TightBeamError) -> Self {
-		Self::Build(cause)
-	}
-}
-
-impl fmt::Display for PublishError {
-	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		match self {
-			Self::Draining => f.write_str("the registry is draining"),
-			Self::Build(cause) => write!(f, "the update frame failed to build: {cause}"),
-			Self::TopicLimit => f.write_str("every counted topic has a live member, so no new topic fits"),
-			Self::Unavailable(fault) => write!(f, "the backplane is unavailable: {fault}"),
-		}
-	}
-}
-
-impl Error for PublishError {
-	fn source(&self) -> Option<&(dyn Error + 'static)> {
-		match self {
-			Self::Build(cause) => Some(cause),
-			Self::Unavailable(fault) => Some(fault),
-			Self::Draining | Self::TopicLimit => None,
-		}
-	}
-}
 
 /// The payload octets one connection holds in its lanes, against
 /// [`RegistryOptions::connection_queue_bytes`].
@@ -248,19 +165,42 @@ struct Queued {
 	_reservation: ByteReservation,
 }
 
-/// The updates one lane holds, and the drain task that serves them.
+/// The drain task of one lane.
 ///
 /// The drop aborts the task, so a lane that lets go of its queue has no
 /// task left.
+struct DrainTask(JoinHandle<()>);
+
+impl DrainTask {
+	/// Abort the task, and resolve once it ended, so no frame of the task
+	/// leaves after the caller goes on.
+	///
+	/// A running task stops only once its current poll returns, so the wait
+	/// covers the frame that poll queues.
+	async fn ended(mut self) {
+		self.0.abort();
+		// A cancelled task answers a `JoinError`, and both outcomes mean that
+		// it ended.
+		let _ = (&mut self.0).await;
+	}
+}
+
+impl Drop for DrainTask {
+	fn drop(&mut self) {
+		self.0.abort();
+	}
+}
+
+/// The updates one lane holds, and the drain task that serves them.
 struct Queue {
 	entries: VecDeque<Queued>,
 	/// A popped update is being emitted right now.
 	in_flight: bool,
-	task: AbortHandle,
+	task: DrainTask,
 }
 
 impl Queue {
-	fn new(task: AbortHandle) -> Self {
+	fn new(task: DrainTask) -> Self {
 		Self { entries: VecDeque::new(), in_flight: false, task }
 	}
 
@@ -293,12 +233,6 @@ impl Queue {
 	}
 }
 
-impl Drop for Queue {
-	fn drop(&mut self) {
-		self.task.abort();
-	}
-}
-
 /// What one offer of an update to a lane did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Offer {
@@ -306,7 +240,7 @@ enum Offer {
 	Queued,
 	/// The queue or the connection byte budget has no room.
 	Full,
-	/// The lane takes no more updates.
+	/// The lane takes no more updates: the subscription completed or ended.
 	Shut,
 }
 
@@ -386,10 +320,14 @@ impl Lane {
 		};
 	}
 
-	/// End delivery. The queue drops, which aborts the drain task and returns
-	/// every reserved octet.
-	fn close(&mut self) {
-		*self = Self::Closed;
+	/// End delivery. The queue drops, which returns every reserved octet, and
+	/// an open or finishing lane hands over its drain task.
+	fn close(&mut self) -> Option<DrainTask> {
+		let lane = mem::replace(self, Self::Closed);
+		match lane {
+			Self::Open(queue) | Self::Finishing { queue, .. } => Some(queue.task),
+			Self::Closed => None,
+		}
 	}
 
 	/// Whether an update or the completion frame has yet to leave.
@@ -398,6 +336,69 @@ impl Lane {
 			Self::Open(queue) => queue.in_flight || !queue.entries.is_empty(),
 			Self::Finishing { .. } => true,
 			Self::Closed => false,
+		}
+	}
+}
+
+/// The count of lanes with an update or a completion yet to leave.
+///
+/// Every change of a lane runs through a [`LaneTurn`], whose drop moves the
+/// count, so the count is exact. Every waiter of [`idle`](Self::idle) reads
+/// the same count, so each one wakes when it reaches zero.
+struct Backlog(watch::Sender<usize>);
+
+impl Backlog {
+	fn new() -> Arc<Self> {
+		Arc::new(Self(watch::Sender::new(0)))
+	}
+
+	/// Count one more lane with an update or a completion yet to leave.
+	fn rose(&self) {
+		self.0.send_modify(|pending| *pending += 1);
+	}
+
+	/// Count one fewer lane with an update or a completion yet to leave.
+	fn fell(&self) {
+		self.0.send_modify(|pending| *pending -= 1);
+	}
+
+	/// Resolve once no lane has anything left to emit.
+	async fn idle(&self) {
+		let mut pending = self.0.subscribe();
+		// The sender lives in this backlog, so the wait ends at an idle count.
+		let _ = pending.wait_for(|lanes| *lanes == 0).await;
+	}
+}
+
+/// The hold of one change on a lane. The drop moves the [`Backlog`] by what
+/// the change did to the lane.
+struct LaneTurn<'a> {
+	lane: MutexGuard<'a, Lane>,
+	was: bool,
+	backlog: &'a Backlog,
+}
+
+impl Deref for LaneTurn<'_> {
+	type Target = Lane;
+
+	fn deref(&self) -> &Lane {
+		&self.lane
+	}
+}
+
+impl DerefMut for LaneTurn<'_> {
+	fn deref_mut(&mut self) -> &mut Lane {
+		&mut self.lane
+	}
+}
+
+impl Drop for LaneTurn<'_> {
+	fn drop(&mut self) {
+		let now = self.lane.pending();
+		match (self.was, now) {
+			(false, true) => self.backlog.rose(),
+			(true, false) => self.backlog.fell(),
+			_ => {}
 		}
 	}
 }
@@ -423,8 +424,8 @@ struct Subscriber {
 	lane: Mutex<Lane>,
 	notify: Notify,
 	dropped: AtomicU64,
-	/// Shared with the registry. See [`TopicRegistry::flushed`].
-	flush: Arc<Notify>,
+	/// Shared with the registry. See [`TopicRegistry::drain`].
+	backlog: Arc<Backlog>,
 	/// Shared with the connection, which records each update that the
 	/// subscription drops on it.
 	audit: ConnectionAudit,
@@ -452,35 +453,31 @@ impl Subscriber {
 			lane: Mutex::new(Lane::Closed),
 			notify: Notify::new(),
 			dropped: AtomicU64::new(0),
-			flush: Arc::clone(&registry.flush),
+			backlog: Arc::clone(&registry.backlog),
 			audit: connected.audit.share(),
 		});
 
-		let deadline = registry.options.emit_deadline;
-		let timer = connected.clock.timer();
-		let mut lane = subscriber.lock_lane();
-		let drain = Arc::clone(&subscriber).drain(connected.emitter.clone(), timer, deadline);
-		let task = tokio::spawn(drain);
+		let mut lane = subscriber.lane();
+		let run = Arc::clone(&subscriber).run(connected.emitter.clone());
+		let task = DrainTask(tokio::spawn(run));
 
-		*lane = Lane::Open(Queue::new(task.abort_handle()));
+		*lane = Lane::Open(Queue::new(task));
 		drop(lane);
 
 		subscriber
 	}
 
-	fn lock_lane(&self) -> MutexGuard<'_, Lane> {
-		self.lane.lock().unwrap_or_else(PoisonError::into_inner)
+	/// The lane, held for one change.
+	fn lane(&self) -> LaneTurn<'_> {
+		let lane = self.lane.lock().unwrap_or_else(PoisonError::into_inner);
+		let was = lane.pending();
+		LaneTurn { lane, was, backlog: &self.backlog }
 	}
 
-	/// Whether updates are still queued or being emitted.
-	fn pending(&self) -> bool {
-		self.lock_lane().pending()
-	}
-
-	/// End delivery, whatever the drain task is doing.
-	fn close(&self) {
-		self.lock_lane().close();
-		self.flush.notify_one();
+	/// End delivery, whatever the drain task is doing, and hand over the
+	/// drain task of a lane that was still open. Its drop aborts it.
+	fn close(&self) -> Option<DrainTask> {
+		self.lane().close()
 	}
 
 	/// End delivery, and take the subscription out of the registry at once,
@@ -495,7 +492,7 @@ impl Subscriber {
 
 	/// Emit `end` after every queued update, then end delivery.
 	fn finish(&self, end: &Arc<Frame>) {
-		self.lock_lane().finish(end);
+		self.lane().finish(end);
 		self.notify.notify_one();
 	}
 
@@ -507,10 +504,9 @@ impl Subscriber {
 	/// Queue `update` of `len` payload octets, consulting the delivery policy
 	/// when the lane or the connection budget is full.
 	///
-	/// The policy of `registry` runs with no registry lock held, on a
-	/// [`RegistryView`] of it. `DropOldest` evicts one queued update and
-	/// offers once more, and a second refusal drops the new update as
-	/// `DropNew` does.
+	/// - The policy of `registry` runs with no registry lock held, on a [`RegistryView`] of it.
+	/// - `DropOldest` evicts one queued update and offers once more, and a second refusal drops the
+	///   new update as `DropNew` does.
 	fn admit(&self, update: &Arc<Frame>, len: usize, registry: &Inner) -> Admission {
 		let options = &registry.options;
 		let capacity = options.queue_capacity;
@@ -524,7 +520,7 @@ impl Subscriber {
 		let verdict = options.delivery.on_full(view, &self.topic, dropped_so_far);
 		match verdict {
 			DeliveryVerdict::DropOldest => {
-				let evicted = self.lock_lane().evict_oldest();
+				let evicted = self.lane().evict_oldest();
 				if evicted {
 					self.count_drop();
 				}
@@ -547,7 +543,7 @@ impl Subscriber {
 	/// Offer `update` to the lane once, and wake the drain task when it
 	/// queued.
 	fn offer(&self, update: &Arc<Frame>, len: usize, capacity: NonZeroUsize) -> Offer {
-		let offered = self.lock_lane().offer(update, len, &self.budget, capacity);
+		let offered = self.lane().offer(update, len, &self.budget, capacity);
 		if offered == Offer::Queued {
 			self.notify.notify_one();
 		}
@@ -555,70 +551,53 @@ impl Subscriber {
 		offered
 	}
 
-	/// Count the update in flight as gone, and wake
-	/// [`TopicRegistry::flushed`] once the lane is idle.
-	fn settle(&self) {
-		let mut lane = self.lock_lane();
-		lane.settle();
+	/// Drain the lane until it closes, and run the expulsion it ends with.
+	///
+	/// The task holds a [`Retirement`], which retires the subscription on
+	/// every exit.
+	async fn run(self: Arc<Self>, emitter: Emitter) {
+		let _retirement = Retirement(Arc::clone(&self));
+		let lost = self.drain(&emitter).await;
 
-		let idle = !lane.pending();
-		drop(lane);
-
-		if idle {
-			self.flush.notify_one();
+		let registry = self.registry.upgrade();
+		if let (Some(expulsion), Some(registry)) = (lost, registry) {
+			expulsion.run(&registry);
 		}
 	}
 
-	/// Emit queued updates in order until the lane closes.
+	/// Emit queued updates in order until the lane closes. An emit that
+	/// counts as the end of the link ends the lane with the expulsion of its
+	/// connection.
 	///
-	/// The lane counts the popped update in flight until its emit settles,
-	/// so an idle lane at [`TopicRegistry::flushed`] means every update left.
-	///
-	/// Every emit runs under `deadline` on `timer`, which reads the clock of
-	/// the link. The task holds a [`Retirement`], which retires the
-	/// subscription on every exit.
-	async fn drain(self: Arc<Self>, emitter: Emitter, mut timer: Timer, deadline: EmitDeadline) {
-		let _retirement = Retirement(Arc::clone(&self));
+	/// - The lane counts the popped update in flight until its emit settles, so an idle lane means
+	///   every update left.
+	/// - Every emit runs under the deadline of `emitter`, on one timer of the clock of the link.
+	async fn drain(&self, emitter: &Emitter) -> Option<Expulsion> {
+		let mut paced = emitter.paced();
 
 		loop {
-			let step = self.lock_lane().next_step();
+			let step = self.lane().next_step();
 			match step {
 				Step::Emit(queued) => {
-					let delivered = self.deliver(&emitter, &queued.update, deadline, &mut timer).await;
+					let delivered = self.emit(&mut paced, &queued.update).await;
 					drop(queued);
 
-					let Ok(()) = delivered else {
-						return;
-					};
+					if delivered.is_err() {
+						return Some(Expulsion { connection: self.connection });
+					}
 
-					self.settle();
+					self.lane().settle();
 				}
 				Step::End(end) => {
-					// Best effort: the topic completes either way.
-					let _ = self.deliver(&emitter, &end, deadline, &mut timer).await;
-					return;
+					// The topic completes whether or not its end/ arrives, and
+					// the drain dismisses the connection next.
+					let _ = paced.until_settled(&end).await;
+					return None;
 				}
 				Step::Wait => self.notify.notified().await,
-				Step::Stop => return,
+				Step::Stop => return None,
 			}
 		}
-	}
-
-	/// Emit one update before `deadline` passes on `timer`.
-	///
-	/// # Errors
-	///
-	/// - [`LinkLost`]: the deadline passed, or [`emit`](Self::emit) lost the link.
-	async fn deliver(
-		&self,
-		emitter: &Emitter,
-		update: &Frame,
-		deadline: EmitDeadline,
-		timer: &mut Timer,
-	) -> Result<(), LinkLost> {
-		let emitted = pin!(self.emit(emitter, update));
-		let bounded = timer.within(deadline.0, emitted).await;
-		bounded.unwrap_or_else(|lapse| Err(LinkLost::lapsed(lapse)))
 	}
 
 	/// Emit one update, and count it dropped when the emit settles as
@@ -626,9 +605,9 @@ impl Subscriber {
 	///
 	/// # Errors
 	///
-	/// - [`LinkLost`]: the emit counts as the end of the link, which ends the lane.
-	async fn emit(&self, emitter: &Emitter, update: &Frame) -> Result<(), LinkLost> {
-		let settled = emitter.until_settled(update).await?;
+	/// - The [`LinkLost`] of an emit that counts as the end of the link, which ends the lane.
+	async fn emit(&self, paced: &mut Paced<'_>, update: &Frame) -> Result<(), LinkLost> {
+		let settled = paced.until_settled(update).await?;
 		if let Settled::Refused(_) = settled {
 			self.count_drop();
 		}
@@ -637,11 +616,42 @@ impl Subscriber {
 	}
 }
 
+/// A subscriber that drops closes its lane, so the backlog counts the live
+/// lanes alone.
+impl Drop for Subscriber {
+	fn drop(&mut self) {
+		self.close();
+	}
+}
+
+/// The act a drain task leaves for its registry once an emit counts as the
+/// end of the link: the expulsion of the whole connection, so its client
+/// reads a GoAway.
+#[must_use = "a lost link expels its connection"]
+struct Expulsion {
+	connection: ConnectionId,
+}
+
+impl Expulsion {
+	/// Expel the connection from `registry` with `EnhanceYourCalm`, the
+	/// analog for a peer that cannot keep pace with delivery.
+	///
+	/// # Sources
+	///
+	/// - RFC 9113 § 7, Error Codes:
+	///   <https://datatracker.ietf.org/doc/html/rfc9113#section-7>
+	fn run(self, registry: &Inner) {
+		let mut vacancies = Vacancies::default();
+		registry.expel(self.connection, GoAwayReason::EnhanceYourCalm, &mut vacancies);
+		vacancies.report(registry.backplane());
+	}
+}
+
 /// The hold of a drain task on its subscriber. The drop retires the
 /// subscription, whichever way the task ends.
 ///
-/// A retirement after the subscription already left does nothing, because
-/// the registry matches the id of the subscription it removes.
+/// A retirement after the subscription already left leaves the registry as
+/// it is, because the registry matches the id of the subscription it removes.
 struct Retirement(Arc<Subscriber>);
 
 impl Drop for Retirement {
@@ -657,13 +667,11 @@ struct TopicState {
 	members: HashSet<SubscriberId>,
 }
 
-/// Per-connection bookkeeping: the emitter and the clock of its link, the
-/// peer its handshake proved, the byte budget its lanes share, the
-/// connection's live subscriptions, and the signal that expels it.
+/// Per-connection bookkeeping: the emitter of its link, the peer its
+/// handshake proved, the byte budget its lanes share, the connection's live
+/// subscriptions, and the signal that expels it.
 struct ConnectionState {
 	emitter: Emitter,
-	/// The clock of the link under `emitter`, for the emit deadlines.
-	clock: RacingClock,
 	session: SessionContext,
 	budget: Arc<ConnectionBudget>,
 	topics: HashMap<Topic, SubscriberId>,
@@ -673,41 +681,7 @@ struct ConnectionState {
 	audit: ConnectionAudit,
 }
 
-/// A connection that left the registry, with the count of the subscriptions
-/// it held. It records its departure on the audit trail of the connection,
-/// which the holder runs once it released the registry lock, so no sink of
-/// the trail runs under the lock.
-struct Departed {
-	connection: ConnectionId,
-	state: ConnectionState,
-	subscriptions: u64,
-}
-
-impl Departed {
-	/// Record the departure of a connection whose serve ended.
-	fn left(self) {
-		self.state.audit.left(self.connection.0, self.subscriptions);
-	}
-
-	/// Expel the connection with `reason`, and record the expulsion ahead of
-	/// the departure it causes.
-	fn expel(self, reason: GoAwayReason) {
-		self.state.audit.expelled(reason);
-		self.state.audit.left(self.connection.0, self.subscriptions);
-		self.state.expel(reason);
-	}
-}
-
 impl ConnectionState {
-	/// Expel this connection with `reason`, the reason its served connection
-	/// drains with.
-	///
-	/// A membership that already left reads no reason, so its connection has
-	/// nothing to drain.
-	fn expel(self, reason: GoAwayReason) {
-		let _ = self.expulsion.send(reason);
-	}
-
 	/// The subscription this connection already holds for `topic`, or `None`
 	/// when a new one fits under `cap` live subscriptions.
 	///
@@ -716,7 +690,7 @@ impl ConnectionState {
 	///
 	/// # Errors
 	///
-	/// - [`RegisterError::LimitReached`]: `topic` is new, and the connection holds `cap`
+	/// - [`RegisterError::LimitReached`] -- `topic` is new, and the connection holds `cap`
 	///   subscriptions.
 	fn admit(&self, topic: &Topic, cap: NonZeroUsize) -> Result<Option<SubscriberId>, RegisterError> {
 		if let Some(held) = self.topics.get(topic) {
@@ -734,6 +708,12 @@ impl ConnectionState {
 		self.topics.get(topic).copied()
 	}
 
+	/// Hold the new subscription `id` for `topic`, which
+	/// [`admit`](Self::admit) answered `None` for.
+	fn hold(&mut self, topic: Topic, id: SubscriberId) {
+		self.topics.insert(topic, id);
+	}
+
 	/// Let go of the subscription `id` for `topic`, while this connection
 	/// still holds `id` for `topic`. Returns whether it let go.
 	///
@@ -748,6 +728,58 @@ impl ConnectionState {
 		self.topics.remove(topic);
 		true
 	}
+
+	/// Let go of every subscription this connection holds, and answer them.
+	fn take_topics(&mut self) -> HashMap<Topic, SubscriberId> {
+		mem::take(&mut self.topics)
+	}
+}
+
+/// A connection that left the registry, with the count of the subscriptions
+/// it held. The holder runs it once it released the registry lock, so no
+/// sink of the audit trail runs under the lock.
+struct Departed {
+	state: ConnectionState,
+	departure: Departure,
+}
+
+impl Departed {
+	/// Record the departure of a connection whose serve ended.
+	fn left(self) {
+		self.state.audit.left(&self.departure);
+	}
+
+	/// Expel the connection with `reason`, the reason its served connection
+	/// drains with, and record the expulsion ahead of the departure it causes.
+	///
+	/// A membership that already left reads no reason, so its connection has
+	/// nothing to drain.
+	fn expel(self, reason: GoAwayReason) {
+		self.state.audit.expelled(reason);
+		self.state.audit.left(&self.departure);
+		let _ = self.state.expulsion.send(reason);
+	}
+}
+
+/// The topics that lost their last local member in one step of the
+/// registry. The step reports them to the backplane once the registry lock
+/// is released, or hands them back from a delivery as [`Delivered`].
+#[derive(Default)]
+#[must_use = "a vacancy reaches the backplane, or its counter waits for a sweep"]
+struct Vacancies(Vec<Topic>);
+
+impl Vacancies {
+	fn record(&mut self, topic: Topic) {
+		self.0.push(topic);
+	}
+
+	/// Report each vacated topic to `backplane`. The caller holds no registry
+	/// lock and runs no delivery.
+	fn report(self, backplane: &dyn Backplane) {
+		for topic in &self.0 {
+			backplane.vacated(topic);
+		}
+	}
 }
 
 #[derive(Default)]
@@ -758,18 +790,23 @@ struct State {
 }
 
 impl State {
+	/// The connection `id` while the registry holds it.
+	fn connection(&self, id: ConnectionId) -> Option<&ConnectionState> {
+		self.connections.get(&id)
+	}
+
 	/// Subscribe `connection` to `topic` under the options of `registry`, or
 	/// return the subscription the connection already holds.
 	///
-	/// A new subscription enters the connection, the subscriber map, and the
-	/// member set of its topic in one step. [`unsubscribe`](Self::unsubscribe),
-	/// [`retire`](Self::retire), and
-	/// [`remove_connection`](Self::remove_connection) undo it.
+	/// - A new subscription enters the connection, the subscriber map, and the member set of its
+	///   topic in one step.
+	/// - [`unsubscribe`](Self::unsubscribe), [`retire`](Self::retire), and
+	///   [`remove_connection`](Self::remove_connection) undo it.
 	///
 	/// # Errors
 	///
-	/// - [`RegisterError::UnknownConnection`]: `connection` was never admitted, or it dropped.
-	/// - [`RegisterError::LimitReached`]: `topic` is new, and the connection holds its cap of
+	/// - [`RegisterError::UnknownConnection`] -- `connection` left.
+	/// - [`RegisterError::LimitReached`] -- `topic` is new, and the connection holds its cap of
 	///   subscriptions.
 	fn attach(
 		&mut self,
@@ -786,7 +823,7 @@ impl State {
 		let id = SubscriberId(registry.next_subscriber.fetch_add(1, Ordering::Relaxed));
 		let subscriber = Subscriber::spawn(id, topic.clone(), connection, connected, registry);
 
-		connected.topics.insert(topic.clone(), id);
+		connected.hold(topic.clone(), id);
 
 		self.subscribers.insert(id, subscriber);
 		self.topics.entry(topic).or_default().members.insert(id);
@@ -795,62 +832,73 @@ impl State {
 	}
 
 	/// End the subscription that `connection` holds for `topic`, through
-	/// [`retire`](Self::retire). Returns whether the subscription existed.
-	fn unsubscribe(&mut self, connection: ConnectionId, topic: &Topic, registry: &Inner) -> bool {
-		let Some(connected) = self.connections.get(&connection) else {
-			return false;
-		};
-		let Some(id) = connected.held(topic) else {
-			return false;
-		};
+	/// [`retire`](Self::retire). Returns its drain task, or `None` when the
+	/// subscription did not exist.
+	fn unsubscribe(&mut self, connection: ConnectionId, topic: &Topic, vacancies: &mut Vacancies) -> Option<DrainTask> {
+		let held = self.connection(connection).and_then(|connected| connected.held(topic));
+		let id = held?;
 
-		self.retire(connection, topic, id, registry)
+		self.retire(connection, topic, id, vacancies)
 	}
 
 	/// End the subscription `id` of `connection` to `topic`, undoing its
 	/// [`attach`](Self::attach), while the connection still holds `id` for
-	/// `topic` ([`ConnectionState::release`]). Returns whether it ended.
-	fn retire(&mut self, connection: ConnectionId, topic: &Topic, id: SubscriberId, registry: &Inner) -> bool {
-		let Some(connected) = self.connections.get_mut(&connection) else {
-			return false;
-		};
-
+	/// `topic` ([`ConnectionState::release`]). Returns the drain task of the
+	/// subscription it ended, or `None` when it ended none.
+	fn retire(
+		&mut self,
+		connection: ConnectionId,
+		topic: &Topic,
+		id: SubscriberId,
+		vacancies: &mut Vacancies,
+	) -> Option<DrainTask> {
+		let connected = self.connections.get_mut(&connection)?;
 		let released = connected.release(topic, id);
 		if !released {
-			return false;
+			return None;
 		}
 
-		self.detach(id, registry);
-		true
+		self.detach(id, vacancies)
 	}
 
 	/// Forget `connection` and end every subscription it holds, undoing each
-	/// [`attach`](Self::attach). Returns its [`Departed`], which records the
-	/// departure once the caller releases the registry lock, or `None` when
-	/// the connection already left.
-	fn remove_connection(&mut self, connection: ConnectionId, registry: &Inner) -> Option<Departed> {
+	/// [`attach`](Self::attach). Returns its [`Departed`], or `None` when the
+	/// connection already left.
+	fn remove_connection(&mut self, connection: ConnectionId, vacancies: &mut Vacancies) -> Option<Departed> {
 		let mut connected = self.connections.remove(&connection)?;
 
-		let topics = mem::take(&mut connected.topics);
+		let topics = connected.take_topics();
 		let subscriptions = u64::try_from(topics.len()).unwrap_or(u64::MAX);
 		for id in topics.into_values() {
-			self.detach(id, registry);
+			self.detach(id, vacancies);
 		}
 
-		Some(Departed { connection, state: connected, subscriptions })
+		let departure = Departure { connection: connection.0, subscriptions };
+		Some(Departed { state: connected, departure })
 	}
 
-	/// End every subscription, because the registry is gone: close each lane,
-	/// which ends its drain task, and report each topic with a member to
-	/// `backplane` as vacated.
-	fn end_all(&self, backplane: &dyn Backplane) {
-		for subscriber in self.subscribers.values() {
+	/// Forget every connection, as
+	/// [`remove_connection`](Self::remove_connection) forgets one.
+	fn depart_all(&mut self, vacancies: &mut Vacancies) -> Vec<Departed> {
+		let connections: Vec<ConnectionId> = self.connections.keys().copied().collect();
+		let departed = connections.into_iter().filter_map(|id| self.remove_connection(id, vacancies));
+		departed.collect()
+	}
+
+	/// End every subscription and forget every connection, because the last
+	/// handle of the registry let go.
+	///
+	/// - Each lane closes, which ends its drain task, and each topic with a member vacates.
+	/// - A dropped expulsion leaves its membership pending, so no served connection drains for it.
+	fn end_all(&mut self, vacancies: &mut Vacancies) {
+		for subscriber in mem::take(&mut self.subscribers).into_values() {
 			subscriber.close();
 		}
-
-		for topic in self.topics.keys() {
-			backplane.vacated(topic);
+		for topic in mem::take(&mut self.topics).into_keys() {
+			vacancies.record(topic);
 		}
+
+		self.connections.clear();
 	}
 
 	/// The live subscribers of `topic`, for work that runs after the lock.
@@ -864,28 +912,23 @@ impl State {
 	}
 
 	/// Remove one subscriber from the subscriber map and the member set of its
-	/// topic, and end its delivery. The caller already removed it from its
-	/// connection.
+	/// topic, and end its delivery. Returns its drain task. The caller already
+	/// removed it from its connection.
 	///
-	/// A topic that loses its last member here is reported to the backplane
-	/// of `registry` as vacated.
-	fn detach(&mut self, id: SubscriberId, registry: &Inner) {
-		let Some(subscriber) = self.subscribers.remove(&id) else {
-			return;
-		};
+	/// A topic that loses its last member here vacates.
+	fn detach(&mut self, id: SubscriberId, vacancies: &mut Vacancies) -> Option<DrainTask> {
+		let subscriber = self.subscribers.remove(&id)?;
 		if let Some(entry) = self.topics.get_mut(&subscriber.topic) {
 			entry.members.remove(&id);
-			/*
-			 * Prune the emptied topic so churn over unique names never grows
-			 * the map without bound. The backplane keeps the order counter.
-			 */
+			// Prune the emptied topic, so the map holds only topics with a
+			// member. The backplane keeps the order counter.
 			if entry.members.is_empty() {
 				self.topics.remove(&subscriber.topic);
-				registry.options.backplane.vacated(&subscriber.topic);
+				vacancies.record(subscriber.topic.clone());
 			}
 		}
 
-		subscriber.close();
+		subscriber.close()
 	}
 }
 
@@ -898,8 +941,21 @@ enum DrainPhase {
 	/// A drain is in flight. Subscriptions and publishes refuse, so the topic
 	/// set and every order hold still while the end frames build.
 	Draining,
-	/// Every topic of the drain queued its `end/<topic>`.
-	Drained,
+	/// Every topic of the drain queued its `end/<topic>`. The registry turns
+	/// every new connection away.
+	Ended,
+}
+
+impl DrainPhase {
+	/// Whether the registry refuses subscriptions and publishes in this phase.
+	fn refuses_work(self) -> bool {
+		self != Self::Live
+	}
+
+	/// Whether a drain completed in this phase.
+	fn has_ended(self) -> bool {
+		self == Self::Ended
+	}
 }
 
 /// The [`DrainPhase`] of a registry. Any reader loads it without a lock, and
@@ -920,7 +976,7 @@ impl AtomicDrainPhase {
 		match phase {
 			Self::LIVE => DrainPhase::Live,
 			Self::DRAINING => DrainPhase::Draining,
-			_ => DrainPhase::Drained,
+			_ => DrainPhase::Ended,
 		}
 	}
 
@@ -930,41 +986,49 @@ impl AtomicDrainPhase {
 	}
 }
 
-/// The hold of one quiesce on the drain, from
-/// [`begin_drain`](TopicRegistry::begin_drain) until its saga finishes or
-/// unwinds. A second quiesce waits on the same lock, so it reads the phase
+/// The hold of one drain on its turn, from
+/// [`begin_drain`](TopicRegistry::begin_drain) until its completion finishes
+/// or unwinds. A second drain waits on the same lock, so it reads the phase
 /// that the first one left.
 struct DrainGuard<'a> {
 	phase: &'a AtomicDrainPhase,
-	_turn: MutexGuard<'a, ()>,
+	_turn: AsyncMutexGuard<'a, ()>,
 }
 
-impl DrainGuard<'_> {
+impl<'a> DrainGuard<'a> {
+	/// The hold of a drain that takes `turn` on `phase` and stores
+	/// [`Draining`](DrainPhase::Draining), or `None` when an earlier drain
+	/// ended.
+	fn begin(phase: &'a AtomicDrainPhase, turn: AsyncMutexGuard<'a, ()>) -> Option<Self> {
+		if phase.load().has_ended() {
+			return None;
+		}
+
+		let guard = Self { phase, _turn: turn };
+		guard.store(DrainPhase::Draining);
+		Some(guard)
+	}
+
 	/// Store `phase` under this guard.
 	fn store(&self, phase: DrainPhase) {
 		self.phase.store(phase, self);
 	}
-
-	/// Cancel the drain, so the registry takes subscriptions and publishes
-	/// again, and a later quiesce starts over.
-	fn cancel(&self) {
-		self.store(DrainPhase::Live);
-	}
 }
 
-/// A drain that unwinds or drops before it finishes cancels, so a panic in
-/// the saga leaves the registry live.
+/// The compensation of the first act: a completion that unwinds or drops
+/// before it queues its end frames cancels, so the registry takes
+/// subscriptions and publishes again and a later drain starts over.
 impl Drop for DrainGuard<'_> {
 	fn drop(&mut self) {
 		let phase = self.phase.load();
 		if phase == DrainPhase::Draining {
-			self.cancel();
+			self.store(DrainPhase::Live);
 		}
 	}
 }
 
-/// The first step of the quiesce saga: a drain in flight, which holds the
-/// drain guard and the topic set it froze.
+/// The first act of the drain saga: a drain in flight, which holds the drain
+/// guard and the topic set it froze.
 #[must_use = "a drain builds its end frames, or its drop cancels it"]
 struct Draining<'a> {
 	registry: &'a Inner,
@@ -975,99 +1039,325 @@ struct Draining<'a> {
 impl<'a> Draining<'a> {
 	/// Build the `end/<topic>` of every frozen topic at its last order.
 	///
-	/// The orders are read with no registry lock held, because [`Local`]
-	/// holds its lock while it delivers into the registry.
-	///
 	/// # Errors
 	///
-	/// - [`TightBeamError`]: an end frame failed to encode. The drain cancels before the error
-	///   returns.
-	fn end_frames(self) -> Result<Ended<'a>, TightBeamError> {
-		self.end_frames_by(Topic::end_frame)
-	}
+	/// - The [`TightBeamError`] of an end frame that failed to encode, the signature of upstream
+	///   `FrameBuilder::build`. The guard drops with the error, which cancels the drain.
+	async fn end_frames(self) -> Result<Completing<'a>, TightBeamError> {
+		let Self { registry, guard, topics } = self;
+		let backplane = registry.backplane();
 
-	/// As [`end_frames`](Self::end_frames), with each end frame built by
-	/// `encode`.
-	///
-	/// A test drives the cancel through `encode`, because every topic and
-	/// order build an end frame.
-	///
-	/// # Errors
-	///
-	/// - The error of `encode`. The drain cancels before the error returns.
-	fn end_frames_by<E>(self, encode: E) -> Result<Ended<'a>, TightBeamError>
-	where
-		E: Fn(&Topic, u64) -> Result<Frame, TightBeamError>,
-	{
-		let backplane = &self.registry.options.backplane;
-
-		let mut ends = Vec::with_capacity(self.topics.len());
-		for topic in self.topics {
-			let order = backplane.last_order(&topic);
-			let built = encode(&topic, order);
-			let end = match built {
-				Ok(end) => end,
-				Err(cause) => {
-					self.guard.cancel();
-					return Err(cause);
-				}
-			};
-
+		let mut ends = Vec::with_capacity(topics.len());
+		for topic in topics {
+			let order = backplane.last_order(&topic).await;
+			let end = topic.end_frame(order)?;
 			ends.push((topic, Arc::new(end)));
 		}
 
-		let ended = Ended { registry: self.registry, guard: self.guard, ends };
-		Ok(ended)
+		Ok(Completing { registry, guard, ends })
 	}
 }
 
-/// The last step of the quiesce saga: a drain whose end frames all built,
+/// The second act of the drain saga: a drain whose end frames all built,
 /// which holds the drain guard until [`finish`](Self::finish) queues them.
-#[must_use = "an ended drain queues its end frames, or its drop cancels it"]
-struct Ended<'a> {
+#[must_use = "a completion queues its end frames, or its drop cancels the drain"]
+struct Completing<'a> {
 	registry: &'a Inner,
 	guard: DrainGuard<'a>,
 	ends: Vec<(Topic, Arc<Frame>)>,
 }
 
-impl Ended<'_> {
+impl Completing<'_> {
 	/// Queue the end frame of each topic behind every update its members
-	/// hold, and mark the registry drained. Returns how many subscribers were
-	/// signaled.
+	/// hold, and mark the registry ended. Returns how many subscriptions
+	/// completed.
+	///
+	/// - The act has no compensation, so the saga only goes forward from here.
+	/// - The phase is stored under the state lock, so each admission reads the phase it races.
 	fn finish(self) -> usize {
 		let state = self.registry.lock_state();
 
-		let mut signaled = 0;
+		let mut completed = 0;
 		for (topic, end) in &self.ends {
 			for subscriber in state.members(topic) {
 				subscriber.finish(end);
-				signaled += 1;
+				completed += 1;
 			}
 		}
 
-		self.guard.store(DrainPhase::Drained);
-		signaled
+		self.guard.store(DrainPhase::Ended);
+		completed
 	}
 }
 
 /// The shared state behind every clone of a [`TopicRegistry`].
 ///
-/// Locks nest in one order on every path: `drain`, then the lock of the
-/// backplane, then `state`.
+/// Locks nest in one order on every path: the drain turn, the turn of a
+/// topic in the backplane, the state of the backplane, the state of the
+/// registry, then a lane.
 struct Inner {
 	options: RegistryOptions,
-	/// The drain guard. One quiesce holds it for its whole saga, so a second
-	/// quiesce waits for the outcome of the first.
-	drain: Mutex<()>,
-	/// The drain phase, which `register`, `deliver`, `publish`, and
-	/// [`RegistryView::is_draining`] read without a lock.
+	/// The drain turn. One completion holds it for its acts, so a second
+	/// drain waits for the outcome of the first.
+	drain: AsyncMutex<()>,
+	/// The drain phase, which every admission, registration, delivery, and
+	/// publish reads.
 	phase: AtomicDrainPhase,
 	next_connection: AtomicU64,
 	next_subscriber: AtomicU64,
 	state: Mutex<State>,
-	/// Signaled whenever a lane goes idle or closes. See
-	/// [`TopicRegistry::flushed`].
-	flush: Arc<Notify>,
+	/// The count of lanes with work left. See [`TopicRegistry::drain`].
+	backlog: Arc<Backlog>,
+}
+
+impl Inner {
+	fn lock_state(&self) -> MutexGuard<'_, State> {
+		self.state.lock().unwrap_or_else(PoisonError::into_inner)
+	}
+
+	fn backplane(&self) -> &dyn Backplane {
+		self.options.backplane.as_ref()
+	}
+
+	/// Hold `connected` as the connection `id`, or answer it as departed when
+	/// the registry already ended, so it is turned away.
+	fn enter(&self, id: ConnectionId, connected: ConnectionState) -> Option<Departed> {
+		let mut state = self.lock_state();
+		let ended = self.phase.load().has_ended();
+		if ended {
+			let departure = Departure { connection: id.0, subscriptions: 0 };
+			return Some(Departed { state: connected, departure });
+		}
+
+		state.connections.insert(id, connected);
+		None
+	}
+
+	/// Subscribe `connection` to `topic`, spawning its delivery task, or
+	/// answer the subscription it already holds.
+	///
+	/// # Errors
+	///
+	/// - [`RegisterError::Draining`] -- a drain is in flight or finished.
+	/// - The errors of [`State::attach`].
+	fn register(self: &Arc<Self>, connection: ConnectionId, topic: Topic) -> Result<SubscriberId, RegisterError> {
+		let mut state = self.lock_state();
+		/*
+		 * Checked under the state lock: a drain stores its phase before it
+		 * freezes the topic set under the same lock, so a subscriber that
+		 * enters before the freeze is in the set, and every later one
+		 * refuses.
+		 */
+		if RegistryView::of(self).is_draining() {
+			return Err(RegisterError::Draining);
+		}
+
+		state.attach(connection, topic, self)
+	}
+
+	/// Drop the subscription of `connection` to `topic`, and report what it
+	/// vacated once the lock is released. Returns its drain task, or `None`
+	/// when none existed.
+	fn unregister(&self, connection: ConnectionId, topic: &Topic) -> Option<DrainTask> {
+		let mut vacancies = Vacancies::default();
+		let ended = self.lock_state().unsubscribe(connection, topic, &mut vacancies);
+
+		vacancies.report(self.backplane());
+		ended
+	}
+
+	/// End the subscription `id` of `connection` to `topic`, unless a newer
+	/// subscription already took its place. See [`State::retire`].
+	fn retire(&self, connection: ConnectionId, topic: &Topic, id: SubscriberId) {
+		let mut vacancies = Vacancies::default();
+		self.lock_state().retire(connection, topic, id, &mut vacancies);
+		vacancies.report(self.backplane());
+	}
+
+	/// Forget `connection`, drop every subscription it holds, and record its
+	/// departure once the registry lock is released.
+	fn leave(&self, connection: ConnectionId) {
+		let mut vacancies = Vacancies::default();
+		let departed = self.lock_state().remove_connection(connection, &mut vacancies);
+
+		vacancies.report(self.backplane());
+		if let Some(departed) = departed {
+			departed.left();
+		}
+	}
+
+	/// Dismiss every connection with a `Shutdown` GoAway: the last act of a
+	/// drain. Returns how many it dismissed.
+	///
+	/// The act is safe to repeat, because a dismissed connection is gone.
+	fn dismiss(&self) -> usize {
+		let mut vacancies = Vacancies::default();
+		let departed = self.lock_state().depart_all(&mut vacancies);
+
+		vacancies.report(self.backplane());
+		let dismissed = departed.len();
+		for connection in departed {
+			connection.expel(GoAwayReason::Shutdown);
+		}
+
+		dismissed
+	}
+
+	/// End every subscription and forget every connection, because the last
+	/// handle of the registry let go. See [`State::end_all`].
+	fn end_all(&self) {
+		let mut vacancies = Vacancies::default();
+		self.lock_state().end_all(&mut vacancies);
+		vacancies.report(self.backplane());
+	}
+
+	/// Offer `update` of `len` payload octets to each member of a snapshot,
+	/// with no registry lock held, and expel every connection the delivery
+	/// policy votes off with `EnhanceYourCalm`.
+	///
+	/// - Each expulsion runs as its vote lands, so a policy that unwinds at a later member leaves
+	///   every earlier vote acted on.
+	/// - The fan-out runs inside a delivery of the backplane, so it answers the topics the
+	///   expulsions vacated instead of reporting them.
+	fn fan_out(&self, members: &[Arc<Subscriber>], update: &Arc<Frame>, len: usize) -> Vacancies {
+		let mut vacancies = Vacancies::default();
+		for subscriber in members {
+			let admission = subscriber.admit(update, len, self);
+			if admission == Admission::Disconnect {
+				self.expel(subscriber.connection, GoAwayReason::EnhanceYourCalm, &mut vacancies);
+			}
+		}
+
+		vacancies
+	}
+
+	/// Forget `connection`, end every subscription it holds into
+	/// `vacancies`, and expel it with `reason` once the registry lock is
+	/// released.
+	fn expel(&self, connection: ConnectionId, reason: GoAwayReason, vacancies: &mut Vacancies) {
+		let departed = self.lock_state().remove_connection(connection, vacancies);
+		if let Some(departed) = departed {
+			departed.expel(reason);
+		}
+	}
+
+	/// One update that the backplane stamped lands on this node: build its
+	/// frame at the assigned order and fan it out to the local members.
+	///
+	/// # Errors
+	///
+	/// - [`DeliverError::Draining`] -- a drain is in flight or finished.
+	/// - [`DeliverError::Build`] -- the update frame failed to encode.
+	fn deliver(&self, topic: &Topic, order: u64, payload: &[u8]) -> Result<Delivered, DeliverError> {
+		/*
+		 * A delivery that passes this check before a drain stores its phase
+		 * offers to a lane that already took its end/ as Shut, so no update
+		 * follows the completion of its subscription.
+		 */
+		if RegistryView::of(self).is_draining() {
+			return Err(DeliverError::Draining);
+		}
+
+		let members = self.lock_state().members(topic);
+
+		let update = Arc::new(topic.update_frame(order, payload)?);
+		let vacancies = self.fan_out(&members, &update, payload.len());
+
+		Ok(Delivered { vacated: vacancies.0 })
+	}
+
+	/// A topic is live while its member set holds a subscriber.
+	fn has_members(&self, topic: &Topic) -> bool {
+		let state = self.lock_state();
+		let entry = state.topics.get(topic);
+		entry.is_some_and(|entry| !entry.members.is_empty())
+	}
+}
+
+/// One attached node, as a backplane holds it: a weak handle that reaches
+/// one registry while the registry lives.
+///
+/// A dropped registry leaves distribution on its own, and each registry
+/// attaches its own handle as it is built.
+pub struct NodeSink(Weak<Inner>);
+
+impl NodeSink {
+	fn of(inner: &Arc<Inner>) -> Self {
+		Self(Arc::downgrade(inner))
+	}
+
+	/// A second handle on the same node.
+	pub(crate) fn share(&self) -> Self {
+		Self(Weak::clone(&self.0))
+	}
+
+	/// Whether the registry still lives.
+	#[must_use]
+	pub fn is_attached(&self) -> bool {
+		self.0.strong_count() > 0
+	}
+
+	/// Fan `payload` out to the subscribers of `topic` on this node at the
+	/// backplane-assigned `order`, or `None` once the node is gone.
+	///
+	/// # Errors
+	///
+	/// - [`DeliverError::Draining`] -- the node is draining.
+	/// - [`DeliverError::Build`] -- the update frame failed to encode.
+	pub fn deliver(&self, topic: &Topic, order: u64, payload: &[u8]) -> Option<Result<Delivered, DeliverError>> {
+		let node = self.0.upgrade()?;
+		Some(node.deliver(topic, order, payload))
+	}
+
+	/// Whether the node has a live member of `topic`. A gone node has none.
+	#[must_use]
+	pub fn has_members(&self, topic: &Topic) -> bool {
+		let node = self.0.upgrade();
+		node.is_some_and(|node| node.has_members(topic))
+	}
+}
+
+/// What one node did with a delivered update: the topics that lost their
+/// last local member while it fanned the update out, because the delivery
+/// policy expelled a connection.
+///
+/// They reach the backplane here, in place of [`Backplane::vacated`].
+#[derive(Debug, Default)]
+#[must_use = "the vacated topics of a delivery reach the backplane, or their counters wait for a sweep"]
+pub struct Delivered {
+	vacated: Vec<Topic>,
+}
+
+impl Delivered {
+	/// The topics the delivery vacated.
+	#[must_use]
+	pub fn into_vacated(self) -> Vec<Topic> {
+		self.vacated
+	}
+}
+
+/// What one [`TopicRegistry::drain`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Drained {
+	/// The subscriptions that this drain completed with `end/<topic>`.
+	pub completed: usize,
+	/// The connections that this drain dismissed with a `Shutdown` GoAway.
+	pub dismissed: usize,
+}
+
+/// The owning handle behind every clone of a [`TopicRegistry`].
+///
+/// Its drop ends every subscription and reports each held topic vacated, in
+/// the context of the caller that let go of the last clone, outside every
+/// delivery.
+struct Owner {
+	inner: Arc<Inner>,
+}
+
+impl Drop for Owner {
+	fn drop(&mut self) {
+		self.inner.end_all();
+	}
 }
 
 /// Topic fan-out over multiplexed tightbeam connections.
@@ -1077,7 +1367,7 @@ struct Inner {
 /// the [`RegistryView`] of [`view`](Self::view).
 #[derive(Clone)]
 pub struct TopicRegistry {
-	inner: Arc<Inner>,
+	owner: Arc<Owner>,
 }
 
 impl Default for TopicRegistry {
@@ -1088,9 +1378,8 @@ impl Default for TopicRegistry {
 
 /// A borrowed view of a [`TopicRegistry`], for the reads a policy weighs.
 ///
-/// The registry lends a view into each policy callback. A view lives only
-/// as long as that call and offers no way to own the registry, so a policy
-/// that the registry holds cannot keep the registry alive.
+/// The registry lends a view into each policy callback for that call alone,
+/// so a policy holds no registry.
 ///
 /// # Examples
 ///
@@ -1098,9 +1387,11 @@ impl Default for TopicRegistry {
 /// use tightbeam_pubsub::{Topic, TopicRegistry};
 ///
 /// let registry = TopicRegistry::default();
+/// let prices: Topic = "prices".parse()?;
 /// let view = registry.view();
-/// assert_eq!(view.subscriber_count(&Topic::fixture("prices")), 0);
+/// assert_eq!(view.subscriber_count(&prices), 0);
 /// assert!(!view.is_draining());
+/// # Ok::<(), tightbeam_pubsub::TopicError>(())
 /// ```
 #[derive(Clone, Copy)]
 pub struct RegistryView<'a> {
@@ -1112,34 +1403,12 @@ impl<'a> RegistryView<'a> {
 		Self { inner }
 	}
 
-	/// Whether a [`quiesce`](TopicRegistry::quiesce) is in flight or finished,
-	/// so the registry refuses subscriptions and publishes.
+	/// Whether a [`drain`](TopicRegistry::drain) is in flight or finished, so
+	/// the registry refuses subscriptions and publishes.
 	#[must_use]
 	pub fn is_draining(&self) -> bool {
 		let phase = self.inner.phase.load();
-		phase != DrainPhase::Live
-	}
-
-	/// The peer that the handshake of `connection` proved, while the
-	/// connection is registered.
-	///
-	/// A connection that left, or that the registry never admitted, has no
-	/// standing and answers `None`, so a revoked caller never reads as an
-	/// anonymous one. An anonymous connection answers a session with no peer
-	/// certificate.
-	#[must_use]
-	pub fn session(&self, connection: ConnectionId) -> Option<SessionContext> {
-		let state = self.inner.lock_state();
-		let connected = state.connections.get(&connection)?;
-		Some(connected.session.clone())
-	}
-
-	/// Updates dropped so far for `subscriber`, or `None` once it is gone.
-	#[must_use]
-	pub fn dropped(&self, subscriber: SubscriberId) -> Option<u64> {
-		let state = self.inner.lock_state();
-		let counter = &state.subscribers.get(&subscriber)?.dropped;
-		Some(counter.load(Ordering::Relaxed))
+		phase.refuses_work()
 	}
 
 	/// Live subscriber count for `topic`.
@@ -1155,349 +1424,263 @@ impl TopicRegistry {
 	pub fn new(options: RegistryOptions) -> Self {
 		let inner = Arc::new(Inner {
 			options,
-			drain: Mutex::new(()),
+			drain: AsyncMutex::new(()),
 			phase: AtomicDrainPhase::new(),
 			next_connection: AtomicU64::new(1),
 			next_subscriber: AtomicU64::new(1),
 			state: Mutex::new(State::default()),
-			flush: Arc::new(Notify::new()),
+			backlog: Backlog::new(),
 		});
 
-		let sink = NodeSink::from(&inner);
+		let sink = NodeSink::of(&inner);
 		inner.options.backplane.attach(sink);
 
-		Self { inner }
+		let owner = Arc::new(Owner { inner });
+		Self { owner }
 	}
 
-	fn lock_state(&self) -> MutexGuard<'_, State> {
-		self.inner.lock_state()
-	}
-
-	/// A share of the audit trail of `connection`, which records nothing for
-	/// a connection that left or was never admitted.
-	pub(crate) fn audit_of(&self, connection: ConnectionId) -> ConnectionAudit {
-		let state = self.lock_state();
-		let connected = state.connections.get(&connection);
-		connected.map(|connected| connected.audit.share()).unwrap_or_default()
+	fn inner(&self) -> &Arc<Inner> {
+		&self.owner.inner
 	}
 
 	/// The reads of this registry, as a [`RegistryView`].
 	#[must_use]
 	pub fn view(&self) -> RegistryView<'_> {
-		RegistryView::of(&self.inner)
+		RegistryView::of(self.inner())
 	}
 
 	/// Admit `served`, yielding the [`Membership`] its subscriptions hang off.
 	///
-	/// The connection registers under the peer its handshake proved, so the
-	/// policies authorize the authenticated caller. Every emit of its
-	/// subscriptions runs its deadline on the clock of its writer.
+	/// - The connection registers under the session of its link: the peer that
+	///   its handshake proved, or the empty session of a cleartext link. The
+	///   policies authorize that session.
+	/// - Every emit of the connection runs under
+	///   [`RegistryOptions::emit_deadline`] on the clock of its writer.
+	/// - A registry that already completed its drain turns the connection away
+	///   with a `Shutdown` GoAway.
 	pub(crate) fn admit(&self, served: &ServedMux) -> Membership {
-		let id = ConnectionId(self.inner.next_connection.fetch_add(1, Ordering::Relaxed));
-		let budget = ConnectionBudget::new(self.inner.options.connection_queue_bytes);
+		let inner = self.inner();
+		let id = ConnectionId(inner.next_connection.fetch_add(1, Ordering::Relaxed));
+		let budget = ConnectionBudget::new(inner.options.connection_queue_bytes);
 		let (expulsion, expelled) = oneshot::channel();
 
-		let emitter = Emitter::from(served.handle().clone());
-		let clock = served.clock().clone();
+		let emitter = Emitter::served(served, inner.options.emit_deadline);
 		let session = served.session().clone();
 		let audit = ConnectionAudit::of(served);
 		audit.admitted(id.0);
 
+		let member = Member { registry: Arc::downgrade(inner), connection: id };
+		let context = ConnectionContext::new(member, emitter.clone());
 		let topics = HashMap::new();
-		let connection = ConnectionState { emitter, clock, session, budget, topics, expulsion, audit };
+		let connected = ConnectionState { emitter, session, budget, topics, expulsion, audit };
 
-		self.lock_state().connections.insert(id, connection);
-
-		let registry = Arc::downgrade(&self.inner);
-		Membership { registry, connection: id, expelled }
-	}
-
-	/// Subscribe `connection` to `topic`, spawning its delivery task.
-	///
-	/// Idempotent per connection and topic: re-subscribing returns the
-	/// existing id. MUST be called within a tokio runtime.
-	///
-	/// # Errors
-	///
-	/// - [`RegisterError::Draining`]: a [`quiesce`](Self::quiesce) is in flight or finished.
-	/// - [`RegisterError::UnknownConnection`]: `connection` was never admitted.
-	/// - [`RegisterError::LimitReached`]: the connection already holds
-	///   [`RegistryOptions::max_subscriptions_per_connection`] subscriptions.
-	pub fn register(&self, connection: ConnectionId, topic: Topic) -> Result<SubscriberId, RegisterError> {
-		let mut state = self.lock_state();
-		/*
-		 * Checked under the state lock: a drain stores its phase before it
-		 * freezes the topic set under the same lock, so a subscriber that
-		 * enters before the freeze is in the set, and every later one
-		 * refuses.
-		 */
-		if self.view().is_draining() {
-			return Err(RegisterError::Draining);
+		let turned_away = inner.enter(id, connected);
+		if let Some(departed) = turned_away {
+			departed.expel(GoAwayReason::Shutdown);
 		}
 
-		state.attach(connection, topic, &self.inner)
+		Membership { context, expelled }
 	}
 
-	/// Drop `connection`'s subscription to `topic`.
+	/// Publish `payload` to every subscriber of `topic` on every node of the
+	/// backplane, and resolve once the backplane answered.
 	///
-	/// Returns whether a subscription existed. Idempotent: a repeat (or a
-	/// never-subscribed topic) is `false`, not an error.
-	pub fn unregister(&self, connection: ConnectionId, topic: &Topic) -> bool {
-		let mut state = self.lock_state();
-		state.unsubscribe(connection, topic, &self.inner)
-	}
-
-	/// Publish `payload` to every subscriber of `topic`, through the backplane.
-	///
-	/// The backplane assigns the dense per-topic stamp and distributes to
-	/// every attached node. Each node builds the update frame (id =
-	/// topic) and fans out locally. The stamp advances even with no
-	/// subscribers, so late subscribers observe continuity.
+	/// The stamp advances with no subscriber too, so a late subscriber reads
+	/// a dense sequence.
 	///
 	/// # Errors
 	///
-	/// - [`PublishError::Draining`]: the registry is quiescing, or every node drains.
-	/// - [`PublishError::Build`]: a node could not encode the update frame.
-	/// - [`PublishError::TopicLimit`]: `topic` is new, and the backplane has no room for its counter.
-	/// - [`PublishError::Unavailable`]: the distribution fabric of the backplane failed.
-	pub fn publish(&self, topic: &Topic, payload: impl AsRef<[u8]>) -> Result<(), PublishError> {
-		/*
-		 * Fast-fail only: deliver reads the phase again for each node, so a
-		 * racing quiesce still refuses the update.
-		 */
+	/// - [`PublishError::Draining`] -- the registry is draining, or every node drains.
+	/// - [`PublishError::Build`] -- a node could not encode the update frame.
+	/// - [`PublishError::TopicLimit`] -- `topic` is new, and the backplane has no room for its counter.
+	/// - [`PublishError::Unavailable`] -- the distribution fabric of the backplane failed.
+	pub async fn publish(&self, topic: &Topic, payload: impl AsRef<[u8]>) -> Result<(), PublishError> {
+		// Each node reads the phase again as it delivers, so a racing drain
+		// still refuses the update.
 		if self.view().is_draining() {
 			return Err(PublishError::Draining);
 		}
 
 		let payload = payload.as_ref();
-		self.inner.options.backplane.publish(topic, payload)
+		self.inner().backplane().publish(topic, payload).await
 	}
 
-	/// Publish a full tightbeam frame as `topic`'s payload: frame in
-	/// frame, the transport-envelope pattern one level up.
+	/// Publish the DER of `inner`, a full tightbeam frame, as the payload of
+	/// one update of `topic`.
 	///
-	/// The inner frame travels byte-for-byte inside the update wrapper
-	/// the registry builds, so everything the publisher applied survives
-	/// the relay end to end: signature, witness, message commitment,
-	/// encrypted or compressed body, priority, lifetime, and the
-	/// `previous_frame` chain. The registry stamps only its wrapper
-	/// (`metadata.id` = topic, `metadata.order` = dense sequence) and
-	/// never reads the inner frame. Subscribers lift the payload and
-	/// decode it as a frame (the TypeScript client's `Framed` codec).
+	/// The page `docs/pubsub.md` (Registry) states what the relay keeps end
+	/// to end.
 	///
 	/// # Errors
 	///
-	/// Same set as [`publish`](Self::publish). Encoding `inner` to DER
-	/// surfaces as [`PublishError::Build`].
-	pub fn publish_frame(&self, topic: &Topic, inner: &Frame) -> Result<(), PublishError> {
+	/// - The errors of [`publish`](Self::publish).
+	/// - [`PublishError::Build`] -- `inner` failed to encode to DER.
+	pub async fn publish_frame(&self, topic: &Topic, inner: &Frame) -> Result<(), PublishError> {
 		let payload = inner.to_der().map_err(TightBeamError::from)?;
-		self.publish(topic, payload)
+		self.publish(topic, payload).await
 	}
 
-	/// Complete every topic: push `end/<topic>` to every subscriber and
-	/// refuse new subscriptions and publishes from now on.
+	/// Drain the registry, as a saga of acts:
 	///
-	/// Returns how many subscribers were signaled. Idempotent: a repeat
-	/// signals nobody. The caller follows with the transport drain
-	/// (`shutdown_with(GoAwayReason::Shutdown)` per connection).
+	/// 1. Refuse new subscriptions and publishes, and freeze the topic set.
+	/// 2. Build the `end/<topic>` of every topic at its [`Backplane::last_order`], so completion
+	///    burns no order and every other node keeps a dense sequence.
+	/// 3. Queue each `end/<topic>` behind every update its subscribers hold. From here the drain
+	///    only goes forward.
+	/// 4. Wait until every lane emptied, so every `end/<topic>` left. Each emit runs under the emit
+	///    deadline, so the wait ends.
+	/// 5. Dismiss every served connection with a `Shutdown` GoAway. A connection admitted after
+	///    step 3 is dismissed at its admission.
 	///
-	/// A quiesce that meets another in flight waits for its outcome. It
-	/// answers `Ok(0)` once that drain finished, and runs its own drain when
-	/// that one cancelled, so `Ok` means every `end/<topic>` is queued.
-	///
-	/// Each `end/<topic>` carries the [`Backplane::last_order`] of its
-	/// topic, the order of the last update the topic accepted. Completion
-	/// therefore burns no order, and every other node on the backplane keeps
-	/// a dense sequence. The orders are read with no registry lock held,
-	/// because [`Local`] holds its lock while it delivers into the registry.
+	/// A drain that meets another in flight waits for its outcome. A repeat,
+	/// or a drain whose future dropped during step 4, completes nothing and
+	/// runs steps 4 and 5 again.
 	///
 	/// # Errors
 	///
-	/// - [`TightBeamError`]: an `end/<topic>` frame failed to encode. The drain cancels, so the
-	///   registry takes subscriptions and publishes again, and a later quiesce starts over.
-	pub fn quiesce(&self) -> Result<usize, TightBeamError> {
-		let Some(draining) = self.begin_drain() else {
+	/// - The [`TightBeamError`] of an `end/<topic>` frame that failed to encode, the signature of
+	///   upstream `FrameBuilder::build`. The drain cancels, so the registry takes subscriptions
+	///   and publishes again, and a later drain starts over.
+	pub async fn drain(&self) -> Result<Drained, TightBeamError> {
+		let completed = self.complete().await?;
+		self.flushed().await;
+
+		let dismissed = self.inner().dismiss();
+		Ok(Drained { completed, dismissed })
+	}
+
+	/// Run the acts of a drain that can still refuse, and queue every end
+	/// frame. Returns how many subscriptions completed, or `0` when an
+	/// earlier drain already completed them.
+	///
+	/// # Errors
+	///
+	/// - The errors of [`drain`](Self::drain).
+	pub(crate) async fn complete(&self) -> Result<usize, TightBeamError> {
+		let Some(draining) = self.begin_drain().await else {
 			return Ok(0);
 		};
 
-		let ended = draining.end_frames()?;
-		let signaled = ended.finish();
-		Ok(signaled)
+		let completing = draining.end_frames().await?;
+		Ok(completing.finish())
 	}
 
-	/// Begin a drain: take the drain guard, refuse subscriptions and
+	/// Begin a drain: take the drain turn, refuse subscriptions and
 	/// publishes from now on, and freeze the topic set. Answers `None` when an
-	/// earlier drain finished.
+	/// earlier drain ended.
 	///
-	/// The call waits for the guard, so a drain in flight settles first. A
-	/// guard that a panic poisoned is recovered and its phase reset to
-	/// [`Live`](DrainPhase::Live), so the drain starts over.
-	fn begin_drain(&self) -> Option<Draining<'_>> {
-		let inner = &*self.inner;
-		let locked = inner.drain.lock();
-		let poisoned = locked.is_err();
-		let turn = locked.unwrap_or_else(PoisonError::into_inner);
+	/// - The call waits for the turn, so a drain in flight settles first.
+	/// - A drain that unwound left the phase [`Live`](DrainPhase::Live) through its guard.
+	async fn begin_drain(&self) -> Option<Draining<'_>> {
+		let inner = &**self.inner();
+		let turn = inner.drain.lock().await;
 
-		let guard = DrainGuard { phase: &inner.phase, _turn: turn };
-		if poisoned {
-			inner.drain.clear_poison();
-			guard.cancel();
-		}
-
-		let phase = inner.phase.load();
-		if phase == DrainPhase::Drained {
-			return None;
-		}
-
-		guard.store(DrainPhase::Draining);
-		let topics: Vec<Topic> = self.lock_state().topics.keys().cloned().collect();
+		let guard = DrainGuard::begin(&inner.phase, turn)?;
+		let topics: Vec<Topic> = inner.lock_state().topics.keys().cloned().collect();
 
 		let draining = Draining { registry: inner, guard, topics };
 		Some(draining)
 	}
 
-	/// Wait until every live subscriber queue has emptied.
-	///
-	/// After [`quiesce`](Self::quiesce) this means every `end/<topic>`
-	/// push has left, so the caller can drain the transport without
-	/// racing the completion signals.
-	pub async fn flushed(&self) {
-		loop {
-			let pending = {
-				let state = self.lock_state();
-				state.subscribers.values().any(|subscriber| subscriber.pending())
-			};
-			if !pending {
-				return;
-			}
-
-			self.inner.flush.notified().await;
-		}
+	/// Resolve once no lane has anything left to emit. Every waiter wakes.
+	async fn flushed(&self) {
+		self.inner().backlog.idle().await;
 	}
 }
 
-impl Inner {
-	fn lock_state(&self) -> MutexGuard<'_, State> {
-		self.state.lock().unwrap_or_else(PoisonError::into_inner)
+/// The standing of one served connection in the registry that admitted it:
+/// that registry, and the id of the connection there.
+///
+/// Only [`TopicRegistry::admit`] builds one, so every command names a
+/// connection of the registry it runs on.
+#[derive(Clone)]
+pub(crate) struct Member {
+	/// Held weakly, so the registry drops while its connections serve.
+	registry: Weak<Inner>,
+	connection: ConnectionId,
+}
+
+impl Member {
+	/// The peer that the handshake of the connection proved, while the
+	/// connection is registered.
+	///
+	/// - A connection that left has no standing and answers `None`.
+	/// - A registered anonymous connection answers a session with no peer certificate.
+	pub(crate) fn session(&self) -> Option<SessionContext> {
+		let registry = self.registry.upgrade()?;
+		let state = registry.lock_state();
+		let session = state.connection(self.connection).map(|connected| connected.session.clone());
+		session
 	}
 
-	/// Forget `connection`, drop every subscription it holds, and record its
-	/// departure once the registry lock is released.
-	fn leave(&self, connection: ConnectionId) {
-		let departed = self.lock_state().remove_connection(connection, self);
-		if let Some(departed) = departed {
-			departed.left();
-		}
+	/// Subscribe the connection to `topic`. Idempotent per topic: a repeat
+	/// answers the id it already holds.
+	///
+	/// # Errors
+	///
+	/// - [`RegisterError::UnknownConnection`] -- the connection left, or the registry is gone.
+	/// - [`RegisterError::Draining`] -- the registry is draining.
+	/// - [`RegisterError::LimitReached`] -- the connection holds its cap of subscriptions.
+	pub(crate) fn subscribe(&self, topic: Topic) -> Result<SubscriberId, RegisterError> {
+		let registry = self.registry.upgrade().ok_or(RegisterError::UnknownConnection)?;
+		registry.register(self.connection, topic)
 	}
 
-	/// End the subscription `id` of `connection` to `topic`, unless a newer
-	/// subscription already took its place. See [`State::retire`].
-	fn retire(&self, connection: ConnectionId, topic: &Topic, id: SubscriberId) {
-		let mut state = self.lock_state();
-		state.retire(connection, topic, id, self);
-	}
-
-	/// Drop a connection the delivery policy voted off, and resolve its
-	/// [`Membership::expelled`] future, so its served connection drains with
-	/// an orderly GoAway instead of a silent stall.
-	///
-	/// The connection drains with `EnhanceYourCalm`, the analog for a
-	/// load-generating peer that cannot keep pace with delivery.
-	///
-	/// # Sources
-	///
-	/// - RFC 9113 § 7, GOAWAY frame:
-	///   <https://datatracker.ietf.org/doc/html/rfc9113#section-7>
-	fn expel(&self, connection: ConnectionId) {
-		let removed = self.lock_state().remove_connection(connection, self);
-		let Some(expelled) = removed else {
-			return;
+	/// Drop the subscription of the connection to `topic`, and resolve once
+	/// its drain task ended, so no update of the subscription leaves after
+	/// the answer. Returns whether one existed, so a repeat answers `false`.
+	pub(crate) async fn unsubscribe(&self, topic: &Topic) -> bool {
+		let registry = self.registry.upgrade();
+		let Some(task) = registry.and_then(|registry| registry.unregister(self.connection, topic)) else {
+			return false;
 		};
 
-		expelled.expel(GoAwayReason::EnhanceYourCalm);
+		task.ended().await;
+		true
 	}
 
-	/// Offer `update` of `len` payload octets to each member of a snapshot,
-	/// with no registry lock held, and expel every connection the delivery
-	/// policy votes off.
-	fn fan_out(&self, members: &[Arc<Subscriber>], update: &Arc<Frame>, len: usize) {
-		let mut doomed = Vec::new();
-		for subscriber in members {
-			let admission = subscriber.admit(update, len, self);
-			if admission == Admission::Disconnect {
-				doomed.push(subscriber.connection);
-			}
+	/// A share of the audit trail of the connection, which records nothing
+	/// once the connection left.
+	pub(crate) fn audit(&self) -> ConnectionAudit {
+		let Some(registry) = self.registry.upgrade() else {
+			return ConnectionAudit::default();
+		};
+
+		let state = registry.lock_state();
+		let audit = state.connection(self.connection).map(|connected| connected.audit.share());
+		audit.unwrap_or_default()
+	}
+
+	/// Leave the registry with every subscription.
+	fn leave(&self) {
+		if let Some(registry) = self.registry.upgrade() {
+			registry.leave(self.connection);
 		}
-
-		for connection in doomed {
-			self.expel(connection);
-		}
-	}
-}
-
-impl UpdateSink for Inner {
-	/// One backplane-sequenced update lands on this node: build the wire
-	/// frame at the assigned order and fan out to the local members.
-	fn deliver(&self, topic: &Topic, order: u64, payload: &[u8]) -> Result<(), DeliverError> {
-		/*
-		 * A drain stores its phase before it reads any last order, and the
-		 * backplane answers a last order only after every delivery in flight
-		 * returned. Every delivery the drain counts therefore lands before
-		 * its end/, and every later one refuses here.
-		 */
-		if RegistryView::of(self).is_draining() {
-			return Err(DeliverError::Draining);
-		}
-
-		let members = self.lock_state().members(topic);
-
-		let update = Arc::new(topic.update_frame(order, payload)?);
-		self.fan_out(&members, &update, payload.len());
-
-		Ok(())
-	}
-
-	/// A topic is live while its member set holds a subscriber.
-	fn has_members(&self, topic: &Topic) -> bool {
-		let state = self.lock_state();
-		let entry = state.topics.get(topic);
-		entry.is_some_and(|entry| !entry.members.is_empty())
-	}
-}
-
-impl Drop for Inner {
-	/// The last registry handle is gone. A drain task holds only its
-	/// subscriber, so every lane closes here to end its task.
-	fn drop(&mut self) {
-		let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
-		state.end_all(self.options.backplane.as_ref());
 	}
 }
 
 /// The registration of one served connection.
 ///
-/// The drop leaves the registry and ends every subscription of the
-/// connection, so a serve that completes or drops leaves no registration
-/// behind. [`expelled`](Self::expelled) is the one signal of a connection the
-/// delivery policy voted off.
+/// - The drop leaves the registry and ends every subscription of the connection, so a serve
+///   that completes or drops leaves no registration behind.
+/// - [`expelled`](Self::expelled) is the one signal of a connection the registry expels.
 pub(crate) struct Membership {
-	/// Held weakly, so the registry drops while its connections serve.
-	registry: Weak<Inner>,
-	connection: ConnectionId,
+	context: ConnectionContext,
 	expelled: Receiver<GoAwayReason>,
 }
 
 impl Membership {
-	/// The registry id this connection's subscriptions hang off.
-	pub(crate) fn connection(&self) -> ConnectionId {
-		self.connection
+	/// What the application handler of the connection works with.
+	pub(crate) fn context(&self) -> &ConnectionContext {
+		&self.context
 	}
 
 	/// Resolve with the reason the registry expels this connection for.
+	/// [`CONNECTION_EXPELLED`] lists the causes of an expulsion.
 	///
-	/// The registry that drops, or that forgets the connection, drops the
-	/// signal unsent. A dropped signal stays pending, so it never drains a
-	/// served connection.
+	/// A registry that drops or forgets the connection leaves the wait pending.
+	///
+	/// [`CONNECTION_EXPELLED`]: crate::events::CONNECTION_EXPELLED
 	pub(crate) async fn expelled(&mut self) -> GoAwayReason {
 		let signaled = (&mut self.expelled).await;
 		match signaled {
@@ -1509,33 +1692,30 @@ impl Membership {
 
 impl Drop for Membership {
 	fn drop(&mut self) {
-		if let Some(registry) = self.registry.upgrade() {
-			registry.leave(self.connection);
-		}
+		self.context.member().leave();
 	}
 }
 
 #[cfg(test)]
 mod tests {
-	use std::panic::{catch_unwind, AssertUnwindSafe};
-	use std::sync::atomic::AtomicBool;
-	use std::sync::OnceLock;
+	use core::pin::pin;
+	use core::time::Duration;
 
-	use der::{Error as DerError, ErrorKind};
 	use tightbeam::clock::{Clock, ManualClock};
+	use tightbeam::marker::MaybeSendFuture;
 	use tightbeam::policy::TransitStatus;
 	use tightbeam::transport::handshake::negotiation::MuxSettings;
-	use tightbeam::transport::multiplex::{MuxDispatch, SpawnedMux};
-	use tightbeam::transport::{ResponsePackage, TransportResult};
-	use tokio::task::{spawn_blocking, yield_now};
-	use tokio::time::{sleep, timeout};
+	use tightbeam::transport::multiplex::{MuxDrivers, MuxHandle, SpawnedMux};
+	use tightbeam::transport::ResponsePackage;
+	use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+	use tokio::sync::Semaphore;
+	use tokio::task::{AbortHandle, JoinSet};
+	use tokio::time::timeout;
 
 	use super::*;
-	use crate::testing::{MemoryLink, OpaqueFrame};
-
-	/// Bound every wait on a live link, so a regression fails instead of
-	/// hanging.
-	const DEADLINE: Duration = Duration::from_secs(2);
+	use crate::frame::OpaqueFrame;
+	use crate::testing::nodes::{waits, Accepting, Admitted, SHORT};
+	use crate::testing::{Dial, Loopback, PATIENCE};
 
 	fn count(value: usize) -> NonZeroUsize {
 		NonZeroUsize::new(value).expect("test counts should be above zero")
@@ -1545,244 +1725,443 @@ mod tests {
 		EmitDeadline::new(span).expect("test deadlines should be above zero")
 	}
 
-	/// Subscribe `connection` to `name`, expecting acceptance.
-	fn subscribed(registry: &TopicRegistry, connection: ConnectionId, name: &str) -> SubscriberId {
-		let topic = Topic::fixture(name);
-		registry
-			.register(connection, topic)
-			.expect("the registration should be accepted")
+	/// Subscribe `member` to `name`, expecting acceptance.
+	fn subscribed(member: &Member, name: &str) -> SubscriberId {
+		let topic: Topic = name.parse().expect("the name should be a topic");
+		member.subscribe(topic).expect("the registration should be accepted")
 	}
 
 	/// Publish `payload` to `name`, expecting acceptance.
-	fn published(registry: &TopicRegistry, name: &str, payload: &[u8]) {
-		let topic = Topic::fixture(name);
-		registry.publish(&topic, payload).expect("the publish should be accepted");
+	async fn published(registry: &TopicRegistry, name: &str, payload: &[u8]) {
+		let topic: Topic = name.parse().expect("the name should be a topic");
+		let outcome = registry.publish(&topic, payload).await;
+		outcome.expect("the publish should be accepted");
 	}
 
-	/// Quiesce the registry, expecting the signaled subscriber count.
-	fn quiesced(registry: &TopicRegistry) -> usize {
-		registry.quiesce().expect("quiesce should succeed")
+	/// Run the acts of a drain that can still refuse, expecting the count of
+	/// completed subscriptions.
+	async fn completed(registry: &TopicRegistry) -> usize {
+		let completed = registry.complete().await;
+		completed.expect("every end frame builds")
 	}
 
 	/// The last order the registry's backplane committed for `name`.
-	fn last_order(registry: &TopicRegistry, name: &str) -> u64 {
-		registry.inner.options.backplane.last_order(&Topic::fixture(name))
+	async fn last_order(registry: &TopicRegistry, name: &str) -> u64 {
+		registry
+			.inner()
+			.backplane()
+			.last_order(&name.parse::<Topic>().expect("the name should be a topic"))
+			.await
 	}
 
-	/// One served end of an in-memory link under `settings`, and the client
-	/// end beside it, spawned with its responder unserved.
-	fn served_over(link: &MemoryLink, settings: MuxSettings) -> (ServedMux, SpawnedMux) {
-		let linked = link.served(settings);
-		let (client, server) = linked.expect("a test link races on a tokio thread");
-		(server.spawn(), client.spawn())
+	/// The subscriber `id` of `registry`, while the registry holds it.
+	fn subscriber_of(registry: &TopicRegistry, id: SubscriberId) -> Option<Arc<Subscriber>> {
+		registry.inner().lock_state().subscribers.get(&id).cloned()
 	}
 
-	/// A registry with one admitted in-memory connection, whose peer reads
-	/// nothing. The returned guard keeps the registration and the peer alive.
-	fn registered(options: RegistryOptions) -> (TopicRegistry, ConnectionId, impl Sized) {
-		let link = MemoryLink::default();
-		let linked = link.served(MuxSettings::symmetric(4));
-		let (client, server) = linked.expect("a test link races on a tokio thread");
-		let served = server.spawn();
+	/// Updates dropped so far for `subscriber`, or `None` once it is gone.
+	fn dropped_of(registry: &TopicRegistry, subscriber: SubscriberId) -> Option<u64> {
+		let held = subscriber_of(registry, subscriber)?;
+		Some(held.dropped.load(Ordering::Relaxed))
+	}
 
+	/// The orders queued in the lane of `subscriber` behind the update in
+	/// flight.
+	fn queued_orders(registry: &TopicRegistry, subscriber: SubscriberId) -> Vec<u64> {
+		let Some(held) = subscriber_of(registry, subscriber) else {
+			return Vec::new();
+		};
+
+		let lane = held.lane();
+		let Lane::Open(queue) = &*lane else {
+			return Vec::new();
+		};
+
+		queue.entries.iter().map(|queued| queued.update.metadata().order()).collect()
+	}
+
+	/// A registry with one admitted loopback connection, whose client end
+	/// answers nothing. The returned guard keeps the registration and the
+	/// link alive.
+	async fn registered(options: RegistryOptions) -> (TopicRegistry, Member, Admitted) {
 		let registry = TopicRegistry::new(options);
-		let membership = registry.admit(&served);
-		let connection = membership.connection();
-		(registry, connection, (membership, served, client))
+		let admitted = Admitted::to(&registry).await;
+		(registry, admitted.member().clone(), admitted)
 	}
 
-	/// A registry with one registered connection over a live link on the
-	/// system clock whose peer takes each update and answers none. The
-	/// returned guard keeps the peer alive.
-	fn stalled(options: RegistryOptions) -> (TopicRegistry, ConnectionId, impl Sized) {
-		stalled_on(options, MemoryLink::default())
+	/// One loopback connection that a registry admitted: its membership, its
+	/// served end, and its client end.
+	struct Connection {
+		membership: Membership,
+		served: ServedMux,
+		client: SpawnedMux,
 	}
 
-	/// As [`stalled`], over `link`.
-	fn stalled_on(options: RegistryOptions, link: MemoryLink) -> (TopicRegistry, ConnectionId, impl Sized) {
-		let (served, client) = served_over(&link, MuxSettings::symmetric(4));
-
-		let registry = TopicRegistry::new(options);
-		let membership = registry.admit(&served);
-		let connection = membership.connection();
-		(registry, connection, (membership, served, client))
+	impl Connection {
+		/// Admit one loopback connection under `dial` to `registry`.
+		async fn to(registry: &TopicRegistry, dial: &Dial) -> Self {
+			let opened = Loopback::open(dial).await;
+			let Loopback { server, client } = opened.expect("a loopback link opens");
+			let served = server.spawn();
+			let membership = registry.admit(&served);
+			Self { membership, served, client }
+		}
 	}
 
-	/// A registry under `options` with one registered connection over a live
-	/// link under `settings`, whose peer answers every update with `status`.
-	/// The returned guard keeps the peer alive.
-	fn answering(
+	/// A registry under `options` with one connection over a link under
+	/// `settings`, whose client answers every update with `status`. The
+	/// returned guard keeps the connection alive.
+	async fn answering(
 		options: RegistryOptions,
 		settings: MuxSettings,
 		status: TransitStatus,
-	) -> (TopicRegistry, ConnectionId, impl Sized) {
-		let link = MemoryLink::default();
-		let (served, client) = served_over(&link, settings);
+	) -> (TopicRegistry, Member, impl Sized) {
+		let registry = TopicRegistry::new(options);
+		let dial = Dial { settings, ..Dial::default() };
+		let Connection { membership, served, client } = Connection::to(&registry, &dial).await;
 		let SpawnedMux { handle, responder, drivers } = client;
 
 		let answer = move |_| async move { ResponsePackage::new(status, None) };
 		let answering = tokio::spawn(responder.serve(answer));
 
+		let member = membership.context().member().clone();
+		let guard = (membership, served, handle, drivers, answering.abort_handle());
+		(registry, member, guard)
+	}
+
+	/// The answer of one update at a [`Holding`] client: its drop before it
+	/// answers reports the cancel of its stream.
+	struct Answer(Option<UnboundedSender<()>>);
+
+	impl Answer {
+		/// The answer settled, so its drop reports nothing.
+		fn settle(mut self) {
+			self.0 = None;
+		}
+	}
+
+	impl Drop for Answer {
+		fn drop(&mut self) {
+			if let Some(cancelled) = self.0.take() {
+				// The test may hold no receiver.
+				let _ = cancelled.send(());
+			}
+		}
+	}
+
+	/// The client end of a connection whose responder reports each update it
+	/// takes, answers it once the semaphore grants a permit, and reports each
+	/// stream whose answer the server cancelled.
+	struct Holding {
+		answers: Arc<Semaphore>,
+		taken: UnboundedReceiver<()>,
+		cancelled: UnboundedReceiver<()>,
+		_client: (MuxHandle, MuxDrivers, AbortHandle),
+	}
+
+	impl Holding {
+		/// Serve `client` as a holding client.
+		fn serve(client: SpawnedMux) -> Self {
+			let SpawnedMux { handle, responder, drivers } = client;
+			let answers = Arc::new(Semaphore::new(0));
+			let (took, taken) = unbounded_channel();
+			let (cancel, cancelled) = unbounded_channel();
+
+			let gate = Arc::clone(&answers);
+			let answer = move |_| {
+				let gate = Arc::clone(&gate);
+				let took = took.clone();
+				let pending = Answer(Some(cancel.clone()));
+				async move {
+					let _ = took.send(());
+					let permit = gate.acquire().await.expect("the answer gate stays open");
+					permit.forget();
+					pending.settle();
+					ResponsePackage::new(TransitStatus::Ok, None)
+				}
+			};
+
+			let answering = tokio::spawn(responder.serve(answer));
+			Self { answers, taken, cancelled, _client: (handle, drivers, answering.abort_handle()) }
+		}
+
+		/// Wait until the client took one more update, so its emit is in
+		/// flight.
+		async fn took(&mut self) {
+			let taken = timeout(PATIENCE, self.taken.recv()).await;
+			assert!(matches!(taken, Ok(Some(()))), "the client should take the update");
+		}
+
+		/// Wait until the server cancelled the stream of one update.
+		async fn cancelled(&mut self) -> bool {
+			let cancelled = timeout(PATIENCE, self.cancelled.recv()).await;
+			matches!(cancelled, Ok(Some(())))
+		}
+	}
+
+	/// A registry under `options` with one connection over a link under
+	/// `dial`, whose client holds every answer. The returned guard keeps the
+	/// membership and the served end alive.
+	async fn holding_over(options: RegistryOptions, dial: &Dial) -> (TopicRegistry, Member, Holding, impl Sized) {
 		let registry = TopicRegistry::new(options);
-		let membership = registry.admit(&served);
-		let connection = membership.connection();
-		(
-			registry,
-			connection,
-			(membership, served, handle, drivers, answering.abort_handle()),
-		)
+		let Connection { membership, served, client } = Connection::to(&registry, dial).await;
+		let member = membership.context().member().clone();
+		(registry, member, Holding::serve(client), (membership, served))
+	}
+
+	/// As [`holding_over`], under the default dial.
+	async fn holding(options: RegistryOptions) -> (TopicRegistry, Member, Holding, impl Sized) {
+		holding_over(options, &Dial::default()).await
 	}
 
 	/// Wait until every lane of `registry` is idle, expecting it within the
 	/// deadline.
 	async fn settled(registry: &TopicRegistry) {
-		let flushed = timeout(DEADLINE, registry.flushed()).await;
+		let flushed = timeout(PATIENCE, registry.flushed()).await;
 		flushed.expect("every lane should go idle");
+	}
+
+	/// Wait until the backlog of `registry`, which the registry and every
+	/// subscriber it ever held share, is gone, once the caller drops the
+	/// registry. Answers whether it went within the deadline.
+	async fn backlog_gone(backlog: Arc<Backlog>, registry: TopicRegistry) -> bool {
+		let mut watched = backlog.0.subscribe();
+		drop((backlog, registry));
+
+		let gone = async { while watched.changed().await.is_ok() {} };
+		timeout(PATIENCE, gone).await.is_ok()
+	}
+
+	/// A manual clock, and a dial whose server end runs on it.
+	fn manual() -> (Arc<ManualClock>, Dial) {
+		let clock = Arc::new(ManualClock::default());
+		let dial = Dial { clock: Arc::clone(&clock) as Arc<dyn Clock>, ..Dial::default() };
+		(clock, dial)
+	}
+
+	#[tokio::test]
+	async fn every_concurrent_flush_waiter_returns_once_the_lanes_idle() {
+		let (registry, member, mut client, _connection) = holding(RegistryOptions::default()).await;
+		subscribed(&member, "prices");
+		published(&registry, "prices", b"tick").await;
+		client.took().await;
+
+		let mut first = pin!(registry.flushed());
+		let mut second = pin!(registry.flushed());
+		let first_waits = waits(first.as_mut()).await;
+		let second_waits = waits(second.as_mut()).await;
+		client.answers.add_permits(1);
+
+		let both = timeout(PATIENCE, async { tokio::join!(first, second) }).await;
+		assert!(first_waits && second_waits);
+		assert!(both.is_ok());
 	}
 
 	#[tokio::test]
 	async fn register_is_idempotent_per_connection_and_topic() {
-		let (registry, connection, _peer) = registered(RegistryOptions::default());
+		let (registry, member, _peer) = registered(RegistryOptions::default()).await;
 
-		let first = subscribed(&registry, connection, "prices");
-		let second = subscribed(&registry, connection, "prices");
+		let first = subscribed(&member, "prices");
+		let second = subscribed(&member, "prices");
 		assert_eq!(first, second);
-		assert_eq!(registry.view().subscriber_count(&Topic::fixture("prices")), 1);
+		assert_eq!(
+			registry
+				.view()
+				.subscriber_count(&"prices".parse::<Topic>().expect("the name should be a topic")),
+			1
+		);
 	}
 
 	#[tokio::test]
 	async fn register_refuses_past_the_per_connection_subscription_cap() {
 		let options = RegistryOptions { max_subscriptions_per_connection: count(2), ..RegistryOptions::default() };
-		let (registry, connection, _peer) = registered(options);
+		let (registry, member, _peer) = registered(options).await;
 
-		let first = subscribed(&registry, connection, "a");
-		subscribed(&registry, connection, "b");
+		let first = subscribed(&member, "a");
+		subscribed(&member, "b");
 
-		let refused = registry.register(connection, Topic::fixture("c"));
+		let refused = member.subscribe("c".parse::<Topic>().expect("the name should be a topic"));
 		assert_eq!(refused, Err(RegisterError::LimitReached));
-		assert_eq!(subscribed(&registry, connection, "a"), first);
+		assert_eq!(subscribed(&member, "a"), first);
 
-		registry.unregister(connection, &Topic::fixture("a"));
+		member
+			.unsubscribe(&"a".parse::<Topic>().expect("the name should be a topic"))
+			.await;
 
-		subscribed(&registry, connection, "c");
-		assert_eq!(registry.view().subscriber_count(&Topic::fixture("c")), 1);
+		subscribed(&member, "c");
+		assert_eq!(
+			registry
+				.view()
+				.subscriber_count(&"c".parse::<Topic>().expect("the name should be a topic")),
+			1
+		);
 	}
 
 	#[tokio::test]
 	async fn register_requires_a_known_connection() {
-		let (registry, connection, peer) = registered(RegistryOptions::default());
+		let (_registry, member, peer) = registered(RegistryOptions::default()).await;
 
 		drop(peer);
 
-		let outcome = registry.register(connection, Topic::fixture("prices"));
+		let outcome = member.subscribe("prices".parse::<Topic>().expect("the name should be a topic"));
 		assert_eq!(outcome, Err(RegisterError::UnknownConnection));
 	}
 
 	#[tokio::test]
+	async fn a_member_subscribes_in_the_registry_that_admitted_it() {
+		let (admitting, member, _peer) = registered(RegistryOptions::default()).await;
+		let (other, _other_member, _other_peer) = registered(RegistryOptions::default()).await;
+
+		subscribed(&member, "prices");
+
+		assert_eq!(
+			admitting
+				.view()
+				.subscriber_count(&"prices".parse::<Topic>().expect("the name should be a topic")),
+			1
+		);
+		assert_eq!(
+			other
+				.view()
+				.subscriber_count(&"prices".parse::<Topic>().expect("the name should be a topic")),
+			0
+		);
+	}
+
+	#[tokio::test]
 	async fn a_session_requires_a_live_registration() {
-		let (registry, connection, peer) = registered(RegistryOptions::default());
-		let member = registry.view().session(connection);
+		let (_registry, member, peer) = registered(RegistryOptions::default()).await;
+		let held = member.session();
 
 		drop(peer);
 
-		let left = registry.view().session(connection);
-		assert!(member.is_some());
+		let left = member.session();
+		assert!(held.is_some());
 		assert!(left.is_none());
 	}
 
 	#[tokio::test]
 	async fn unregister_prunes_the_emptied_topic() {
-		let (registry, connection, _peer) = registered(RegistryOptions::default());
-		subscribed(&registry, connection, "prices");
+		let (registry, member, _peer) = registered(RegistryOptions::default()).await;
+		subscribed(&member, "prices");
 
-		registry.unregister(connection, &Topic::fixture("prices"));
+		member
+			.unsubscribe(&"prices".parse::<Topic>().expect("the name should be a topic"))
+			.await;
 
-		let state = registry.lock_state();
-		assert!(!state.topics.contains_key(&Topic::fixture("prices")));
+		let state = registry.inner().lock_state();
+		assert!(!state
+			.topics
+			.contains_key(&"prices".parse::<Topic>().expect("the name should be a topic")));
 	}
 
 	#[tokio::test]
 	async fn unregister_forgets_the_membership() {
-		let (registry, connection, _peer) = registered(RegistryOptions::default());
+		let (registry, member, _peer) = registered(RegistryOptions::default()).await;
 
-		subscribed(&registry, connection, "prices");
+		subscribed(&member, "prices");
 
-		let removed = registry.unregister(connection, &Topic::fixture("prices"));
-		let repeat = registry.unregister(connection, &Topic::fixture("prices"));
+		let removed = member
+			.unsubscribe(&"prices".parse::<Topic>().expect("the name should be a topic"))
+			.await;
+		let repeat = member
+			.unsubscribe(&"prices".parse::<Topic>().expect("the name should be a topic"))
+			.await;
 		assert!(removed);
 		assert!(!repeat);
-		assert_eq!(registry.view().subscriber_count(&Topic::fixture("prices")), 0);
+		assert_eq!(
+			registry
+				.view()
+				.subscriber_count(&"prices".parse::<Topic>().expect("the name should be a topic")),
+			0
+		);
 	}
 
 	#[tokio::test]
 	async fn a_dropped_membership_forgets_every_subscription() {
-		let (registry, connection, peer) = registered(RegistryOptions::default());
-		subscribed(&registry, connection, "prices");
-		subscribed(&registry, connection, "chat");
+		let (registry, member, peer) = registered(RegistryOptions::default()).await;
+		subscribed(&member, "prices");
+		subscribed(&member, "chat");
 
 		drop(peer);
 
-		assert_eq!(registry.view().subscriber_count(&Topic::fixture("prices")), 0);
-		assert_eq!(registry.view().subscriber_count(&Topic::fixture("chat")), 0);
-	}
-
-	/// Yield until the last strong reference behind `subscriber` is gone,
-	/// or give up.
-	async fn released(subscriber: &Weak<Subscriber>) -> bool {
-		for _ in 0..64 {
-			if subscriber.strong_count() == 0 {
-				return true;
-			}
-
-			yield_now().await;
-		}
-
-		false
+		assert_eq!(
+			registry
+				.view()
+				.subscriber_count(&"prices".parse::<Topic>().expect("the name should be a topic")),
+			0
+		);
+		assert_eq!(
+			registry
+				.view()
+				.subscriber_count(&"chat".parse::<Topic>().expect("the name should be a topic")),
+			0
+		);
 	}
 
 	#[tokio::test]
 	async fn a_dropped_membership_ends_a_drain_task_parked_in_an_emit() {
-		let (registry, connection, peer) = stalled(RegistryOptions::default());
-		let id = subscribed(&registry, connection, "prices");
-		published(&registry, "prices", b"tick");
-		yield_now().await;
-		let subscriber = Arc::downgrade(&registry.lock_state().subscribers[&id]);
+		let registry = TopicRegistry::default();
+		let Connection { membership, served, client } = Connection::to(&registry, &Dial::default()).await;
+		let mut client = Holding::serve(client);
 
-		drop(peer);
+		subscribed(membership.context().member(), "prices");
+		published(&registry, "prices", b"tick").await;
+		client.took().await;
 
-		assert!(released(&subscriber).await);
+		drop(membership);
+
+		let cancelled = client.cancelled().await;
+		settled(&registry).await;
+		assert!(cancelled, "the parked emit should end and cancel its stream");
+		drop(served);
+	}
+
+	#[tokio::test]
+	async fn an_unsubscribe_returns_once_its_drain_task_ended() {
+		let (registry, member, mut client, _connection) = holding(RegistryOptions::default()).await;
+		let id = subscribed(&member, "prices");
+		published(&registry, "prices", b"tick").await;
+		client.took().await;
+		let held = subscriber_of(&registry, id).map(|subscriber| Arc::downgrade(&subscriber));
+
+		let unsubscribed = member
+			.unsubscribe(&"prices".parse::<Topic>().expect("the name should be a topic"))
+			.await;
+
+		assert!(unsubscribed);
+		let ended = held.is_some_and(|subscriber| subscriber.upgrade().is_none());
+		assert!(ended, "the drain task should hold its subscriber no more");
 	}
 
 	#[tokio::test]
 	async fn a_dropped_registry_ends_every_drain_task() {
-		let (registry, connection, _peer) = registered(RegistryOptions::default());
-		let id = subscribed(&registry, connection, "prices");
-		let subscriber = Arc::downgrade(&registry.lock_state().subscribers[&id]);
+		let (registry, member, _peer) = registered(RegistryOptions::default()).await;
+		subscribed(&member, "prices");
+		let backlog = Arc::clone(&registry.inner().backlog);
 
-		drop(registry);
-
-		assert!(released(&subscriber).await);
+		assert!(backlog_gone(backlog, registry).await);
 	}
 
 	#[tokio::test]
 	async fn publish_to_a_memberless_topic_retains_no_state() {
-		let (registry, connection, _peer) = registered(RegistryOptions::default());
-		published(&registry, "silence", b"tick");
-		published(&registry, "silence", b"tock");
+		let (registry, member, _peer) = registered(RegistryOptions::default()).await;
+		published(&registry, "silence", b"tick").await;
+		published(&registry, "silence", b"tock").await;
 
 		{
-			let state = registry.lock_state();
-			assert!(!state.topics.contains_key(&Topic::fixture("silence")));
+			let state = registry.inner().lock_state();
+			assert!(!state
+				.topics
+				.contains_key(&"silence".parse::<Topic>().expect("the name should be a topic")));
 		}
 
-		/*
-		 * The backplane kept the counter: a late subscriber still
-		 * observes the continued dense sequence.
-		 */
-		subscribed(&registry, connection, "silence");
-		published(&registry, "silence", b"third");
+		// The backplane kept the counter, so a late subscriber still reads a
+		// dense sequence.
+		subscribed(&member, "silence");
+		published(&registry, "silence", b"third").await;
 
-		assert_eq!(last_order(&registry, "silence"), 3);
+		assert_eq!(last_order(&registry, "silence").await, 3);
 	}
 
 	/// Delivery policy returning one fixed verdict.
@@ -1794,304 +2173,314 @@ mod tests {
 		}
 	}
 
-	/// Options of `capacity` queue slots, `bytes` of connection budget, and
-	/// one fixed `verdict`.
-	fn saturating(capacity: usize, bytes: usize, verdict: DeliveryVerdict) -> RegistryOptions {
-		RegistryOptions {
-			queue_capacity: count(capacity),
-			connection_queue_bytes: count(bytes),
-			delivery: Arc::new(FixedVerdict(verdict)),
-			..RegistryOptions::default()
+	/// The saturation of a registry: `capacity` queue slots, `bytes` of
+	/// connection budget, and one fixed `verdict`.
+	struct Saturating {
+		capacity: usize,
+		bytes: usize,
+		verdict: DeliveryVerdict,
+	}
+
+	impl Saturating {
+		/// The registry options of this saturation.
+		fn options(self) -> RegistryOptions {
+			RegistryOptions {
+				queue_capacity: count(self.capacity),
+				connection_queue_bytes: count(self.bytes),
+				delivery: Arc::new(FixedVerdict(self.verdict)),
+				..RegistryOptions::default()
+			}
 		}
 	}
 
-	/// A subscriber on `budget` whose lane takes offers and never drains.
-	fn parked(budget: &Arc<ConnectionBudget>) -> Subscriber {
-		let task = tokio::spawn(pending::<()>());
-		let lane = Lane::Open(Queue::new(task.abort_handle()));
-
-		Subscriber {
-			id: SubscriberId(1),
-			topic: Topic::fixture("prices"),
-			connection: ConnectionId(1),
-			registry: Weak::new(),
-			budget: Arc::clone(budget),
-			lane: Mutex::new(lane),
-			notify: Notify::new(),
-			dropped: AtomicU64::new(0),
-			flush: Arc::new(Notify::new()),
-			audit: ConnectionAudit::default(),
-		}
+	/// A holding connection under `options` subscribed to `prices`, whose
+	/// first update `first` is in flight.
+	async fn in_flight(
+		options: RegistryOptions,
+		first: &[u8],
+	) -> (TopicRegistry, SubscriberId, Member, Holding, impl Sized) {
+		let (registry, member, mut client, connection) = holding(options).await;
+		let id = subscribed(&member, "prices");
+		published(&registry, "prices", first).await;
+		client.took().await;
+		(registry, id, member, client, connection)
 	}
 
-	/// A subscriber with its own budget under the options of `registry` that
-	/// never drains.
-	fn parked_under(registry: &TopicRegistry) -> Subscriber {
-		let budget = ConnectionBudget::new(registry.inner.options.connection_queue_bytes);
-		parked(&budget)
-	}
+	#[tokio::test]
+	async fn drop_oldest_keeps_the_newest_updates() {
+		let options = Saturating { capacity: 2, bytes: 1024, verdict: DeliveryVerdict::DropOldest }.options();
+		let (registry, id, _member, _client, _connection) = in_flight(options, b"1").await;
 
-	/// Admit one update per payload to `subscriber` under the options of
-	/// `registry`, stamped `1, 2, ...`, returning the last admission.
-	fn admitted(subscriber: &Subscriber, registry: &TopicRegistry, payloads: &[&[u8]]) -> Admission {
-		let topic = Topic::fixture("prices");
-		let mut last = Admission::Settled;
-		for (order, payload) in (1..).zip(payloads) {
-			let update = topic.update_frame(order, payload).expect("update frames should build");
-			last = subscriber.admit(&Arc::new(update), payload.len(), &registry.inner);
+		for payload in [b"2", b"3", b"4"] {
+			published(&registry, "prices", payload).await;
 		}
 
-		last
-	}
-
-	fn queued_orders(subscriber: &Subscriber) -> Vec<u64> {
-		let lane = subscriber.lock_lane();
-		let Lane::Open(queue) = &*lane else {
-			return Vec::new();
-		};
-
-		queue.entries.iter().map(|queued| queued.update.metadata().order()).collect()
-	}
-
-	fn dropped(subscriber: &Subscriber) -> u64 {
-		subscriber.dropped.load(Ordering::Relaxed)
+		assert_eq!(queued_orders(&registry, id), [3, 4]);
+		assert_eq!(dropped_of(&registry, id), Some(1));
 	}
 
 	#[tokio::test]
-	async fn admit_drop_oldest_keeps_the_newest_updates() {
-		let registry = TopicRegistry::new(saturating(2, 1024, DeliveryVerdict::DropOldest));
-		let subscriber = parked_under(&registry);
+	async fn drop_new_keeps_the_oldest_updates() {
+		let options = Saturating { capacity: 2, bytes: 1024, verdict: DeliveryVerdict::DropNew }.options();
+		let (registry, id, _member, _client, _connection) = in_flight(options, b"1").await;
 
-		admitted(&subscriber, &registry, &[b"tick", b"tick", b"tick"]);
+		for payload in [b"2", b"3", b"4"] {
+			published(&registry, "prices", payload).await;
+		}
 
-		assert_eq!(queued_orders(&subscriber), [2, 3]);
-		assert_eq!(dropped(&subscriber), 1);
+		assert_eq!(queued_orders(&registry, id), [2, 3]);
+		assert_eq!(dropped_of(&registry, id), Some(1));
 	}
 
 	#[tokio::test]
-	async fn admit_drop_new_keeps_the_oldest_updates() {
-		let registry = TopicRegistry::new(saturating(2, 1024, DeliveryVerdict::DropNew));
-		let subscriber = parked_under(&registry);
+	async fn disconnect_expels_the_connection_with_enhance_your_calm() {
+		let options = Saturating { capacity: 1, bytes: 1024, verdict: DeliveryVerdict::Disconnect }.options();
+		let registry = TopicRegistry::new(options);
+		let Connection { mut membership, served, client } = Connection::to(&registry, &Dial::default()).await;
+		let mut client = Holding::serve(client);
+		subscribed(membership.context().member(), "prices");
+		published(&registry, "prices", b"1").await;
+		client.took().await;
 
-		admitted(&subscriber, &registry, &[b"tick", b"tick", b"tick"]);
+		published(&registry, "prices", b"2").await;
+		published(&registry, "prices", b"3").await;
 
-		assert_eq!(queued_orders(&subscriber), [1, 2]);
-		assert_eq!(dropped(&subscriber), 1);
-	}
-
-	#[tokio::test]
-	async fn admit_disconnect_names_the_connection() {
-		let registry = TopicRegistry::new(saturating(1, 1024, DeliveryVerdict::Disconnect));
-		let subscriber = parked_under(&registry);
-
-		let outcome = admitted(&subscriber, &registry, &[b"tick", b"tick"]);
-
-		assert_eq!(outcome, Admission::Disconnect);
-		assert_eq!(queued_orders(&subscriber), [1]);
+		let reason = timeout(PATIENCE, membership.expelled()).await;
+		assert_eq!(reason.ok(), Some(GoAwayReason::EnhanceYourCalm));
+		assert_eq!(
+			registry
+				.view()
+				.subscriber_count(&"prices".parse::<Topic>().expect("the name should be a topic")),
+			0
+		);
+		drop(served);
 	}
 
 	#[tokio::test]
 	async fn an_update_past_the_byte_budget_counts_as_a_full_queue() {
-		let registry = TopicRegistry::new(saturating(32, 8, DeliveryVerdict::DropNew));
-		let subscriber = parked_under(&registry);
+		let options = Saturating { capacity: 32, bytes: 8, verdict: DeliveryVerdict::DropNew }.options();
+		let (registry, id, _member, _client, _connection) = in_flight(options, b"123456").await;
 
-		admitted(&subscriber, &registry, &[b"123456", b"abcdef"]);
+		published(&registry, "prices", b"abcdef").await;
 
-		assert_eq!(queued_orders(&subscriber), [1]);
-		assert_eq!(dropped(&subscriber), 1);
+		assert_eq!(queued_orders(&registry, id), Vec::<u64>::new());
+		assert_eq!(dropped_of(&registry, id), Some(1));
 	}
 
 	#[tokio::test]
-	async fn an_update_that_fills_the_byte_budget_exactly_is_queued() {
-		let registry = TopicRegistry::new(saturating(32, 8, DeliveryVerdict::DropNew));
-		let subscriber = parked_under(&registry);
-
-		admitted(&subscriber, &registry, &[b"12345678"]);
-
-		assert_eq!(queued_orders(&subscriber), [1]);
-		assert_eq!(dropped(&subscriber), 0);
+	async fn an_update_that_fills_the_byte_budget_exactly_is_delivered() {
+		let options = Saturating { capacity: 32, bytes: 8, verdict: DeliveryVerdict::DropNew }.options();
+		let (registry, id, _member, _client, _connection) = in_flight(options, b"12345678").await;
+		assert_eq!(dropped_of(&registry, id), Some(0));
 	}
 
 	#[tokio::test]
 	async fn drop_oldest_frees_the_byte_budget_for_the_new_update() {
-		let registry = TopicRegistry::new(saturating(32, 8, DeliveryVerdict::DropOldest));
-		let subscriber = parked_under(&registry);
+		let options = Saturating { capacity: 32, bytes: 12, verdict: DeliveryVerdict::DropOldest }.options();
+		let (registry, id, _member, _client, _connection) = in_flight(options, b"123456").await;
 
-		admitted(&subscriber, &registry, &[b"123456", b"abcdef"]);
+		published(&registry, "prices", b"abcd").await;
+		published(&registry, "prices", b"5678").await;
 
-		assert_eq!(queued_orders(&subscriber), [2]);
-		assert_eq!(dropped(&subscriber), 1);
+		assert_eq!(queued_orders(&registry, id), [3]);
+		assert_eq!(dropped_of(&registry, id), Some(1));
 	}
 
 	#[tokio::test]
 	async fn drop_oldest_drops_the_new_update_when_eviction_frees_too_little() {
-		let registry = TopicRegistry::new(saturating(32, 8, DeliveryVerdict::DropOldest));
-		let budget = ConnectionBudget::new(registry.inner.options.connection_queue_bytes);
-		let holder = parked(&budget);
-		let starved = parked(&budget);
+		let options = Saturating { capacity: 32, bytes: 8, verdict: DeliveryVerdict::DropOldest }.options();
+		let (registry, _holder, member, client, _connection) = in_flight(options, b"123456").await;
+		let starved = subscribed(&member, "chat");
 
-		admitted(&holder, &registry, &[b"123456"]);
-		admitted(&starved, &registry, &[b"abcdef"]);
+		published(&registry, "chat", b"abcdef").await;
 
-		assert_eq!(queued_orders(&starved), Vec::<u64>::new());
-		assert_eq!(dropped(&starved), 1);
+		assert_eq!(queued_orders(&registry, starved), Vec::<u64>::new());
+		assert_eq!(dropped_of(&registry, starved), Some(1));
+		drop(client);
 	}
 
 	#[tokio::test]
 	async fn a_closed_lane_returns_its_octets_to_the_budget() {
-		let registry = TopicRegistry::new(saturating(32, 8, DeliveryVerdict::DropNew));
-		let budget = ConnectionBudget::new(registry.inner.options.connection_queue_bytes);
-		let leaving = parked(&budget);
-		let staying = parked(&budget);
+		let options = Saturating { capacity: 32, bytes: 10, verdict: DeliveryVerdict::DropNew }.options();
+		let (registry, _leaving, member, mut client, _connection) = in_flight(options, b"12").await;
+		let staying = subscribed(&member, "chat");
+		published(&registry, "prices", b"123456").await;
 
-		admitted(&leaving, &registry, &[b"123456"]);
-		leaving.close();
-		admitted(&staying, &registry, &[b"abcdef"]);
+		member
+			.unsubscribe(&"prices".parse::<Topic>().expect("the name should be a topic"))
+			.await;
+		published(&registry, "chat", b"abcdef").await;
 
-		assert_eq!(queued_orders(&staying), [1]);
+		client.took().await;
+		assert_eq!(dropped_of(&registry, staying), Some(0));
 	}
 
-	#[test]
-	fn an_emit_deadline_is_above_zero() {
-		assert_eq!(EmitDeadline::new(Duration::ZERO), None);
-	}
+	#[tokio::test]
+	async fn an_emit_past_the_deadline_on_the_clock_of_the_link_ends_its_lane() {
+		let (clock, dial) = manual();
+		let options = RegistryOptions { emit_deadline: deadline(SHORT), ..RegistryOptions::default() };
+		let (registry, member, mut client, _connection) = holding_over(options, &dial).await;
+		let id = subscribed(&member, "prices");
+		published(&registry, "prices", b"tick").await;
+		client.took().await;
+		let before = dropped_of(&registry, id);
 
-	#[tokio::test(start_paused = true)]
-	async fn an_emit_past_the_deadline_ends_its_lane() {
-		let options = RegistryOptions { emit_deadline: deadline(Duration::from_secs(5)), ..RegistryOptions::default() };
-		let (registry, connection, _peer) = stalled(options);
-		let id = subscribed(&registry, connection, "prices");
-		let subscriber = Arc::downgrade(&registry.lock_state().subscribers[&id]);
-
-		published(&registry, "prices", b"tick");
-
-		let flushed = timeout(Duration::from_secs(6), registry.flushed()).await;
-		assert!(flushed.is_ok());
-		assert!(released(&subscriber).await);
-	}
-
-	#[tokio::test(start_paused = true)]
-	async fn the_emit_deadline_runs_on_the_clock_of_the_link() {
-		let clock = Arc::new(ManualClock::default());
-		let options = RegistryOptions { emit_deadline: deadline(Duration::from_secs(5)), ..RegistryOptions::default() };
-		let (registry, connection, _peer) = stalled_on(options, MemoryLink::new(Arc::clone(&clock) as Arc<dyn Clock>));
-		let id = subscribed(&registry, connection, "prices");
-
-		published(&registry, "prices", b"tick");
-		sleep(Duration::from_secs(60)).await;
-
-		let before = registry.view().dropped(id);
-
-		clock.advance(Duration::from_secs(6));
+		clock.advance(SHORT + Duration::from_secs(1));
 		settled(&registry).await;
 
 		assert_eq!(before, Some(0));
-		assert_eq!(registry.view().dropped(id), None);
+		assert_eq!(dropped_of(&registry, id), None);
 	}
 
-	#[tokio::test(start_paused = true)]
-	async fn an_emit_past_the_deadline_unregisters_its_subscription() {
-		let options = RegistryOptions { emit_deadline: deadline(Duration::from_secs(5)), ..RegistryOptions::default() };
-		let (registry, connection, _peer) = stalled(options);
-		let lapsed = subscribed(&registry, connection, "prices");
+	#[tokio::test]
+	async fn an_emit_past_the_deadline_expels_its_connection() {
+		let (clock, dial) = manual();
+		let options = RegistryOptions { emit_deadline: deadline(SHORT), ..RegistryOptions::default() };
+		let registry = TopicRegistry::new(options);
+		let Connection { mut membership, served, client } = Connection::to(&registry, &dial).await;
+		let mut client = Holding::serve(client);
+		let member = membership.context().member().clone();
+		subscribed(&member, "prices");
+		subscribed(&member, "chat");
+		published(&registry, "prices", b"tick").await;
+		client.took().await;
 
-		published(&registry, "prices", b"tick");
+		clock.advance(SHORT + Duration::from_secs(1));
 
-		let flushed = timeout(Duration::from_secs(6), registry.flushed()).await;
-		let renewed = subscribed(&registry, connection, "prices");
-		assert!(flushed.is_ok());
-		assert_eq!(registry.view().dropped(lapsed), None);
-		assert_ne!(lapsed, renewed);
+		let reason = timeout(PATIENCE, membership.expelled()).await;
+		let renewed = member.subscribe("prices".parse::<Topic>().expect("the name should be a topic"));
+		assert_eq!(reason.ok(), Some(GoAwayReason::EnhanceYourCalm));
+		assert_eq!(renewed, Err(RegisterError::UnknownConnection));
+		assert_eq!(
+			registry
+				.view()
+				.subscriber_count(&"chat".parse::<Topic>().expect("the name should be a topic")),
+			0
+		);
+		drop(served);
+	}
+
+	#[tokio::test]
+	async fn an_emit_of_the_application_ends_at_the_emit_deadline() {
+		let (clock, dial) = manual();
+		let options = RegistryOptions { emit_deadline: deadline(SHORT), ..RegistryOptions::default() };
+		let registry = TopicRegistry::new(options);
+		let admitted = Admitted::over(&registry, &dial).await;
+		let notice = OpaqueFrame { id: "notice", order: 1, payload: b"ping" }.build();
+		let notice = notice.expect("the notice builds");
+
+		let mut emitted = pin!(admitted.context().emitter().until_settled(&notice));
+		let parked = waits(emitted.as_mut()).await;
+		clock.advance(SHORT + Duration::from_secs(1));
+
+		let settled = timeout(PATIENCE, emitted).await;
+		assert!(parked);
+		assert!(matches!(settled, Ok(Err(_))));
 	}
 
 	#[tokio::test]
 	async fn a_stale_retirement_spares_a_newer_subscription() {
-		let (registry, connection, _peer) = registered(RegistryOptions::default());
-		let stale = subscribed(&registry, connection, "prices");
-		registry.unregister(connection, &Topic::fixture("prices"));
+		let (registry, member, _peer) = registered(RegistryOptions::default()).await;
+		let stale = subscribed(&member, "prices");
+		member
+			.unsubscribe(&"prices".parse::<Topic>().expect("the name should be a topic"))
+			.await;
 
-		let fresh = subscribed(&registry, connection, "prices");
+		let fresh = subscribed(&member, "prices");
 
-		registry.inner.retire(connection, &Topic::fixture("prices"), stale);
+		registry.inner().retire(
+			member.connection,
+			&"prices".parse::<Topic>().expect("the name should be a topic"),
+			stale,
+		);
 
-		let held = subscribed(&registry, connection, "prices");
+		let held = subscribed(&member, "prices");
 		assert_eq!(held, fresh);
-		assert_eq!(registry.view().subscriber_count(&Topic::fixture("prices")), 1);
+		assert_eq!(
+			registry
+				.view()
+				.subscriber_count(&"prices".parse::<Topic>().expect("the name should be a topic")),
+			1
+		);
 	}
 
 	#[tokio::test]
 	async fn a_completed_subscription_leaves_the_registry() {
 		let accepting = TransitStatus::Ok;
-		let (registry, connection, _peer) = answering(RegistryOptions::default(), MuxSettings::symmetric(4), accepting);
-		let id = subscribed(&registry, connection, "prices");
+		let (registry, member, _peer) =
+			answering(RegistryOptions::default(), MuxSettings::symmetric(4), accepting).await;
+		let id = subscribed(&member, "prices");
 
-		quiesced(&registry);
+		completed(&registry).await;
 		settled(&registry).await;
 
-		assert_eq!(registry.view().dropped(id), None);
+		assert_eq!(dropped_of(&registry, id), None);
 	}
 
 	#[tokio::test]
 	async fn a_peer_refusal_counts_the_update_and_the_lane_continues() {
 		let refusing = TransitStatus::ResourceExhausted;
-		let (registry, connection, _peer) = answering(RegistryOptions::default(), MuxSettings::symmetric(4), refusing);
-		let id = subscribed(&registry, connection, "prices");
+		let (registry, member, _peer) =
+			answering(RegistryOptions::default(), MuxSettings::symmetric(4), refusing).await;
+		let id = subscribed(&member, "prices");
 
-		published(&registry, "prices", b"one");
-		published(&registry, "prices", b"two");
+		published(&registry, "prices", b"one").await;
+		published(&registry, "prices", b"two").await;
 
-		let flushed = timeout(DEADLINE, registry.flushed()).await;
-		assert!(flushed.is_ok());
-		assert_eq!(registry.view().dropped(id), Some(2));
+		settled(&registry).await;
+		assert_eq!(dropped_of(&registry, id), Some(2));
 	}
 
 	#[tokio::test]
 	async fn an_update_past_the_session_budget_counts_and_the_lane_continues() {
 		let unfunded = MuxSettings::symmetric(4).with_send_budget(Some(0));
-		let (registry, connection, _peer) = answering(RegistryOptions::default(), unfunded, TransitStatus::Ok);
-		let id = subscribed(&registry, connection, "prices");
+		let (registry, member, _peer) = answering(RegistryOptions::default(), unfunded, TransitStatus::Ok).await;
+		let id = subscribed(&member, "prices");
 
-		published(&registry, "prices", b"one");
-		published(&registry, "prices", b"two");
+		published(&registry, "prices", b"one").await;
+		published(&registry, "prices", b"two").await;
 
-		let flushed = timeout(DEADLINE, registry.flushed()).await;
-		assert!(flushed.is_ok());
-		assert_eq!(registry.view().dropped(id), Some(2));
+		settled(&registry).await;
+		assert_eq!(dropped_of(&registry, id), Some(2));
 	}
 
 	#[tokio::test]
 	async fn a_delivered_update_returns_its_octets_to_the_budget() {
-		let options = saturating(32, 8, DeliveryVerdict::DropNew);
-		let (registry, connection, _peer) = answering(options, MuxSettings::symmetric(4), TransitStatus::Ok);
-		let id = subscribed(&registry, connection, "prices");
+		let options = Saturating { capacity: 32, bytes: 8, verdict: DeliveryVerdict::DropNew }.options();
+		let (registry, member, _peer) = answering(options, MuxSettings::symmetric(4), TransitStatus::Ok).await;
+		let id = subscribed(&member, "prices");
 
-		published(&registry, "prices", b"123456");
+		published(&registry, "prices", b"123456").await;
 		settled(&registry).await;
-		published(&registry, "prices", b"abcdef");
+		published(&registry, "prices", b"abcdef").await;
 		settled(&registry).await;
 
-		assert_eq!(registry.view().dropped(id), Some(0));
+		assert_eq!(dropped_of(&registry, id), Some(0));
 	}
 
 	#[tokio::test]
 	async fn a_counter_whose_last_member_left_makes_room_for_a_new_topic() {
 		let backplane: Arc<dyn Backplane> = Arc::new(Local::default().with_max_topics(count(1)));
-		let (registry, connection, _peer) = registered(RegistryOptions { backplane, ..RegistryOptions::default() });
+		let (registry, member, _peer) = registered(RegistryOptions { backplane, ..RegistryOptions::default() }).await;
 
-		subscribed(&registry, connection, "prices");
-		registry.unregister(connection, &Topic::fixture("prices"));
-		published(&registry, "prices", b"tick");
+		subscribed(&member, "prices");
+		member
+			.unsubscribe(&"prices".parse::<Topic>().expect("the name should be a topic"))
+			.await;
+		published(&registry, "prices", b"tick").await;
 
-		let outcome = registry.publish(&Topic::fixture("chat"), b"hello");
+		let outcome = registry
+			.publish(&"chat".parse::<Topic>().expect("the name should be a topic"), b"hello")
+			.await;
 		assert!(outcome.is_ok());
 	}
 
-	/// Subscribe `connection` to each of `names` and publish once to each, so
+	/// Subscribe `member` to each of `names` and publish once to each, so
 	/// every counted topic of the backplane has a member.
-	fn crowded(registry: &TopicRegistry, connection: ConnectionId, names: &[&str]) {
+	async fn crowded(registry: &TopicRegistry, member: &Member, names: &[&str]) {
 		for name in names {
-			subscribed(registry, connection, name);
-			published(registry, name, b"tick");
+			subscribed(member, name);
+			published(registry, name, b"tick").await;
 		}
 	}
 
@@ -2101,15 +2490,21 @@ mod tests {
 	#[tokio::test]
 	async fn a_topic_that_loses_its_last_member_after_a_refusal_makes_room() {
 		let backplane: Arc<dyn Backplane> = Arc::new(Local::default().with_max_topics(count(3)));
-		let (registry, connection, _peer) = registered(RegistryOptions { backplane, ..RegistryOptions::default() });
+		let (registry, member, _peer) = registered(RegistryOptions { backplane, ..RegistryOptions::default() }).await;
 
-		crowded(&registry, connection, &FULL);
+		crowded(&registry, &member, &FULL).await;
 
-		let refused = registry.publish(&Topic::fixture("sports"), b"hello");
+		let refused = registry
+			.publish(&"sports".parse::<Topic>().expect("the name should be a topic"), b"hello")
+			.await;
 
-		registry.unregister(connection, &Topic::fixture("prices"));
+		member
+			.unsubscribe(&"prices".parse::<Topic>().expect("the name should be a topic"))
+			.await;
 
-		let outcome = registry.publish(&Topic::fixture("sports"), b"hello");
+		let outcome = registry
+			.publish(&"sports".parse::<Topic>().expect("the name should be a topic"), b"hello")
+			.await;
 		assert!(matches!(refused, Err(PublishError::TopicLimit)));
 		assert!(outcome.is_ok());
 	}
@@ -2119,15 +2514,47 @@ mod tests {
 		let backplane = Arc::new(Local::default().with_max_topics(count(3)));
 		let shared = Arc::clone(&backplane) as Arc<dyn Backplane>;
 		let options = RegistryOptions { backplane: shared, ..RegistryOptions::default() };
-		let (registry, connection, _peer) = registered(options);
+		let (registry, member, _peer) = registered(options).await;
 
-		crowded(&registry, connection, &FULL);
+		crowded(&registry, &member, &FULL).await;
 
-		let refused = registry.publish(&Topic::fixture("sports"), b"hello");
+		let refused = registry
+			.publish(&"sports".parse::<Topic>().expect("the name should be a topic"), b"hello")
+			.await;
 
 		drop(registry);
 
-		let outcome = backplane.publish(&Topic::fixture("sports"), b"hello");
+		let outcome = backplane
+			.publish(&"sports".parse::<Topic>().expect("the name should be a topic"), b"hello")
+			.await;
+		assert!(matches!(refused, Err(PublishError::TopicLimit)));
+		assert!(outcome.is_ok());
+	}
+
+	#[tokio::test]
+	async fn an_expulsion_during_a_delivery_frees_the_counters_it_vacates() {
+		let backplane: Arc<dyn Backplane> = Arc::new(Local::default().with_max_topics(count(2)));
+		let saturating = Saturating { capacity: 1, bytes: 1024, verdict: DeliveryVerdict::Disconnect }.options();
+		let options = RegistryOptions { backplane, ..saturating };
+		let (registry, member, mut client, _connection) = holding(options).await;
+
+		subscribed(&member, "prices");
+		subscribed(&member, "chat");
+		published(&registry, "chat", b"one").await;
+		client.took().await;
+		published(&registry, "prices", b"one").await;
+		client.took().await;
+
+		let refused = registry
+			.publish(&"sports".parse::<Topic>().expect("the name should be a topic"), b"hello")
+			.await;
+
+		published(&registry, "prices", b"two").await;
+		published(&registry, "prices", b"three").await;
+
+		let outcome = registry
+			.publish(&"news".parse::<Topic>().expect("the name should be a topic"), b"hello")
+			.await;
 		assert!(matches!(refused, Err(PublishError::TopicLimit)));
 		assert!(outcome.is_ok());
 	}
@@ -2140,11 +2567,11 @@ mod tests {
 			self.0.attach(sink);
 		}
 
-		fn publish(&self, topic: &Topic, payload: &[u8]) -> Result<(), PublishError> {
+		fn publish<'a>(&'a self, topic: &'a Topic, payload: &'a [u8]) -> MaybeSendFuture<'a, Result<(), PublishError>> {
 			self.0.publish(topic, payload)
 		}
 
-		fn last_order(&self, topic: &Topic) -> u64 {
+		fn last_order<'a>(&'a self, topic: &'a Topic) -> MaybeSendFuture<'a, u64> {
 			self.0.last_order(topic)
 		}
 
@@ -2155,122 +2582,118 @@ mod tests {
 	async fn a_wrapper_that_drops_vacancy_reports_still_frees_counters() {
 		let local = Local::default().with_max_topics(count(1));
 		let backplane: Arc<dyn Backplane> = Arc::new(Forgetful(local));
-		let (registry, connection, _peer) = registered(RegistryOptions { backplane, ..RegistryOptions::default() });
+		let (registry, member, _peer) = registered(RegistryOptions { backplane, ..RegistryOptions::default() }).await;
 
-		crowded(&registry, connection, &["prices"]);
+		crowded(&registry, &member, &["prices"]).await;
 
-		let refused = registry.publish(&Topic::fixture("chat"), b"hello");
+		let refused = registry
+			.publish(&"chat".parse::<Topic>().expect("the name should be a topic"), b"hello")
+			.await;
 
-		registry.unregister(connection, &Topic::fixture("prices"));
+		member
+			.unsubscribe(&"prices".parse::<Topic>().expect("the name should be a topic"))
+			.await;
 
-		let outcome = registry.publish(&Topic::fixture("chat"), b"hello");
+		let outcome = registry
+			.publish(&"chat".parse::<Topic>().expect("the name should be a topic"), b"hello")
+			.await;
 		assert!(matches!(refused, Err(PublishError::TopicLimit)));
 		assert!(outcome.is_ok());
 	}
 
-	/// Answers every unary stream with an empty `Ok`.
-	struct Accepting;
-
-	impl MuxDispatch for Accepting {
-		async fn unary(&self, _frame: Arc<Frame>) -> TransportResult<ResponsePackage> {
-			Ok(ResponsePackage::new(TransitStatus::Ok, None))
-		}
-	}
-
 	#[tokio::test]
 	async fn a_dropped_expulsion_sender_never_drains_the_connection() {
-		let link = MemoryLink::default();
-		let (served, client) = served_over(&link, MuxSettings::symmetric(4));
 		let registry = TopicRegistry::default();
-		let mut membership = registry.admit(&served);
+		let Connection { mut membership, served, client } = Connection::to(&registry, &Dial::default()).await;
 
 		drop(registry);
 
-		let serving = tokio::spawn(async move { served.serve(Accepting, membership.expelled()).await });
+		let mut serving = JoinSet::new();
+		serving.spawn(async move { served.serve_dispatch(Accepting, membership.expelled()).await });
+
 		let probe = OpaqueFrame { id: "probe", order: 1, payload: b"ping" }.build();
 		let probe = probe.expect("the probe builds");
-		let emitted = client.handle.emit_on_stream(&probe);
-		let answered = timeout(DEADLINE, emitted).await;
-		serving.abort();
 
+		let emitted = client.handle.emit_on_stream(&probe);
+		let answered = timeout(PATIENCE, emitted).await;
 		assert!(matches!(answered, Ok(Ok(None))));
 		assert_eq!(client.handle.goaway_reason(), None);
 	}
 
-	/// Reads live membership from inside `on_full`, as a policy that
-	/// weighs the audience of a topic does, then drops the new update.
-	#[derive(Default)]
-	struct Inspecting {
-		seen: OnceLock<usize>,
-	}
+	/// Disconnects a connection whose topic has a subscriber, as the
+	/// registry counts it from inside `on_full`, and drops the update
+	/// otherwise.
+	struct DisconnectWhileSubscribed;
 
-	impl DeliveryPolicy for Inspecting {
+	impl DeliveryPolicy for DisconnectWhileSubscribed {
 		fn on_full(&self, registry: RegistryView<'_>, topic: &Topic, _dropped_so_far: u64) -> DeliveryVerdict {
-			let _ = self.seen.set(registry.subscriber_count(topic));
+			if registry.subscriber_count(topic) > 0 {
+				return DeliveryVerdict::Disconnect;
+			}
+
 			DeliveryVerdict::DropNew
 		}
 	}
 
-	/// A fresh [`Inspecting`] policy, and `options` under it.
-	fn inspected(options: RegistryOptions) -> (Arc<Inspecting>, RegistryOptions) {
-		let policy = Arc::new(Inspecting::default());
-		let delivery = Arc::clone(&policy) as Arc<dyn DeliveryPolicy>;
-		(policy, RegistryOptions { delivery, ..options })
-	}
-
 	#[tokio::test]
 	async fn a_registry_drops_while_a_policy_and_a_backplane_are_attached() {
-		let (_policy, options) = inspected(RegistryOptions::default());
+		let delivery: Arc<dyn DeliveryPolicy> = Arc::new(DisconnectWhileSubscribed);
 		let backplane: Arc<dyn Backplane> = Arc::new(Forgetful(Local::default()));
-		let (registry, connection, _peer) = registered(RegistryOptions { backplane, ..options });
-		let id = subscribed(&registry, connection, "prices");
-		let subscriber = Arc::downgrade(&registry.lock_state().subscribers[&id]);
+		let options = RegistryOptions { delivery, backplane, ..RegistryOptions::default() };
+		let (registry, member, _peer) = registered(options).await;
+		subscribed(&member, "prices");
 
-		drop(registry);
-
-		assert!(released(&subscriber).await);
+		let backlog = Arc::clone(&registry.inner().backlog);
+		assert!(backlog_gone(backlog, registry).await);
 	}
 
 	#[tokio::test]
 	async fn a_delivery_policy_may_call_back_into_the_registry() {
-		let (policy, options) = inspected(RegistryOptions { queue_capacity: count(1), ..RegistryOptions::default() });
-		let (registry, connection, _peer) = stalled(options);
-		subscribed(&registry, connection, "prices");
-		published(&registry, "prices", b"one");
-		yield_now().await;
-		published(&registry, "prices", b"two");
+		let delivery: Arc<dyn DeliveryPolicy> = Arc::new(DisconnectWhileSubscribed);
+		let options = RegistryOptions { queue_capacity: count(1), delivery, ..RegistryOptions::default() };
+		let registry = TopicRegistry::new(options);
+		let Connection { mut membership, served, client } = Connection::to(&registry, &Dial::default()).await;
+		let mut client = Holding::serve(client);
 
-		let publisher = registry.clone();
-		let full = spawn_blocking(move || publisher.publish(&Topic::fixture("prices"), b"three"));
-		let joined = timeout(DEADLINE, full).await;
-		assert!(joined.is_ok());
-		assert_eq!(policy.seen.get(), Some(&1));
+		subscribed(membership.context().member(), "prices");
+		published(&registry, "prices", b"one").await;
+
+		client.took().await;
+
+		published(&registry, "prices", b"two").await;
+		published(&registry, "prices", b"three").await;
+
+		let reason = timeout(PATIENCE, membership.expelled()).await;
+		assert_eq!(reason.ok(), Some(GoAwayReason::EnhanceYourCalm));
+		drop(served);
 	}
 
 	#[tokio::test]
 	async fn publish_stamps_dense_per_topic_orders() {
-		let (registry, connection, _peer) = registered(RegistryOptions::default());
-		subscribed(&registry, connection, "prices");
-		subscribed(&registry, connection, "chat");
+		let (registry, member, _peer) = registered(RegistryOptions::default()).await;
+		subscribed(&member, "prices");
+		subscribed(&member, "chat");
 
-		published(&registry, "prices", b"one");
-		published(&registry, "prices", b"two");
-		published(&registry, "chat", b"hello");
+		published(&registry, "prices", b"one").await;
+		published(&registry, "prices", b"two").await;
+		published(&registry, "chat", b"hello").await;
 
-		assert_eq!(last_order(&registry, "prices"), 2);
-		assert_eq!(last_order(&registry, "chat"), 1);
+		assert_eq!(last_order(&registry, "prices").await, 2);
+		assert_eq!(last_order(&registry, "chat").await, 1);
 	}
 
 	#[tokio::test]
-	async fn quiesce_refuses_further_registration_and_publish() {
-		let (registry, connection, _peer) = registered(RegistryOptions::default());
+	async fn a_completed_registry_refuses_further_registration_and_publish() {
+		let (registry, member, _peer) = registered(RegistryOptions::default()).await;
 
-		subscribed(&registry, connection, "prices");
+		subscribed(&member, "prices");
 
-		let signaled = quiesced(&registry);
-		let again = quiesced(&registry);
-		let refused = registry.register(connection, Topic::fixture("chat"));
-		let late = registry.publish(&Topic::fixture("prices"), b"tick");
+		let signaled = completed(&registry).await;
+		let again = completed(&registry).await;
+		let refused = member.subscribe("chat".parse::<Topic>().expect("the name should be a topic"));
+		let late = registry
+			.publish(&"prices".parse::<Topic>().expect("the name should be a topic"), b"tick")
+			.await;
 		assert_eq!(signaled, 1);
 		assert_eq!(again, 0);
 		assert!(matches!(refused, Err(RegisterError::Draining)));
@@ -2278,197 +2701,116 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn quiesce_burns_no_order() {
-		let (registry, connection, _peer) = registered(RegistryOptions::default());
-		subscribed(&registry, connection, "prices");
-		published(&registry, "prices", b"tick");
-		assert_eq!(quiesced(&registry), 1);
-		assert_eq!(last_order(&registry, "prices"), 1);
+	async fn a_drain_dismisses_every_connection_with_shutdown() {
+		let registry = TopicRegistry::default();
+		let Connection { mut membership, served, client } = Connection::to(&registry, &Dial::default()).await;
+
+		let drained = registry.drain().await;
+
+		let reason = timeout(PATIENCE, membership.expelled()).await;
+		assert!(matches!(drained, Ok(Drained { completed: 0, dismissed: 1 })));
+		assert_eq!(reason.ok(), Some(GoAwayReason::Shutdown));
+		drop((served, client));
 	}
 
 	#[tokio::test]
-	async fn quiesce_leaves_sibling_orders_dense() {
+	async fn a_repeat_drain_completes_and_dismisses_nothing() {
+		let (registry, _member, _peer) = registered(RegistryOptions::default()).await;
+		registry.drain().await.expect("the first drain completes");
+
+		let repeated = registry.drain().await;
+		assert!(matches!(repeated, Ok(Drained { completed: 0, dismissed: 0 })));
+	}
+
+	#[tokio::test]
+	async fn a_connection_admitted_after_a_drain_is_dismissed_at_once() {
+		let registry = TopicRegistry::default();
+		registry.drain().await.expect("a drain with no topic completes");
+
+		let Connection { mut membership, served, client } = Connection::to(&registry, &Dial::default()).await;
+
+		let reason = timeout(PATIENCE, membership.expelled()).await;
+		assert_eq!(reason.ok(), Some(GoAwayReason::Shutdown));
+		drop((served, client));
+	}
+
+	#[tokio::test]
+	async fn a_drain_burns_no_order() {
+		let (registry, member, _peer) = registered(RegistryOptions::default()).await;
+		subscribed(&member, "prices");
+		published(&registry, "prices", b"tick").await;
+		assert_eq!(completed(&registry).await, 1);
+		assert_eq!(last_order(&registry, "prices").await, 1);
+	}
+
+	#[tokio::test]
+	async fn a_drain_leaves_sibling_orders_dense() {
 		let backplane = Arc::new(Local::default());
 		let options = || RegistryOptions {
 			backplane: Arc::clone(&backplane) as Arc<dyn Backplane>,
 			..RegistryOptions::default()
 		};
 
-		let (alpha, alpha_connection, _alpha_peer) = registered(options());
-		let (beta, beta_connection, _beta_peer) = registered(options());
-		subscribed(&alpha, alpha_connection, "prices");
-		subscribed(&beta, beta_connection, "prices");
-		published(&alpha, "prices", b"tick");
-		assert_eq!(quiesced(&alpha), 1);
+		let (alpha, alpha_member, _alpha_peer) = registered(options()).await;
+		let (beta, beta_member, _beta_peer) = registered(options()).await;
+		subscribed(&alpha_member, "prices");
+		subscribed(&beta_member, "prices");
+		published(&alpha, "prices", b"tick").await;
 
-		published(&beta, "prices", b"tock");
+		assert_eq!(completed(&alpha).await, 1);
 
-		assert_eq!(backplane.last_order(&Topic::fixture("prices")), 2);
+		published(&beta, "prices", b"tock").await;
+
+		assert_eq!(
+			backplane
+				.last_order(&"prices".parse::<Topic>().expect("the name should be a topic"))
+				.await,
+			2
+		);
 	}
 
 	#[tokio::test]
-	async fn quiesce_and_publish_do_not_deadlock() {
-		let (registry, connection, _peer) = registered(RegistryOptions::default());
-		subscribed(&registry, connection, "prices");
+	async fn a_drain_waits_for_a_publish_in_flight() {
+		let (registry, member, mut client, _connection) = holding(RegistryOptions::default()).await;
+		subscribed(&member, "prices");
+		published(&registry, "prices", b"tick").await;
+		client.took().await;
 
-		let publisher = registry.clone();
-		let publish = spawn_blocking(move || {
-			for _ in 0..64 {
-				let _ = publisher.publish(&Topic::fixture("prices"), b"x");
-			}
-		});
+		let mut draining = pin!(registry.drain());
+		let parked = waits(draining.as_mut()).await;
+		client.answers.add_permits(2);
 
-		yield_now().await;
-		assert!(registry.quiesce().is_ok());
-
-		timeout(Duration::from_secs(2), publish)
-			.await
-			.expect("quiesce and publish must not deadlock")
-			.expect("the publisher task must join");
+		let drained = timeout(PATIENCE, draining).await;
+		assert!(parked, "the drain should wait for the update in flight");
+		assert!(matches!(drained, Ok(Ok(Drained { completed: 1, dismissed: 1 }))));
 	}
-
-	/// How long a case lets a second quiesce reach a drain in flight before
-	/// that drain settles.
-	const ARRIVAL: Duration = Duration::from_millis(50);
 
 	/// Begin a drain of `registry`, expecting a live registry.
-	fn begun(registry: &TopicRegistry) -> Draining<'_> {
-		registry.begin_drain().expect("a live registry should begin its drain")
-	}
-
-	/// Refuse every end frame: the fault a case injects, because every topic
-	/// and order build one.
-	fn refusing(_topic: &Topic, _order: u64) -> Result<Frame, TightBeamError> {
-		let encoding = DerError::from(ErrorKind::Failed);
-		Err(encoding.into())
-	}
-
-	/// Begin a drain of `registry`, and cancel it with a refused end frame.
-	fn cancelled(registry: &TopicRegistry) {
-		let refused = begun(registry).end_frames_by(refusing);
-		refused.err().expect("the refused end frame should cancel the drain");
-	}
-
-	/// A backplane that wraps [`Local`] and panics on its first read of a
-	/// last order: a user backplane can fail inside a drain this way, and no
-	/// shipped backplane does.
-	struct PanicsOnce {
-		local: Local,
-		armed: AtomicBool,
-	}
-
-	impl Backplane for PanicsOnce {
-		fn attach(&self, sink: NodeSink) {
-			self.local.attach(sink);
-		}
-
-		fn publish(&self, topic: &Topic, payload: &[u8]) -> Result<(), PublishError> {
-			self.local.publish(topic, payload)
-		}
-
-		fn last_order(&self, topic: &Topic) -> u64 {
-			let armed = self.armed.swap(false, Ordering::Relaxed);
-			if armed {
-				panic!("the backplane fails inside the drain");
-			}
-
-			self.local.last_order(topic)
-		}
-
-		fn vacated(&self, topic: &Topic) {
-			self.local.vacated(topic);
-		}
-	}
-
-	/// A registry over a backplane that panics once, with one connection
-	/// subscribed to `prices`.
-	fn panicking() -> (TopicRegistry, ConnectionId, impl Sized) {
-		let faulty = PanicsOnce { local: Local::default(), armed: AtomicBool::new(true) };
-		let backplane: Arc<dyn Backplane> = Arc::new(faulty);
-		let (registry, connection, peer) = registered(RegistryOptions { backplane, ..RegistryOptions::default() });
-		subscribed(&registry, connection, "prices");
-
-		(registry, connection, peer)
-	}
-
-	/// Quiesce `registry` through a drain that panics, expecting the panic.
-	fn panicked(registry: &TopicRegistry) {
-		let quiesce = AssertUnwindSafe(|| registry.quiesce());
-		let unwound = catch_unwind(quiesce);
-		unwound.expect_err("the drain should panic");
+	async fn begun(registry: &TopicRegistry) -> Draining<'_> {
+		let begun = registry.begin_drain().await;
+		begun.expect("a live registry should begin its drain")
 	}
 
 	#[tokio::test]
 	async fn a_subscribe_during_a_drain_is_refused() {
-		let (registry, connection, _peer) = registered(RegistryOptions::default());
-		let _draining = begun(&registry);
+		let (registry, member, _peer) = registered(RegistryOptions::default()).await;
+		let _draining = begun(&registry).await;
 
-		let refused = registry.register(connection, Topic::fixture("prices"));
+		let refused = member.subscribe("prices".parse::<Topic>().expect("the name should be a topic"));
 		assert!(matches!(refused, Err(RegisterError::Draining)));
 	}
 
 	#[tokio::test]
-	async fn a_quiesce_whose_end_frame_fails_cancels_its_drain() {
-		let (registry, connection, _peer) = registered(RegistryOptions::default());
-		subscribed(&registry, connection, "prices");
+	async fn a_drain_that_unwinds_before_it_completes_leaves_the_registry_live() {
+		let (registry, member, _peer) = registered(RegistryOptions::default()).await;
+		subscribed(&member, "prices");
 
-		let refused = begun(&registry).end_frames_by(refusing);
-		assert!(refused.is_err());
-		assert!(!registry.view().is_draining());
-	}
+		let draining = begun(&registry).await;
+		drop(draining);
 
-	#[tokio::test]
-	async fn a_cancelled_drain_accepts_subscribes_again() {
-		let (registry, connection, _peer) = registered(RegistryOptions::default());
-		subscribed(&registry, connection, "prices");
-		cancelled(&registry);
-
-		let resubscribed = registry.register(connection, Topic::fixture("chat"));
+		let resubscribed = member.subscribe("chat".parse::<Topic>().expect("the name should be a topic"));
+		let retried = registry.complete().await;
 		assert!(resubscribed.is_ok());
-	}
-
-	#[tokio::test]
-	async fn a_quiesce_during_a_cancelled_drain_reports_not_drained() {
-		let (registry, connection, _peer) = registered(RegistryOptions::default());
-		subscribed(&registry, connection, "prices");
-		let draining = begun(&registry);
-
-		let waiting = registry.clone();
-		let mut second = spawn_blocking(move || waiting.quiesce());
-		let early = timeout(ARRIVAL, &mut second).await;
-		let refused = draining.end_frames_by(refusing);
-		let answered = timeout(DEADLINE, second).await;
-		assert!(early.is_err());
-		assert!(refused.is_err());
-		assert!(matches!(answered, Ok(Ok(Ok(1)))));
-	}
-
-	#[tokio::test]
-	async fn a_drain_dropped_by_a_panic_leaves_the_registry_live() {
-		let (registry, connection, _peer) = panicking();
-		panicked(&registry);
-
-		let resubscribed = registry.register(connection, Topic::fixture("chat"));
-		assert!(resubscribed.is_ok());
-	}
-
-	#[tokio::test]
-	async fn a_retry_after_a_panicked_drain_completes_every_topic() {
-		let (registry, connection, _peer) = panicking();
-		subscribed(&registry, connection, "chat");
-		panicked(&registry);
-
-		let retried = registry.quiesce();
 		assert!(matches!(retried, Ok(2)));
-	}
-
-	#[tokio::test]
-	async fn a_repeat_after_a_recovered_drain_signals_nobody() {
-		let (registry, _connection, _peer) = panicking();
-		panicked(&registry);
-		quiesced(&registry);
-
-		let repeated = registry.quiesce();
-		assert!(matches!(repeated, Ok(0)));
 	}
 }

@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
-# pubsub contribution to the shared e2e stack. Declares the demo-server port,
-# its queue bound, the processed topic seal, and this extension's compose
-# file. The env file derives an X_ENDPOINT for every X_HOST_PORT key.
+# The pubsub contribution to the shared e2e stack, which scripts/env.sh reads.
 
 # Preferred host ports for the pubsub demo servers (plain, and the one
 # publishing through the processor servlet). Replaced by OS ports if in use.
-# The processor itself never gets a host port.
+# The processor itself listens on the compose network alone.
 : "${PREFERRED_PUBSUB_WS_PORT:=9110}"
 : "${PREFERRED_PUBSUB_PROCESSED_WS_PORT:=9112}"
+
+# The port that each demo server listens on inside its container.
+: "${PUBSUB_WS_PORT:=9110}"
+
+# The port that the processor servlet listens on inside its container.
+: "${PUBSUB_PROCESSOR_PORT:=9111}"
 
 # Per-subscriber queue bound on the pubsub demo server. Small so the e2e
 # suite can force a DropOldest gap with a short publish burst.
@@ -29,6 +33,8 @@ STACK_PORT_SPECS+=(
 
 # Passed through to the compose environment and the env file unchanged.
 STACK_ENV_VARS+=(
+	"PUBSUB_WS_PORT"
+	"PUBSUB_PROCESSOR_PORT"
 	"PUBSUB_QUEUE_CAPACITY"
 	"PUBSUB_TOPIC_KEY"
 	"PUBSUB_TOPIC_KEY_ID"

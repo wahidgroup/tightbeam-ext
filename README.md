@@ -12,7 +12,7 @@ This repository holds the parts of tightbeam that sit beyond the core crate: the
 
 ## Extensions
 
-### [wire/](wire): Envelope wire rules
+### [wire/](wire): Envelope rules of message sockets
 
 - [tightbeam-wire](wire/tightbeam-wire): the rules that every message-oriented socket transport shares, one envelope per transport message. Published to crates.io.
 
@@ -28,18 +28,18 @@ This repository holds the parts of tightbeam that sit beyond the core crate: the
 
 ### [pubsub/](pubsub): Topic pub/sub
 
-- [tightbeam-pubsub](pubsub/tightbeam-pubsub): the server-side topic registry over the tightbeam mux. It adds no wire protocol.
+- [tightbeam-pubsub](pubsub/tightbeam-pubsub): the server-side topic registry over the tightbeam mux, which carries each subscription as a command stream of the mux.
 - [tightbeam-pubsub-client](pubsub/client): `@wahidgroup/tightbeam-pubsub-client`, typed topic subscriptions over the ws client.
 
 ### [asn/](asn): ASN.1 bridge to TypeScript
 
-- [tightbeam-asn](asn/tightbeam-asn): `#[derive(AsnCodec)]` on `der` wire types, and the `tightbeam-asn-emit` binary that writes TypeScript `MessageCodec` modules.
+- [tightbeam-asn](asn/tightbeam-asn): `#[derive(AsnCodec)]` on `der` types, and the `tightbeam-asn-emit` binary that writes TypeScript `MessageCodec` modules.
 
 ## Development
 
 ```sh
 make setup       # toolchains + npm workspaces + Playwright (idempotent)
-make lint        # rustfmt + clippy -D warnings + eslint/prettier + cspell
+make lint        # every lint check that make help lists
 make lint fix=1  # apply lint/format fixes
 make test        # cargo tests + TS units + dockerized e2e
 make build       # cargo build --release

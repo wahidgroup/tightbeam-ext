@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 
 import type { CommitmentSalt } from "#wasm";
 
-import { TightbeamWsClient } from "./index.js";
+import { Engine } from "./index.js";
 
 /**
  * Detached message commitments: commit/verify must realize a
@@ -11,7 +11,7 @@ import { TightbeamWsClient } from "./index.js";
  * `Opening` publishes.
  */
 
-const engine = await TightbeamWsClient.init();
+const engine = await Engine.load();
 
 const TEXT = new TextEncoder();
 const HASHER = engine.sha3_256;
@@ -24,12 +24,9 @@ const OTHER_SALT_OCTETS = TEXT.encode("some-other-blinding-salt");
  * The shared payload and salt of the TypeScript/Rust opening interop
  * fixture, with the commitment Rust `Opening::prove::<Sha3_256>`.
  */
-const INTEROP_BODY = engine.opaque.encode(
-	TEXT.encode("tightbeam opening interop fixture body"),
-);
+const INTEROP_BODY = engine.opaque.encode(TEXT.encode("tightbeam opening interop fixture body"));
 const INTEROP_SALT_OCTETS = TEXT.encode("opening-interop-salt");
-const INTEROP_COMMITMENT_HEX =
-	"678bec1605c349a2af6ceaa627569d31d57759ee2fbeffd2ac33026df930e04e";
+const INTEROP_COMMITMENT_HEX = "678bec1605c349a2af6ceaa627569d31d57759ee2fbeffd2ac33026df930e04e";
 
 /**
  * The interop commitment digest as bytes, for direct comparison.
@@ -70,9 +67,7 @@ describe("Opening", () => {
 		const commitment = await proving.commit(HASHER);
 		const disclosed = engine.opening(saltOf(openSalt), openBody);
 
-		await expect(disclosed.verify(HASHER, commitment)).resolves.toBe(
-			expected,
-		);
+		await expect(disclosed.verify(HASHER, commitment)).resolves.toBe(expected);
 	});
 
 	it("publishes the commitment under the hasher's algorithm OID", async () => {
@@ -87,10 +82,7 @@ describe("Opening", () => {
 	it("rejects a commitment carried under another algorithm OID", async () => {
 		const opening = engine.opening(saltOf(SALT_OCTETS), BODY);
 		const commitment = await opening.commit(HASHER);
-		const relabeled = engine.digestInfo(
-			engine.profile.zstd,
-			commitment.digest,
-		);
+		const relabeled = engine.digestInfo(engine.profile.zstd, commitment.digest);
 
 		await expect(opening.verify(HASHER, relabeled)).resolves.toBe(false);
 	});
@@ -137,9 +129,19 @@ describe("Opening", () => {
 		const salt = saltOf(SALT_OCTETS);
 		engine.opening(salt, BODY);
 
-		expect(() => engine.opening(salt, BODY)).toThrow(
-			expect.objectContaining({ code: "CommitmentSpent" }),
-		);
+		expect(() => engine.opening(salt, BODY)).toThrow(expect.objectContaining({ code: "CommitmentSpent" }));
+	});
+
+	it("a body detached before the opening leaves the salt to the retry", async () => {
+		const salt = saltOf(SALT_OCTETS);
+		const detached = new Uint8Array(BODY);
+		structuredClone(detached.buffer, { transfer: [detached.buffer] });
+		expect(() => engine.opening(salt, detached)).toThrow("detached ArrayBuffer");
+
+		const opening = engine.opening(salt, BODY);
+		const reference = engine.opening(saltOf(SALT_OCTETS), BODY);
+		const commitment = await reference.commit(HASHER);
+		await expect(opening.verify(HASHER, commitment)).resolves.toBe(true);
 	});
 
 	it("a disposed opening refuses a later call with OpeningReleased", async () => {
@@ -154,29 +156,18 @@ describe("Opening", () => {
 
 	it("refuses a salt too short to hide the body", () => {
 		const shortSalt = new Uint8Array(15);
-		expect(() => engine.salt(shortSalt)).toThrow(
-			expect.objectContaining({ code: "InvalidSaltLength" }),
-		);
+		expect(() => engine.salt(shortSalt)).toThrow(expect.objectContaining({ code: "InvalidSaltLength" }));
 	});
 
 	it("reproduces the commitment tightbeam-rs publishes over the shared fixture", async () => {
-		const opening = engine.opening(
-			saltOf(INTEROP_SALT_OCTETS),
-			INTEROP_BODY,
-		);
+		const opening = engine.opening(saltOf(INTEROP_SALT_OCTETS), INTEROP_BODY);
 		const commitment = await opening.commit(HASHER);
 		expect(commitment.digest).toEqual(INTEROP_COMMITMENT_DIGEST);
 	});
 
 	it("verifies a commitment disclosed by a tightbeam-rs prover", async () => {
-		const commitment = engine.digestInfo(
-			engine.profile.sha3_256,
-			INTEROP_COMMITMENT_DIGEST,
-		);
-		const disclosed = engine.opening(
-			saltOf(INTEROP_SALT_OCTETS),
-			INTEROP_BODY,
-		);
+		const commitment = engine.digestInfo(engine.profile.sha3_256, INTEROP_COMMITMENT_DIGEST);
+		const disclosed = engine.opening(saltOf(INTEROP_SALT_OCTETS), INTEROP_BODY);
 		await expect(disclosed.verify(HASHER, commitment)).resolves.toBe(true);
 	});
 });

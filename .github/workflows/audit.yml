@@ -10,9 +10,9 @@ on:
       - "Cargo.lock"
       - "**/Cargo.toml"
       - "rust-toolchain.toml"
-      - "ws/package.json"
-      - "ws/package-lock.json"
-      - "ws/*/package.json"
+      - ".cargo/audit.toml"
+      - "**/package.json"
+      - "**/package-lock.json"
   pull_request:
     branches: [master]
     paths:
@@ -20,9 +20,9 @@ on:
       - "Cargo.lock"
       - "**/Cargo.toml"
       - "rust-toolchain.toml"
-      - "ws/package.json"
-      - "ws/package-lock.json"
-      - "ws/*/package.json"
+      - ".cargo/audit.toml"
+      - "**/package.json"
+      - "**/package-lock.json"
   workflow_dispatch:
 
 permissions:
@@ -36,21 +36,17 @@ env:
 jobs:
   audit:
     runs-on: ubuntu-latest
+    env:
+      NPM_INSTALL_FLAGS: --ignore-scripts
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version-file: .nvmrc
-          cache: npm
-          cache-dependency-path: ws/package-lock.json
-          registry-url: https://npm.pkg.github.com
-          scope: "@wahidgroup"
+      - uses: ./.github/actions/node
 
       - name: Setup
-        run: make setup NPM_INSTALL_FLAGS=--ignore-scripts
+        run: make setup
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

@@ -1,13 +1,13 @@
 import { describe, expect, it } from "vitest";
 
 import type { MessageCodec } from "./index.js";
-import { HeldCodec, TightbeamWsClient } from "./index.js";
+import { Engine, HeldCodec } from "./index.js";
 
 /**
  * A codec held past the call that received it, on the real engine.
  */
 
-const engine = await TightbeamWsClient.init();
+const engine = await Engine.load();
 
 /**
  * The content type `id-data`, which the held codec declares.

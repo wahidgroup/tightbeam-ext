@@ -1,10 +1,5 @@
 /**
- * The typed message that the client unit tests and the e2e suites
- * round-trip: a JSON note.
- *
- * The module imports nothing, so the e2e stack and its browser apps import
- * it as the unit tests do, and each wraps {@link NotePayload} with its own
- * `MessageCodec`. Nothing under `src/testing` ships.
+ * The JSON note that the client unit tests round-trip.
  */
 
 /**

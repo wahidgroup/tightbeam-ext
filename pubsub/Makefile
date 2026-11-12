@@ -7,7 +7,7 @@
 REPO := ..
 CRATES := -p tightbeam-pubsub
 
-# The wire constants of Rust `Topic`, which the client imports at build.
+# The contract that Rust `Topic` renders, which the client imports at build.
 WIRE_CONTRACT := client/src/wire.generated.json
 
 # Cargo feature passthroughs (e.g., `make test pubsub features="testing"`).
@@ -67,7 +67,7 @@ wasm:
 	@echo "pubsub has no wasm crate; nothing to do."
 
 wire:
-	@echo "Rendering the pubsub wire contract..."
+	@echo "Rendering the pubsub command contract..."
 	cargo run --quiet $(CRATES) --example wire_contract > $(WIRE_CONTRACT)
 
 client: setup

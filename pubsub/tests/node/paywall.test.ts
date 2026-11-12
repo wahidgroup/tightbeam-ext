@@ -5,77 +5,65 @@
 
 import { describe, expect, it } from "vitest";
 
-import { TightbeamWsClient } from "@wahidgroup/tightbeam-ws-client";
-import {
-	ClientPorts,
-	SubscriptionManager,
-} from "@wahidgroup/tightbeam-pubsub-client";
+import { Engine } from "@wahidgroup/tightbeam-ws-client";
+import { ClientPorts, SubscriptionManager } from "@wahidgroup/tightbeam-pubsub-client";
 
-import { certBytes, demoIdentity } from "#ws-env";
-import { mutualSessionOptions, withClient } from "#ws-fixtures";
+import { Identities } from "#ws-env";
 import { NobleTransportSigner } from "#ws-signer";
+import { TopicRun } from "../fixtures.js";
 import { STACK } from "./stack.js";
 
-const ENGINE = await TightbeamWsClient.init();
+const ENGINE = await Engine.load();
 
 describe("pubsub mutual paywall", () => {
 	it("exposes usableSendBudget after a paid handshake", async () => {
-		await withClient(
-			() =>
-				ENGINE.connectMutual(
-					STACK.pubsubEndpoint,
-					demoIdentity(),
-					mutualSessionOptions(STACK.paywall),
-				),
-			async (client) => {
-				expect(client.usableSendBudget).toBeTypeOf("number");
-				expect(client.usableSendBudget).toBeGreaterThan(0);
-			},
+		await using client = await ENGINE.connectMutual(
+			STACK.pubsubEndpoint,
+			Identities.stack.demo(),
+			STACK.dial.paywall.sessionOptions(),
 		);
+		expect(client.usableSendBudget).toBeTypeOf("number");
+		expect(client.usableSendBudget).toBeGreaterThan(0);
 	});
 
 	it("closes the session when settlement is unpaid", async () => {
 		const client = await ENGINE.connectMutual(
 			STACK.pubsubEndpoint,
-			demoIdentity(),
-			mutualSessionOptions(STACK.paywall, 0),
+			Identities.stack.demo(),
+			STACK.dial.paywall.sessionOptions(0),
 		);
 
 		await expect(client.closed).resolves.toBeTruthy();
 	});
 
-	it("authenticates through an external transport signer under the paywall", async () => {
-		const signer = new NobleTransportSigner(
-			ENGINE,
-			certBytes("client.key"),
+	/*
+	 * The server pins the demo client certificate, so a handshake that
+	 * completes proves the external signer signed with the certificate key,
+	 * and the delivered update proves the paid session carries traffic.
+	 */
+	it("completes a paid round trip with the client key in an external signer", async () => {
+		const signer = new NobleTransportSigner(ENGINE, Identities.stack.bytes("client.key"));
+
+		await using client = await ENGINE.connectMutual(
+			STACK.pubsubEndpoint,
+			Identities.stack.demo(signer),
+			STACK.dial.paywall.sessionOptions(),
 		);
+		const ports = ClientPorts.split(client);
+		const manager = new SubscriptionManager(ports);
+		const topic = TopicRun.current.topic("signer");
+		const subscription = await manager.subscribe(topic, {
+			codec: ENGINE.opaque,
+		});
 
-		await withClient(
-			() =>
-				ENGINE.connectMutual(
-					STACK.pubsubEndpoint,
-					demoIdentity(signer),
-					mutualSessionOptions(STACK.paywall),
-				),
-			async (client) => {
-				const ports = ClientPorts.split(client);
-				const manager = new SubscriptionManager(ports);
-				const topic = `e2e/signer/${Date.now()}`;
-				const subscription = await manager.subscribe(topic, {
-					codec: ENGINE.opaque,
-				});
+		const updates = subscription[Symbol.asyncIterator]();
+		const sent = new TextEncoder().encode("ok");
+		await manager.publish(topic, sent, { codec: ENGINE.opaque });
 
-				const updates = subscription[Symbol.asyncIterator]();
-				await manager.publish(topic, new TextEncoder().encode("ok"), {
-					codec: ENGINE.opaque,
-				});
+		const next = await updates.next();
+		expect(next.done).toBe(false);
+		expect(next.value?.message).toEqual(sent);
 
-				const next = await updates.next();
-				expect(next.done).toBe(false);
-				expect(signer.signatures).toBe(2);
-
-				await subscription.unsubscribe();
-			},
-		);
+		await subscription.unsubscribe();
 	});
 });

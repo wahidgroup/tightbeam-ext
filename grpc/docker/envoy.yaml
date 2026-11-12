@@ -1,9 +1,10 @@
 # Envoy in front of the grpc work gateway: an h2c hop that routes each tunnel
 # by its :authority, configured to the hop requirements of docs/grpc.md.
 
+# The admin endpoint, which the stack publishes on host loopback alone.
 admin:
   address:
-    socket_address: { address: 127.0.0.1, port_value: 9901 }
+    socket_address: { address: 0.0.0.0, port_value: 9901 }
 
 static_resources:
   listeners:
@@ -18,7 +19,7 @@ static_resources:
                 stat_prefix: tunnel
                 codec_type: HTTP2
                 # A tunnel that runs no multiplexed keepalive stays silent up
-                # to the 30-second operation timeout of its session.
+                # to the operation_timeout of its session TransportLimits.
                 stream_idle_timeout: 300s
                 route_config:
                   virtual_hosts:
@@ -56,8 +57,8 @@ static_resources:
       typed_extension_protocol_options:
         envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
           "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
-          # The gateway closes a connection that carries no tunnel at its
-          # handshake timeout, 10 seconds by default, with no GOAWAY.
+          # The gateway closes a connection that carries no tunnel at the
+          # handshake_timeout of its TransportLimits, with no GOAWAY.
           common_http_protocol_options:
             idle_timeout: 5s
           # The gateway admits one stream per connection, and HTTP/2 refuses

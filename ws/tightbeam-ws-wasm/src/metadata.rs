@@ -1,11 +1,5 @@
-//! The labels JavaScript reads a frame's protocol version and message
-//! priority by.
-//!
-//! Each label maps both ways to the enum tightbeam defines, and each match
-//! covers every variant. A variant that tightbeam adds therefore fails to
-//! compile here until it has a label. The labels copy the wire ordinals as
-//! literal discriminants, because a `wasm-bindgen` enum takes literals, and
-//! the pin tests below hold each ordinal equal to its variant.
+//! The labels JavaScript reads a protocol version and a message priority by,
+//! as the codes section of `docs/ws-wasm.md` describes.
 
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::convert::TryFromJsValue;
@@ -18,8 +12,8 @@ use crate::fault::{JsFault, RefusalCode};
 #[cfg(target_arch = "wasm32")]
 use crate::promise::WholeNumber;
 
-/// A frame protocol version, valued by its wire ordinal. Each version admits a
-/// larger metadata field set than the one before it.
+/// A frame protocol version, valued by its encoded ordinal. Each version
+/// admits a larger metadata field set than the one before it.
 #[wasm_bindgen(js_name = Version)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VersionLabel {
@@ -57,7 +51,7 @@ impl From<VersionLabel> for Version {
 }
 
 /// A version as JavaScript passes it: a member of `Version`, which is its
-/// ordinal. A fraction never truncates to a version, so `1.5` is refused.
+/// ordinal, so a fraction such as `1.5` refuses with `InvalidVersion`.
 #[cfg(target_arch = "wasm32")]
 impl TryFrom<&JsValue> for VersionLabel {
 	type Error = JsFault;
@@ -72,7 +66,7 @@ impl TryFrom<&JsValue> for VersionLabel {
 	}
 }
 
-/// The priority of a message (V2+), valued by its wire ordinal. A higher
+/// The priority of a message (V2+), valued by its encoded ordinal. A higher
 /// ordinal requests earlier scheduling under congestion.
 #[wasm_bindgen(js_name = MessagePriority)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -105,7 +99,7 @@ impl From<MessagePriority> for PriorityLabel {
 }
 
 /// A priority as JavaScript passes it: a member of `MessagePriority`, which
-/// is its ordinal. A fraction never truncates to a priority.
+/// is its ordinal, so a fraction refuses with `InvalidPriority`.
 #[cfg(target_arch = "wasm32")]
 impl TryFrom<&JsValue> for PriorityLabel {
 	type Error = JsFault;
@@ -146,7 +140,8 @@ mod tests {
 
 	type TestResult = core::result::Result<(), Box<dyn core::error::Error>>;
 
-	// Each label carries the wire ordinal of its version, and maps back to it.
+	// Each label carries the encoded ordinal of its version, and maps back to
+	// it.
 	tb_cases! {
 		fn the_version_label_carries_the_wire_ordinal(version: Version) -> TestResult {
 			let label = VersionLabel::from(version);
@@ -162,7 +157,8 @@ mod tests {
 		}
 	}
 
-	// Each label carries the wire ordinal of its priority, and maps back to it.
+	// Each label carries the encoded ordinal of its priority, and maps back to
+	// it.
 	tb_cases! {
 		fn the_priority_label_carries_the_wire_ordinal(priority: MessagePriority) -> TestResult {
 			let label = PriorityLabel::from(priority);

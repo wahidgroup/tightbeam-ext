@@ -27,7 +27,6 @@ let listener: WsListener = WsListener::bind_cleartext("127.0.0.1:9101").await?;
 let server_handle = server! {
 	protocol WsListener: listener,
 	handle: |message: Frame| async move {
-		// Echo the frame back
 		Ok(Some(message))
 	}
 };
@@ -40,28 +39,28 @@ The listener serves in the clear here, and `bind_cleartext` says so: its connect
 
 ## Transport
 
-`WsListener` is a tightbeam protocol: it binds, accepts, and dials WebSocket connections, and its stream holds every read and write to the envelope rules of [tightbeam-wire](../../wire/tightbeam-wire). The browser engine shares those rules. Implementation: [docs/ws.md](../../docs/ws.md#listener).
+`WsListener` is a tightbeam protocol: it binds, accepts, and dials WebSocket connections, and its stream holds every read and write to the envelope rules of [tightbeam-wire](https://github.com/wahidgroup/tightbeam-ext/tree/master/wire/tightbeam-wire). The browser engine shares those rules. Implementation: [docs/ws.md](https://github.com/wahidgroup/tightbeam-ext/blob/master/docs/ws.md#listener).
 
 ## Security
 
-Authentication and confidentiality come from the tightbeam handshake above the socket, so the listener binds `ws://` and leaves TLS to a terminator in front of it. A listener that serves no anonymous peer requires mutual authentication. Implementation: [docs/ws.md](../../docs/ws.md#limitations).
+Authentication and confidentiality come from the tightbeam handshake above the socket, so the listener binds `ws://` and leaves TLS to a terminator in front of it. A listener that serves no anonymous peer requires mutual authentication. Implementation: [docs/ws.md](https://github.com/wahidgroup/tightbeam-ext/blob/master/docs/ws.md#limitations).
 
 ## Push-capable servers
 
-The `serve` feature owns one accepted multiplexed connection and lends its service the handle that server-initiated streams leave on. `tightbeam-pubsub` serves through it. Implementation: [docs/ws.md](../../docs/ws.md#accepted-links).
+The `serve` feature owns one accepted multiplexed connection and lends its service the handle that server-initiated streams leave on. `tightbeam-pubsub` serves through it. Implementation: [docs/ws.md](https://github.com/wahidgroup/tightbeam-ext/blob/master/docs/ws.md#accepted-links).
 
 ## Cluster edge
 
-A tightbeam cluster gateway binds a WebSocket edge that admits signed work frames from browsers, while the colony keeps its TCP protocol. Implementation: [docs/ws.md](../../docs/ws.md#cluster-work-plane).
+A tightbeam cluster gateway binds a WebSocket edge that admits signed work frames from browsers, and the colony runs on WebSocket too. Implementation: [docs/ws.md](https://github.com/wahidgroup/tightbeam-ext/blob/master/docs/ws.md#cluster-work-plane).
 
 ## Features
 
-`socket`, on by default, holds the listener and the dial. `serve`, `link-parts`, `instrument`, `testing`, and `colony` select the other parts. Implementation: [docs/ws.md](../../docs/ws.md#features).
+`socket`, on by default, holds the listener and the dial. `serve`, `instrument`, `testing`, and `colony` select the other parts. Implementation: [docs/ws.md](https://github.com/wahidgroup/tightbeam-ext/blob/master/docs/ws.md#features).
 
 ## Related
 
-The browser engine is [tightbeam-ws-wasm](../tightbeam-ws-wasm), packaged for npm as `@wahidgroup/tightbeam-ws-client` ([client](../client)). See the [repository README](../../README.md) for development and release workflows.
+The browser engine is [tightbeam-ws-wasm](https://github.com/wahidgroup/tightbeam-ext/tree/master/ws/tightbeam-ws-wasm), packaged for npm as `@wahidgroup/tightbeam-ws-client` ([client](https://github.com/wahidgroup/tightbeam-ext/tree/master/ws/client)). See the [repository README](https://github.com/wahidgroup/tightbeam-ext/blob/master/README.md) for development and release workflows.
 
 ## License
 
-Licensed under either of [MIT](./LICENSE-MIT) or [Apache-2.0](./LICENSE-APACHE) at your option.
+Licensed under either of [MIT](https://github.com/wahidgroup/tightbeam-ext/blob/master/ws/tightbeam-ws/LICENSE-MIT) or [Apache-2.0](https://github.com/wahidgroup/tightbeam-ext/blob/master/ws/tightbeam-ws/LICENSE-APACHE) at your option.

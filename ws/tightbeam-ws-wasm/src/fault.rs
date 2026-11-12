@@ -1,17 +1,5 @@
-//! The codes and the structured JavaScript errors of the wasm bindings.
-//!
-//! A failure crosses the boundary as a JavaScript `Error` named
-//! `TightbeamTransportError`. Its `code` is a variant of one of three string
-//! enums, and the declarations that `wasm-bindgen` writes carry each enum as a
-//! TypeScript union, so every code a TypeScript caller observes has one
-//! declaration:
-//!
-//! - [`RefusalCode`]: a value the bindings refuse before an engine or a transport error exists.
-//! - [`TransportCode`]: an error of the tightbeam engine or transport.
-//! - [`TransitCode`]: a gRPC canonical status, the code of a peer refusal.
-//!
-//! A refusal of one field names it on `path`, such as `matrix.n`, and a
-//! refused work submission carries its transit status on `status`.
+//! The codes and the structured JavaScript errors of the wasm bindings, as
+//! the codes section of `docs/ws-wasm.md` describes.
 
 #[cfg(target_arch = "wasm32")]
 use core::fmt::Display;
@@ -20,6 +8,8 @@ use core::fmt::Display;
 use js_sys::{Error as JsError, Reflect};
 use wasm_bindgen::prelude::*;
 
+#[cfg(any(test, target_arch = "wasm32"))]
+use tightbeam::asn1::BodyTransform;
 use tightbeam::policy::TransitStatus;
 #[cfg(any(test, target_arch = "wasm32"))]
 use tightbeam::transport::{TransportError, TransportFailure};
@@ -28,23 +18,90 @@ use tightbeam::TightBeamError;
 
 #[cfg(any(test, target_arch = "wasm32"))]
 use crate::build::BuildRefusal;
+#[cfg(target_arch = "wasm32")]
+use crate::build::SharedKeyRefusal;
+#[cfg(target_arch = "wasm32")]
+use crate::build::StepError;
 #[cfg(any(test, target_arch = "wasm32"))]
 use crate::compress::ZstdRefusal;
 #[cfg(target_arch = "wasm32")]
+use crate::profile::Aes256Gcm;
+#[cfg(target_arch = "wasm32")]
 use crate::promise::Record;
 
-/// A code enum and its TypeScript union, from one list of variants. The
-/// label of each variant is the `code` JavaScript reads, and the declarations
-/// that `wasm-bindgen` writes carry the union of the labels, so TypeScript
-/// copies no code by hand.
+/// A string enum and its TypeScript union, from one list of variants.
+///
+/// - A `fault` clause makes the enum a code family: a const assertion holds
+///   each label equal to the name of its variant, and the union of the family
+///   member of `EngineFault` is emitted with it.
+/// - A code family lists its labels in `LABELS`, which [`FAMILIES`] reads.
+/// - A `refusing` clause names the variant that names no refusal, and the
+///   refusal type that the family faults with.
 macro_rules! code_enum {
 	(
 		$(#[$meta:meta])*
-		pub enum $name:ident in $section:ident {
+		pub enum $name:ident in $section:ident, fault $fault:ident {
 			$(
 				$(#[$doc:meta])*
 				$variant:ident = $label:tt,
 			)*
+		}
+	) => {
+		code_enum! {
+			@enum $(#[$meta])* $name { $( $(#[$doc])* $variant = $label, )* }
+		}
+		code_enum! {
+			@named $name { $( $variant = $label, )* }
+		}
+
+		#[cfg(target_arch = "wasm32")]
+		#[wasm_bindgen(typescript_custom_section)]
+		const $section: &'static str = concat!(
+			"\n/**\n * Every `code` label of `", stringify!($name), "`.\n */\nexport type ", stringify!($name), " =",
+			$("\n\t| \"", $label, "\"",)*
+			";\n\n/**\n * A transport error whose `code` is a `", stringify!($name), "`.\n */\nexport type ",
+			stringify!($fault), " = FaultOf<", stringify!($name), ">;\n"
+		);
+	};
+	(
+		$(#[$meta:meta])*
+		pub enum $name:ident in $section:ident, fault $fault:ident refusing $ok:ident as $refusal:ident {
+			$(
+				$(#[$doc:meta])*
+				$variant:ident = $label:tt,
+			)*
+		}
+	) => {
+		code_enum! {
+			@enum $(#[$meta])* $name { $( $(#[$doc])* $variant = $label, )* }
+		}
+		code_enum! {
+			@named $name { $( $variant = $label, )* }
+		}
+
+		impl $name {
+			/// The refusal that `label` names: a variant other than the one
+			/// that names no refusal, or `None`.
+			#[cfg(any(test, target_arch = "wasm32"))]
+			pub(crate) fn refusal(label: &str) -> Option<Self> {
+				Self::from_str(label).filter(|code| *code != Self::$ok)
+			}
+		}
+
+		#[cfg(target_arch = "wasm32")]
+		#[wasm_bindgen(typescript_custom_section)]
+		const $section: &'static str = concat!(
+			"\n/**\n * Every `code` label of `", stringify!($name), "`.\n */\nexport type ", stringify!($name), " =",
+			$("\n\t| \"", $label, "\"",)*
+			";\n\n/**\n * Every label of `", stringify!($name), "` but `", stringify!($ok),
+			"`, which names no refusal.\n */\nexport type ", stringify!($refusal), " = Exclude<", stringify!($name),
+			", \"", stringify!($ok), "\">;\n\n/**\n * A transport error whose `code` is a `", stringify!($refusal),
+			"`.\n */\nexport type ", stringify!($fault), " = FaultOf<", stringify!($refusal), ">;\n"
+		);
+	};
+	(
+		@enum $(#[$meta:meta])* $name:ident {
+			$( $(#[$doc:meta])* $variant:ident = $label:tt, )*
 		}
 	) => {
 		$(#[$meta])*
@@ -57,25 +114,148 @@ macro_rules! code_enum {
 			)*
 		}
 
-		#[cfg(target_arch = "wasm32")]
+	};
+	(
+		@named $name:ident { $( $variant:ident = $label:tt, )* }
+	) => {
 		impl $name {
-			/// Whether `label` is the label of a variant.
-			fn contains(label: &str) -> bool {
-				matches!(label, $($label)|*)
-			}
+			/// Every `code` label of this family.
+			const LABELS: &'static [&'static str] = &[$($label),*];
+		}
+
+		const _: () = {
+			$(
+				assert!(
+					Label::same(stringify!($variant), $label),
+					concat!("the label of ", stringify!($name), "::", stringify!($variant), " differs from its name")
+				);
+			)*
+		};
+	};
+	(
+		$(#[$meta:meta])*
+		pub enum $name:ident in $section:ident {
+			$(
+				$(#[$doc:meta])*
+				$variant:ident = $label:tt,
+			)*
+		}
+	) => {
+		code_enum! {
+			@enum $(#[$meta])* $name { $( $(#[$doc])* $variant = $label, )* }
 		}
 
 		#[cfg(target_arch = "wasm32")]
 		#[wasm_bindgen(typescript_custom_section)]
 		const $section: &'static str = concat!(
-			"\n/**\n * Every `code` label of `",
-			stringify!($name),
-			"`.\n */\nexport type ",
-			stringify!($name),
-			" =",
+			"\n/**\n * Every label of `", stringify!($name), "`.\n */\nexport type ", stringify!($name), " =",
 			$("\n\t| \"", $label, "\"",)*
 			";\n"
 		);
+	};
+}
+
+/// A `code` label, compared in a const context.
+struct Label;
+
+impl Label {
+	/// Whether `left` and `right` hold the same octets.
+	const fn same(left: &str, right: &str) -> bool {
+		let (left, right) = (left.as_bytes(), right.as_bytes());
+		if left.len() != right.len() {
+			return false;
+		}
+
+		let mut index = 0;
+		while index < left.len() {
+			if left[index] != right[index] {
+				return false;
+			}
+			index += 1;
+		}
+
+		true
+	}
+
+	/// Whether no label of one family in `families` is a label of another.
+	const fn disjoint(families: &[&[&str]]) -> bool {
+		let mut family = 0;
+		while family < families.len() {
+			let mut other = family + 1;
+			while other < families.len() {
+				if Self::shared(families[family], families[other]) {
+					return false;
+				}
+				other += 1;
+			}
+			family += 1;
+		}
+
+		true
+	}
+
+	/// Whether a label of `left` is a label of `right`.
+	const fn shared(left: &[&str], right: &[&str]) -> bool {
+		let mut index = 0;
+		while index < left.len() {
+			let mut other = 0;
+			while other < right.len() {
+				if Self::same(left[index], right[other]) {
+					return true;
+				}
+				other += 1;
+			}
+			index += 1;
+		}
+
+		false
+	}
+}
+
+/// The label of a refused work submission, which carries its transit status.
+macro_rules! work_refused {
+	() => {
+		"WorkRefused"
+	};
+}
+
+/// The label of a body that a read cannot reverse, which carries its layer.
+macro_rules! opaque_body {
+	() => {
+		"OpaqueBody"
+	};
+}
+
+/// The member of a structured transport error that holds its code.
+#[cfg(target_arch = "wasm32")]
+macro_rules! code_member {
+	() => {
+		"code"
+	};
+}
+
+/// The member of a structured transport error that holds the field the
+/// failure concerns.
+#[cfg(target_arch = "wasm32")]
+macro_rules! path_member {
+	() => {
+		"path"
+	};
+}
+
+/// The member of a refused work submission that holds its transit status.
+#[cfg(target_arch = "wasm32")]
+macro_rules! status_member {
+	() => {
+		"status"
+	};
+}
+
+/// The member of an opaque body refusal that holds the layer it lacks.
+#[cfg(target_arch = "wasm32")]
+macro_rules! layer_member {
+	() => {
+		"layer"
 	};
 }
 
@@ -100,10 +280,77 @@ const TRANSPORT_ERROR_NAME_TYPE: &'static str = concat!(
 	"\";\n"
 );
 
+/// TypeScript shapes of the structured errors, one member per [`Code`]
+/// variant.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen(typescript_custom_section)]
+const ENGINE_FAULT_TS: &'static str = concat!(
+	r#"
+/**
+ * The members of a structured transport error whose `code` is a label of
+ * `Code`.
+ */
+export interface FaultOf<Code extends string> extends Error {
+	/**
+	 * The name brand of every structured transport error.
+	 */
+	readonly name: TransportErrorName;
+	/**
+	 * The code that names the failure.
+	 */
+	readonly "#,
+	code_member!(),
+	r#": Code;
+	/**
+	 * The field the failure concerns, as a TypeScript access such as
+	 * `matrix.n`, when it concerns one.
+	 */
+	readonly "#,
+	path_member!(),
+	r#"?: string;
+}
+
+/**
+ * A refused work submission, with the transit status of the gateway.
+ */
+export interface WorkRefusedFault extends FaultOf<""#,
+	work_refused!(),
+	r#""> {
+	/**
+	 * The gRPC canonical status that the gateway refused the work with.
+	 */
+	readonly "#,
+	status_member!(),
+	r#": TransitCode;
+}
+
+/**
+ * A body that a read cannot reverse, with the layer it lacks a capability
+ * for.
+ */
+export interface OpaqueBodyFault extends FaultOf<""#,
+	opaque_body!(),
+	r#""> {
+	/**
+	 * The layer of the body that the read holds no capability for.
+	 */
+	readonly "#,
+	layer_member!(),
+	r#": BodyLayer;
+}
+
+/**
+ * A structured transport error of the engine, one member per family of its
+ * code, so a check of `code` narrows to its member.
+ */
+export type EngineFault = RefusalFault | TransportFault | TransitFault | WorkRefusedFault | OpaqueBodyFault;
+"#
+);
+
 code_enum! {
-	/// A value the bindings refuse before an engine or a transport error exists.
-	/// The label is the `code` JavaScript reads.
-	pub enum RefusalCode in REFUSAL_CODE_UNION {
+	/// A value the bindings refuse before an engine or a transport error
+	/// exists. The label is the `code` JavaScript reads.
+	pub enum RefusalCode in REFUSAL_CODE_UNION, fault RefusalFault {
 		/// A byte value is not a `Uint8Array`.
 		InvalidBytes = "InvalidBytes",
 		/// A value is no dotted object identifier the engine encodes.
@@ -120,10 +367,6 @@ code_enum! {
 		InvalidPrehash = "InvalidPrehash",
 		/// A client key is neither a raw scalar nor a `TransportSigner`.
 		InvalidClientKey = "InvalidClientKey",
-		/// The `signPrehash` member of a `TransportSigner` is not a function.
-		InvalidSigner = "InvalidSigner",
-		/// `approveReceipt` is not a function.
-		InvalidApproveReceipt = "InvalidApproveReceipt",
 		/// The session budgets are not two non-negative integers.
 		InvalidBudgets = "InvalidBudgets",
 		/// The authorization token is no `OCTET STRING`.
@@ -144,8 +387,13 @@ code_enum! {
 		StreamClosed = "StreamClosed",
 		/// The WebSocket refuses the URL.
 		InvalidUrl = "InvalidUrl",
-		/// The options of a dial are not an object, or their signal is no
-		/// `AbortSignal`.
+		/// A value is not a string.
+		InvalidText = "InvalidText",
+		/// A value is neither absent nor an `AbortSignal`.
+		InvalidSignal = "InvalidSignal",
+		/// A value is not a function.
+		InvalidCallback = "InvalidCallback",
+		/// The options of a dial are not an object.
 		InvalidConnectOptions = "InvalidConnectOptions",
 		/// A stream cap is no whole number from 1 to the `u32` ceiling.
 		InvalidStreamCap = "InvalidStreamCap",
@@ -169,6 +417,8 @@ code_enum! {
 		EmptyKeyId = "EmptyKeyId",
 		/// A signer key identifier holds no octets, so it names no certificate.
 		EmptySignerId = "EmptySignerId",
+		/// A frame builds at another version than its builder asserted.
+		VersionMismatch = "VersionMismatch",
 		/// A zstd frame declares a window past the rounded ceiling.
 		WindowTooLarge = "WindowTooLarge",
 		/// A zstd frame inflates past the ceiling.
@@ -188,9 +438,9 @@ code_enum! {
 	/// An error of the tightbeam engine or transport, by the variant behind it.
 	/// The label is the `code` JavaScript reads.
 	///
-	/// A peer refusal carries no transport code: its code is the
-	/// [`TransitCode`] of the status the peer answered with.
-	pub enum TransportCode in TRANSPORT_CODE_UNION {
+	/// - A peer refusal names the [`TransitCode`] of the status the peer answered with.
+	/// - A refused work submission and an opaque body each name a [`Code`] variant that carries its detail.
+	pub enum TransportCode in TRANSPORT_CODE_UNION, fault TransportFault {
 		/// `TransportError::ConnectionClosed`.
 		ConnectionClosed = "ConnectionClosed",
 		/// `TransportError::PeerClosedBeforeHandshake`.
@@ -229,7 +479,8 @@ code_enum! {
 		InvalidCertificate = "InvalidCertificate",
 		/// `TransportError::InvalidLimits`.
 		InvalidLimits = "InvalidLimits",
-		/// `TransportError::HandshakeError`, and `TightBeamError::HandshakeError`.
+		/// `TransportError::HandshakeError`, and
+		/// `TightBeamError::HandshakeError`.
 		HandshakeError = "HandshakeError",
 		/// `TransportError::DerError`.
 		DerError = "DerError",
@@ -245,9 +496,11 @@ code_enum! {
 		EncryptorUnavailable = "EncryptorUnavailable",
 		/// `TransportFailure::NonceGenerationFailed`.
 		NonceGenerationFailed = "NonceGenerationFailed",
-		/// `TransportFailure::RekeyRequired`, and `TightBeamError::RekeyRequired`.
+		/// `TransportFailure::RekeyRequired`, and
+		/// `TightBeamError::RekeyRequired`.
 		RekeyRequired = "RekeyRequired",
-		/// `TransportFailure::RenewalBoundExceeded`, and `TightBeamError::RenewalBoundExceeded`.
+		/// `TransportFailure::RenewalBoundExceeded`, and
+		/// `TightBeamError::RenewalBoundExceeded`.
 		RenewalBoundExceeded = "RenewalBoundExceeded",
 		/// `TransportFailure::TamperDetected`.
 		TamperDetected = "TamperDetected",
@@ -331,8 +584,6 @@ code_enum! {
 		Requirement = "Requirement",
 		/// `TightBeamError::MissingResponse`.
 		MissingResponse = "MissingResponse",
-		/// `TightBeamError::WorkRefused`.
-		WorkRefused = "WorkRefused",
 		/// `TightBeamError::ChannelClosed`.
 		ChannelClosed = "ChannelClosed",
 		/// `TightBeamError::MissingSignature`.
@@ -359,22 +610,21 @@ code_enum! {
 		MissingConfiguration = "MissingConfiguration",
 		/// `TightBeamError::Sequence`.
 		Sequence = "Sequence",
-		/// `TightBeamError::OpaqueBody`.
-		OpaqueBody = "OpaqueBody",
-		/// a variant that tightbeam added after this crate, which `#[non_exhaustive]` lets reach the last arm.
+		/// A variant that tightbeam added after this crate, which
+		/// `#[non_exhaustive]` lets reach the last arm.
 		Unrecognized = "Unrecognized",
 	}
 }
 
 code_enum! {
-	/// A gRPC canonical status (`google.rpc.Code`), by the name tightbeam writes
-	/// for it: the code of a peer refusal, and the status a stream handler
-	/// answers with.
+	/// A gRPC canonical status (`google.rpc.Code`), by the name tightbeam
+	/// writes for it: the code of a peer refusal, and the status a stream
+	/// handler answers with.
 	///
-	/// The labels copy the names of [`TransitStatus::as_str`], because a
-	/// `wasm-bindgen` string enum takes literal discriminants, and the pin test
-	/// `transit_code_labels_match_transit_status` holds them equal.
-	pub enum TransitCode in TRANSIT_CODE_UNION {
+	/// - The labels copy the names of [`TransitStatus::as_str`], because a `wasm-bindgen` string enum takes
+	///   literal discriminants.
+	/// - The pin test `transit_code_labels_match_transit_status` holds them equal.
+	pub enum TransitCode in TRANSIT_CODE_UNION, fault TransitFault refusing Ok as TransitRefusal {
 		/// `TransitStatus::Ok`.
 		Ok = "Ok",
 		/// `TransitStatus::Cancelled`.
@@ -412,7 +662,7 @@ code_enum! {
 	}
 }
 
-/// The status of each code. The match covers every status tightbeam
+/// The code of each status. The match covers every status tightbeam
 /// defines, so a new status fails to compile here until it has a code.
 impl From<TransitStatus> for TransitCode {
 	fn from(status: TransitStatus) -> Self {
@@ -463,26 +713,109 @@ impl From<TransitCode> for TransitStatus {
 	}
 }
 
+code_enum! {
+	/// The layer of a frame body that a read cannot reverse without a
+	/// capability, by the name of the capability that reverses it.
+	pub enum BodyLayer in BODY_LAYER_UNION {
+		/// The seal, which an opener opens.
+		Opener = "opener",
+		/// The compression, which an inflator inflates.
+		Inflator = "inflator",
+	}
+}
+
+/// The labels of every code family, and the two labels whose code carries a
+/// detail. [`Code::read`] tries the families in turn, so a label names one
+/// family alone.
+const FAMILIES: [&[&str]; 4] = [
+	RefusalCode::LABELS,
+	TransportCode::LABELS,
+	TransitCode::LABELS,
+	&[work_refused!(), opaque_body!()],
+];
+
+const _: () = assert!(Label::disjoint(&FAMILIES), "a code label names more than one family");
+
 #[cfg(any(test, target_arch = "wasm32"))]
-/// The code of one failure, from the family that decides it.
+impl From<BodyTransform> for BodyLayer {
+	fn from(transform: BodyTransform) -> Self {
+		match transform {
+			BodyTransform::Decrypt => Self::Opener,
+			BodyTransform::Inflate => Self::Inflator,
+		}
+	}
+}
+
+#[cfg(any(test, target_arch = "wasm32"))]
+/// The code of one failure, from the family that decides it, with the detail
+/// that the family carries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Code {
+enum Code {
 	/// A value the bindings refused.
 	Refusal(RefusalCode),
 	/// An error of the engine or the transport.
 	Transport(TransportCode),
 	/// A refusal of the peer, by the status it answered with.
 	Transit(TransitCode),
+	/// A refused work submission, by the transit status of the gateway.
+	WorkRefused(TransitCode),
+	/// A body that a read cannot reverse, by the layer it lacks.
+	OpaqueBody(BodyLayer),
+}
+
+/// The members of the JavaScript error that one [`Code`] encodes.
+#[cfg(target_arch = "wasm32")]
+struct Members {
+	/// The label of the `code` member.
+	code: &'static str,
+	/// The member a code carries besides its label: the `status` of a refused
+	/// work submission, or the `layer` of an opaque body.
+	detail: Option<Detail>,
+}
+
+/// A member of a JavaScript error, by its name and the label it holds.
+#[cfg(target_arch = "wasm32")]
+struct Detail {
+	member: &'static str,
+	label: &'static str,
 }
 
 #[cfg(target_arch = "wasm32")]
 impl Code {
-	/// The label JavaScript reads.
-	pub(crate) fn to_str(self) -> &'static str {
+	/// The members that JavaScript reads for this code.
+	fn members(self) -> Members {
 		match self {
-			Self::Refusal(code) => code.to_str(),
-			Self::Transport(code) => code.to_str(),
-			Self::Transit(code) => code.to_str(),
+			Self::Refusal(code) => Members { code: code.to_str(), detail: None },
+			Self::Transport(code) => Members { code: code.to_str(), detail: None },
+			Self::Transit(code) => Members { code: code.to_str(), detail: None },
+			Self::WorkRefused(status) => {
+				let detail = Detail { member: status_member!(), label: status.to_str() };
+				Members { code: work_refused!(), detail: Some(detail) }
+			}
+			Self::OpaqueBody(layer) => {
+				let detail = Detail { member: layer_member!(), label: layer.to_str() };
+				Members { code: opaque_body!(), detail: Some(detail) }
+			}
+		}
+	}
+
+	/// The code of `value`, read back from a structured error as
+	/// [`JsFault`] writes one, or `None` for any other value.
+	fn read(value: &JsValue) -> Option<Self> {
+		let error = value.dyn_ref::<JsError>()?;
+		if error.name() != TRANSPORT_ERROR_NAME {
+			return None;
+		}
+
+		let label = Record::member(value, code_member!()).as_string()?;
+		let detail = |member: &str| Record::member(value, member).as_string();
+		match label.as_str() {
+			work_refused!() => TransitCode::from_str(&detail(status_member!())?).map(Self::WorkRefused),
+			opaque_body!() => BodyLayer::from_str(&detail(layer_member!())?).map(Self::OpaqueBody),
+			other => RefusalCode::from_str(other)
+				.map(Self::Refusal)
+				.or_else(|| TransportCode::from_str(other).map(Self::Transport))
+				.or_else(|| TransitCode::refusal(other).map(Self::Transit)),
 		}
 	}
 }
@@ -502,70 +835,53 @@ impl From<TransportCode> for Code {
 }
 
 #[cfg(any(test, target_arch = "wasm32"))]
-impl From<TransitCode> for Code {
-	fn from(code: TransitCode) -> Self {
-		Self::Transit(code)
-	}
-}
-
-#[cfg(any(test, target_arch = "wasm32"))]
-/// A peer refusal names the [`TransitCode`] of its status, through
-/// tightbeam's own conversion, and a local failure names its
-/// [`TransportCode`].
+/// A local failure names its [`TransportCode`], and a peer refusal names the
+/// [`TransitCode`] of the status it carries.
+///
+/// - The pin test `a_peer_failure_names_the_code_of_its_status` holds these pairs equal to those of
+///   `TryFrom<TransportFailure> for TransitStatus`.
+/// - The type is exhaustive, so a failure that tightbeam adds fails to compile here until it has a code.
 impl From<TransportFailure> for Code {
 	fn from(failure: TransportFailure) -> Self {
-		match TransitStatus::try_from(failure) {
-			Ok(status) => Self::Transit(TransitCode::from(status)),
-			Err(_) => Self::Transport(TransportCode::local(failure)),
-		}
-	}
-}
+		let local = match failure {
+			TransportFailure::EncodingFailed => TransportCode::EncodingFailed,
+			TransportFailure::EncryptionFailed => TransportCode::EncryptionFailed,
+			TransportFailure::SizeExceeded => TransportCode::SizeExceeded,
+			TransportFailure::EncryptorUnavailable => TransportCode::EncryptorUnavailable,
+			TransportFailure::NonceGenerationFailed => TransportCode::NonceGenerationFailed,
+			TransportFailure::RekeyRequired => TransportCode::RekeyRequired,
+			TransportFailure::RenewalBoundExceeded => TransportCode::RenewalBoundExceeded,
+			TransportFailure::TamperDetected => TransportCode::TamperDetected,
+			TransportFailure::StreamsExhausted => TransportCode::StreamsExhausted,
+			TransportFailure::BudgetExhausted => TransportCode::BudgetExhausted,
+			TransportFailure::PolicyRejection => TransportCode::PolicyRejection,
+			TransportFailure::Cancelled => return Self::Transit(TransitCode::Cancelled),
+			TransportFailure::Unknown => return Self::Transit(TransitCode::Unknown),
+			TransportFailure::InvalidArgument => return Self::Transit(TransitCode::InvalidArgument),
+			TransportFailure::DeadlineExceeded => return Self::Transit(TransitCode::DeadlineExceeded),
+			TransportFailure::NotFound => return Self::Transit(TransitCode::NotFound),
+			TransportFailure::AlreadyExists => return Self::Transit(TransitCode::AlreadyExists),
+			TransportFailure::PermissionDenied => return Self::Transit(TransitCode::PermissionDenied),
+			TransportFailure::ResourceExhausted => return Self::Transit(TransitCode::ResourceExhausted),
+			TransportFailure::FailedPrecondition => return Self::Transit(TransitCode::FailedPrecondition),
+			TransportFailure::Aborted => return Self::Transit(TransitCode::Aborted),
+			TransportFailure::OutOfRange => return Self::Transit(TransitCode::OutOfRange),
+			TransportFailure::Unimplemented => return Self::Transit(TransitCode::Unimplemented),
+			TransportFailure::Internal => return Self::Transit(TransitCode::Internal),
+			TransportFailure::Unavailable => return Self::Transit(TransitCode::Unavailable),
+			TransportFailure::DataLoss => return Self::Transit(TransitCode::DataLoss),
+			TransportFailure::Unauthenticated => return Self::Transit(TransitCode::Unauthenticated),
+		};
 
-#[cfg(any(test, target_arch = "wasm32"))]
-impl TransportCode {
-	/// The code of a failure that carries no wire status. A peer refusal
-	/// never reaches its arm, because [`Code::from`] reads its status first.
-	fn local(failure: TransportFailure) -> Self {
-		match failure {
-			TransportFailure::EncodingFailed => Self::EncodingFailed,
-			TransportFailure::EncryptionFailed => Self::EncryptionFailed,
-			TransportFailure::SizeExceeded => Self::SizeExceeded,
-			TransportFailure::EncryptorUnavailable => Self::EncryptorUnavailable,
-			TransportFailure::NonceGenerationFailed => Self::NonceGenerationFailed,
-			TransportFailure::RekeyRequired => Self::RekeyRequired,
-			TransportFailure::RenewalBoundExceeded => Self::RenewalBoundExceeded,
-			TransportFailure::TamperDetected => Self::TamperDetected,
-			TransportFailure::StreamsExhausted => Self::StreamsExhausted,
-			TransportFailure::BudgetExhausted => Self::BudgetExhausted,
-			TransportFailure::PolicyRejection => Self::PolicyRejection,
-			// A peer refusal carries a wire status, which `Code::from` reads first,
-			// so these arms never run. Each variant has an arm, so a failure that
-			// tightbeam adds fails to compile here until it has a code.
-			TransportFailure::Cancelled
-			| TransportFailure::Unknown
-			| TransportFailure::InvalidArgument
-			| TransportFailure::DeadlineExceeded
-			| TransportFailure::NotFound
-			| TransportFailure::AlreadyExists
-			| TransportFailure::PermissionDenied
-			| TransportFailure::ResourceExhausted
-			| TransportFailure::FailedPrecondition
-			| TransportFailure::Aborted
-			| TransportFailure::OutOfRange
-			| TransportFailure::Unimplemented
-			| TransportFailure::Internal
-			| TransportFailure::Unavailable
-			| TransportFailure::DataLoss
-			| TransportFailure::Unauthenticated => Self::Unrecognized,
-		}
+		Self::Transport(local)
 	}
 }
 
 #[cfg(any(test, target_arch = "wasm32"))]
 /// One arm per variant of `TransportError`. An operation failure names its
 /// inner failure, which is the signal callers branch on. The type is
-/// `#[non_exhaustive]`, so the last arm names a variant this crate does not
-/// know as [`TransportCode::Unrecognized`].
+/// `#[non_exhaustive]`, so the last arm names each variant outside the list
+/// as [`TransportCode::Unrecognized`].
 impl From<&TransportError> for Code {
 	fn from(error: &TransportError) -> Self {
 		let code = match error {
@@ -604,8 +920,8 @@ impl From<&TransportError> for Code {
 #[cfg(any(test, target_arch = "wasm32"))]
 /// One arm per variant of `TightBeamError` under the features this crate
 /// enables. A transport error names its own code, and the type is
-/// `#[non_exhaustive]`, so the last arm names a variant this crate does not
-/// know as [`TransportCode::Unrecognized`].
+/// `#[non_exhaustive]`, so the last arm names each variant outside the list
+/// as [`TransportCode::Unrecognized`].
 impl From<&TightBeamError> for Code {
 	fn from(error: &TightBeamError) -> Self {
 		let code = match error {
@@ -648,9 +964,9 @@ impl From<&TightBeamError> for Code {
 			TightBeamError::MissingFeature(..) => TransportCode::MissingFeature,
 			TightBeamError::MissingProtection { .. } => TransportCode::MissingProtection,
 			TightBeamError::Requirement(..) => TransportCode::Requirement,
-			TightBeamError::OpaqueBody(..) => TransportCode::OpaqueBody,
+			TightBeamError::OpaqueBody(transform) => return Self::OpaqueBody(BodyLayer::from(*transform)),
 			TightBeamError::MissingResponse => TransportCode::MissingResponse,
-			TightBeamError::WorkRefused(..) => TransportCode::WorkRefused,
+			TightBeamError::WorkRefused(status) => return Self::WorkRefused(TransitCode::from(*status)),
 			TightBeamError::ChannelClosed => TransportCode::ChannelClosed,
 			TightBeamError::MissingSignature => TransportCode::MissingSignature,
 			TightBeamError::MissingSignatureInfo => TransportCode::MissingSignatureInfo,
@@ -694,15 +1010,13 @@ impl From<&BuildRefusal> for RefusalCode {
 	fn from(refusal: &BuildRefusal) -> Self {
 		match refusal {
 			BuildRefusal::EmptyDigest => Self::EmptyDigest,
-			BuildRefusal::EmptyKeyId => Self::EmptyKeyId,
 			BuildRefusal::EmptySignerId => Self::EmptySignerId,
+			BuildRefusal::VersionMismatch { .. } => Self::VersionMismatch,
 		}
 	}
 }
 
-/// The code labels a structured transport error carries, as one membership
-/// check, so a guard narrows an unknown value to a transport error only when
-/// its `code` is a label the engine declares.
+/// The recognizer of the structured transport errors of the engine.
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 pub struct Codes;
@@ -710,43 +1024,36 @@ pub struct Codes;
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 impl Codes {
-	/// Whether `label` is a code of [`RefusalCode`] or [`TransportCode`], or
-	/// a refusal of [`TransitCode`]. `Ok` names no refusal, so no transport
-	/// error carries it.
-	pub fn has(label: &str) -> bool {
-		let refusal = RefusalCode::contains(label);
-		let transport = TransportCode::contains(label);
-		let transit = label != TransitCode::Ok.to_str() && TransitCode::contains(label);
-		refusal || transport || transit
+	/// Whether `value` is a structured transport error of the engine.
+	///
+	/// - It is an `Error` named `TightbeamTransportError` whose `code` the
+	///   engine declares.
+	/// - A `WorkRefused` carries a `status`, and an `OpaqueBody` a `layer`,
+	///   that the engine declares.
+	pub fn recognizes(#[wasm_bindgen(unchecked_param_type = "unknown")] value: JsValue) -> bool {
+		Code::read(&value).is_some()
 	}
 }
 
-/// A structured JavaScript error: an `Error` named `TightbeamTransportError`
-/// whose `code` names the failure, whose `path` names the field a refusal
-/// concerns, and whose `status` names the transit status of a refused work
-/// submission.
+/// A structured JavaScript error: an `Error` named `TightbeamTransportError`.
 ///
-/// Engine, transport, and binding failures convert into it, so a binding
-/// returns `Result<_, JsFault>` and reaches each conversion through `?`.
+/// - Its `code` names the failure, and it carries the detail of its code.
+/// - Its `path` names the field that a refusal concerns.
+/// - Engine, transport, and binding failures convert into it, so a binding returns `Result<_, JsFault>` and
+///   reaches each conversion through `?`.
 #[cfg(target_arch = "wasm32")]
 #[derive(Debug)]
 pub struct JsFault {
 	code: Code,
 	message: String,
 	path: String,
-	status: Option<TransitCode>,
 }
 
 #[cfg(target_arch = "wasm32")]
 impl JsFault {
 	/// The failure `code`, explained by `message`, at no field.
 	fn new(code: impl Into<Code>, message: impl Display) -> Self {
-		Self {
-			code: code.into(),
-			message: message.to_string(),
-			path: String::new(),
-			status: None,
-		}
+		Self { code: code.into(), message: message.to_string(), path: String::new() }
 	}
 
 	/// This refusal, one field deeper: `field` heads the path, as `matrix`
@@ -766,7 +1073,7 @@ impl JsFault {
 #[cfg(target_arch = "wasm32")]
 impl From<JsFault> for JsValue {
 	fn from(fault: JsFault) -> Self {
-		let JsFault { code, message, path, status } = fault;
+		let JsFault { code, message, path } = fault;
 		let text = if path.is_empty() {
 			message
 		} else {
@@ -777,13 +1084,15 @@ impl From<JsFault> for JsValue {
 		js_error.set_name(TRANSPORT_ERROR_NAME);
 		let error: JsValue = js_error.into();
 
+		let Members { code, detail } = code.members();
+
 		// `Reflect::set` on a freshly built `Error` object cannot fail.
-		let _ = Reflect::set(&error, &JsValue::from_str("code"), &JsValue::from_str(code.to_str()));
+		let _ = Reflect::set(&error, &JsValue::from_str(code_member!()), &JsValue::from_str(code));
 		if !path.is_empty() {
-			let _ = Reflect::set(&error, &JsValue::from_str("path"), &JsValue::from_str(&path));
+			let _ = Reflect::set(&error, &JsValue::from_str(path_member!()), &JsValue::from_str(&path));
 		}
-		if let Some(status) = status {
-			let _ = Reflect::set(&error, &JsValue::from_str("status"), &JsValue::from_str(status.to_str()));
+		if let Some(Detail { member, label }) = detail {
+			let _ = Reflect::set(&error, &JsValue::from_str(member), &JsValue::from_str(label));
 		}
 
 		error
@@ -816,20 +1125,11 @@ impl From<TransportError> for JsFault {
 	}
 }
 
-/// A refusal of a work submission also carries the gateway's transit status
-/// on `status`, the gRPC canonical name the serve path uses too, so a
-/// JavaScript caller branches on the status without parsing the message.
 #[cfg(target_arch = "wasm32")]
 impl From<TightBeamError> for JsFault {
 	fn from(error: TightBeamError) -> Self {
 		let code = Code::from(&error);
-		let status = match &error {
-			TightBeamError::WorkRefused(status) => Some(TransitCode::from(*status)),
-			_ => None,
-		};
-
-		let fault = Self::new(code, error);
-		Self { status, ..fault }
+		Self::new(code, error)
 	}
 }
 
@@ -842,44 +1142,67 @@ impl From<BuildRefusal> for JsFault {
 }
 
 #[cfg(target_arch = "wasm32")]
+impl From<ZstdRefusal> for JsFault {
+	fn from(refusal: ZstdRefusal) -> Self {
+		let code = RefusalCode::from(&refusal);
+		code.because(refusal)
+	}
+}
+
+#[cfg(target_arch = "wasm32")]
+/// A shared key refusal names its code at the member of the `SharedKey` it
+/// concerns: its own refusal code at the key identifier, or the code of the
+/// error that tightbeam refuses the key with at the key.
+impl From<SharedKeyRefusal> for JsFault {
+	fn from(refusal: SharedKeyRefusal) -> Self {
+		let (code, member) = match &refusal {
+			SharedKeyRefusal::EmptyKeyId => (Code::Refusal(RefusalCode::EmptyKeyId), Aes256Gcm::KEY_ID),
+			SharedKeyRefusal::Key(error) => (Code::from(error), Aes256Gcm::KEY),
+		};
+
+		Self::new(code, refusal).at(member)
+	}
+}
+
+#[cfg(target_arch = "wasm32")]
+impl From<StepError> for JsFault {
+	fn from(error: StepError) -> Self {
+		match error {
+			StepError::Refused(refusal) => Self::from(refusal),
+			StepError::Engine(error) => Self::from(error),
+		}
+	}
+}
+
+#[cfg(target_arch = "wasm32")]
 impl From<tightbeam::der::Error> for JsFault {
 	fn from(error: tightbeam::der::Error) -> Self {
 		Self::from(TightBeamError::from(error))
 	}
 }
 
-#[cfg(target_arch = "wasm32")]
-impl TransitCode {
-	/// The status that a stream handler's settlement answers with: the status
-	/// `value` names, as a label or as the `code` of a rejection. `Ok` names
-	/// no refusal, so it answers `Unknown`, as every other value does.
-	pub(crate) fn of_js(value: &JsValue) -> TransitStatus {
-		let label = value.as_string();
-		let label = label.or_else(|| Record::member(value, "settled.code").as_string());
-		let named = label.as_deref().and_then(Self::from_str);
-
-		match named {
-			Some(Self::Ok) | None => TransitStatus::Unknown,
-			Some(code) => TransitStatus::from(code),
-		}
-	}
-}
-
 /// The outcome of a binding call, as the unit tests of every binding read
 /// its refusal.
 #[cfg(all(test, target_arch = "wasm32"))]
-pub(crate) trait Refused {
-	/// The `code` that a refused outcome carries, as a JavaScript caller
-	/// reads it, or `None` for an outcome that succeeded.
-	fn code(self) -> Option<String>;
+pub(crate) trait Refused: Sized {
+	/// The `code` and the `path` that a refused outcome carries, as a
+	/// JavaScript caller reads them, or `None` for an outcome that succeeded.
+	fn refusal(self) -> Option<(String, String)>;
+
+	/// The `code` that a refused outcome carries, or `None` for an outcome
+	/// that succeeded.
+	fn code(self) -> Option<String> {
+		self.refusal().map(|(code, _)| code)
+	}
 }
 
 #[cfg(all(test, target_arch = "wasm32"))]
 impl<T, E: Into<JsValue>> Refused for Result<T, E> {
-	fn code(self) -> Option<String> {
+	fn refusal(self) -> Option<(String, String)> {
 		let refusal: JsValue = self.err()?.into();
-		let code = Record::member(&refusal, "refusal.code");
-		code.as_string()
+		let code = Record::member(&refusal, code_member!()).as_string()?;
+		let path = Record::member(&refusal, path_member!()).as_string().unwrap_or_default();
+		Some((code, path))
 	}
 }
 
@@ -891,7 +1214,7 @@ mod tests {
 	use tightbeam::transport::{TransportError, TransportFailure};
 	use tightbeam::TightBeamError;
 
-	use super::{Code, TransitCode, TransportCode};
+	use super::{BodyLayer, Code, TransitCode, TransportCode};
 
 	type TestResult = core::result::Result<(), Box<dyn core::error::Error>>;
 
@@ -924,6 +1247,59 @@ mod tests {
 		}
 	}
 
+	// Each peer failure names the code of the status tightbeam pairs it with,
+	// and each local failure names a transport code.
+	tb_cases! {
+		fn a_peer_failure_names_the_code_of_its_status(failure: TransportFailure) -> TestResult {
+			let code = match TransitStatus::try_from(failure) {
+				Ok(status) => Code::Transit(TransitCode::from(status)),
+				Err(_) => return Err("a peer failure carries a status".into()),
+			};
+
+			assert_eq!(Code::from(failure), code);
+			Ok(())
+		}
+		cases {
+			cancelled => TransportFailure::Cancelled,
+			unknown => TransportFailure::Unknown,
+			invalid_argument => TransportFailure::InvalidArgument,
+			deadline_exceeded => TransportFailure::DeadlineExceeded,
+			not_found => TransportFailure::NotFound,
+			already_exists => TransportFailure::AlreadyExists,
+			permission_denied => TransportFailure::PermissionDenied,
+			resource_exhausted => TransportFailure::ResourceExhausted,
+			failed_precondition => TransportFailure::FailedPrecondition,
+			aborted => TransportFailure::Aborted,
+			out_of_range => TransportFailure::OutOfRange,
+			unimplemented => TransportFailure::Unimplemented,
+			internal => TransportFailure::Internal,
+			unavailable => TransportFailure::Unavailable,
+			data_loss => TransportFailure::DataLoss,
+			unauthenticated => TransportFailure::Unauthenticated,
+		}
+	}
+
+	tb_cases! {
+		fn a_local_failure_carries_no_status(failure: TransportFailure) -> TestResult {
+			assert!(TransitStatus::try_from(failure).is_err());
+			assert!(matches!(Code::from(failure), Code::Transport(_)));
+			Ok(())
+		}
+		cases {
+			encoding_failed => TransportFailure::EncodingFailed,
+			encryption_failed => TransportFailure::EncryptionFailed,
+			size_exceeded => TransportFailure::SizeExceeded,
+			encryptor_unavailable => TransportFailure::EncryptorUnavailable,
+			nonce_generation_failed => TransportFailure::NonceGenerationFailed,
+			rekey_required => TransportFailure::RekeyRequired,
+			renewal_bound_exceeded => TransportFailure::RenewalBoundExceeded,
+			tamper_detected => TransportFailure::TamperDetected,
+			streams_exhausted => TransportFailure::StreamsExhausted,
+			budget_exhausted => TransportFailure::BudgetExhausted,
+			policy_rejection => TransportFailure::PolicyRejection,
+		}
+	}
+
 	#[test]
 	fn a_peer_refusal_names_the_transit_code_of_its_status() {
 		let refused = TransportError::OperationFailed(TransportFailure::ResourceExhausted);
@@ -943,9 +1319,33 @@ mod tests {
 	}
 
 	#[test]
-	fn an_opaque_body_names_the_label_of_its_upstream_variant() {
+	fn an_opaque_body_names_the_layer_it_lacks() {
 		let sealed = TightBeamError::OpaqueBody(BodyTransform::Decrypt);
-		assert_eq!(Code::from(&sealed), Code::Transport(TransportCode::OpaqueBody));
-		assert_eq!(TransportCode::OpaqueBody.to_str(), "OpaqueBody");
+		let compressed = TightBeamError::OpaqueBody(BodyTransform::Inflate);
+		assert_eq!(Code::from(&sealed), Code::OpaqueBody(BodyLayer::Opener));
+		assert_eq!(Code::from(&compressed), Code::OpaqueBody(BodyLayer::Inflator));
+	}
+
+	#[test]
+	fn a_refused_work_submission_names_the_status_of_the_gateway() {
+		let refused = TightBeamError::WorkRefused(TransitStatus::PermissionDenied);
+		assert_eq!(Code::from(&refused), Code::WorkRefused(TransitCode::PermissionDenied));
+	}
+
+	tb_cases! {
+		fn only_ok_names_no_refusal(status: TransitStatus) -> TestResult {
+			let code = TransitCode::from(status);
+			let refused = TransitCode::refusal(code.to_str());
+			assert_eq!(refused.is_none(), status == TransitStatus::Ok);
+			Ok(())
+		}
+		cases {
+			ok => TransitStatus::Ok,
+			cancelled => TransitStatus::Cancelled,
+			unknown => TransitStatus::Unknown,
+			not_found => TransitStatus::NotFound,
+			unavailable => TransitStatus::Unavailable,
+			unauthenticated => TransitStatus::Unauthenticated,
+		}
 	}
 }

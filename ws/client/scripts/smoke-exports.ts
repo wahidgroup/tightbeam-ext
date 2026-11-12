@@ -1,15 +1,10 @@
 /**
- * Smoke: load every `package.json` export and scan dist for Node coupling.
- *
- * - Only `dist/` is scanned for isomorphism. The `wasm-node/` tree is the
- *   Node-target wasm-pack output and is Node-bound by design. The `node`
- *   condition of the `#engine` imports map selects its loader, which imports
- *   that glue only inside `load`.
- * - An export loads without the glue, because `TightbeamWsClient.init` is
- *   the one call that loads it.
+ * Smoke: load every `package.json` export, which loads without the glue, as
+ * the package section of `docs/ws-client.md` describes.
  */
 
-import { access, readFile, readdir } from "node:fs/promises";
+import { access, readFile } from "node:fs/promises";
+import { registerHooks } from "node:module";
 import { pathToFileURL } from "node:url";
 import path from "node:path";
 import process from "node:process";
@@ -29,25 +24,6 @@ const exportsField: unknown = Reflect.get(pkg, "exports");
 if (typeof exportsField !== "object" || exportsField === null) {
 	console.error("package.json missing exports");
 	process.exit(1);
-}
-
-/**
- * Collects `.js` files under `dir`.
- */
-async function collectJsFiles(dir: string): Promise<string[]> {
-	const entries = await readdir(dir, {
-		recursive: true,
-		withFileTypes: true,
-	});
-
-	const files: string[] = [];
-	for (const entry of entries) {
-		if (entry.isFile() && entry.name.endsWith(".js")) {
-			files.push(path.join(entry.parentPath, entry.name));
-		}
-	}
-
-	return files;
 }
 
 /**
@@ -82,25 +58,22 @@ try {
 }
 
 /**
- * Node-bound markers that must not appear in published dist JS.
+ * The directories of the two glue bundles, which no export loads as it imports.
  */
-const nodeBound = /node:|require\(|__dirname|__filename/;
+const glue = ["wasm/", "wasm-node/"].map((directory) => new URL(directory, pathToFileURL(`${root}/`)).href);
+
+registerHooks({
+	resolve(specifier, context, nextResolve) {
+		const resolved = nextResolve(specifier, context);
+		if (glue.some((directory) => resolved.url.startsWith(directory))) {
+			throw new Error(`${context.parentURL ?? specifier} loads the glue ${resolved.url} as it imports`);
+		}
+
+		return resolved;
+	},
+});
+
 let failed = false;
-
-const jsFiles = await collectJsFiles(distDir);
-for (const file of jsFiles) {
-	const source = await readFile(file, "utf8");
-	if (!nodeBound.test(source)) {
-		continue;
-	}
-
-	console.error(`Node-bound pattern in ${path.relative(root, file)}`);
-	failed = true;
-}
-
-if (!failed) {
-	console.log("ok isomorphic dist scan");
-}
 
 for (const key of Object.keys(exportsField)) {
 	if (key === "./package.json") {

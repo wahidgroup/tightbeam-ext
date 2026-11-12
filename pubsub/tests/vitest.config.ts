@@ -12,7 +12,7 @@ export default defineConfig({
 	},
 	resolve: {
 		// The e2e fixtures, environment readers, and signer are shared with
-		// the ws extension, and the wire contract with the pubsub client, at
+		// the ws extension, and the command contract with the pubsub client, at
 		// the source level: one file each, no copies.
 		alias: SOURCE_ALIASES,
 	},

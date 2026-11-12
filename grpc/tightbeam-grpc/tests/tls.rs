@@ -1,44 +1,42 @@
 //! Tunnels over a TLS 1.3 edge.
 
 // The colony runtime macros expand `cfg(feature = ...)` probes against the
-// invoking crate's feature namespace. Those upstream feature names do not
-// exist in this crate, so the leaked cfg warnings carry no signal here.
+// invoking crate's feature namespace, which holds the features of this crate
+// alone, so the leaked cfg warnings carry no signal here.
 #![allow(unexpected_cfgs)]
+
+mod support;
 
 use std::time::Duration;
 
 use tightbeam::colony::SubmitWork;
 use tightbeam::crypto::profiles::DefaultCryptoProvider;
 use tightbeam::instrumentation::events;
-use tightbeam::prelude::TightBeamSocketAddr;
-use tightbeam::testing::error::TestingError;
-use tightbeam::testing::macros::BuiltAssertSpec;
-use tightbeam::testing::{
-	ClientEnv, ClusterEnv, Expect, Layer, ScenarioConfig, ScenarioConfigError, SetupEnv, TestFrame,
-};
+use tightbeam::testing::{ClientEnv, ClusterEnv, SetupEnv, TestFrame};
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::policy::RestartLinearBackoff;
-use tightbeam::transport::tcp::r#async::TokioListener;
-use tightbeam::transport::EncryptedProtocol;
-use tightbeam::urn::Urn;
-use tightbeam::{client, cluster, exactly, tb_assert_spec, tb_scenario, urn, TightBeamError};
+use tightbeam::transport::TransportLimits;
+use tightbeam::{client, cluster, exactly, tb_assert_spec, tb_scenario};
 use tightbeam_grpc::edge::{Dial, Edge};
-use tightbeam_grpc::protocol::{GrpcAddr, GrpcListener};
+use tightbeam_grpc::events::EDGE_REFUSED;
+use tightbeam_grpc::protocol::{GrpcAddr, GrpcListener, HEALTH_CHECK_PATH};
 use tightbeam_grpc::staged_profile;
 use tightbeam_grpc::testing::TlsAuthority;
+use tightbeam_ws::protocol::WsListener;
 use tightbeam_ws::testing::specs::{CleartextRoundTripSpec, EdgeWorkSpec, EncryptedRoundTripSpec};
-use tightbeam_ws::testing::{EchoService, Identity, WorkClient, WorkPlane};
-use tokio::task::JoinHandle;
+use tightbeam_ws::testing::{EchoService, EventWatch, Identity, WorkClient, WorkPlane};
+use tokio::net::TcpStream;
 
-/// The server of a scenario, and the socket address it bound.
-type Served = Result<(JoinHandle<()>, TightBeamSocketAddr), TightBeamError>;
+use support::{bounded, edge_error, mint_error, server_identity, Coupled, EchoServer, Graded, LIFETIME, SERVING};
 
-/// How long every certificate of a scenario stays valid.
-const LIFETIME: Duration = Duration::from_secs(3600);
+/// The subject of the identity of each encrypted echo.
+const ECHO: &str = "CN=tunnel echo,O=tightbeam-grpc,C=US";
 
-/// How a dial of a scenario ended, which the scenario records itself: no code
-/// under test records a dial that TLS refuses before any session exists.
-const DIAL: Urn<'static> = urn!("test", "event:tls/dial");
+/// How long a connection of the edge of the late scenario waits for its TLS
+/// handshake, on a clock that the scenario moves: past the patience of
+/// `EventWatch::recorded`, so only an advance of that clock ends the wait
+/// within the wait of the scenario.
+const SECURING: Duration = EventWatch::PATIENCE.saturating_add(Duration::from_secs(2));
 
 staged_profile! {
 	/// The profile of the cleartext round trip.
@@ -77,44 +75,56 @@ type TrustedEchoListener = GrpcListener<DefaultCryptoProvider, TrustedEcho>;
 type TlsGatewayListener = GrpcListener<DefaultCryptoProvider, TlsGatewayEdge>;
 
 cluster! {
-	/// TCP colony gateway with a gRPC edge accept plane over TLS.
+	/// WebSocket colony gateway with a gRPC edge accept plane over TLS.
 	pub TlsGateway,
-	protocol: TokioListener,
+	protocol: WsListener,
 	edge: TlsGatewayListener
+}
+
+staged_profile! {
+	/// A TLS edge whose connection never starts its handshake.
+	LateEcho
 }
 
 tb_assert_spec! {
 	/// A dial that TLS refuses: the server accepts no connection, no end
-	/// completes a handshake, and the dial records its refusal.
+	/// completes a handshake, and the edge records its refusal.
 	pub RefusedDialSpec,
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
 			(events::CONNECTION_ACCEPTED, exactly!(0)),
 			(events::SESSION_HANDSHAKE_COMPLETE, exactly!(0)),
-			(DIAL, exactly!(1), equals!("refused"))
+			(EDGE_REFUSED, exactly!(1), equals!("tls"))
+		]
+	}
+}
+
+tb_assert_spec! {
+	/// A connection that never starts its TLS handshake: the edge closes it
+	/// at its deadline, records it as late, and accepts no connection.
+	pub LateSpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(events::CONNECTION_ACCEPTED, exactly!(0)),
+			(EDGE_REFUSED, exactly!(1), equals!("late"))
 		]
 	}
 }
 
 /// A root, which issues the edge certificate of a scenario.
 fn authority() -> TlsAuthority {
-	let minted = TlsAuthority::mint("CN=tunnel root,O=tightbeam-grpc,C=US", LIFETIME);
-	minted.expect("a test root mints")
+	let created = TlsAuthority::mint("CN=tunnel root,O=tightbeam-grpc,C=US", LIFETIME);
+	created.expect("a test root is created")
 }
 
 /// The TLS edge of `authority`, and the dial that trusts it.
 fn trusted(authority: &TlsAuthority) -> (Edge, Dial) {
-	let minted = authority.edge("CN=tunnel edge,O=tightbeam-grpc,C=US");
-	let edge = minted.expect("an edge certificate mints");
+	let created = authority.edge("CN=tunnel edge,O=tightbeam-grpc,C=US");
+	let edge = created.expect("an edge certificate is created");
 	let dial = authority.dial().expect("a dial trusts the root");
-	(Edge::Tls(edge), Dial::Tls(dial))
-}
-
-/// The identity of an encrypted server, which its client pins.
-fn server_identity() -> Identity {
-	let minted = Identity::mint("CN=tunnel echo,O=tightbeam-grpc,C=US", 1, Duration::from_secs(3600));
-	minted.expect("a test identity mints")
+	(Edge::tls(edge), Dial::Tls(dial))
 }
 
 /// The identity of an encrypted server whose profile `stage` stages a
@@ -122,48 +132,13 @@ fn server_identity() -> Identity {
 fn staged_identity(stage: fn(Edge, Dial)) -> Identity {
 	let (edge, dial) = trusted(&authority());
 	stage(edge, dial);
-	server_identity()
+	server_identity(ECHO)
 }
 
-/// The shared echo on `listener`, which records each session on `trace`.
-fn echo<C>(listener: GrpcListener<DefaultCryptoProvider, C>, trace: &TraceCollector) -> Served
-where
-	C: tightbeam_grpc::edge::EdgeProfile,
-{
-	let addr = TightBeamSocketAddr(listener.local_addr());
-	Ok((EchoService::serve(listener, None, trace), addr))
-}
-
-/// Bind the shared echo of profile `C` on loopback under the encrypted
-/// config of `identity`.
-async fn encrypted_echo<C>(identity: &Identity, trace: &TraceCollector) -> Served
-where
-	C: tightbeam_grpc::edge::EdgeProfile,
-{
-	let bind: GrpcAddr = "127.0.0.1:0".parse()?;
-	let config = identity.server_config()?;
-	let bound = <GrpcListener<DefaultCryptoProvider, C> as EncryptedProtocol>::bind_with(bind, config);
-	let (listener, _addr) = bound.await?;
-
-	echo(listener, trace)
-}
-
-/// Record how `dialed` ended on `trace` as [`DIAL`]: `connected` or
-/// `refused`.
-fn record_dial<T>(dialed: &Result<T, TightBeamError>, trace: &TraceCollector) -> Result<(), TightBeamError> {
-	let outcome = match dialed {
-		Ok(_) => "connected",
-		Err(_) => "refused",
-	};
-	trace.event_with(DIAL, &[], outcome)?;
-	Ok(())
-}
-
-/// The config that grades a run with `spec`, and expects the spec to reject
-/// it.
-fn rejected_by(spec: &'static BuiltAssertSpec) -> Result<ScenarioConfig, ScenarioConfigError> {
-	let config = ScenarioConfig::builder().with_spec(spec);
-	config.with_expect(Expect::Violation(Layer::Assertion)).build()
+/// Stage a trusted TLS edge through `stage`, which records on `trace`.
+fn stage_traced(stage: fn(Edge, Dial), trace: &TraceCollector) {
+	let (edge, dial) = trusted(&authority());
+	stage(edge.with_trace(trace.share()), dial);
 }
 
 // `server!` and `client!` drive a cleartext tunnel inside TLS.
@@ -176,8 +151,7 @@ tb_scenario! {
 			CleartextEcho::stage(edge, dial);
 		},
 		server: |SetupEnv { trace, .. }| async move {
-			let listener = CleartextEchoListener::bind_cleartext("127.0.0.1:0").await?;
-			echo(listener, &trace)
+			EchoServer::cleartext::<CleartextEcho>(&trace).await
 		},
 		client: |ClientEnv { addr, .. }| async move {
 			let mut client = client! {
@@ -203,7 +177,7 @@ tb_scenario! {
 	spec: EncryptedRoundTripSpec,
 	environment ServiceClient {
 		context: staged_identity(EncryptedEcho::stage),
-		server: |SetupEnv { trace, context }| async move { encrypted_echo::<EncryptedEcho>(&context, &trace).await },
+		server: |SetupEnv { trace, context }| async move { EchoServer::encrypted::<EncryptedEcho>(context.server_config(), None, &trace).await },
 		client: |ClientEnv { trace, addr, context }| async move {
 			let expected = TestFrame::v0(None, None);
 			let exchanged = EchoService::exchange::<EncryptedEchoListener, _, _>(GrpcAddr::from(addr.0), context.trust_anchor()?, expected.clone(), &trace);
@@ -214,40 +188,49 @@ tb_scenario! {
 	}
 }
 
+/// The events of the scenario of a dial that trusts another root.
+static UNTRUSTED_DIAL_EVENTS: EventWatch = EventWatch::new();
+
 // A dial that trusts another root fails its TLS handshake, so the server
 // accepts no connection and no tightbeam handshake starts.
 tb_scenario! {
 	name: a_dial_that_trusts_another_root_reaches_no_tunnel,
-	spec: RefusedDialSpec,
+	config: RefusedDialSpec::latest().watched(&UNTRUSTED_DIAL_EVENTS),
 	environment ServiceClient {
-		context: {
+		context: server_identity(ECHO),
+		server: |SetupEnv { trace, context }| async move {
 			let (edge, _dial) = trusted(&authority());
 			let (_edge, other) = trusted(&authority());
-			UntrustedEcho::stage(edge, other);
-			server_identity()
+			UntrustedEcho::stage(edge.with_trace(trace.share()), other);
+			EchoServer::encrypted::<UntrustedEcho>(context.server_config(), None, &trace).await
 		},
-		server: |SetupEnv { trace, context }| async move { encrypted_echo::<UntrustedEcho>(&context, &trace).await },
 		client: |ClientEnv { trace, addr, context }| async move {
 			let frame = TestFrame::v0(None, None);
 			let exchanged = EchoService::exchange::<UntrustedEchoListener, _, _>(GrpcAddr::from(addr.0), context.trust_anchor()?, frame, &trace);
-			let dialed = exchanged.await.map_err(TightBeamError::from);
-			record_dial(&dialed, &trace)
+			assert!(exchanged.await.is_err(), "a dial that trusts another root MUST fail");
+			Ok(UNTRUSTED_DIAL_EVENTS.recorded(EDGE_REFUSED, 1).await?)
 		}
 	}
 }
 
+/// The events of the scenario of an h2c dial to a TLS edge.
+static H2C_DIAL_EVENTS: EventWatch = EventWatch::new();
+
 // An h2c dial to a TLS edge reaches no tunnel.
 tb_scenario! {
 	name: an_h2c_dial_to_a_tls_edge_reaches_no_tunnel,
-	spec: RefusedDialSpec,
+	config: RefusedDialSpec::latest().watched(&H2C_DIAL_EVENTS),
 	environment ServiceClient {
-		context: staged_identity(TlsOnlyEcho::stage),
-		server: |SetupEnv { trace, context }| async move { encrypted_echo::<TlsOnlyEcho>(&context, &trace).await },
+		context: server_identity(ECHO),
+		server: |SetupEnv { trace, context }| async move {
+			stage_traced(TlsOnlyEcho::stage, &trace);
+			EchoServer::encrypted::<TlsOnlyEcho>(context.server_config(), None, &trace).await
+		},
 		client: |ClientEnv { trace, addr, context }| async move {
 			let frame = TestFrame::v0(None, None);
 			let exchanged = EchoService::exchange::<GrpcListener, _, _>(GrpcAddr::from(addr.0), context.trust_anchor()?, frame, &trace);
-			let dialed = exchanged.await.map_err(TightBeamError::from);
-			record_dial(&dialed, &trace)
+			assert!(exchanged.await.is_err(), "an h2c dial to a TLS edge MUST fail");
+			Ok(H2C_DIAL_EVENTS.recorded(EDGE_REFUSED, 1).await?)
 		}
 	}
 }
@@ -256,15 +239,51 @@ tb_scenario! {
 // so the tunnel opens and the echo answers.
 tb_scenario! {
 	name: the_refused_dial_spec_rejects_a_trusted_dial,
-	config: rejected_by(RefusedDialSpec::latest()),
+	config: RefusedDialSpec::latest().rejected(),
 	environment ServiceClient {
-		context: staged_identity(TrustedEcho::stage),
-		server: |SetupEnv { trace, context }| async move { encrypted_echo::<TrustedEcho>(&context, &trace).await },
+		context: server_identity(ECHO),
+		server: |SetupEnv { trace, context }| async move {
+			stage_traced(TrustedEcho::stage, &trace);
+			EchoServer::encrypted::<TrustedEcho>(context.server_config(), None, &trace).await
+		},
 		client: |ClientEnv { trace, addr, context }| async move {
 			let frame = TestFrame::v0(None, None);
 			let exchanged = EchoService::exchange::<TrustedEchoListener, _, _>(GrpcAddr::from(addr.0), context.trust_anchor()?, frame, &trace);
-			let dialed = exchanged.await.map_err(TightBeamError::from);
-			record_dial(&dialed, &trace)
+			exchanged.await?;
+			Ok(())
+		}
+	}
+}
+
+/// The events of the scenario of a connection that never secures.
+static LATE_EVENTS: EventWatch = EventWatch::new();
+
+// A connection that opens TCP and never starts its TLS handshake holds its
+// slot until the securing deadline of the edge, which then records it late.
+// The edge answers the health check of a connection that secures after it
+// once it read the deadline of the silent one.
+tb_scenario! {
+	name: a_connection_that_never_secures_is_refused_late,
+	config: LateSpec::latest().watched(&LATE_EVENTS),
+	environment ServiceClient {
+		context: Coupled::clocked(&LATE_EVENTS),
+		server: |SetupEnv { trace, context }| async move {
+			let edge = context.tls.edge("CN=tunnel edge,O=tightbeam-grpc,C=US").map_err(mint_error)?;
+			let dial = context.tls.dial().map_err(edge_error)?;
+			let edge = Edge::tls(edge).with_trace(trace.share()).with_clock(context.clock.edge());
+			LateEcho::stage(edge, Dial::Tls(dial));
+			let limits = TransportLimits { handshake_timeout: SECURING, ..TransportLimits::default() };
+			let config = context.transport.server_config().with_limits(limits)?;
+			EchoServer::encrypted::<LateEcho>(config, None, &trace).await
+		},
+		client: |ClientEnv { addr, context, .. }| async move {
+			let _silent = bounded(TcpStream::connect(addr.0)).await??;
+			let secured = context.channel(&GrpcAddr::from(addr.0), None).await?;
+			let checked = secured.call(HEALTH_CHECK_PATH, &[], None).await?;
+			assert_eq!(checked.ok(), Some(SERVING.to_vec()), "the secured connection MUST read SERVING");
+
+			context.clock.advance(SECURING)?;
+			Ok(LATE_EVENTS.recorded(EDGE_REFUSED, 1).await?)
 		}
 	}
 }
@@ -275,15 +294,8 @@ fn tls_work_plane() -> WorkPlane {
 	let (edge, dial) = trusted(&authority());
 	TlsGatewayEdge::stage(edge, dial);
 
-	let minted = WorkPlane::mint("tightbeam-grpc");
-	minted.expect("the work plane identities mint")
-}
-
-/// The address of the edge plane of `gateway`.
-fn edge_of(gateway: &TlsGateway) -> Result<GrpcAddr, TightBeamError> {
-	let bound = gateway.edge_addr().cloned();
-	let unbound = TightBeamError::TestingError(TestingError::UnexpectedOutcome("the edge plane did not bind"));
-	bound.ok_or(unbound)
+	let created = WorkPlane::mint("tightbeam-grpc");
+	created.expect("the work plane identities are created")
 }
 
 // A native client submits work through a TLS edge to the colony.
@@ -296,7 +308,7 @@ tb_scenario! {
 		hives: |SetupEnv { trace, context }| vec![async move { context.hive(&trace).await }],
 		client: |ClusterEnv { context, cluster, .. }| async move {
 			let probe = context.client();
-			let mut client = probe.connect::<TlsGatewayListener>(edge_of(&cluster)?).await?;
+			let mut client = probe.connect::<TlsGatewayListener>(WorkClient::edge_of(&cluster)?).await?;
 
 			let work = probe.work(b"tls-work-1").await?;
 			let served = client.submit_work_to(WorkClient::probe()?, &work).await?;

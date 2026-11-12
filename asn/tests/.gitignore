@@ -1,0 +1,3 @@
+# The module and the wasm package that `make test asn` builds for this suite.
+/codecs.ts
+/fixture/

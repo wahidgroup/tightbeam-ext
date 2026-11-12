@@ -1,11 +1,8 @@
 import { defineConfig, devices } from "@playwright/test";
 
-let port = 4317; // default
-if (process.env.E2E_APP_PORT) {
-	port = Number(process.env.E2E_APP_PORT);
-}
+import { APP_PORT } from "./app_port.js";
 
-const baseURL = `http://localhost:${port}`;
+const baseURL = `http://localhost:${APP_PORT}`;
 
 /**
  * The dockerized echo servers are owned by scripts/stack.sh, and

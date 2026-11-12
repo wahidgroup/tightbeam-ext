@@ -1,79 +1,49 @@
 import { describe, expect, it } from "vitest";
 
-import { Command, Topic, TopicError } from "./topic.js";
+import { Push, Topic, TopicError } from "./topic.js";
 import WIRE from "./wire.generated.json" with { type: "json" };
 
 /**
- * The longest name the generated limit admits.
+ * The sample names that the Rust suite grades too, each with the code that
+ * refuses it, or `null` for an accepted name.
  */
-const LONGEST = "a".repeat(WIRE.topicMaxLen);
+const SAMPLES = WIRE.samples;
 
 /**
- * The longest name the generated limit admits, in two-octet characters.
+ * The sample names that both validations accept.
  */
-const LONGEST_WIDE = "é".repeat(WIRE.topicMaxLen / 2);
+const ACCEPTED = SAMPLES.filter(({ refusal }) => refusal === null);
 
-const VALID_NAMES = [
-	{ label: "a plain name", topic: "prices" },
-	{ label: "a hierarchical name", topic: "prices/spot/BTC" },
-	{ label: "a reserved word after the start", topic: "orders/sub/updates" },
-	{ label: "a name at the generated limit", topic: LONGEST },
-	{
-		label: "two-octet characters at the generated limit",
-		topic: LONGEST_WIDE,
-	},
-] as const;
+const UTF8 = new TextEncoder();
 
-const INVALID_NAMES = [
-	{ label: "an empty name", topic: "", code: "Empty" },
-	{
-		label: "one two-octet character past the generated limit",
-		topic: `${LONGEST_WIDE}é`,
-		code: "TooLong",
-	},
-	{
-		label: "the sub/ command prefix",
-		topic: "sub/prices",
-		code: "ReservedPrefix",
-	},
-	{
-		label: "the unsub/ command prefix",
-		topic: "unsub/prices",
-		code: "ReservedPrefix",
-	},
-	{
-		label: "the pub/ command prefix",
-		topic: "pub/prices",
-		code: "ReservedPrefix",
-	},
-	{
-		label: "the end/ command prefix",
-		topic: "end/prices",
-		code: "ReservedPrefix",
-	},
+/**
+ * The names that UTF-16 holds and UTF-8 does not, which only this suite
+ * grades.
+ */
+const LONE_SURROGATES = [
+	{ label: "a lone high surrogate", topic: "prices\uD800" },
+	{ label: "a lone low surrogate", topic: "\uDC00prices" },
 ] as const;
 
 describe("Topic.parse", () => {
-	it.each(VALID_NAMES)("accepts $label", ({ topic }) => {
-		expect(Topic.parse(topic).name).toBe(topic);
+	it.each(SAMPLES)("answers the sample $name with $refusal", ({ name, refusal }) => {
+		if (refusal === null) {
+			expect(Topic.parse(name).name).toBe(name);
+			return;
+		}
+
+		const refused = expect.objectContaining({ code: refusal });
+		expect(() => Topic.parse(name)).toThrow(TopicError);
+		expect(() => Topic.parse(name)).toThrow(refused);
 	});
 
-	it.each(INVALID_NAMES)("rejects $label as $code", ({ topic, code }) => {
-		const refusal = expect.objectContaining({ code });
-		expect(() => Topic.parse(topic)).toThrow(TopicError);
-		expect(() => Topic.parse(topic)).toThrow(refusal);
-	});
-
-	it("a topic past the generated limit is refused", () => {
-		const overlong = `${LONGEST}a`;
-		const refusal = expect.objectContaining({ code: "TooLong" });
-
-		expect(() => Topic.parse(overlong)).toThrow(refusal);
+	it.each(LONE_SURROGATES)("rejects $label as NotUtf8", ({ topic }) => {
+		const refused = expect.objectContaining({ code: "NotUtf8" });
+		expect(() => Topic.parse(topic)).toThrow(refused);
 	});
 
 	it("passes a parsed topic through", () => {
 		const topic = Topic.parse("prices");
-
 		expect(Topic.parse(topic)).toBe(topic);
 	});
 
@@ -82,16 +52,30 @@ describe("Topic.parse", () => {
 	});
 });
 
-describe("Command.parse", () => {
-	it("an end id parses back to its topic", () => {
-		const parsed = Command.parse("end/prices");
-
-		expect(parsed?.completed?.name).toBe("prices");
+describe("Push.parse", () => {
+	it("an end id parses as the completion of its topic", () => {
+		const parsed = Push.parse(UTF8.encode("end/prices"));
+		expect(parsed?.kind).toBe("end");
+		expect(parsed?.topic.name).toBe("prices");
 	});
 
-	it("reads a topic update as no command", () => {
-		const parsed = Command.parse("prices");
+	it("a topic name parses as an update of that topic", () => {
+		const parsed = Push.parse(UTF8.encode("prices"));
+		expect(parsed?.kind).toBe("update");
+		expect(parsed?.topic.name).toBe("prices");
+	});
 
-		expect(parsed).toBeUndefined();
+	it.each(ACCEPTED)("the octets of the sample $name parse as an update of that exact name", ({ name }) => {
+		const parsed = Push.parse(UTF8.encode(name));
+		expect(parsed?.topic.name).toBe(name);
+	});
+
+	it.each(["sub/prices", "end/", ""])("the id %j names no topic", (id) => {
+		expect(Push.parse(UTF8.encode(id))).toBeUndefined();
+	});
+
+	it("an id whose octets are not UTF-8 names no topic", () => {
+		const id = Uint8Array.of(0xff, ...UTF8.encode("prices"));
+		expect(Push.parse(id)).toBeUndefined();
 	});
 });

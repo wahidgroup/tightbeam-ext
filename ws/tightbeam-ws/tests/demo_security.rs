@@ -1,16 +1,9 @@
 //! Both halves of each demo [`Security`] kind, over a loopback handshake, as
 //! tightbeam scenarios.
-//!
-//! Each case accepts one dial on a server of a kind and dials it under the same
-//! kind, as the pubsub demo relay dials its processor. Both transports record
-//! on the trace, so the spec grades the handshake and the receipt each end
-//! files. The server records whether the client certificate it authenticated
-//! is the whole pinned identity, and the dial records the budgets and the
-//! settlement challenge of the receipt it countersigned. A dial that does not
-//! pay a paywalled server fails the handshake, so a case whose spec holds paid
-//! what it was asked.
 
 #![cfg(feature = "testing")]
+
+pub mod support;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,14 +15,15 @@ use tightbeam::trace::TraceCollector;
 use tightbeam::transport::handshake::negotiation::MuxBudgets;
 use tightbeam::transport::handshake::receipt::StoredReceipt;
 use tightbeam::transport::multiplex::MuxAcceptor;
-use tightbeam::transport::{ClientBuilder, ConnectionBuilder, EncryptedMessageIO, EncryptedProtocol};
+use tightbeam::transport::{EncryptedMessageIO, EncryptedProtocol};
 use tightbeam::urn::Urn;
 use tightbeam::{exactly, tb_assert_spec, tb_scenario, urn, TightBeamError};
 use tightbeam_ws::protocol::WsListener;
-use tightbeam_ws::testing::{DemoPaywall, Identity, Security};
+use tightbeam_ws::testing::{DemoPaywall, DemoSettlement, Identity, Security};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
-use tokio::time::timeout;
+
+use support::bounded;
 
 /// Which identity of the kind the client certificate that the server
 /// authenticated is, as [`Security::peer_identity`] names it.
@@ -60,16 +54,8 @@ const CEILING: MuxBudgets = MuxBudgets { client_to_server: 50_000, server_to_cli
 /// How long each identity stays valid.
 const VALIDITY: Duration = Duration::from_secs(3600);
 
-/// How long a loopback handshake may take.
-const PROMPT: Duration = Duration::from_secs(5);
-
 /// The server of a scenario, and the socket address it bound.
 type Served = Result<(JoinHandle<Result<(), TightBeamError>>, TightBeamSocketAddr), TightBeamError>;
-
-/// A deadline that passed, as the failure of the exchange it bounded.
-fn late(elapsed: tokio::time::error::Elapsed) -> TightBeamError {
-	TightBeamError::IoError(elapsed.into())
-}
 
 /// One handshake of a demo kind: the identity of its server, the kind, and the
 /// signal that the server recorded what it authenticated.
@@ -82,20 +68,21 @@ struct Case {
 impl Case {
 	/// A case of `security` against the one server identity of this file.
 	fn of(security: Security) -> Self {
-		let minted = Identity::mint("CN=security server,O=tightbeam-ws,C=US", 1, VALIDITY);
-		let server = minted.expect("the server identity mints");
+		let issued = Identity::mint("CN=security server,O=tightbeam-ws,C=US", 1, VALIDITY);
+		let server = issued.expect("the server identity issues");
 		Self { server, security, served: Notify::new() }
 	}
 
 	/// The client identity that a mutual kind pins.
 	fn client() -> Identity {
-		let minted = Identity::mint("CN=security client,O=tightbeam-ws,C=US", 2, VALIDITY);
-		minted.expect("the client identity mints")
+		let issued = Identity::mint("CN=security client,O=tightbeam-ws,C=US", 2, VALIDITY);
+		issued.expect("the client identity issues")
 	}
 
 	/// The paywalled kind, which invoices [`INVOICE`] under [`CEILING`].
 	fn paywalled() -> Self {
-		let paywall = DemoPaywall::new(INVOICE, PAYMENT, CEILING).expect("the invoice and the payment encode");
+		let settlement = DemoSettlement { invoice: INVOICE, payment: PAYMENT };
+		let paywall = DemoPaywall::new(settlement, CEILING).expect("the invoice and the payment encode");
 		Self::of(Security::Paywalled { pinned: Self::client(), paywall: Arc::new(paywall) })
 	}
 
@@ -130,10 +117,7 @@ impl Case {
 	/// server to record its side.
 	async fn dial(&self, addr: TightBeamSocketAddr, trace: &TraceCollector) -> Result<(), TightBeamError> {
 		let trust = self.server.trust_anchor()?;
-		let mut builder = ClientBuilder::<WsListener>::builder().with_trust_store(trust);
-		if let Some(client) = self.security.client_identity() {
-			builder = builder.with_client_identity(client.signing_identity()?);
-		}
+		let builder = self.security.client_builder::<WsListener>(trust);
 
 		let dialed = builder.connect(addr).await?;
 		let traced = dialed.into_transport().with_trace(trace.share());
@@ -148,7 +132,7 @@ impl Case {
 			}
 		}
 
-		timeout(PROMPT, self.served.notified()).await.map_err(late)
+		bounded(self.served.notified()).await
 	}
 }
 

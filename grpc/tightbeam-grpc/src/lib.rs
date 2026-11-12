@@ -21,6 +21,7 @@ pub mod couple;
 #[cfg(feature = "testing")]
 pub mod testing;
 
+mod deadline;
 mod health;
 mod incoming;
 mod service;

@@ -1,246 +1,455 @@
-//! In-memory transport fixtures for tests and examples.
-//!
-//! Compiled under the `testing` feature. The memory link implements the
-//! upstream envelope traits over channels, so a real client/server mux
-//! pair runs in one process with no sockets.
-//!
-//! [`OpaqueFrame`] builds the frames a TypeScript client would build with its
-//! frame builder, so integration tests and examples send them in its place.
+//! Test support over loopback WebSocket links, and the backplane contract
+//! suite. The page `docs/pubsub.md` (Testing) lists each part.
 
+pub(crate) mod conformance;
+
+use core::future::Future;
+use core::pin::pin;
+use core::time::Duration;
+use std::io;
 use std::sync::Arc;
 
-use tightbeam::builder::TypeBuilder;
 use tightbeam::clock::{Clock, SystemClock};
-use tightbeam::crypto::key::Aes256GcmKeyProvider;
-use tightbeam::policy::{AcceptAllGate, SessionContext};
+use tightbeam::policy::TransitStatus;
+use tightbeam::prelude::TightBeamSocketAddr;
+use tightbeam::trace::TraceCollector;
+use tightbeam::transport::envelopes::GoAwayReason;
 use tightbeam::transport::error::TransportError;
 use tightbeam::transport::handshake::negotiation::MuxSettings;
-use tightbeam::transport::multiplex::{MuxRole, MuxTransport};
-use tightbeam::transport::{CheckedLimits, EnvelopeSink, EnvelopeSource, TransportEnvelope, TransportResult};
-use tightbeam::{Frame, TightBeamError, Version};
-use tightbeam_ws::serve::{AcceptedLink, LinkError, LinkParts};
-use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tightbeam::transport::multiplex::{
+	MuxAcceptor, MuxConnector, MuxDrivers, MuxHandle, MuxRole, MuxTransport, SpawnedMux,
+};
+use tightbeam::transport::{ClientBuilder, Protocol, ResponsePackage};
+use tightbeam::{Frame, TightBeamError};
+use tightbeam_ws::protocol::WsListener;
+use tightbeam_ws::serve::AcceptedLink;
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 
-pub use crate::frame::OpaqueFrame;
-use crate::topic::Topic;
+pub use self::conformance::{BackplaneBreach, BackplaneConformance, Fabric, Refusal};
+use crate::dispatch::PubsubCommands;
+use crate::frame::OpaqueFrame;
+use crate::policy::SubscribePolicy;
+use crate::serve::Unrouted;
+use crate::topic::{Topic, SUB_PREFIX, UNSUB_PREFIX};
 
-/// Envelopes in flight per direction before writers wait.
-const LINK_DEPTH: usize = 64;
+/// How long the kit waits for each step before it reads the step as lost.
+pub(crate) const PATIENCE: Duration = Duration::from_secs(5);
 
-/// The mux of one end of a [`MemoryLink`].
-type MemoryMux = MuxTransport<MemorySource, MemorySink>;
+/// The output of `step`, a wait on the other end of a link, once it settles
+/// within [`PATIENCE`] on `clock`.
+///
+/// # Errors
+///
+/// - [`TightBeamError::TransportError`] -- `step` did not settle in time, or the thread has no timer
+///   for `clock`, as the `From<Lapse>` of [`TransportError`] maps each.
+async fn patient<T>(clock: &dyn Clock, step: impl Future<Output = T>) -> Result<T, TightBeamError> {
+	let bounded = clock.within(PATIENCE, pin!(step)).await;
+	let settled = bounded.map_err(TransportError::from)?;
+	Ok(settled)
+}
 
-/// The server end of a [`MemoryLink`], as the link a server accepts.
-type MemoryServed = AcceptedLink<MemorySource, MemorySink>;
+/// The transport of each end of a [`Loopback`].
+type LoopbackTransport = <WsListener as Protocol>::Transport;
 
-impl OpaqueFrame<'_> {
-	/// The V1 frame whose opaque body is sealed to the key-encryption key
-	/// `kek`, which `kek_id` names: what a TypeScript client's `sealed`
-	/// envelope builds. Only a key holder opens the body.
-	///
-	/// The body seals under a fresh AES-256-GCM content key, wrapped under
-	/// `kek` in a `KEKRecipientInfo`.
+/// The server end of a [`Loopback`], as the link that
+/// [`PubsubCommands::serve`] takes.
+pub type ServerEnd = AcceptedLink<
+	<LoopbackTransport as MuxAcceptor>::EnvelopeReader,
+	<LoopbackTransport as MuxAcceptor>::EnvelopeWriter,
+>;
+
+/// How a [`Loopback`] link dials.
+///
+/// A cleartext link negotiates nothing, so both ends take `settings`.
+pub struct Dial {
+	/// The multiplexing settings of both ends.
+	pub settings: MuxSettings,
+	/// The clock of the server end, which runs every deadline of the
+	/// registry that serves it.
+	pub clock: Arc<dyn Clock>,
+	/// The trace that both transports record on, when the link has one.
+	pub trace: Option<TraceCollector>,
+}
+
+impl Default for Dial {
+	/// Four streams each way, the system clock, and no trace.
+	fn default() -> Self {
+		Self { settings: MuxSettings::symmetric(4), clock: Arc::new(SystemClock), trace: None }
+	}
+}
+
+impl Dial {
+	/// The default dial, recording on `trace`.
+	#[must_use]
+	pub fn traced(trace: &TraceCollector) -> Self {
+		Self { trace: Some(trace.share()), ..Self::default() }
+	}
+
+	/// `transport`, recording on the trace of this dial.
+	fn recording(&self, transport: LoopbackTransport) -> LoopbackTransport {
+		match &self.trace {
+			Some(trace) => transport.with_trace(trace.share()),
+			None => transport,
+		}
+	}
+}
+
+/// One cleartext WebSocket connection on loopback, through the real
+/// listener, dial, and [`AcceptedLink::cleartext`] of `tightbeam-ws`.
+///
+/// The server end dials, because a dial runs on the clock it names and an
+/// accepted transport runs on the system clock.
+pub struct Loopback {
+	/// The server end, on the clock of the dial.
+	pub server: ServerEnd,
+	/// The client end, spawned, with its responder unserved.
+	pub client: SpawnedMux,
+}
+
+impl Loopback {
+	/// Open one link under `dial`.
 	///
 	/// # Errors
 	///
-	/// - [`TightBeamError::SerializationError`]: the body or the frame fails
-	///   to encode as DER.
-	/// - Any other [`TightBeamError`] of
-	///   [`TypeBuilder::build`](tightbeam::builder::TypeBuilder::build): the
-	///   body fails to seal.
-	///
-	/// # Sources
-	///
-	/// - RFC 5083, CMS Authenticated-Enveloped-Data Content Type:
-	///   <https://datatracker.ietf.org/doc/html/rfc5083>
-	/// - RFC 5652 § 6.2.3, `KEKRecipientInfo`:
-	///   <https://datatracker.ietf.org/doc/html/rfc5652#section-6.2.3>
-	pub fn sealed(&self, kek: &[u8; 32], kek_id: &[u8]) -> Result<Frame, TightBeamError> {
-		let framed = self.framed(Version::V1)?;
-		let sealer = Aes256GcmKeyProvider::new(kek.to_vec(), kek_id.to_vec())?;
-		framed.with_encryptor(sealer).build()
+	/// - The [`TightBeamError`] of a listener that failed to bind, a dial or an
+	///   accept that failed, or a clock of `dial` that cannot race a wait on
+	///   the calling thread.
+	/// - [`TightBeamError::TransportError`] -- the dial and the accept did not settle within the
+	///   patience of the kit on the system clock.
+	pub async fn open(dial: &Dial) -> Result<Self, TightBeamError> {
+		let loopback = TightBeamSocketAddr("127.0.0.1:0".parse()?);
+		let (listener, addr) = <WsListener as Protocol>::bind_cleartext(loopback).await?;
+		let builder = ClientBuilder::<WsListener>::on_clock(Arc::clone(&dial.clock)).allow_cleartext();
+
+		let linking = async { tokio::try_join!(listener.accept(), builder.connect(addr)) };
+		let linked = patient(&SystemClock, linking).await?;
+		let ((accepted, _peer), dialed) = linked?;
+		let server_transport = dial.recording(dialed.into_transport());
+		let server = AcceptedLink::cleartext(server_transport, dial.settings).map_err(io::Error::other)?;
+
+		let client_transport = dial.recording(accepted);
+		let (reader, writer) = MuxConnector::into_envelope_halves(client_transport)?;
+		let client = MuxTransport::new(reader, writer, MuxRole::Client, dial.settings).spawn();
+		Ok(Self { server, client })
 	}
 }
 
-impl Topic {
-	/// The topic `name`, for a test or an example that names a valid topic.
-	///
-	/// # Panics
-	///
-	/// Panics when `name` fails [`Topic`] validation.
-	///
-	/// # Examples
-	///
-	/// ```
-	/// use tightbeam_pubsub::Topic;
-	///
-	/// let topic = Topic::fixture("prices/spot");
-	/// assert_eq!(topic.as_str(), "prices/spot");
-	/// ```
-	#[must_use]
-	pub fn fixture(name: &str) -> Self {
-		name.parse().expect("a fixture names a valid topic")
-	}
-}
-
-/// Receive half of one in-memory link direction.
-pub struct MemorySource {
-	envelopes: Receiver<TransportEnvelope>,
-}
-
-impl EnvelopeSource for MemorySource {
-	async fn read_envelope(&mut self) -> TransportResult<TransportEnvelope> {
-		self.envelopes.recv().await.ok_or(TransportError::ConnectionClosed)
-	}
-
-	fn limits(&self) -> CheckedLimits {
-		CheckedLimits::default()
-	}
-}
-
-/// Send half of one in-memory link direction.
-pub struct MemorySink {
-	envelopes: Sender<TransportEnvelope>,
-	clock: Arc<dyn Clock>,
-}
-
-impl EnvelopeSink for MemorySink {
-	async fn write_envelope(&mut self, envelope: TransportEnvelope) -> TransportResult<()> {
-		self.envelopes
-			.send(envelope)
-			.await
-			.map_err(|_| TransportError::ConnectionClosed)
-	}
-
-	fn remaining_records(&self) -> u64 {
-		u64::MAX
-	}
-
-	fn clock(&self) -> Arc<dyn Clock> {
-		Arc::clone(&self.clock)
-	}
-}
-
-/// The two halves of one end of a [`MemoryLink`].
-struct MemoryEnd {
-	source: MemorySource,
-	sink: MemorySink,
-}
-
-/// An in-memory link between a client end and a server end. Every half
-/// reads one clock, as the halves of one transport do.
+/// One client of a registry over a [`Loopback`] link. The server end serves
+/// through [`PubsubCommands::serve`], and the client answers each update
+/// with `Ok` once it holds an ack permit.
 ///
-/// The link skips the handshake negotiation, so [`MuxSettings::symmetric`]
-/// matches cleartext multiplexing. A send budget on the settings meters what
-/// each end may emit.
+/// The drop ends the link, which leaves the registry.
 ///
 /// # Examples
 ///
 /// ```
-/// use tightbeam::transport::handshake::negotiation::MuxSettings;
-/// use tightbeam_pubsub::testing::MemoryLink;
+/// use tightbeam_pubsub::testing::{Dial, Peer};
+/// use tightbeam_pubsub::{AllowAll, PubsubCommands, Topic, TopicRegistry};
 ///
-/// let link = MemoryLink::default();
-/// let (_client, _server) = link.mux_pair(MuxSettings::symmetric(4));
+/// # async fn read() -> Result<(), Box<dyn std::error::Error>> {
+/// let registry = TopicRegistry::default();
+/// let commands = PubsubCommands::new(registry.clone(), AllowAll);
+/// let topic: Topic = "prices".parse()?;
+///
+/// let mut peer = Peer::connect(&commands, &Dial::default()).await?;
+/// peer.subscribe(&topic).await?;
+/// registry.publish(&topic, b"tick").await?;
+///
+/// let update = peer.next_update().await;
+/// assert_eq!(update.map(|update| update.metadata().order()), Some(1));
+/// # Ok(())
+/// # }
 /// ```
-#[derive(Clone)]
-pub struct MemoryLink {
+pub struct Peer {
+	handle: MuxHandle,
+	updates: UnboundedReceiver<Arc<Frame>>,
+	acks: Arc<Semaphore>,
+	streams: u32,
+	/// The clock of the patience of each command.
 	clock: Arc<dyn Clock>,
+	serving: JoinSet<()>,
+	_responding: JoinSet<()>,
+	_drivers: MuxDrivers,
 }
 
-impl Default for MemoryLink {
-	/// A link on the system clock.
-	fn default() -> Self {
-		Self::new(Arc::new(SystemClock))
-	}
-}
-
-impl MemoryLink {
-	/// A link whose halves read `clock`.
-	pub fn new(clock: Arc<dyn Clock>) -> Self {
-		Self { clock }
-	}
-
-	/// The clock every half of this link reads.
-	#[must_use]
-	pub fn clock(&self) -> Arc<dyn Clock> {
-		Arc::clone(&self.clock)
-	}
-
-	/// A connected client and server mux over this link, both under
-	/// `settings`.
-	#[must_use]
-	pub fn mux_pair(&self, settings: MuxSettings) -> (MemoryMux, MemoryMux) {
-		let (client, server) = self.ends();
-
-		let client_mux = MuxTransport::new(client.source, client.sink, MuxRole::Client, settings);
-		let server_mux = MuxTransport::new(server.source, server.sink, MuxRole::Server, settings);
-		(client_mux, server_mux)
-	}
-
-	/// A connected client mux, and the server end as the [`AcceptedLink`]
-	/// that [`PubsubCommands::serve`](crate::PubsubCommands::serve) takes, both
-	/// under `settings`.
-	///
-	/// The link runs no handshake, so its gate admits every call and its peer
-	/// is anonymous.
+impl Peer {
+	/// Connect to the registry of `commands` under `dial`, acking each update
+	/// as it arrives.
 	///
 	/// # Errors
 	///
-	/// - [`LinkError::ClockCannotRace`]: the clock of this link cannot race a wait on the calling
-	///   thread.
-	pub fn served(&self, settings: MuxSettings) -> Result<(MemoryMux, MemoryServed), LinkError> {
-		let (client, server) = self.ends();
-		let client_mux = MuxTransport::new(client.source, client.sink, MuxRole::Client, settings);
-		let parts = LinkParts {
-			reader: server.source,
-			writer: server.sink,
-			settings,
-			gate: Box::new(AcceptAllGate),
-			session: SessionContext::default(),
-		};
-
-		let server_link = AcceptedLink::from_parts(parts)?;
-		Ok((client_mux, server_link))
+	/// - The errors of [`Loopback::open`].
+	pub async fn connect<P>(commands: &PubsubCommands<P>, dial: &Dial) -> Result<Self, TightBeamError>
+	where
+		P: SubscribePolicy + 'static,
+	{
+		Self::open(commands, dial, 1).await
 	}
 
-	/// The halves of the two ends: the client's, then the server's.
-	fn ends(&self) -> (MemoryEnd, MemoryEnd) {
-		let (to_server, from_client) = channel(LINK_DEPTH);
-		let (to_client, from_server) = channel(LINK_DEPTH);
+	/// Connect as [`connect`](Self::connect) does, with every ack held until
+	/// [`grant`](Self::grant) hands out a permit for it.
+	///
+	/// # Errors
+	///
+	/// - The errors of [`Loopback::open`].
+	pub async fn stalled<P>(commands: &PubsubCommands<P>, dial: &Dial) -> Result<Self, TightBeamError>
+	where
+		P: SubscribePolicy + 'static,
+	{
+		Self::open(commands, dial, 0).await
+	}
 
-		let client = MemoryEnd {
-			source: MemorySource { envelopes: from_server },
-			sink: MemorySink { envelopes: to_server, clock: self.clock() },
+	/// Connect with `permits` acks free at once.
+	async fn open<P>(commands: &PubsubCommands<P>, dial: &Dial, permits: usize) -> Result<Self, TightBeamError>
+	where
+		P: SubscribePolicy + 'static,
+	{
+		let Loopback { server, client } = Loopback::open(dial).await?;
+		let SpawnedMux { handle, responder, drivers } = client;
+		let (sender, updates) = unbounded_channel();
+		let acks = Arc::new(Semaphore::new(permits));
+
+		let gate = Arc::clone(&acks);
+		let answer = move |update: Arc<Frame>| {
+			let sender = sender.clone();
+			let gate = Arc::clone(&gate);
+			async move {
+				// A peer that dropped its receiver reads nothing more.
+				let _ = sender.send(update);
+				// The semaphore closes only with the peer.
+				if let Ok(permit) = gate.acquire().await {
+					drop(permit);
+				}
+
+				ResponsePackage::new(TransitStatus::Ok, None)
+			}
 		};
-		let server = MemoryEnd {
-			source: MemorySource { envelopes: from_client },
-			sink: MemorySink { envelopes: to_client, clock: self.clock() },
-		};
-		(client, server)
+
+		let commands = commands.clone();
+		let mut serving = JoinSet::new();
+		serving.spawn(async move {
+			// The client reads the end of the serve as the end of its link.
+			let _ = commands.serve(server, Unrouted).await;
+		});
+
+		let mut responding = JoinSet::new();
+		responding.spawn(async move {
+			// The responder ends with the link.
+			let _ = responder.serve(answer).await;
+		});
+
+		let streams = dial.settings.local_initiated_cap();
+		Ok(Self {
+			handle,
+			updates,
+			acks,
+			streams,
+			clock: Arc::new(SystemClock),
+			serving,
+			_responding: responding,
+			_drivers: drivers,
+		})
+	}
+
+	/// Subscribe to `topic` with a `sub/` command.
+	///
+	/// # Errors
+	///
+	/// - The errors of [`request`](Self::request).
+	pub async fn subscribe(&self, topic: &Topic) -> Result<(), TightBeamError> {
+		let id = format!("{SUB_PREFIX}{topic}");
+		self.request(&id, b"").await?;
+		Ok(())
+	}
+
+	/// Unsubscribe from `topic` with an `unsub/` command.
+	///
+	/// # Errors
+	///
+	/// - The errors of [`request`](Self::request).
+	pub async fn unsubscribe(&self, topic: &Topic) -> Result<(), TightBeamError> {
+		let id = format!("{UNSUB_PREFIX}{topic}");
+		self.request(&id, b"").await?;
+		Ok(())
+	}
+
+	/// Emit one stream of the id `id` that carries `payload`, and answer the
+	/// frame the server answered with.
+	///
+	/// # Errors
+	///
+	/// - The errors of [`OpaqueFrame::build`].
+	/// - [`TightBeamError::TransportError`] -- the stream was refused, the link failed, the server
+	///   did not answer within the patience of the kit on the system clock (`DeadlineExceeded`), or
+	///   the polling thread has no timer for that clock (`FailedPrecondition`).
+	pub async fn request(&self, id: &str, payload: &[u8]) -> Result<Option<Frame>, TightBeamError> {
+		let frame = OpaqueFrame { id, order: 1, payload };
+		let built = frame.build()?;
+		let answered = patient(&*self.clock, self.handle.emit_on_stream(&built)).await?;
+		Ok(answered?)
+	}
+
+	/// The next update that the registry pushed, or `None` once the link
+	/// closed. The update arrives before its ack.
+	pub async fn next_update(&mut self) -> Option<Arc<Frame>> {
+		self.updates.recv().await
+	}
+
+	/// Free `acks` more acks of updates.
+	pub fn grant(&self, acks: usize) {
+		self.acks.add_permits(acks);
+	}
+
+	/// Wait for the GoAway of the server, and answer its reason.
+	///
+	/// The peer holds every local stream slot, so its wait for a free slot
+	/// ends when a GoAway ends admission. A slot that will not open means
+	/// admission already ended.
+	pub async fn goaway(&self) -> Option<GoAwayReason> {
+		let mut held = Vec::new();
+		for _ in 0..self.streams {
+			let Ok(stream) = self.handle.open_stream() else {
+				break;
+			};
+
+			held.push(stream);
+		}
+
+		let admission = self.handle.wait_for_stream_slot().await;
+		drop(held);
+
+		admission.err()?;
+		self.handle.goaway_reason()
+	}
+
+	/// Drop the serve of the server end, as an accept loop that aborts its
+	/// handlers does, and wait until the serve is gone.
+	pub async fn drop_serve(&mut self) {
+		self.serving.abort_all();
+		while self.serving.join_next().await.is_some() {}
 	}
 }
 
-/// The faults that the unit tests of this crate inject.
+/// The fixtures of the unit tests of this crate.
 #[cfg(test)]
-pub(crate) mod faults {
-	use der::{Error as DerError, ErrorKind};
+pub(crate) mod nodes {
+	use core::future::{poll_fn, Future};
+	use core::pin::Pin;
+	use core::task::Poll;
+	use core::time::Duration;
+	use std::sync::Arc;
 
-	use crate::backplane::{DeliverError, UpdateSink};
+	use tightbeam::policy::TransitStatus;
+	use tightbeam::transport::multiplex::{MuxDispatch, SpawnedMux};
+	use tightbeam::transport::{ResponsePackage, TransportResult};
+	use tightbeam::Frame;
+	use tightbeam_ws::serve::ServedMux;
+
+	use super::{Dial, Loopback, PATIENCE};
+	use crate::registry::{Member, Membership, TopicRegistry};
+	use crate::serve::ConnectionContext;
 	use crate::topic::Topic;
 
-	/// A node whose every update frame fails to build: the hard refusal that
-	/// fails a publish closed.
-	pub(crate) struct Rejector;
+	/// The emit deadline of the tests that advance a manual clock past it,
+	/// twice [`PATIENCE`], so only the advance ends an emit within the bound.
+	pub(crate) const SHORT: Duration = Duration::from_secs(PATIENCE.as_secs() * 2);
 
-	impl UpdateSink for Rejector {
-		fn deliver(&self, _topic: &Topic, _order: u64, _payload: &[u8]) -> Result<(), DeliverError> {
-			let encoding = DerError::from(ErrorKind::Failed);
-			Err(DeliverError::Build(encoding.into()))
+	/// Answers every unary stream with an empty `Ok`.
+	pub(crate) struct Accepting;
+
+	impl MuxDispatch for Accepting {
+		async fn unary(&self, _frame: Arc<Frame>) -> TransportResult<ResponsePackage> {
+			Ok(ResponsePackage::new(TransitStatus::Ok, None))
+		}
+	}
+
+	/// Whether `future` waits at its first poll.
+	pub(crate) async fn waits<F: Future>(mut future: Pin<&mut F>) -> bool {
+		poll_fn(|context| Poll::Ready(future.as_mut().poll(context).is_pending())).await
+	}
+
+	/// One loopback connection that a registry admitted, whose client end
+	/// reads nothing. The drop leaves the registry.
+	pub(crate) struct Admitted {
+		membership: Membership,
+		_link: (ServedMux, SpawnedMux),
+	}
+
+	impl Admitted {
+		/// Admit one connection to `registry` under the default dial.
+		pub(crate) async fn to(registry: &TopicRegistry) -> Self {
+			Self::over(registry, &Dial::default()).await
 		}
 
-		fn has_members(&self, _topic: &Topic) -> bool {
-			false
+		/// Admit one connection to `registry` under `dial`.
+		pub(crate) async fn over(registry: &TopicRegistry, dial: &Dial) -> Self {
+			let opened = Loopback::open(dial).await;
+			let Loopback { server, client } = opened.expect("a loopback link opens");
+			let served = server.spawn();
+			let membership = registry.admit(&served);
+			Self { membership, _link: (served, client) }
+		}
+
+		/// The context of the connection.
+		pub(crate) fn context(&self) -> &ConnectionContext {
+			self.membership.context()
+		}
+
+		/// The standing of the connection in its registry.
+		pub(crate) fn member(&self) -> &Member {
+			self.context().member()
+		}
+
+		/// Subscribe the connection to `name`, expecting acceptance.
+		pub(crate) fn subscribe(&self, name: &str) {
+			let topic: Topic = name.parse().expect("the name should be a topic");
+			self.member().subscribe(topic).expect("the registration should be accepted");
+		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use tightbeam::testing::SetupEnv;
+	use tightbeam::urn::Urn;
+	use tightbeam::{exactly, tb_assert_spec, tb_scenario, urn};
+
+	use super::*;
+	use crate::policy::AllowAll;
+	use crate::registry::TopicRegistry;
+	use crate::testing::conformance::PAST_DER_LIMIT;
+
+	/// Whether a request whose frame failed to build answered the encode
+	/// error of the build.
+	const BUILD_FAILED: Urn<'static> = urn!("test", "event:pubsub-peer/build-failed");
+
+	tb_assert_spec! {
+		pub FailedBuildSpec,
+		V(1,0,0): {
+			mode: Accept,
+			assertions: [
+				(BUILD_FAILED, exactly!(1), equals!(true))
+			]
+		}
+	}
+
+	// A request whose payload passes the longest DER length answers the
+	// encode error of its frame.
+	tb_scenario! {
+		name: a_request_whose_frame_fails_to_build_answers_the_encode_error,
+		spec: FailedBuildSpec,
+		environment Bare {
+			exec: |SetupEnv { trace, .. }| async move {
+				let commands = PubsubCommands::new(TopicRegistry::default(), AllowAll);
+				let peer = Peer::connect(&commands, &Dial::default()).await?;
+				let oversized = vec![0_u8; PAST_DER_LIMIT];
+				let requested = peer.request("pub/prices", &oversized).await;
+				let failed = matches!(requested, Err(TightBeamError::SerializationError(_)));
+				trace.event_with(BUILD_FAILED, &[], failed)?;
+				Ok(())
+			}
 		}
 	}
 }

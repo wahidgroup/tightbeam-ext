@@ -1,15 +1,5 @@
-//! WebSocket message I/O for tightbeam.
-//!
-//! [`WsStream`] adapts a `tokio-tungstenite` WebSocket to tightbeam's
-//! transport-agnostic [`AsyncProtocolStream`] trait: each DER-encoded tightbeam
-//! envelope is carried as a single WebSocket frame. Plugged into tightbeam's
-//! generic transport, it yields [`WsTransport`]. [`WsStream`] also splits into
-//! exclusive halves ([`SplittableStream`]) so a multiplexed connection can read
-//! and write concurrently.
-//!
-//! [`WsReadHalf`] and [`WsWriteHalf`] are the native kinds of [`WireStream`]
-//! and [`WireSink`], and [`WsStream`] holds the [`WireDuplex`] of the two, so
-//! every read and write runs the envelope rules of [`tightbeam_wire`].
+//! WebSocket message I/O for tightbeam, as `docs/ws.md` (Stream and envelope
+//! rules) states it.
 //!
 //! # Sources
 //!
@@ -20,6 +10,7 @@ use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
+use tokio_tungstenite::tungstenite::error::ProtocolError;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::{Bytes, Error as WsError, Message};
 use tokio_tungstenite::{accept_async_with_config, connect_async_with_config, MaybeTlsStream, WebSocketStream};
@@ -33,10 +24,10 @@ use crate::acceptor::WsInner;
 /// A bidirectional WebSocket carrying tightbeam frames, one DER envelope per
 /// binary message.
 ///
-/// The stream is the [`WireDuplex`] of the native halves, so every read and
-/// write settles into its liveness. A stream comes only from a dial or an
-/// accept of [`WsListener`](crate::protocol::WsListener), and each one opens
-/// its socket under the envelope ceiling of its endpoint.
+/// - The stream is the [`WireDuplex`] of [`WsReadHalf`] and [`WsWriteHalf`], so every read and write
+///   runs the envelope rules of [`tightbeam_wire`].
+/// - A dial or an accept of [`WsListener`](crate::protocol::WsListener) opens the socket under the
+///   envelope ceiling of its endpoint.
 ///
 /// # Examples
 ///
@@ -48,7 +39,7 @@ use crate::acceptor::WsInner;
 /// # #[tokio::main(flavor = "current_thread")]
 /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let listener: WsListener = WsListener::bind_cleartext("127.0.0.1:0").await?;
-/// let addr = TightBeamSocketAddr(listener.local_addr()?);
+/// let addr = TightBeamSocketAddr(listener.local_addr());
 /// let stream = <WsListener as Protocol>::connect(addr).await?;
 /// let (_read, _write) = stream.into_split();
 /// # Ok(())
@@ -96,13 +87,12 @@ impl WsStream<WsInner> {
 		Ok(Self::over(socket))
 	}
 
-	/// The WebSocket configuration that holds a peer to the ceilings of
-	/// `limits`.
+	/// The WebSocket configuration that holds a peer to the larger ceiling of
+	/// `limits`, which each read narrows to the cap of its phase.
 	///
-	/// Tungstenite refuses a frame by its declared length before it sizes a
-	/// buffer, which [`AsyncProtocolStream::read_frame`] requires of a stream.
-	/// The reader knows the wire mode only once it holds the bytes, so the
-	/// socket admits the larger ceiling, and each read narrows it to its cap.
+	/// - Tungstenite refuses a frame by its declared length before it sizes a buffer, as
+	///   [`AsyncProtocolStream::read_frame`] requires of a stream.
+	/// - Only the transport knows the phase of a read, so the socket holds the larger ceiling.
 	fn socket_config(limits: &TransportLimits) -> WebSocketConfig {
 		let ceiling = Some(limits.max_envelope());
 		WebSocketConfig::default().max_message_size(ceiling).max_frame_size(ceiling)
@@ -145,13 +135,19 @@ pub type WsTransport<S, P = DefaultCryptoProvider> = TcpTransport<WsStream<S>, P
 
 /// The fault class of a tungstenite error:
 ///
-/// - A closed connection, at a read or a write, is [`WireFault::Closed`].
-/// - A failed byte stream is [`WireFault::Io`].
+/// - A close, the end of the stream with no close, a send after the close, and
+///   a use after the end are [`WireFault::Closed`].
+/// - A failed byte stream, such as a write to a peer that left with no close,
+///   is [`WireFault::Io`].
 /// - A message past the socket configuration is [`WireFault::Oversize`].
-/// - Every other error, such as a protocol violation, is [`WireFault::Invalid`].
+/// - Every other error is a break of the protocol, which is [`WireFault::Invalid`].
 fn fault(error: WsError) -> WireFault {
 	match error {
-		WsError::ConnectionClosed | WsError::AlreadyClosed => WireFault::Closed,
+		WsError::ConnectionClosed
+		| WsError::AlreadyClosed
+		| WsError::Protocol(ProtocolError::ResetWithoutClosingHandshake | ProtocolError::SendAfterClosing) => {
+			WireFault::Closed
+		}
 		WsError::Io(io) => WireFault::Io(io),
 		WsError::Capacity(_) => WireFault::Oversize,
 		_ => WireFault::Invalid,
@@ -284,12 +280,23 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn a_reset_without_a_close_reads_as_an_invalid_message() -> TestResult {
+	async fn a_reset_without_a_close_reads_as_connection_closed() -> TestResult {
 		let (mut stream, peer) = connected().await;
 		drop(peer);
 
 		let reset = stream.read_frame(CAP).await;
-		assert!(matches!(reset, Err(TransportError::InvalidMessage)));
+		assert!(matches!(reset, Err(TransportError::ConnectionClosed)));
+		Ok(())
+	}
+
+	#[tokio::test]
+	async fn a_write_after_the_peer_closed_is_connection_closed() -> TestResult {
+		let (mut stream, mut peer) = connected().await;
+		peer.close(None).await?;
+		let _closed = stream.read_frame(CAP).await;
+
+		let refused = stream.write_frame(&[1, 2, 3]).await;
+		assert!(matches!(refused, Err(TransportError::ConnectionClosed)));
 		Ok(())
 	}
 

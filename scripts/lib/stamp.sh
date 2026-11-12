@@ -1,30 +1,20 @@
 #!/usr/bin/env bash
-# Shared stamp/lock primitives for the setup scripts. Each setup script
-# (root toolchain, per-project installs) sources this and composes:
-#
-#   REPO_ROOT=... . "$REPO_ROOT/scripts/lib/stamp.sh"
-#   acquire_lock; trap release_lock EXIT
-#   if stamp_stale "$STAMP" "${MANIFESTS[@]}"; then
-#       ...install...
-#       write_stamp "$STAMP" "${MANIFESTS[@]}"
-#   fi
-#
-# The lock is one file for every setup script, so parallel make jobs and
-# nested invocations serialize instead of racing npm/cargo installs.
+# The stamp and lock that each installing setup script sources with REPO_ROOT set: docs/development.md (Projects).
 
 STAMP_DIR="$REPO_ROOT/.make"
+# One lock for every installing setup script, so parallel make jobs and nested runs take turns at the installs.
 LOCK_FILE="$STAMP_DIR/setup.lock"
 LOCK_DIR="$STAMP_DIR/setup.lock.d"
 LOCK_FD=9
 LOCK_KIND=""
 
-# GitHub Actions sets CI=true; prefer lockfile-faithful installs there.
+# GitHub Actions sets CI=true, and there npm installs exactly what the lockfile holds.
 NPM_INSTALL_CMD=install
 if [ "${CI:-}" = "true" ] || [ "${CI:-}" = "1" ]; then
 	NPM_INSTALL_CMD=ci
 fi
 
-# sha256sum (Linux) or shasum (macOS); both print "hash  path".
+# sha256sum on Linux, or shasum on macOS. Both print "hash  path".
 if command -v sha256sum >/dev/null 2>&1; then
 	SHA256_CMD=(sha256sum)
 elif command -v shasum >/dev/null 2>&1; then

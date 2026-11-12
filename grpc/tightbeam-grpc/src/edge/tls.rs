@@ -10,6 +10,9 @@ use std::sync::Arc;
 use http::Uri;
 use hyper_util::rt::TokioIo;
 use rustls::crypto::{ring, CryptoProvider};
+use rustls::server::danger::ClientCertVerifier;
+use rustls::server::WebPkiClientVerifier;
+use rustls::sign::{CertifiedKey, SingleCertAndKey};
 use rustls::version::TLS13;
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use rustls_pki_types::pem::PemObject;
@@ -28,10 +31,67 @@ use crate::protocol::GrpcAddr;
 /// The one ALPN protocol of an edge: HTTP/2 over TLS (RFC 9113 section 3.2).
 const ALPN_H2: &[u8] = b"h2";
 
-/// The provider of every config of this module, and of the client verifier
-/// of a coupled edge.
-pub(crate) fn provider() -> Arc<CryptoProvider> {
-	Arc::new(ring::default_provider())
+/// The TLS of every end of an edge: TLS 1.3 alone and ALPN `h2` alone, under
+/// the ring provider.
+pub(crate) struct EdgeTlsPolicy;
+
+impl EdgeTlsPolicy {
+	/// The provider of every config of an edge, and of the client verifier
+	/// of a coupled edge.
+	pub(crate) fn provider() -> Arc<CryptoProvider> {
+		Arc::new(ring::default_provider())
+	}
+
+	/// The key of `chain`, the certificate of an end first, once the provider
+	/// loads `key` and it matches the certificate.
+	///
+	/// # Errors
+	///
+	/// - [`EdgeError::NoCertificate`] -- `chain` is empty.
+	/// - [`EdgeError::Tls`] -- rustls refuses the key, or it does not match the certificate.
+	fn certified(
+		chain: Vec<CertificateDer<'static>>,
+		key: PrivateKeyDer<'static>,
+	) -> Result<Arc<CertifiedKey>, EdgeError> {
+		if chain.is_empty() {
+			return Err(EdgeError::NoCertificate);
+		}
+
+		let certified = CertifiedKey::from_der(chain, key, &Self::provider())?;
+		Ok(Arc::new(certified))
+	}
+
+	/// The config of a bind that presents `key`, and verifies the client chain
+	/// of each connection with `verifier`.
+	///
+	/// # Errors
+	///
+	/// - [`EdgeError::Tls`] -- the provider refuses TLS 1.3.
+	fn server(key: &Arc<CertifiedKey>, verifier: Arc<dyn ClientCertVerifier>) -> Result<ServerConfig, EdgeError> {
+		let builder = ServerConfig::builder_with_provider(Self::provider()).with_protocol_versions(&[&TLS13])?;
+		let resolver = Arc::new(SingleCertAndKey::from(Arc::clone(key)));
+		let mut config = builder.with_client_cert_verifier(verifier).with_cert_resolver(resolver);
+		config.alpn_protocols = vec![ALPN_H2.to_vec()];
+		Ok(config)
+	}
+
+	/// The config of a dial that trusts `roots`, and presents `identity` when
+	/// it is `Some`.
+	///
+	/// # Errors
+	///
+	/// - [`EdgeError::Tls`] -- the provider refuses TLS 1.3.
+	fn client(roots: &Arc<RootCertStore>, identity: Option<&Arc<CertifiedKey>>) -> Result<ClientConfig, EdgeError> {
+		let builder = ClientConfig::builder_with_provider(Self::provider()).with_protocol_versions(&[&TLS13])?;
+		let builder = builder.with_root_certificates(Arc::clone(roots));
+		let mut config = match identity {
+			Some(identity) => builder.with_client_cert_resolver(Arc::new(SingleCertAndKey::from(Arc::clone(identity)))),
+			None => builder.with_no_client_auth(),
+		};
+
+		config.alpn_protocols = vec![ALPN_H2.to_vec()];
+		Ok(config)
+	}
 }
 
 /// The TLS of the bind of an edge: the certificate chain that the edge
@@ -39,23 +99,24 @@ pub(crate) fn provider() -> Arc<CryptoProvider> {
 ///
 /// # Examples
 ///
-/// ```no_run
-/// use tightbeam_grpc::edge::{Edge, EdgeError, EdgeTls};
+/// ```
+/// use tightbeam_grpc::edge::{Edge, EdgeTls, EdgeTlsFiles};
+/// # use tightbeam_grpc::testing::{CoupledStack, MintError};
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// # let dir = std::env::temp_dir().join(format!("tightbeam-grpc-doc-edge-{}", std::process::id()));
+/// # let stack = CoupledStack::at(dir);
+/// # stack.write(core::time::Duration::from_secs(60), |_| Ok::<(), MintError>(()))?;
+/// # let (chain, key) = (stack.edge_chain(), stack.edge_key());
 ///
-/// let tls = EdgeTls::from_pem("/run/edge/tls.crt", "/run/edge/tls.key")?;
-/// let edge = Edge::Tls(tls);
-/// # Ok::<(), EdgeError>(())
+/// let tls = EdgeTls::from_pem(EdgeTlsFiles { chain, key })?;
+/// let edge = Edge::tls(tls);
+/// # std::fs::remove_dir_all(stack.dir())?;
+/// # Ok(())
+/// # }
 /// ```
 #[derive(Clone, Debug)]
 pub struct EdgeTls {
-	config: Arc<ServerConfig>,
-	/// The chain and the key of the config, which a coupled edge builds a
-	/// config with its client verifier from, because rustls fixes the
-	/// verifier of a config when it builds it.
-	#[cfg(feature = "couple")]
-	chain: Vec<CertificateDer<'static>>,
-	#[cfg(feature = "couple")]
-	key: Arc<PrivateKeyDer<'static>>,
+	key: Arc<CertifiedKey>,
 }
 
 impl EdgeTls {
@@ -66,85 +127,78 @@ impl EdgeTls {
 	/// # Errors
 	///
 	/// - [`EdgeError::NoCertificate`] -- `chain` is empty.
-	/// - [`EdgeError::Tls`] -- rustls refuses the chain or the key, such as a
-	///   key that does not match the certificate.
+	/// - [`EdgeError::Tls`] -- rustls refuses the key, such as a key that does
+	///   not match the certificate.
 	pub fn new(
 		chain: impl IntoIterator<Item = CertificateDer<'static>>,
 		key: PrivateKeyDer<'static>,
 	) -> Result<Self, EdgeError> {
-		let chain: Vec<CertificateDer<'static>> = chain.into_iter().collect();
-		if chain.is_empty() {
-			return Err(EdgeError::NoCertificate);
-		}
-
-		#[cfg(feature = "couple")]
-		let (material, kept) = (chain.clone(), Arc::new(key.clone_key()));
-		let builder = ServerConfig::builder_with_provider(provider()).with_protocol_versions(&[&TLS13])?;
-		let mut config = builder.with_no_client_auth().with_single_cert(chain, key)?;
-		config.alpn_protocols = vec![ALPN_H2.to_vec()];
-		Ok(Self {
-			config: Arc::new(config),
-			#[cfg(feature = "couple")]
-			chain: material,
-			#[cfg(feature = "couple")]
-			key: kept,
-		})
+		let key = EdgeTlsPolicy::certified(chain.into_iter().collect(), key)?;
+		Ok(Self { key })
 	}
 
-	/// TLS under the PEM certificate chain in the file `chain` and the PEM
-	/// private key in the file `key`, as [`EdgeTls::new`] takes them.
+	/// TLS under the PEM certificate chain and the PEM private key in
+	/// `files`, as [`EdgeTls::new`] takes them.
 	///
 	/// # Errors
 	///
 	/// - [`EdgeError::Io`] -- a file cannot be read.
-	/// - [`EdgeError::Pem`] -- a file is malformed, or `key` holds no private key.
+	/// - [`EdgeError::Pem`] -- a file is malformed, or the key file holds no private key.
 	/// - The errors of [`EdgeTls::new`].
-	pub fn from_pem(chain: impl AsRef<Path>, key: impl AsRef<Path>) -> Result<Self, EdgeError> {
-		let certificates = CertificateDer::pem_file_iter(chain)?;
+	pub fn from_pem<P: AsRef<Path>>(files: EdgeTlsFiles<P>) -> Result<Self, EdgeError> {
+		let certificates = CertificateDer::pem_file_iter(files.chain)?;
 		let chain = certificates.collect::<Result<Vec<_>, _>>()?;
-		let key = PrivateKeyDer::from_pem_file(key)?;
+		let key = PrivateKeyDer::from_pem_file(files.key)?;
 		Self::new(chain, key)
 	}
 
-	/// The acceptor that secures each connection of a bind.
-	pub(super) fn acceptor(&self) -> TlsAcceptor {
-		TlsAcceptor::from(Arc::clone(&self.config))
-	}
-
-	/// The acceptor of a coupled bind, which verifies each client chain with
-	/// `verifier`.
+	/// The acceptor of a bind that verifies each client chain with
+	/// `verifier`, or admits every connection with no client chain when it
+	/// is `None`.
 	///
 	/// # Errors
 	///
-	/// - [`EdgeError::Tls`] -- rustls refuses the chain or the key.
-	#[cfg(feature = "couple")]
-	pub(super) fn verifying(
-		&self,
-		verifier: Arc<dyn rustls::server::danger::ClientCertVerifier>,
-	) -> Result<TlsAcceptor, EdgeError> {
-		let builder = ServerConfig::builder_with_provider(provider()).with_protocol_versions(&[&TLS13])?;
-		let builder = builder.with_client_cert_verifier(verifier);
-		let mut config = builder.with_single_cert(self.chain.clone(), self.key.clone_key())?;
-		config.alpn_protocols = vec![ALPN_H2.to_vec()];
+	/// - The errors of [`EdgeTlsPolicy::server`].
+	pub(super) fn acceptor(&self, verifier: Option<Arc<dyn ClientCertVerifier>>) -> Result<TlsAcceptor, EdgeError> {
+		let verifier = verifier.unwrap_or_else(WebPkiClientVerifier::no_client_auth);
+		let config = EdgeTlsPolicy::server(&self.key, verifier)?;
 		Ok(TlsAcceptor::from(Arc::new(config)))
 	}
+}
+
+/// The PEM files of the TLS of an edge, which [`EdgeTls::from_pem`] reads.
+#[derive(Clone, Debug)]
+pub struct EdgeTlsFiles<P> {
+	/// The file of the certificate chain: the certificate of the edge first,
+	/// and the certificates of its issuers after it.
+	pub chain: P,
+	/// The file of the private key of the certificate of the edge.
+	pub key: P,
 }
 
 /// The TLS of a dial of an edge: the roots that the certificate of the edge
 /// must chain to.
 ///
-/// The dial names the host of its [`GrpcAddr`] as the server it verifies, so
-/// the certificate of the edge carries that DNS name or IP address as a
-/// subject alternative name.
+/// - The dial names the host of its [`GrpcAddr`] as the server it verifies,
+///   so the certificate of the edge carries that DNS name or IP address as a
+///   subject alternative name.
 ///
 /// # Examples
 ///
-/// ```no_run
-/// use tightbeam_grpc::edge::{Dial, DialTls, EdgeError};
+/// ```
+/// use tightbeam_grpc::edge::{Dial, DialTls};
+/// # use tightbeam_grpc::testing::{CoupledStack, MintError};
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// # let dir = std::env::temp_dir().join(format!("tightbeam-grpc-doc-dial-{}", std::process::id()));
+/// # let stack = CoupledStack::at(dir);
+/// # stack.write(core::time::Duration::from_secs(60), |_| Ok::<(), MintError>(()))?;
+/// # let roots = stack.root();
 ///
-/// let tls = DialTls::from_pem("/run/edge/ca.crt")?;
+/// let tls = DialTls::from_pem(&roots)?;
 /// let dial = Dial::Tls(tls);
-/// # Ok::<(), EdgeError>(())
+/// # std::fs::remove_dir_all(stack.dir())?;
+/// # Ok(())
+/// # }
 /// ```
 #[derive(Clone, Debug)]
 pub struct DialTls {
@@ -170,10 +224,7 @@ impl DialTls {
 		}
 
 		let roots = Arc::new(store);
-		let builder = ClientConfig::builder_with_provider(provider()).with_protocol_versions(&[&TLS13])?;
-
-		let mut config = builder.with_root_certificates(Arc::clone(&roots)).with_no_client_auth();
-		config.alpn_protocols = vec![ALPN_H2.to_vec()];
+		let config = EdgeTlsPolicy::client(&roots, None)?;
 		Ok(Self { roots, config: Arc::new(config) })
 	}
 
@@ -190,15 +241,8 @@ impl DialTls {
 		chain: impl IntoIterator<Item = CertificateDer<'static>>,
 		key: PrivateKeyDer<'static>,
 	) -> Result<Self, EdgeError> {
-		let chain: Vec<CertificateDer<'static>> = chain.into_iter().collect();
-		if chain.is_empty() {
-			return Err(EdgeError::NoCertificate);
-		}
-
-		let builder = ClientConfig::builder_with_provider(provider()).with_protocol_versions(&[&TLS13])?;
-		let builder = builder.with_root_certificates(Arc::clone(&self.roots));
-		let mut config = builder.with_client_auth_cert(chain, key)?;
-		config.alpn_protocols = vec![ALPN_H2.to_vec()];
+		let identity = EdgeTlsPolicy::certified(chain.into_iter().collect(), key)?;
+		let config = EdgeTlsPolicy::client(&self.roots, Some(&identity))?;
 		Ok(Self { roots: self.roots, config: Arc::new(config) })
 	}
 
@@ -219,26 +263,30 @@ impl DialTls {
 	/// The endpoint of a TLS dial to `addr`, and the connector that secures
 	/// its connection.
 	///
-	/// The connect URI stays `http`, so tonic hands the connection to the
-	/// connector whether or not an application enables a TLS feature of tonic,
-	/// which would otherwise refuse an `https` URI that carries no tonic TLS
-	/// config. The origin of each call names `https`, so its `:scheme` says
-	/// TLS.
+	/// - The connect URI stays `http`, so tonic hands the connection to the
+	///   connector under any tonic features.
+	/// - The origin of each call names `https`, so its `:scheme` says TLS.
 	///
 	/// # Errors
 	///
-	/// - [`TransportError::InvalidAddress`] -- tonic refuses the URI of
-	///   `addr`, or TLS cannot name its host.
-	pub(crate) fn endpoint(&self, addr: &GrpcAddr) -> Result<(Endpoint, TlsDialer), TransportError> {
-		let endpoint = Endpoint::from_shared(format!("http://{addr}")).map_err(|_| TransportError::InvalidAddress)?;
+	/// - [`TransportError::InvalidAddress`] -- tonic refuses the URI of `addr`.
+	pub(crate) fn endpoint(&self, addr: &GrpcAddr) -> Result<TlsEndpoint, TransportError> {
+		let endpoint = addr.endpoint()?;
 		let origin = Uri::try_from(format!("https://{addr}")).map_err(|_| TransportError::InvalidAddress)?;
 
-		let name = addr.server_name()?;
+		let name = addr.server_name();
 		let connector = TlsConnector::from(Arc::clone(&self.config));
 		let dialer = TlsDialer { connector, authority: addr.to_string(), name };
 
-		Ok((endpoint.origin(origin), dialer))
+		Ok(TlsEndpoint { endpoint: endpoint.origin(origin), dialer })
 	}
+}
+
+/// The endpoint of one TLS dial, and the connector that secures its
+/// connection.
+pub(crate) struct TlsEndpoint {
+	pub(crate) endpoint: Endpoint,
+	pub(crate) dialer: TlsDialer,
 }
 
 /// The connector of one TLS dial, which tonic calls for the connection of

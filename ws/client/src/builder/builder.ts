@@ -3,135 +3,137 @@
  * structure engine.
  */
 
-import type {
-	CommitmentSalt,
-	FrameAssembly,
-	FrameComposer,
-	MessagePriority,
-	Oid,
-	Signing,
-	Version,
-} from "#wasm";
+import type { CommitmentSalt, FrameComposer, MessagePriority, Version } from "#wasm";
 
 import type { BodyCompressor } from "../compress.js";
 import type { BodyEncryptor, Hasher, Signatory } from "../crypto.js";
 import type { EngineParts } from "../engine.js";
 import type { MessageCodec } from "../message.js";
 import type { DigestName, OidName } from "../views.js";
-import type { ValidationIssue } from "./errors.js";
-import type { FrameSpec, MessageSlot } from "./spec.js";
-import { HeldCompressor } from "../compress.js";
-import { HeldHasher } from "../crypto.js";
-import { InternalError } from "../errors.js";
 import { Frame } from "../frame.js";
 import { Codecs, HeldCodec } from "../message.js";
-import { DigestInfoView, Lent, OidView } from "../views.js";
-import { ValidationError } from "./errors.js";
+import { DigestInfoView, OidView } from "../views.js";
+import { Assembled } from "./assembly.js";
+import { SecurityLayers } from "./layers.js";
 
 /**
- * The octets of the plain-digest salt, for a commitment that names none.
- */
-const EMPTY_SALT = new Uint8Array();
-
-/**
- * UTF-8 encoder.
+ * The encoder of a string message identifier, as UTF-8.
  */
 const UTF8 = new TextEncoder();
 
 /**
- * Coerces a `Uint8Array | string` into bytes, encoding strings as UTF-8.
+ * The frame body: a codec and the message it encodes, held as a deferred
+ * body encoding under a copy of the content type the codec declares.
  */
-function toBytes(value: Uint8Array | string): Uint8Array {
-	if (typeof value === "string") {
-		const bytes = UTF8.encode(value);
-		return bytes;
-	}
+class MessageBody {
+	readonly #encode: () => Uint8Array;
 
-	return value;
-}
+	/**
+	 * The content type the codec declares, which the seal records unless the
+	 * builder names another.
+	 */
+	readonly contentOid: OidView | undefined;
 
-/**
- * A codec and the message it encodes, held as a deferred body encoding. The
- * slot erases the codec's type parameter from the spec, and holds the codec
- * under a copy of the content type it declares, so a free of the codec's
- * handle leaves the build its own.
- */
-class CodecSlot<T> implements MessageSlot {
-	readonly #codec: HeldCodec<T>;
-
-	constructor(
-		codec: MessageCodec<T>,
-		private readonly message: T,
-	) {
-		this.#codec = HeldCodec.of(codec);
-	}
-
-	get contentOid(): OidView | undefined {
-		return this.#codec.contentOid;
+	private constructor(encode: () => Uint8Array, contentOid: OidView | undefined) {
+		this.#encode = encode;
+		this.contentOid = contentOid;
 	}
 
 	/**
-	 * Whether `value` is a codec rather than raw bytes. The check reads the
-	 * shape of `value` alone, so bytes of any realm take the raw-bytes path,
-	 * and the engine reads them at the build.
+	 * The body that `codec` encodes from `message`.
 	 */
-	static isCodec<T>(
-		value: Uint8Array | MessageCodec<T>,
-	): value is MessageCodec<T> {
-		const encode: unknown = Reflect.get(value, "encode");
-		const isCodec = typeof encode === "function";
-		return isCodec;
+	static of<T>(codec: MessageCodec<T>, message: T): MessageBody {
+		const held = HeldCodec.of(codec);
+		const encode = (): Uint8Array => held.encode(message);
+
+		const body = new MessageBody(encode, held.contentOid);
+		return body;
 	}
 
-	encodeBody(): Uint8Array {
-		const body = this.#codec.encode(this.message);
-		return body;
+	/**
+	 * The body DER the frame carries.
+	 */
+	encode(): Uint8Array {
+		const bodyDer = this.#encode();
+		return bodyDer;
 	}
 }
 
 /**
- * A fluent, immutable frame builder. Each `with*` call returns a new
- * builder, and {@link build} assembles the frame through the wasm engine,
- * which also decides the version floor and parses every value it receives.
+ * Everything a build reads, accumulated by the `with*` calls of the builder.
  */
-export class FrameBuilder {
-	private readonly spec: FrameSpec;
+interface BuildSpec {
+	readonly body: MessageBody;
+	readonly layers: SecurityLayers;
+	readonly version?: Version;
+	readonly assertedVersion?: Version;
+	readonly id?: Uint8Array;
+	readonly order?: bigint | number;
+	readonly contentOid?: OidView;
+	readonly priority?: MessagePriority;
+	readonly lifetime?: bigint | number;
+	readonly previousHash?: DigestInfoView;
+	readonly matrix?: { readonly n: number; readonly data: Uint8Array };
+}
+
+/**
+ * The key of the record of whether a builder holds a message identifier. A
+ * symbol key keeps the record in the emitted declarations, where a private
+ * member loses its type.
+ */
+declare const NAMED: unique symbol;
+
+/**
+ * A fluent, immutable frame builder. Each `with*` call returns a new builder,
+ * and {@link build} assembles the frame through the wasm engine. `Named`
+ * records whether the builder holds the message identifier that every frame
+ * carries, so {@link build} exists only on a builder that {@link withId} named.
+ */
+export class FrameBuilder<Named extends boolean = false> {
+	/**
+	 * Whether the builder holds a message identifier, recorded in the type
+	 * alone.
+	 */
+	declare readonly [NAMED]: Named;
 
 	readonly #parts: EngineParts;
 
-	/**
-	 * The salt `withCommitment` took, which no public path reaches.
-	 */
-	readonly #commitment: CommitmentSalt | undefined;
+	readonly #spec: BuildSpec;
 
-	private constructor(
-		parts: EngineParts,
-		spec: FrameSpec,
-		commitment?: CommitmentSalt,
-	) {
+	private constructor(parts: EngineParts, spec: BuildSpec) {
 		this.#parts = parts;
-		this.spec = spec;
-		this.#commitment = commitment;
+		this.#spec = spec;
 	}
 
 	/**
-	 * Begin building a tightbeam frame through the engine `parts` (the same
-	 * API as the tightbeam-rs `compose!` surface), and seed the body with the
-	 * raw bytes `message` under the profile opaque wrapper when one is given.
+	 * Begin a frame through the engine `parts` whose body carries the raw
+	 * bytes `bytes` under the profile opaque wrapper.
+	 *
+	 * @internal
 	 */
-	static of(parts: EngineParts, message?: Uint8Array): FrameBuilder {
-		const builder = new FrameBuilder(parts, {});
-		if (message === undefined) {
-			return builder;
-		}
-
-		const seeded = builder.withMessage(message);
-		return seeded;
+	static bytes(parts: EngineParts, bytes: Uint8Array): FrameBuilder {
+		const opaque = Codecs.over(parts.glue).opaque;
+		const builder = FrameBuilder.message(parts, opaque, bytes);
+		return builder;
 	}
 
-	private with(patch: Partial<FrameSpec>): FrameBuilder {
-		const spec = { ...this.spec, ...patch };
-		const next = new FrameBuilder(this.#parts, spec, this.#commitment);
+	/**
+	 * Begin a frame through the engine `parts` whose body carries `message`
+	 * under the schema of `codec`. Encoding is deferred to {@link build}.
+	 *
+	 * @internal
+	 */
+	static message<T>(parts: EngineParts, codec: MessageCodec<T>, message: T): FrameBuilder {
+		const body = MessageBody.of(codec, message);
+		const layers = SecurityLayers.none();
+
+		const builder = new FrameBuilder(parts, { body, layers });
+		return builder;
+	}
+
+	#with<N extends boolean>(patch: Partial<BuildSpec>): FrameBuilder<N> {
+		const spec = { ...this.#spec, ...patch };
+		const next = new FrameBuilder<N>(this.#parts, spec);
 		return next;
 	}
 
@@ -140,88 +142,64 @@ export class FrameBuilder {
 	 * lowest version that admits the requested fields, and a pin below that
 	 * floor fails the build with an `UnsupportedField` error.
 	 */
-	withVersion(version: Version): FrameBuilder {
-		const next = this.with({ version });
+	withVersion(version: Version): FrameBuilder<Named> {
+		const next = this.#with<Named>({ version });
 		return next;
 	}
 
 	/**
-	 * Assert the version the assembled frame will carry: `build` fails when
-	 * the frame the engine built carries another version.
+	 * Assert the version the assembled frame will carry: the engine refuses
+	 * another version with `VersionMismatch` as the structure assembles,
+	 * before any hasher, encryptor, or signatory acts.
 	 */
-	assertVersion(version: Version): FrameBuilder {
-		const next = this.with({ assertedVersion: version });
+	assertVersion(version: Version): FrameBuilder<Named> {
+		const next = this.#with<Named>({ assertedVersion: version });
 		return next;
 	}
 
 	/**
-	 * Set the opaque message identifier.
+	 * Set the opaque message identifier, which every frame carries. The
+	 * builder holds a copy of `id`, so a later write to it leaves the build as
+	 * it was.
 	 */
-	withId(id: Uint8Array | string): FrameBuilder {
-		const next = this.with({ id: toBytes(id) });
+	withId(id: Uint8Array | string): FrameBuilder<true> {
+		let bytes: Uint8Array;
+		if (typeof id === "string") {
+			bytes = UTF8.encode(id);
+		} else {
+			bytes = new Uint8Array(id);
+		}
+
+		const next = this.#with<true>({ id: bytes });
 		return next;
 	}
 
 	/**
 	 * Set the frame order stamp: a whole number or a `bigint` from 0 to
-	 * 2^64-1, which the engine parses at the build.
-	 *
-	 * The value is protocol-opaque. Any monotonic scheme works, such as a
-	 * Unix timestamp or a dense per-channel counter. When omitted, the
-	 * build defaults it to the current Unix time in seconds.
+	 * 2^64-1, which the engine parses at the build. Any monotonic scheme works,
+	 * such as a Unix timestamp or a per-channel counter. A build without one
+	 * stamps the current Unix time in seconds.
 	 */
-	withOrder(order: bigint | number): FrameBuilder {
-		const next = this.with({ order });
+	withOrder(order: bigint | number): FrameBuilder<Named> {
+		const next = this.#with<Named>({ order });
 		return next;
-	}
-
-	/**
-	 * Set the frame body: raw bytes follow the profile opaque wrapper, while
-	 * a `MessageCodec<T>` carries a typed message under the implementor's
-	 * schema. Encoding is deferred to `build()`.
-	 */
-	withMessage(message: Uint8Array): FrameBuilder;
-	withMessage<T>(codec: MessageCodec<T>, message: T): FrameBuilder;
-	withMessage<T>(
-		messageOrCodec: Uint8Array | MessageCodec<T>,
-		...rest: [T] | []
-	): FrameBuilder {
-		if (!CodecSlot.isCodec(messageOrCodec)) {
-			const opaque = Codecs.over(this.#glue).opaque;
-			const slot = new CodecSlot(opaque, messageOrCodec);
-			const next = this.with({ message: slot });
-			return next;
-		}
-
-		if (rest.length === 1) {
-			const [message] = rest;
-			const slot = new CodecSlot(messageOrCodec, message);
-
-			const next = this.with({ message: slot });
-			return next;
-		}
-
-		throw new InternalError(
-			"MESSAGE_ARITY",
-			"withMessage(codec, message) requires the message argument",
-		);
 	}
 
 	/**
 	 * Set the body content-type OID. The builder holds a copy of `oid`, so a
 	 * free of the caller's handle leaves the build its own.
 	 */
-	withContentOid(oid: OidName): FrameBuilder {
+	withContentOid(oid: OidName): FrameBuilder<Named> {
 		const contentOid = OidView.copyOf(oid);
-		const next = this.with({ contentOid });
+		const next = this.#with<Named>({ contentOid });
 		return next;
 	}
 
 	/**
 	 * Set the message priority (V2+).
 	 */
-	withPriority(priority: MessagePriority): FrameBuilder {
-		const next = this.with({ priority });
+	withPriority(priority: MessagePriority): FrameBuilder<Named> {
+		const next = this.#with<Named>({ priority });
 		return next;
 	}
 
@@ -229,8 +207,8 @@ export class FrameBuilder {
 	 * Set the time-to-live in seconds (V2+): a whole number or a `bigint` from
 	 * 0 to 2^64-1, which the engine parses at the build.
 	 */
-	withLifetime(seconds: bigint | number): FrameBuilder {
-		const next = this.with({ lifetime: seconds });
+	withLifetime(seconds: bigint | number): FrameBuilder<Named> {
+		const next = this.#with<Named>({ lifetime: seconds });
 		return next;
 	}
 
@@ -239,339 +217,128 @@ export class FrameBuilder {
 	 * holds a copy of `parent`, so a free of the caller's handle leaves the
 	 * build its own.
 	 */
-	withPreviousHash(parent: DigestName): FrameBuilder {
+	withPreviousHash(parent: DigestName): FrameBuilder<Named> {
 		const copy = parent.clone();
-		const previousHash = DigestInfoView.over(copy, copy.algorithmOid);
-		const next = this.with({ previousHash });
+		const previousHash = DigestInfoView.over(copy);
+		const next = this.#with<Named>({ previousHash });
 		return next;
 	}
 
 	/**
-	 * Set an N×N control matrix from row-major bytes (V3+).
+	 * Set an N×N control matrix from row-major bytes (V3+). The builder holds
+	 * a copy of `data`, so a later write to it leaves the build as it was.
 	 */
-	withMatrix(n: number, data: Uint8Array): FrameBuilder {
-		const next = this.with({ matrix: { n, data } });
+	withMatrix(n: number, data: Uint8Array): FrameBuilder<Named> {
+		const matrix = { n, data: new Uint8Array(data) };
+		const next = this.#with<Named>({ matrix });
 		return next;
 	}
 
 	/**
-	 * Commit to the message body under any `Hasher` (V1+). The profile
-	 * hasher is `Engine.sha3_256`. Bring your own hasher for other digests.
+	 * Commit to the body under any `Hasher` (V1+), hidden by `salt` when given. The builder copies the algorithm of
+	 * `hasher` and then takes `salt`, and the caller keeps an empty shell.
 	 *
-	 * Without {@link withCommitment} the commitment is a plain digest of the
-	 * body. The builder holds a copy of the algorithm the hasher names, so a
-	 * free of the caller's handle leaves the build its own.
+	 * @throws TightbeamTransportError `CommitmentSpent` when the salt moved out of `salt` already.
+	 * @throws the refusal of `hasher.algorithmOid.clone()`, such as for a freed `Oid`, and `salt` keeps its salt.
 	 */
-	withMessageHasher(hasher: Hasher): FrameBuilder {
-		const messageIntegrity = new HeldHasher(hasher);
-		const next = this.with({ messageIntegrity });
-		return next;
-	}
-
-	/**
-	 * Hide the message commitment behind `salt`, which the builder takes.
-	 *
-	 * - The caller keeps an empty shell that frees as any handle does, so a
-	 *   disposal of `salt` after this call leaves the builder its salt.
-	 * - A salt commits one frame, so the builder, and every builder made from
-	 *   it, builds once. A second build refuses with `CommitmentSpent`.
-	 *
-	 * @throws TightbeamTransportError `CommitmentSpent` when the salt moved out
-	 * of `salt` already.
-	 */
-	withCommitment(salt: CommitmentSalt): FrameBuilder {
-		const taken = salt.take();
-		const next = new FrameBuilder(this.#parts, this.spec, taken);
+	withMessageHasher(hasher: Hasher, salt?: CommitmentSalt): FrameBuilder<Named> {
+		const layers = this.#spec.layers.withCommitment(hasher, salt);
+		const next = this.#with<Named>({ layers });
 		return next;
 	}
 
 	/**
 	 * Witness the envelope with frame integrity under any `Hasher` (V1+). The
-	 * builder holds a copy of the algorithm the hasher names, as
-	 * {@link withMessageHasher} does.
+	 * builder holds a copy of the algorithm the hasher names, so a free of
+	 * the caller's handle leaves the build its own.
 	 */
-	withWitnessHasher(hasher: Hasher): FrameBuilder {
-		const frameIntegrity = new HeldHasher(hasher);
-		const next = this.with({ frameIntegrity });
+	withWitnessHasher(hasher: Hasher): FrameBuilder<Named> {
+		const layers = this.#spec.layers.withWitness(hasher);
+		const next = this.#with<Named>({ layers });
 		return next;
 	}
 
 	/**
-	 * Compress the message body with any `BodyCompressor` (any version).
-	 * Compression runs after the message commitment (the commitment is over
-	 * the uncompressed body) and before encryption (peers encrypt the
-	 * compressed bytes). Inflate the received body with
-	 * `Frame.open(codec, { inflator })`.
-	 *
-	 * The builder holds a copy of the `algorithmOid` the compressor names, so
-	 * every build of it records that algorithm, and the compressor keeps its
-	 * own handle.
+	 * Compress the message body with any `BodyCompressor` (any version), after
+	 * the message commitment and before the encryption. The builder holds a
+	 * copy of the `algorithmOid` the compressor names, so every build records
+	 * that algorithm.
 	 */
-	withCompressor(compressor: BodyCompressor): FrameBuilder {
-		const held = new HeldCompressor(compressor);
-		const next = this.with({ compressor: held });
+	withCompressor(compressor: BodyCompressor): FrameBuilder<Named> {
+		const layers = this.#spec.layers.withCompression(compressor);
+		const next = this.#with<Named>({ layers });
 		return next;
 	}
 
 	/**
-	 * Encrypt the message body with any `BodyEncryptor` (V1+).
-	 *
-	 * The profile encryptors are `Aes256Gcm` (shared key) and
-	 * `HpkeEncryptor` (to a recipient public key). Bring your own
-	 * encryptor for other schemes. Open the received body with
-	 * `Frame.open(codec, { opener })`.
+	 * Encrypt the message body with any `BodyEncryptor` (V1+), such as the
+	 * profile `Aes256Gcm` for a shared key or `HpkeEncryptor` for a recipient
+	 * public key. Open the received body with `Frame.open(codec, { opener })`.
 	 */
-	withEncryptor(encryptor: BodyEncryptor): FrameBuilder {
-		const next = this.with({ encryptor });
+	withEncryptor(encryptor: BodyEncryptor): FrameBuilder<Named> {
+		const layers = this.#spec.layers.withEncryption(encryptor);
+		const next = this.#with<Named>({ layers });
 		return next;
 	}
 
 	/**
-	 * Sign the assembled frame with any `Signatory` (V1+) - the profile
+	 * Sign the assembled frame with any `Signatory` (V1+), such as the profile
 	 * `Secp256k1SigningKey`, or an external implementation (wallet, passkey,
-	 * HSM) whose private key never enters wasm memory.
+	 * HSM) whose private key stays in its own backend.
 	 */
-	withSigner(signatory: Signatory): FrameBuilder {
-		const next = this.with({ signer: signatory });
+	withSigner(signatory: Signatory): FrameBuilder<Named> {
+		const layers = this.#spec.layers.withSignature(signatory);
+		const next = this.#with<Named>({ layers });
 		return next;
 	}
 
 	/**
-	 * Return a frozen copy of the accumulated specification without
-	 * assembling a frame.
-	 */
-	toSpec(): Readonly<FrameSpec> {
-		const spec = Object.freeze({ ...this.spec });
-		return spec;
-	}
-
-	/**
-	 * Validate the accumulated spec and assemble the frame through the wasm
-	 * engine, driving the configured hashers, compressor, encryptor, and
-	 * signatory in protocol order.
+	 * Assemble the frame through the wasm engine, then drive the configured
+	 * hashers, compressor, encryptor, and signatory in protocol order.
 	 *
-	 * @throws ValidationError when the spec is structurally invalid or the
-	 * built frame carries another version than {@link assertVersion} named.
-	 * @throws TightbeamTransportError `UnsupportedField` when a pinned version
-	 * is below the floor of a requested field, and the engine's refusal of a
-	 * field with the field on `path`, such as `InvalidMatrixDimension` at
-	 * `matrix.n`.
+	 * @throws TightbeamTransportError a refusal that the build rules of
+	 * `docs/ws-client.md` name, such as `VersionMismatch` or `CommitmentSpent`.
 	 */
-	async build(): Promise<Frame> {
-		const issues = this.issues();
-		if (issues.length > 0) {
-			throw new ValidationError("FRAME_SPEC", issues);
-		}
+	async build(this: FrameBuilder<true>): Promise<Frame> {
+		const bodyDer = this.#spec.body.encode();
+		const inputs = { parts: this.#parts, contentOid: this.#contentOid() };
 
-		const der = await this.compose();
+		const der = await this.#spec.layers.encode(() => this.#compose(bodyDer), inputs);
 		const frame = Frame.decode(this.#parts, der);
-		const built = this.assertBuilt(frame);
-		return built;
-	}
-
-	/**
-	 * Collect every structural issue in the accumulated spec (empty when
-	 * valid).
-	 */
-	private issues(): ValidationIssue[] {
-		const { message, messageIntegrity } = this.spec;
-		const commitment = this.#commitment;
-		const issues: ValidationIssue[] = [];
-
-		if (message === undefined) {
-			issues.push({
-				path: "message",
-				message: "Missing required field: message",
-			});
-		}
-		if (commitment !== undefined && messageIntegrity === undefined) {
-			issues.push({
-				path: "commitment",
-				message: "A commitment salt needs withMessageHasher",
-			});
-		}
-
-		return issues;
-	}
-
-	/**
-	 * Verify the version the engine wrote matches the caller's assertion.
-	 */
-	private assertBuilt(frame: Frame): Frame {
-		const asserted = this.spec.assertedVersion;
-		if (asserted !== undefined && frame.version !== asserted) {
-			throw new ValidationError("FRAME_SPEC", [
-				{
-					path: "assertedVersion",
-					message: `Version assertion failed: asserted V${asserted}, but the engine built V${frame.version}`,
-				},
-			]);
-		}
-
 		return frame;
 	}
 
 	/**
-	 * Assemble the frame DER: the structural frame first, then each security
-	 * artifact over the frame before it. The engine holds the frame between
-	 * the steps and refuses a step out of protocol order. The slot frees the
-	 * handle it holds on every exit of the build.
+	 * The structural frame over `bodyDer`: the metadata, and a declaration of
+	 * each security layer, so the engine sets the version floor over every
+	 * field the frame carries. A refused field frees the composer.
 	 */
-	private async compose(): Promise<Uint8Array> {
-		const bodyDer = this.bodyDer();
-		const slot = new AssemblySlot(new this.#glue.FrameComposer());
+	#compose(bodyDer: Uint8Array): Assembled {
+		const composer = new this.#parts.glue.FrameComposer();
 		try {
-			this.structural(slot.composer, bodyDer);
-			slot.assemble();
-			await this.secure(slot, bodyDer);
-
-			const der = slot.live.encode();
-			return der;
-		} finally {
-			slot[Symbol.dispose]();
+			this.#declare(composer, bodyDer);
+		} catch (refusal) {
+			composer.free();
+			throw refusal;
 		}
+
+		const assembled = Assembled.of(composer);
+		return assembled;
 	}
 
 	/**
-	 * Install each security artifact of the spec on the frame in `slot`, in
-	 * protocol order.
+	 * Set the structural fields of the spec, and declare each layer, on
+	 * `composer`.
 	 */
-	private async secure(
-		slot: AssemblySlot,
-		bodyDer: Uint8Array,
-	): Promise<void> {
-		const spec = this.spec;
-		if (spec.messageIntegrity !== undefined) {
-			const hasher = spec.messageIntegrity;
-			const preimage = this.commitmentPreimage(slot.live);
-			const digest = await hasher.digest(preimage);
-
-			const commit = (algorithmOid: Oid): void => {
-				const step = (live: FrameAssembly): FrameAssembly =>
-					live.withMessageIntegrity(algorithmOid, digest);
-				slot.advance(step);
-			};
-			Lent.oid(hasher.algorithmOid, commit);
-		}
-
-		// The bytes the encryptor seals: the compressed body when a
-		// compressor is configured (peers decompress after decrypting).
-		let sealInput = bodyDer;
-		if (spec.compressor !== undefined) {
-			const compressor = spec.compressor;
-			const compressed = await compressor.compress(bodyDer);
-			const { data, parametersDer } = compressed;
-			const compact = (algorithmOid: Oid): void => {
-				const step = (live: FrameAssembly): FrameAssembly =>
-					live.withCompactness(algorithmOid, data, parametersDer);
-				slot.advance(step);
-			};
-
-			Lent.oid(compressor.algorithmOid, compact);
-			sealInput = data;
-		}
-
-		if (spec.encryptor !== undefined) {
-			const contentOid = this.contentOid();
-			const sealed = await spec.encryptor.encrypt(sealInput, contentOid);
-			slot.advance((live) => live.withConfidentiality(sealed));
-		}
-		if (spec.frameIntegrity !== undefined) {
-			const hasher = spec.frameIntegrity;
-			const preimage = slot.live.witnessPreimage();
-			const digest = await hasher.digest(preimage);
-
-			const witness = (algorithmOid: Oid): void => {
-				slot.advance((live) => live.withWitness(algorithmOid, digest));
-			};
-			Lent.oid(hasher.algorithmOid, witness);
-		}
-		if (spec.signer !== undefined) {
-			await slot.sign(spec.signer);
-		}
-	}
-
-	/**
-	 * The message-commitment preimage over the body that `assembly` holds,
-	 * under the salt of the spec, or the plain-digest salt without one.
-	 *
-	 * Each build takes the salt into a build-local handle and frees it, so the
-	 * builder keeps an empty shell and a second build refuses with
-	 * `CommitmentSpent`.
-	 */
-	private commitmentPreimage(assembly: FrameAssembly): Uint8Array {
-		const salt = this.buildSalt();
-		try {
-			const preimage = assembly.commitmentPreimage(salt);
-			return preimage;
-		} finally {
-			salt.free();
-		}
-	}
-
-	/**
-	 * The build-local salt of the commitment: the salt the spec names, taken
-	 * out of its shell, or the plain-digest salt without one.
-	 */
-	private buildSalt(): CommitmentSalt {
-		const commitment = this.#commitment;
-		if (commitment === undefined) {
-			const plain = this.#glue.CommitmentSalt.parse(EMPTY_SALT);
-			return plain;
-		}
-
-		const taken = commitment.take();
-		return taken;
-	}
-
-	/**
-	 * The content type the encryptor seals the body as: the one the builder
-	 * names, the one the codec declares, or the `id-data` the engine holds.
-	 */
-	private contentOid(): OidName {
-		const named = this.spec.contentOid ?? this.spec.message?.contentOid;
-		if (named !== undefined) {
-			return named;
-		}
-
-		return this.#parts.data;
-	}
-
-	/**
-	 * The glue of the loaded module.
-	 */
-	get #glue(): EngineParts["glue"] {
-		return this.#parts.glue;
-	}
-
-	/**
-	 * The body DER installed in the frame, committed to by the hashers, and
-	 * sealed by the encryptor: the deferred message encoding, or the empty
-	 * profile body for a message-less spec.
-	 */
-	private bodyDer(): Uint8Array {
-		const message = this.spec.message;
-		if (message === undefined) {
-			const empty = new Uint8Array();
-			const bodyDer = this.#glue.OpaqueCodec.encode(empty);
-			return bodyDer;
-		}
-
-		const bodyDer = message.encodeBody();
-		return bodyDer;
-	}
-
-	/**
-	 * Set the structural frame on `composer`: the metadata, and a declaration
-	 * of each security field installed afterwards, so the engine sets the
-	 * version floor over every field the frame carries.
-	 */
-	private structural(composer: FrameComposer, bodyDer: Uint8Array): void {
-		const spec = this.spec;
+	#declare(composer: FrameComposer, bodyDer: Uint8Array): void {
+		const spec = this.#spec;
 		composer.withMessage(bodyDer);
 
 		if (spec.version !== undefined) {
 			composer.withVersion(spec.version);
+		}
+		if (spec.assertedVersion !== undefined) {
+			composer.assertVersion(spec.assertedVersion);
 		}
 		if (spec.id !== undefined) {
 			composer.withId(spec.id);
@@ -586,175 +353,27 @@ export class FrameBuilder {
 			composer.withLifetime(spec.lifetime);
 		}
 		if (spec.previousHash !== undefined) {
-			Lent.digest(spec.previousHash, (parent) => {
-				composer.withPreviousHash(parent);
-			});
+			using parent = spec.previousHash.clone();
+			composer.withPreviousHash(parent);
 		}
-		this.installMatrix(composer);
-		if (spec.messageIntegrity !== undefined) {
-			composer.declareMessageIntegrity();
+		if (spec.matrix !== undefined) {
+			composer.withMatrix(spec.matrix.n, spec.matrix.data);
 		}
-		if (spec.encryptor !== undefined) {
-			composer.declareConfidentiality();
-		}
-		if (spec.frameIntegrity !== undefined) {
-			composer.declareFrameIntegrity();
-		}
-		if (spec.signer !== undefined) {
-			composer.declareNonrepudiation();
-		}
+
+		spec.layers.declare(composer);
 	}
 
 	/**
-	 * Set the control matrix, when one is set, on `composer`. The engine owns
-	 * the matrix rule, and its refusal names the field on `path`.
+	 * The content type the encryptor seals the body as: the one the builder
+	 * names, the one the codec declares, or the `id-data` the engine holds.
 	 */
-	private installMatrix(composer: FrameComposer): void {
-		const { matrix } = this.spec;
-		if (matrix === undefined) {
-			return;
+	#contentOid(): OidName {
+		const spec = this.#spec;
+		const named = spec.contentOid ?? spec.body.contentOid;
+		if (named !== undefined) {
+			return named;
 		}
 
-		composer.withMatrix(matrix.n, matrix.data);
-	}
-}
-
-/**
- * The one wasm handle a build holds between its steps.
- *
- * - `composing`: the composer, until it assembles the structural frame.
- * - `assembled`: the live assembly between the security steps.
- * - `signing`: the signature draft while a signatory signs its prehash.
- * - `spent`: no handle, while a step runs or once the slot freed it.
- */
-type BuildHandle =
-	| { readonly step: "composing"; readonly composer: FrameComposer }
-	| { readonly step: "assembled"; readonly assembly: FrameAssembly }
-	| { readonly step: "signing"; readonly signing: Signing }
-	| { readonly step: "spent" };
-
-/**
- * The slot of a build while a step runs.
- */
-const SPENT: BuildHandle = { step: "spent" };
-
-/**
- * The live wasm handle of one build: the composer, until it assembles the
- * structural frame, then the one live assembly, and the signature draft while
- * a signatory signs. Each step consumes the handle it takes, so the slot holds
- * none while a step runs, and holds the result of the step after it. A step
- * that throws drops its handle in wasm, and the slot frees the handle it holds
- * as the build leaves, whether the build ends or throws.
- */
-class AssemblySlot implements Disposable {
-	private held: BuildHandle;
-
-	constructor(composer: FrameComposer) {
-		this.held = { step: "composing", composer };
-	}
-
-	/**
-	 * The composer, before the structural frame assembles.
-	 *
-	 * @throws InternalError `COMPOSER_SPENT` once the frame assembled.
-	 */
-	get composer(): FrameComposer {
-		const held = this.held;
-		if (held.step !== "composing") {
-			throw new InternalError(
-				"COMPOSER_SPENT",
-				"a build step set the composer after it assembled the frame",
-			);
-		}
-
-		return held.composer;
-	}
-
-	/**
-	 * Assemble the structural frame: the build consumes the composer, and the
-	 * slot holds the assembly.
-	 */
-	assemble(): void {
-		const composer = this.composer;
-		this.held = SPENT;
-
-		const assembly = composer.build();
-		this.held = { step: "assembled", assembly };
-	}
-
-	/**
-	 * The live assembly, for a read that leaves it live.
-	 *
-	 * @throws InternalError `ASSEMBLY_SPENT` after a step that threw.
-	 */
-	get live(): FrameAssembly {
-		const held = this.held;
-		if (held.step !== "assembled") {
-			throw new InternalError(
-				"ASSEMBLY_SPENT",
-				"a build step ran after an earlier step consumed the assembly",
-			);
-		}
-
-		return held.assembly;
-	}
-
-	/**
-	 * Replace the live assembly with the result of `step`, which consumes
-	 * it.
-	 */
-	advance(step: (live: FrameAssembly) => FrameAssembly): void {
-		const assembly = this.live;
-		this.held = SPENT;
-
-		const next = step(assembly);
-		this.held = { step: "assembled", assembly: next };
-	}
-
-	/**
-	 * Replace the live assembly with the frame `signatory` signs. The engine
-	 * drafts the signature over the assembly it consumes, the slot holds the
-	 * draft while the signatory signs its prehash, and the completed draft
-	 * returns the signed frame.
-	 */
-	async sign(signatory: Signatory): Promise<void> {
-		const signerId = signatory.signerId();
-		const assembly = this.live;
-		this.held = SPENT;
-
-		const signing = assembly.signing(signerId);
-		this.held = { step: "signing", signing };
-		const signature = await signatory.signPrehash(signing.prehash);
-
-		this.held = SPENT;
-		const signed = signing.complete(signature);
-		this.held = { step: "assembled", assembly: signed };
-	}
-
-	/**
-	 * Free the composer, the live assembly, or the signature draft, whichever
-	 * the slot holds.
-	 */
-	[Symbol.dispose](): void {
-		const held = this.held;
-		this.held = SPENT;
-
-		switch (held.step) {
-			case "composing":
-				held.composer.free();
-				return;
-			case "assembled":
-				held.assembly.free();
-				return;
-			case "signing":
-				held.signing.free();
-				return;
-			case "spent":
-				return;
-			default: {
-				const leftover: never = held;
-				return leftover;
-			}
-		}
+		return this.#parts.data;
 	}
 }

@@ -21,7 +21,7 @@ use tightbeam::transport::{
 use tightbeam::{encode, server, Frame, TightBeamError};
 use tokio::task::JoinHandle;
 
-use crate::Result as WsResult;
+use super::Result as WsResult;
 
 /// The concurrent streams of the pooled echo.
 const POOL_STREAMS: u32 = 8;
@@ -69,9 +69,8 @@ impl EchoService {
 	/// Serve this echo on every connection that `listener` accepts, through
 	/// tightbeam's `server!`, recording each session on `trace`.
 	///
-	/// The server answers `offer` to a client that offers multiplexing, and a
-	/// client that offers none gets the single-flight unary echo. A `None`
-	/// offer declines multiplexing to every client.
+	/// - A client that offers multiplexing gets `offer`, and a `None` offer declines it.
+	/// - A client that offers none gets the single-flight unary echo.
 	pub fn serve<L, S, C>(listener: L, offer: Option<TransportOffer>, trace: &TraceCollector) -> JoinHandle<()>
 	where
 		L: AsyncListenerTrait<Transport = TcpTransport<S, C>> + Send + Sync + 'static,
@@ -94,17 +93,15 @@ impl EchoService {
 	}
 
 	/// Echo `frame` once over a dial of the protocol `P` to `addr`, whose
-	/// server serves this echo, with a client that pins `trust`, and return
-	/// the answer.
+	/// server serves this echo, with a client that pins `trust`.
 	///
-	/// The client dials through `ClientBuilder`, which takes no trace, and
-	/// sends `frame` on the transport of the dial with `trace` attached, so the
-	/// handshake of the client records beside the session of the server.
+	/// - `ClientBuilder` takes no trace, so the client sends on the dialed
+	///   transport with `trace` attached, and its handshake records beside the
+	///   session of the server.
 	///
 	/// # Errors
 	///
-	/// - [`Error::Tightbeam`](crate::Error::Tightbeam) -- the dial, the
-	///   handshake, or the exchange fails.
+	/// - [`Error::Ws`](super::Error::Ws) -- the dial, the handshake, or the exchange fails.
 	pub async fn exchange<P, S, C>(
 		addr: P::Address,
 		trust: Arc<dyn CertificateTrust>,
@@ -132,8 +129,10 @@ impl EchoService {
 	///
 	/// # Errors
 	///
-	/// - The [`Error::Transport`](crate::Error::Transport) or
-	///   [`Error::Tightbeam`](crate::Error::Tightbeam) of a dial or a stream.
+	/// - [`Error::Transport`](super::Error::Transport) -- the pool fails to
+	///   connect, or a call of a stream kind fails.
+	/// - [`Error::Ws`](super::Error::Ws) -- the frame of the streamed call does
+	///   not encode.
 	pub async fn through_pool<P>(
 		addr: P::Address,
 		trust: Arc<dyn CertificateTrust>,
@@ -160,12 +159,13 @@ impl EchoService {
 		let (mut sink, response) = lease.open_stream()?;
 		sink.push(head).await?;
 		sink.close_with(tail).await?;
-		let streamed = response.await?;
 
+		let streamed = response.await?;
 		let [first, last] = DUPLEX_CHUNKS;
 		let (mut sink, mut body) = lease.open_duplex()?;
 		sink.push(first).await?;
 		sink.close_with(last).await?;
+
 		let mut duplex = Vec::new();
 		while let Some(chunk) = body.chunk().await? {
 			duplex.push(chunk);
@@ -194,6 +194,7 @@ impl MuxService for EchoService {
 		while let Some(chunk) = body.chunk().await? {
 			reply.push(&chunk).await?;
 		}
+
 		Ok(())
 	}
 }

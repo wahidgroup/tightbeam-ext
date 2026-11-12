@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# pubsub extension setup: the npm workspace (subscription manager client
-# and its e2e tests). Idempotent via a stamp under .make/.
+# The pubsub setup, which installs the npm workspace and the Playwright
+# chromium: docs/development.md (Projects).
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 REPO_ROOT="$(cd "$ROOT/.." && pwd)"

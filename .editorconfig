@@ -1,4 +1,4 @@
-# EditorConfig is awesome: https://EditorConfig.org
+# The editor defaults of the repo: https://EditorConfig.org
 
 root = true
 
@@ -12,9 +12,9 @@ trim_trailing_whitespace = true
 indent_style = space
 indent_size = 2
 
-[*.{rs,ts,js,json}]
+[*.{rs,ts,tsx,mts,cts,js,mjs,cjs,json}]
 indent_style = tab
 indent_size = 4
 
-[Makefile]
+[{Makefile,*.sh,*.toml,.husky/*}]
 indent_style = tab

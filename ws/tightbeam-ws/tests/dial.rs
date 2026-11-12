@@ -3,8 +3,9 @@
 
 #![cfg(feature = "testing")]
 
+pub mod support;
+
 use core::future::pending;
-use core::time::Duration;
 use std::io;
 
 use futures_util::StreamExt;
@@ -18,16 +19,12 @@ use tightbeam_ws::testing::ReadOutcome;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
-use tokio::time::timeout;
 use tokio_tungstenite::accept_async;
+
+use support::bounded;
 
 /// The hostile peer of the scenario, and the socket address it bound.
 type Served = Result<(JoinHandle<Result<(), TightBeamError>>, TightBeamSocketAddr), TightBeamError>;
-
-/// How long a refusal by declared length may take on loopback. A socket that
-/// admits the frame waits for its payload until the default operation timeout,
-/// which is far longer.
-const PROMPT: Duration = Duration::from_secs(2);
 
 /// Both envelope ceilings of the dialing endpoint, below the default ceilings.
 const CEILING: usize = 32 * 1024;
@@ -69,9 +66,9 @@ async fn declaring_peer() -> Served {
 }
 
 // The dial refuses a frame past the ceiling of its endpoint by its declared
-// length, before any byte of its payload arrives, so the refusal comes within
-// `PROMPT`. The emit path of tightbeam files no refusal event for it, so the
-// client records the outcome of its read.
+// length, within the patience of `bounded`, while a dial that waits for the
+// payload runs to the operation timeout. The emit path of tightbeam files no
+// refusal event for it, so the client records the outcome of its read.
 tb_scenario! {
 	name: a_dial_refuses_a_frame_past_the_ceiling_of_its_endpoint,
 	spec: DialCeilingSpec,
@@ -82,7 +79,7 @@ tb_scenario! {
 			let mut client = builder.build().connect(addr).await?;
 
 			let emit = client.emit(TestFrame::v0(None, None), None);
-			let emitted = timeout(PROMPT, emit).await.map_err(|elapsed| TightBeamError::IoError(elapsed.into()))?;
+			let emitted = bounded(emit).await?;
 			ReadOutcome::record(&emitted, &trace)
 		}
 	}

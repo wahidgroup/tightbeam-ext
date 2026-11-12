@@ -28,21 +28,15 @@ const cases: readonly RoundTripCase[] = [
 ];
 
 for (const testCase of cases) {
-	test(`round-trips a built frame through the echo server: ${testCase.name}`, async ({
-		page,
-	}) => {
+	test(`round-trips a built frame through the echo server: ${testCase.name}`, async ({ page }) => {
 		await openApp(page);
 
-		const result: RoundTripResult = await page.evaluate(
-			({ url, payload, id, order }) =>
-				window.tbRoundTrip(url, payload, id, order),
-			{
-				url: STACK.muxClearEndpoint,
-				payload: testCase.payloadHex,
-				id: testCase.id,
-				order: testCase.order,
-			},
-		);
+		const result: RoundTripResult = await page.evaluate((echo) => window.tb.roundTrip(echo), {
+			url: STACK.muxClearEndpoint,
+			payloadHex: testCase.payloadHex,
+			idText: testCase.id,
+			order: testCase.order,
+		});
 		expect(result.bodyHex).toBe(testCase.payloadHex);
 		expect(result.idText).toBe(testCase.id);
 		expect(result.order).toBe(String(testCase.order));

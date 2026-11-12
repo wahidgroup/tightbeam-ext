@@ -1,17 +1,5 @@
-//! Progressive body streaming bridges for the multiplexed wasm client: the
-//! tightbeam [`RequestSink`], [`StreamBody`], and [`ReplySink`] for
-//! JavaScript.
-//!
-//! - Pushes reach the wire eagerly, so a duplex exchange may await a reply
-//!   chunk between pushes.
-//! - A known final chunk closes the body in one record through `closeWith`.
-//! - A close consumes the handle it closes. The glue nulls the JavaScript
-//!   wrapper, and the promise of the close holds the stream until it settles.
-//! - Every other async method clones an `Rc` to shared state into its promise,
-//!   so a free of the JavaScript wrapper mid-await keeps the call alive.
-//! - The shared state of a client-initiated stream holds its connection, and
-//!   so does the reply body of a duplex stream. The socket therefore stays
-//!   open while the stream lives, even after its client is freed.
+//! The progressive and duplex bodies of the multiplexed client, as the
+//! browser transport section of `docs/ws-wasm.md` describes.
 
 use core::cell::{Cell, RefCell};
 use core::future::Future;
@@ -20,7 +8,7 @@ use core::str::FromStr;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use futures_util::future::{AbortHandle, Abortable};
+use futures_util::future::{AbortHandle, AbortRegistration, Abortable};
 use js_sys::{Function, Promise, Uint8Array};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
@@ -37,53 +25,120 @@ use crate::fault::{JsFault, RefusalCode, TransitCode};
 use crate::mux::Connection;
 use crate::promise::{JsBytes, JsResponse, Record, Returned};
 
-type FrameResponseFut = Pin<Box<dyn Future<Output = TransportResult<Option<Frame>>> + 'static>>;
+/// The response of a request stream, which its close awaits once, and the
+/// socket it arrives on.
+struct FrameResponseFut {
+	response: Pin<Box<dyn Future<Output = TransportResult<Option<Frame>>> + 'static>>,
+	/// Holds the socket open while this response lives.
+	_connection: Rc<Connection>,
+}
+
+impl FrameResponseFut {
+	/// Await the response and surface its Frame DER.
+	async fn resolve(self) -> Result<JsValue, JsValue> {
+		let frame = self.response.await.map_err(JsFault::from)?;
+
+		let response = JsValue::try_from(JsResponse(frame))?;
+		Ok(response)
+	}
+}
+
+/// TypeScript shapes of the route a served stream reads and of the handler
+/// each `serve*` call takes.
+#[wasm_bindgen(typescript_custom_section)]
+const SERVE_HANDLERS_TS: &'static str = r#"
+/**
+ * The Open route stamped on a progressive or duplex stream.
+ */
+export interface StreamRoute {
+	/**
+	 * The servlet target as `urn:<nid>:<nss>`, when the Open named one.
+	 */
+	readonly target?: string;
+	/**
+	 * The hop budget that remains on this Open.
+	 */
+	readonly hopsRemaining: number;
+}
+
+/**
+ * The handler of `serve`: the request frame DER, answered with the response
+ * frame DER, or `undefined` for a bodiless acceptance. A throw or a rejection
+ * with a `TransitRefusal` label answers with that status, and any other throw
+ * or rejection answers `Unknown`.
+ */
+export type UnaryServeHandler = (
+	requestDer: Uint8Array,
+) => Promise<Uint8Array | undefined> | Uint8Array | undefined;
+
+/**
+ * The handler of `serveStreaming`: the request body and the Open route,
+ * answered as a `UnaryServeHandler` answers.
+ */
+export type StreamingServeHandler = (
+	body: MuxStreamBody,
+	route: StreamRoute,
+) => Promise<Uint8Array | undefined> | Uint8Array | undefined;
+
+/**
+ * The handler of `serveDuplex`: the request body, the reply half, and the
+ * Open route, answered with the refusal that ends the stream, or `undefined`
+ * for `Ok`. A throw or a rejection answers as it does for a
+ * `UnaryServeHandler`.
+ */
+export type DuplexServeHandler = (
+	body: MuxStreamBody,
+	reply: MuxReplySink,
+	route: StreamRoute,
+) => Promise<TransitRefusal | undefined> | TransitRefusal | undefined;
+"#;
 
 /// Why a call on a closed stream half refuses.
 const STREAM_CLOSED: &str = "the streaming handle is closed";
 
 /// A stream half that one call at a time holds.
 ///
-/// A call holds the half for the length of its await, so a second call in
-/// that span finds the half busy rather than closed.
-struct Slot<T>(Cell<SlotState<T>>);
+/// A call leases the half for the length of its await, so a second call in
+/// that span finds the half busy rather than closed. The slot ends the call
+/// that holds the half as it drops, so the half drops with its owner.
+struct Slot<T>(Rc<Cell<SlotState<T>>>);
 
 /// What a [`Slot`] holds between calls.
 enum SlotState<T> {
 	/// The half waits for the next call.
 	Ready(T),
-	/// A call holds the half until its await ends.
-	Busy,
-	/// A close consumed the half.
+	/// A call holds the half, and the handle ends that call.
+	Busy(AbortHandle),
+	/// A close consumed the half, or the slot ended the call that held it.
 	Closed,
 }
 
 impl<T> Slot<T> {
 	/// A slot whose half waits for the first call.
 	fn new(half: T) -> Self {
-		Self(Cell::new(SlotState::Ready(half)))
+		Self(Rc::new(Cell::new(SlotState::Ready(half))))
 	}
 
-	/// Lend the half to `call` for the length of its await, then hand it back
-	/// for the next call.
+	/// Lease the half to one call now. The call runs once the lease is
+	/// [run](Lease::run), and the slot can end it from this moment on.
 	///
 	/// # Errors
 	///
 	/// - `StreamBusy` -- another call holds the half.
 	/// - `StreamClosed` -- a close consumed the half.
-	async fn lend<R>(&self, call: impl AsyncFnOnce(&mut T) -> R) -> Result<R, JsFault> {
-		let mut half = self.take_leaving(SlotState::Busy)?;
-		let outcome = call(&mut half).await;
+	fn lease(&self) -> Result<Lease<T>, JsFault> {
+		let (abort, registration) = AbortHandle::new_pair();
+		let half = self.take_leaving(SlotState::Busy(abort))?;
+		let guard = LeaseGuard(Rc::clone(&self.0));
 
-		self.0.set(SlotState::Ready(half));
-		Ok(outcome)
+		Ok(Lease { guard, half, registration })
 	}
 
 	/// Take the half for a close, which consumes it.
 	///
 	/// # Errors
 	///
-	/// - The errors of [`Self::lend`].
+	/// - The errors of [`Self::lease`].
 	fn retire(&self) -> Result<T, JsFault> {
 		self.take_leaving(SlotState::Closed)
 	}
@@ -93,8 +148,8 @@ impl<T> Slot<T> {
 	fn take_leaving(&self, next: SlotState<T>) -> Result<T, JsFault> {
 		match self.0.replace(next) {
 			SlotState::Ready(half) => Ok(half),
-			SlotState::Busy => {
-				self.0.set(SlotState::Busy);
+			SlotState::Busy(abort) => {
+				self.0.set(SlotState::Busy(abort));
 				Err(RefusalCode::StreamBusy.because("another call holds this stream half"))
 			}
 			SlotState::Closed => {
@@ -105,23 +160,155 @@ impl<T> Slot<T> {
 	}
 }
 
-struct RequestInner {
-	sink: Slot<RequestSink>,
-	response: Cell<Option<FrameResponseFut>>,
-	/// Holds the socket open while the stream lives.
-	_connection: Rc<Connection>,
+/// The owner of the half is gone: the call that holds the half ends at once,
+/// and a half that waits drops now.
+impl<T> Drop for Slot<T> {
+	fn drop(&mut self) {
+		if let SlotState::Busy(abort) = self.0.replace(SlotState::Closed) {
+			abort.abort();
+		}
+	}
 }
 
-impl RequestInner {
-	/// Await the stashed response future and surface its Frame DER.
-	async fn resolve_response(&self) -> Result<JsValue, JsValue> {
-		let pending = self.response.take();
-		let fut = pending.ok_or_else(|| RefusalCode::StreamClosed.because(STREAM_CLOSED))?;
-		let frame = fut.await.map_err(JsFault::from)?;
+/// The half of a [`Slot`] that one call holds.
+struct Lease<T> {
+	guard: LeaseGuard<T>,
+	half: T,
+	registration: AbortRegistration,
+}
 
-		let response = JsValue::try_from(JsResponse(frame))?;
-		Ok(response)
+/// How a leased call ended.
+enum Lent<R> {
+	/// The call ran to its end.
+	Done(R),
+	/// The slot ended the call first.
+	Ended,
+}
+
+impl<T> Lease<T> {
+	/// Run `call` over the half, and hand the half back once it ends, unless
+	/// the slot ended the call first.
+	async fn run<R>(self, call: impl AsyncFnOnce(&mut T) -> R) -> Lent<R> {
+		let Self { guard, mut half, registration } = self;
+
+		let outcome = Abortable::new(call(&mut half), registration).await;
+		match outcome {
+			Ok(done) => {
+				guard.hand_back(half);
+				Lent::Done(done)
+			}
+			Err(_) => Lent::Ended,
+		}
 	}
+}
+
+impl<R> Lent<R> {
+	/// The outcome of a call whose end by the slot reads as a closed half.
+	///
+	/// # Errors
+	///
+	/// - `StreamClosed` -- the slot ended the call.
+	fn closed_if_ended(self) -> Result<R, JsFault> {
+		match self {
+			Self::Done(done) => Ok(done),
+			Self::Ended => Err(RefusalCode::StreamClosed.because(STREAM_CLOSED)),
+		}
+	}
+}
+
+/// The hold of a [`Lease`] on its slot. A lease that drops before it hands
+/// the half back leaves the slot closed, because the half drops with it.
+struct LeaseGuard<T>(Rc<Cell<SlotState<T>>>);
+
+impl<T> LeaseGuard<T> {
+	/// Hand `half` back for the next call, unless the slot closed while the
+	/// call ran.
+	fn hand_back(self, half: T) {
+		if let SlotState::Busy(_) = self.0.replace(SlotState::Closed) {
+			self.0.set(SlotState::Ready(half));
+		}
+	}
+}
+
+impl<T> Drop for LeaseGuard<T> {
+	fn drop(&mut self) {
+		let current = self.0.replace(SlotState::Closed);
+		if !matches!(current, SlotState::Busy(_)) {
+			self.0.set(current);
+		}
+	}
+}
+
+/// A stream half that pushes one chunk per call toward the peer.
+trait PushHalf {
+	/// Push `chunk`. An empty chunk sends nothing to the peer.
+	fn push_chunk(&mut self, chunk: &[u8]) -> impl Future<Output = TransportResult<()>>;
+}
+
+impl PushHalf for RequestSink {
+	fn push_chunk(&mut self, chunk: &[u8]) -> impl Future<Output = TransportResult<()>> {
+		self.push(chunk)
+	}
+}
+
+impl PushHalf for ReplySink {
+	fn push_chunk(&mut self, chunk: &[u8]) -> impl Future<Output = TransportResult<()>> {
+		self.push(chunk)
+	}
+}
+
+impl<T: PushHalf + 'static> Slot<T> {
+	/// Push `chunk` through the half, and keep `holder`, the shared state of
+	/// the stream, until the push settles.
+	fn push(&self, chunk: JsBytes, holder: impl Sized + 'static) -> Promise {
+		let leased = chunk.read().and_then(|chunk| Ok((chunk, self.lease()?)));
+		future_to_promise(async move {
+			let _holder = holder;
+			let (chunk, lease) = leased?;
+			let pushed = lease.run(async |half: &mut T| half.push_chunk(&chunk).await).await;
+			pushed.closed_if_ended()?.map_err(JsFault::from)?;
+
+			Ok(JsValue::UNDEFINED)
+		})
+	}
+}
+
+impl Slot<RequestSink> {
+	/// Take the half for a close that sends `last` with no payload, and keep
+	/// `holder`, the shared state of the stream, until the close settles.
+	fn close(&self, holder: impl Sized + 'static) -> impl Future<Output = Result<(), JsValue>> + 'static {
+		let held = self.retire();
+		async move {
+			let _holder = holder;
+			held?.close().await.map_err(JsFault::from)?;
+
+			Ok(())
+		}
+	}
+
+	/// Take the half for a close that sends `chunk` with `last` set, and keep
+	/// `holder`, the shared state of the stream, until the close settles.
+	fn close_with(
+		&self,
+		chunk: JsBytes,
+		holder: impl Sized + 'static,
+	) -> impl Future<Output = Result<(), JsValue>> + 'static {
+		let closing = chunk.read().and_then(|chunk| Ok((chunk, self.retire()?)));
+		async move {
+			let _holder = holder;
+			let (chunk, held) = closing?;
+			held.close_with(&chunk).await.map_err(JsFault::from)?;
+
+			Ok(())
+		}
+	}
+}
+
+struct RequestInner {
+	sink: Slot<RequestSink>,
+	/// Holds the socket open for the handle of this stream, its pushes, and
+	/// its close.
+	_connection: Rc<Connection>,
 }
 
 /// Client-initiated streaming request: push chunks, then close for the
@@ -129,6 +316,8 @@ impl RequestInner {
 #[wasm_bindgen(js_name = MuxRequestStream)]
 pub struct MuxRequestStream {
 	inner: Rc<RequestInner>,
+	/// The response, which the close of this handle awaits.
+	response: FrameResponseFut,
 }
 
 #[wasm_bindgen(js_class = MuxRequestStream)]
@@ -137,52 +326,49 @@ impl MuxRequestStream {
 	/// holds.
 	pub(crate) fn open(connection: Rc<Connection>) -> Result<MuxRequestStream, JsFault> {
 		let (sink, response) = connection.handle().open_stream().map_err(JsFault::from)?;
-		Ok(Self::from_parts(sink, Box::pin(response), connection))
+		Ok(Self::from_parts(sink, response, connection))
 	}
 
 	/// Open a progressive request routed to a servlet URN
 	/// (`urn:<nid>:<nss>`). The Open carries the origin hop-budget
 	/// sentinel so the first gateway applies its `max_hops` clamp.
-	pub(crate) fn open_to(connection: Rc<Connection>, target: &str) -> Result<MuxRequestStream, JsFault> {
-		let StreamTarget(urn) = StreamTarget::try_from(target)?;
+	pub(crate) fn open_to(connection: Rc<Connection>, target: StreamTarget) -> Result<MuxRequestStream, JsFault> {
+		let StreamTarget(urn) = target;
 		let (sink, response) = connection.handle().open_stream_to(urn).map_err(JsFault::from)?;
-		Ok(Self::from_parts(sink, Box::pin(response), connection))
+		Ok(Self::from_parts(sink, response, connection))
 	}
 
-	fn from_parts(sink: RequestSink, response: FrameResponseFut, connection: Rc<Connection>) -> Self {
-		let response = Cell::new(Some(response));
-		let inner = RequestInner { sink: Slot::new(sink), response, _connection: connection };
-		Self { inner: Rc::new(inner) }
+	fn from_parts(
+		sink: RequestSink,
+		response: impl Future<Output = TransportResult<Option<Frame>>> + 'static,
+		connection: Rc<Connection>,
+	) -> Self {
+		let response = FrameResponseFut { response: Box::pin(response), _connection: Rc::clone(&connection) };
+		let inner = RequestInner { sink: Slot::new(sink), _connection: connection };
+		Self { inner: Rc::new(inner), response }
 	}
 
-	/// Push one request chunk. Empty chunks are no-ops on the wire.
+	/// Push one request chunk. An empty chunk sends nothing.
 	#[wasm_bindgen(js_name = push, unchecked_return_type = "Promise<void>")]
 	pub fn push(&self, chunk: JsBytes) -> Promise {
-		let chunk = chunk.read();
-		let inner = Rc::clone(&self.inner);
-		future_to_promise(async move {
-			let chunk = chunk?;
-			let outcome = inner.sink.lend(async |held| held.push(&chunk).await).await?;
-			outcome.map_err(JsFault::from)?;
-
-			Ok(JsValue::UNDEFINED)
-		})
+		let holder = Rc::clone(&self.inner);
+		self.inner.sink.push(chunk, holder)
 	}
 
 	/// Flush `last`, then resolve with the response Frame DER (or
 	/// `undefined`). Dropping without close cancels the stream.
 	///
-	/// The close consumes this handle. A close while a push is in flight
-	/// refuses with `StreamBusy`, and the stream then cancels once that push
-	/// settles.
+	/// - The close consumes this handle.
+	/// - A close while a push is in flight refuses with `StreamBusy`, and the stream then cancels once that
+	///   push settles.
 	#[wasm_bindgen(js_name = close, unchecked_return_type = "Promise<Uint8Array | undefined>")]
 	pub fn close(self) -> Promise {
-		let inner = self.inner;
+		let Self { inner, response } = self;
+		let closing = inner.sink.close(Rc::clone(&inner));
 		future_to_promise(async move {
-			let held = inner.sink.retire()?;
-			held.close().await.map_err(JsFault::from)?;
+			closing.await?;
 
-			inner.resolve_response().await
+			response.resolve().await
 		})
 	}
 
@@ -193,21 +379,20 @@ impl MuxRequestStream {
 	/// The close consumes this handle, as [`close`](Self::close) does.
 	#[wasm_bindgen(js_name = closeWith, unchecked_return_type = "Promise<Uint8Array | undefined>")]
 	pub fn close_with(self, chunk: JsBytes) -> Promise {
-		let chunk = chunk.read();
-		let inner = self.inner;
+		let Self { inner, response } = self;
+		let closing = inner.sink.close_with(chunk, Rc::clone(&inner));
 		future_to_promise(async move {
-			let chunk = chunk?;
-			let held = inner.sink.retire()?;
-			held.close_with(&chunk).await.map_err(JsFault::from)?;
+			closing.await?;
 
-			inner.resolve_response().await
+			response.resolve().await
 		})
 	}
 }
 
 struct DuplexInner {
 	sink: Slot<RequestSink>,
-	/// Holds the socket open while the stream lives.
+	/// Holds the socket open for the handle of this stream, its pushes, and
+	/// its close.
 	_connection: Rc<Connection>,
 }
 
@@ -215,8 +400,8 @@ struct DuplexInner {
 /// chunks through the body that [`takeBody`](Self::take_body) moves into a
 /// handle of its own.
 ///
-/// The request half and the reply body end apart. A close consumes this
-/// handle, and the reply body still reads until the peer's `last`.
+/// - The request half and the reply body end apart.
+/// - A close consumes this handle, and the reply body still reads until the peer's `last`.
 #[wasm_bindgen(js_name = MuxDuplexStream)]
 pub struct MuxDuplexStream {
 	inner: Rc<DuplexInner>,
@@ -238,8 +423,8 @@ impl MuxDuplexStream {
 	///
 	/// The Open carries the origin hop-budget sentinel so the first
 	/// gateway applies its `max_hops` clamp.
-	pub(crate) fn open_to(connection: Rc<Connection>, target: &str) -> Result<MuxDuplexStream, JsFault> {
-		let StreamTarget(urn) = StreamTarget::try_from(target)?;
+	pub(crate) fn open_to(connection: Rc<Connection>, target: StreamTarget) -> Result<MuxDuplexStream, JsFault> {
+		let StreamTarget(urn) = target;
 		let (sink, body) = connection.handle().open_duplex_to(urn).map_err(JsFault::from)?;
 		Ok(Self::from_parts(sink, body, connection))
 	}
@@ -266,15 +451,8 @@ impl MuxDuplexStream {
 	/// is sound.
 	#[wasm_bindgen(js_name = push, unchecked_return_type = "Promise<void>")]
 	pub fn push(&self, chunk: JsBytes) -> Promise {
-		let chunk = chunk.read();
-		let inner = Rc::clone(&self.inner);
-		future_to_promise(async move {
-			let chunk = chunk?;
-			let outcome = inner.sink.lend(async |held| held.push(&chunk).await).await?;
-			outcome.map_err(JsFault::from)?;
-
-			Ok(JsValue::UNDEFINED)
-		})
+		let holder = Rc::clone(&self.inner);
+		self.inner.sink.push(chunk, holder)
 	}
 
 	/// Flush the request body's `last` flag.
@@ -284,9 +462,9 @@ impl MuxDuplexStream {
 	#[wasm_bindgen(js_name = close, unchecked_return_type = "Promise<void>")]
 	pub fn close(self) -> Promise {
 		let inner = self.inner;
+		let closing = inner.sink.close(Rc::clone(&inner));
 		future_to_promise(async move {
-			let held = inner.sink.retire()?;
-			held.close().await.map_err(JsFault::from)?;
+			closing.await?;
 
 			Ok(JsValue::UNDEFINED)
 		})
@@ -298,12 +476,10 @@ impl MuxDuplexStream {
 	/// The close consumes this handle, as [`close`](Self::close) does.
 	#[wasm_bindgen(js_name = closeWith, unchecked_return_type = "Promise<void>")]
 	pub fn close_with(self, chunk: JsBytes) -> Promise {
-		let chunk = chunk.read();
 		let inner = self.inner;
+		let closing = inner.sink.close_with(chunk, Rc::clone(&inner));
 		future_to_promise(async move {
-			let chunk = chunk?;
-			let held = inner.sink.retire()?;
-			held.close_with(&chunk).await.map_err(JsFault::from)?;
+			closing.await?;
 
 			Ok(JsValue::UNDEFINED)
 		})
@@ -312,9 +488,6 @@ impl MuxDuplexStream {
 
 struct BodyInner {
 	body: Slot<StreamBody>,
-	/// The abort of the read in flight, which a free of the handle runs, so
-	/// the read ends and the body drops with it.
-	reading: Cell<Option<AbortHandle>>,
 	/// Holds the socket open while the reply body of a client-initiated
 	/// duplex stream lives. A served body leaves that hold to its serve loop.
 	_connection: Option<Rc<Connection>>,
@@ -324,9 +497,9 @@ struct BodyInner {
 /// a stream that a `serveStreaming` or `serveDuplex` handler answers, or the
 /// reply body of a client-initiated duplex stream.
 ///
-/// A free of the handle before the peer's `last` discards the chunks still
-/// to come. On a duplex reply body, it cancels the stream, and a read still
-/// in flight ends with `undefined`, so the free cancels at once.
+/// - A free of the handle before the peer's `last` discards the chunks still to come.
+/// - On a duplex reply body, the free cancels the stream at once, and a read still in flight ends with
+///   `undefined`.
 #[wasm_bindgen(js_name = MuxStreamBody)]
 pub struct MuxStreamBody {
 	inner: Rc<BodyInner>,
@@ -336,56 +509,37 @@ pub struct MuxStreamBody {
 impl MuxStreamBody {
 	/// The request body of a served stream.
 	fn wrap(body: StreamBody) -> Self {
-		let inner = BodyInner { body: Slot::new(body), reading: Cell::new(None), _connection: None };
+		let inner = BodyInner { body: Slot::new(body), _connection: None };
 		Self { inner: Rc::new(inner) }
 	}
 
 	/// The reply body of a duplex stream on `connection`, which the body
 	/// holds.
 	fn reply(body: StreamBody, connection: Rc<Connection>) -> Self {
-		let inner = BodyInner { body: Slot::new(body), reading: Cell::new(None), _connection: Some(connection) };
+		let inner = BodyInner { body: Slot::new(body), _connection: Some(connection) };
 		Self { inner: Rc::new(inner) }
 	}
 
 	/// Next chunk, or `undefined` after the peer's `last`, or once a free of
 	/// the handle ended the read.
+	///
+	/// The read holds the body from this call on, so a free that lands before
+	/// the read first runs still ends it.
 	#[wasm_bindgen(js_name = nextChunk, unchecked_return_type = "Promise<Uint8Array | undefined>")]
 	pub fn next_chunk(&self) -> Promise {
-		let inner = Rc::clone(&self.inner);
-
-		// The abort exists before the read first runs, so a free that lands
-		// before the spawned read starts still ends it.
-		let (abort, registration) = AbortHandle::new_pair();
-		inner.reading.set(Some(abort));
-
+		let lease = self.inner.body.lease();
 		future_to_promise(async move {
-			let read = async move |held: &mut StreamBody| Abortable::new(held.chunk(), registration).await;
-			let outcome = inner.body.lend(read).await;
-			inner.reading.set(None);
-
-			// A free ended the read: drop the body now, which cancels its stream.
-			let outcome = outcome?;
-			let Ok(outcome) = outcome else {
-				drop(inner.body.retire());
+			let read = lease?.run(async |held: &mut StreamBody| held.chunk().await).await;
+			let Lent::Done(chunk) = read else {
 				return Ok(JsValue::UNDEFINED);
 			};
 
-			let chunk = outcome.map_err(JsFault::from)?;
+			let chunk = chunk.map_err(JsFault::from)?;
 			Ok(match chunk {
 				Some(bytes) => Uint8Array::from(bytes.as_slice()).into(),
 				None => JsValue::UNDEFINED,
 			})
 		})
-	}
-}
-
-/// A free of the handle ends the read in flight, whose future holds a share
-/// of the body, so the body drops once that read returns.
-impl Drop for MuxStreamBody {
-	fn drop(&mut self) {
-		if let Some(reading) = self.inner.reading.take() {
-			reading.abort();
-		}
 	}
 }
 
@@ -408,15 +562,8 @@ impl MuxReplySink {
 	/// Push one reply chunk toward the peer.
 	#[wasm_bindgen(js_name = push, unchecked_return_type = "Promise<void>")]
 	pub fn push(&self, chunk: JsBytes) -> Promise {
-		let chunk = chunk.read();
-		let inner = Rc::clone(&self.inner);
-		future_to_promise(async move {
-			let chunk = chunk?;
-			let outcome = inner.sink.lend(async |held| held.push(&chunk).await).await?;
-			outcome.map_err(JsFault::from)?;
-
-			Ok(JsValue::UNDEFINED)
-		})
+		let holder = Rc::clone(&self.inner);
+		self.inner.sink.push(chunk, holder)
 	}
 }
 
@@ -485,9 +632,18 @@ impl StreamHandler {
 
 	/// The response to a stream whose function settled with `outcome`, for
 	/// the unary and the streaming kinds alike. A rejection answers with the
-	/// status [`TransitCode::of_js`] reads from it.
+	/// status that [`Self::refused`] reads from it.
 	fn answer(outcome: Result<ResponsePackage, JsValue>) -> ResponsePackage {
-		outcome.unwrap_or_else(|rejection| ResponsePackage::new(TransitCode::of_js(&rejection), None))
+		outcome.unwrap_or_else(|rejection| ResponsePackage::new(Self::refused(&rejection), None))
+	}
+
+	/// The status that a settlement `value` refuses the stream with: the
+	/// refusal its label names, and `Unknown` for `Ok` and for any value that
+	/// is no label.
+	fn refused(value: &JsValue) -> TransitStatus {
+		let label = value.as_string();
+		let refusal = label.as_deref().and_then(TransitCode::refusal);
+		refusal.map_or(TransitStatus::Unknown, TransitStatus::from)
 	}
 
 	/// Answer one duplex stream through a body, a reply, and the Open's
@@ -498,7 +654,7 @@ impl StreamHandler {
 		let route_arg = JsValue::from(JsRoute(&route));
 		match self.call_duplex(&body_arg, &reply_arg, &route_arg).await {
 			Ok(status) => status,
-			Err(rejection) => TransitCode::of_js(&rejection),
+			Err(rejection) => Self::refused(&rejection),
 		}
 	}
 
@@ -541,7 +697,7 @@ impl StreamHandler {
 	/// Call the function with the body, the reply half, and the Open's route,
 	/// and read the status its resolution names: `undefined` or `null`
 	/// accepts, and any other value answers the status that
-	/// [`TransitCode::of_js`] reads from it.
+	/// [`Self::refused`] reads from it.
 	async fn call_duplex(&self, body: &JsValue, reply: &JsValue, route: &JsValue) -> Result<TransitStatus, JsValue> {
 		let returned = self.0.call3(&JsValue::UNDEFINED, body, reply, route).map(Returned::from)?;
 		let settled = returned.settle().await?;
@@ -549,7 +705,7 @@ impl StreamHandler {
 			return Ok(TransitStatus::Ok);
 		};
 
-		let status = TransitCode::of_js(&settled);
+		let status = Self::refused(&settled);
 		Ok(status)
 	}
 }
@@ -557,21 +713,18 @@ impl StreamHandler {
 /// The servlet URN that a routed stream open or a work submission targets.
 pub(crate) struct StreamTarget(pub(crate) Urn<'static>);
 
-impl TryFrom<&str> for StreamTarget {
-	type Error = JsFault;
-
-	/// Parse `target` as `urn:<nid>:<nss>`.
+impl StreamTarget {
+	/// Parse `value`, the field at `path`, as `urn:<nid>:<nss>`.
 	///
 	/// # Errors
 	///
-	/// - `InvalidStreamRoute` -- `target` is no URN.
-	fn try_from(target: &str) -> Result<Self, Self::Error> {
-		let urn = Urn::from_str(target);
-		let refusal = |error| {
-			let message = format!("stream target must be a URN (urn:<nid>:<nss>): {error}");
-			RefusalCode::InvalidStreamRoute.because(message)
-		};
+	/// - `InvalidStreamRoute` -- `value` is no URN string.
+	pub(crate) fn read(value: &JsValue, path: &str) -> Result<Self, JsFault> {
+		let refused = |message: String| RefusalCode::InvalidStreamRoute.because(message).at(path);
+		let target = value.as_string().ok_or_else(|| refused(String::from("must be a string")))?;
 
+		let urn = Urn::from_str(&target);
+		let refusal = |error| refused(format!("stream target must be a URN (urn:<nid>:<nss>): {error}"));
 		urn.map(Self).map_err(refusal)
 	}
 }
@@ -644,21 +797,30 @@ impl MuxDispatch for DuplexDispatch {
 
 #[cfg(test)]
 mod tests {
+	use core::cell::RefCell;
 	use core::future::{pending, Future};
+	use std::rc::Rc;
 
 	use futures_util::FutureExt;
-	use js_sys::Function;
+	use js_sys::{Function, Promise};
+	use tightbeam::marker::MaybeSend;
 	use tightbeam::policy::TransitStatus;
 	use tightbeam::testing::TestFrame;
+	use tightbeam::transport::multiplex::{MuxDispatch, ReplySink, StreamBody, StreamRoute};
+	use tightbeam::transport::{TransportError, TransportFailure, TransportResult};
 	use wasm_bindgen::JsValue;
+	use wasm_bindgen_futures::{spawn_local, JsFuture};
 	use wasm_bindgen_test::wasm_bindgen_test;
 
-	use super::{Slot, StreamHandler};
-	use crate::fault::{JsFault, Refused, TransitCode};
+	use super::{MuxStreamBody, ServeHandler, Slot, StreamHandler};
+	use crate::fault::{JsFault, Refused};
+	use crate::loopback::{settled, Loopback};
+	use crate::mux::SessionParts;
 
-	/// A call that takes the half of `slot` and never hands it back.
-	fn holding(slot: &Slot<()>) -> impl Future<Output = Result<(), JsFault>> + '_ {
-		let mut call = Box::pin(slot.lend(async |_| pending::<()>().await));
+	/// A call that takes the half of `slot` and holds it until the call drops.
+	fn holding(slot: &Slot<()>) -> impl Future<Output = Result<(), JsFault>> {
+		let lease = slot.lease();
+		let mut call = Box::pin(async move { lease?.run(async |_| pending::<()>().await).await.closed_if_ended() });
 		let _ = (&mut call).now_or_never();
 
 		call
@@ -666,7 +828,7 @@ mod tests {
 
 	/// A call that hands the half of `slot` back at once.
 	async fn passing(slot: &Slot<()>) -> Result<(), JsFault> {
-		slot.lend(async |_| ()).await
+		slot.lease()?.run(async |_| ()).await.closed_if_ended()
 	}
 
 	/// A `serve*` handler that resolves with a number in place of bytes.
@@ -675,10 +837,9 @@ mod tests {
 		StreamHandler(function)
 	}
 
-	/// A `serve*` handler that rejects with the code of a gRPC status.
-	fn refusing_handler() -> StreamHandler {
-		let function = Function::new_no_args("return Promise.reject({ code: 'PermissionDenied' })");
-		StreamHandler(function)
+	/// A `serve*` handler that rejects with the label of a gRPC status.
+	fn refusing_handler() -> Function {
+		Function::new_no_args("return Promise.reject('PermissionDenied')")
 	}
 
 	/// A `serveDuplex` handler that resolves with the label `Ok`.
@@ -687,10 +848,148 @@ mod tests {
 		StreamHandler(function)
 	}
 
-	/// A `serve*` handler that rejects with the code `Ok`.
-	fn rejecting_ok_handler() -> StreamHandler {
-		let function = Function::new_no_args("return Promise.reject({ code: 'Ok' })");
-		StreamHandler(function)
+	/// A `serve*` handler that rejects with the label `Ok`.
+	fn rejecting_ok_handler() -> Function {
+		Function::new_no_args("return Promise.reject('Ok')")
+	}
+
+	/// A `serve` handler that rethrows a peer refusal: an error whose `code`
+	/// names the status `Unavailable`.
+	fn peer_refusal_handler() -> Function {
+		let body = "const refusal = new Error('the inner call was refused'); \
+		            refusal.name = 'TightbeamTransportError'; refusal.code = 'Unavailable'; \
+		            return Promise.reject(refusal)";
+		Function::new_no_args(body)
+	}
+
+	/// Serve the streams of `server` through `dispatch` until the test ends.
+	fn serve(server: SessionParts, dispatch: impl MuxDispatch + 'static) {
+		spawn_local(async move {
+			let served = server;
+			let _ = served.responder.serve_with(dispatch).await;
+			pending::<()>().await;
+		});
+	}
+
+	/// The outcome of one emit that the server answers through a unary serve
+	/// loop of `handler`, over a real socket.
+	async fn served_unary(handler: Function) -> TransportResult<Option<tightbeam::Frame>> {
+		let loopback = Loopback::open(1).await;
+		let Loopback { client, server, .. } = loopback;
+		serve(server, ServeHandler::new(handler).unary());
+
+		settled(client.handle.emit_on_stream(&TestFrame::v0(None, None))).await
+	}
+
+	/// The response to one empty request stream that the server answers
+	/// through a streaming serve loop of `handler`, over a real socket.
+	async fn served_streaming(handler: Function) -> TransportResult<Option<tightbeam::Frame>> {
+		let loopback = Loopback::open(1).await;
+		let Loopback { client, server, .. } = loopback;
+		serve(server, ServeHandler::new(handler).streaming());
+
+		let (sink, response) = client.handle.open_stream()?;
+		settled(sink.close()).await?;
+		settled(response).await
+	}
+
+	/// The first read of the reply body of one empty duplex stream that the
+	/// server answers through a duplex serve loop of `handler`, over a real
+	/// socket.
+	async fn served_duplex(handler: Function) -> TransportResult<Option<Vec<u8>>> {
+		let loopback = Loopback::open(1).await;
+		let Loopback { client, server, .. } = loopback;
+		serve(server, ServeHandler::new(handler).duplex());
+
+		let (sink, mut body) = client.handle.open_duplex()?;
+		settled(sink.close()).await?;
+		settled(body.chunk()).await
+	}
+
+	/// A served duplex stream whose reply half the test takes, and the promise
+	/// that settles once the server dispatched it.
+	struct ReplyHandoff {
+		reply: Rc<RefCell<Option<ReplySink>>>,
+		arrived: Function,
+	}
+
+	impl MuxDispatch for ReplyHandoff {
+		fn duplex(
+			&self,
+			body: StreamBody,
+			reply: ReplySink,
+			_route: StreamRoute,
+		) -> impl Future<Output = TransportResult<TransitStatus>> + MaybeSend {
+			self.reply.borrow_mut().replace(reply);
+			let _ = self.arrived.call0(&JsValue::UNDEFINED);
+
+			async move {
+				let _held = body;
+				pending::<()>().await;
+				Ok(TransitStatus::Ok)
+			}
+		}
+	}
+
+	/// The reply slot that a [`ReplyHandoff`] fills, the dispatch that fills
+	/// it, and the promise of its arrival.
+	fn reply_handoff() -> (Rc<RefCell<Option<ReplySink>>>, ReplyHandoff, Promise) {
+		let reply = Rc::new(RefCell::new(None));
+		let mut resolve = None;
+		let arrival = Promise::new(&mut |settle, _reject| resolve = Some(settle));
+		let arrived = resolve.expect("the promise executor runs at once");
+
+		let handoff = ReplyHandoff { reply: Rc::clone(&reply), arrived };
+		(reply, handoff, arrival)
+	}
+
+	#[wasm_bindgen_test]
+	async fn a_free_ends_the_read_that_holds_the_body() {
+		let loopback = Loopback::open(1).await;
+		let Loopback { client, server, .. } = loopback;
+		let (reply, handoff, arrival) = reply_handoff();
+		serve(server, handoff);
+
+		let (mut sink, body) = client.handle.open_duplex().expect("the client should open a duplex stream");
+		let opened = settled(sink.push(b"open")).await;
+		opened.expect("the first push should open the stream");
+		let arrived = settled(JsFuture::from(arrival)).await;
+		arrived.expect("the server should dispatch the stream");
+
+		let body = MuxStreamBody::wrap(body);
+		let reading = JsFuture::from(body.next_chunk());
+		let busy = settled(JsFuture::from(body.next_chunk())).await;
+		drop(body);
+
+		let late = reply.borrow_mut().take().expect("the server holds the reply half");
+		let _ = settled(async move {
+			let mut late = late;
+			late.push(b"late").await
+		})
+		.await;
+
+		let first = settled(reading).await.expect("the read should settle");
+		assert_eq!(busy.code().as_deref(), Some("StreamBusy"));
+		assert!(first.is_undefined());
+		drop(sink);
+	}
+
+	#[wasm_bindgen_test]
+	async fn a_rejection_whose_code_names_a_status_answers_the_peer_unknown() {
+		let answered = served_unary(peer_refusal_handler()).await;
+		assert!(matches!(
+			answered,
+			Err(TransportError::OperationFailed(TransportFailure::Unknown))
+		));
+	}
+
+	#[wasm_bindgen_test]
+	async fn a_rejection_with_a_refusal_label_answers_the_peer_its_status() {
+		let answered = served_unary(Function::new_no_args("return Promise.reject('NotFound')")).await;
+		assert!(matches!(
+			answered,
+			Err(TransportError::OperationFailed(TransportFailure::NotFound))
+		));
 	}
 
 	#[wasm_bindgen_test]
@@ -725,6 +1024,15 @@ mod tests {
 	}
 
 	#[wasm_bindgen_test]
+	async fn a_dropped_call_closes_the_half() {
+		let slot = Slot::new(());
+		drop(holding(&slot));
+
+		let after = passing(&slot).await;
+		assert_eq!(after.code().as_deref(), Some("StreamClosed"));
+	}
+
+	#[wasm_bindgen_test]
 	async fn a_retired_half_reports_closed() {
 		let slot = Slot::new(());
 		let _retired = slot.retire();
@@ -738,42 +1046,51 @@ mod tests {
 	#[wasm_bindgen_test]
 	async fn a_number_from_a_unary_handler_is_no_response() {
 		let frame = TestFrame::v0(None, None);
-		let answered = numeric_handler().call_unary(&frame).await;
+		let answered = settled(numeric_handler().call_unary(&frame)).await;
 		assert_eq!(answered.code().as_deref(), Some("InvalidBytes"));
 	}
 
 	#[wasm_bindgen_test]
-	async fn a_streaming_refusal_answers_with_its_code() {
-		let undefined = JsValue::UNDEFINED;
-		let outcome = refusing_handler().call_streaming(&undefined, &undefined).await;
+	async fn a_refusal_label_answers_its_status_on_both_serve_paths() {
+		let streamed = served_streaming(refusing_handler()).await;
+		let duplexed = served_duplex(refusing_handler()).await;
 
-		let answered = StreamHandler::answer(outcome);
-		assert_eq!(answered.status(), TransitStatus::PermissionDenied);
+		assert!(matches!(
+			streamed,
+			Err(TransportError::OperationFailed(TransportFailure::PermissionDenied))
+		));
+		assert!(matches!(
+			duplexed,
+			Err(TransportError::OperationFailed(TransportFailure::PermissionDenied))
+		));
 	}
 
 	#[wasm_bindgen_test]
 	async fn a_number_from_a_streaming_handler_is_no_response() {
 		let undefined = JsValue::UNDEFINED;
-		let answered = numeric_handler().call_streaming(&undefined, &undefined).await;
+		let answered = settled(numeric_handler().call_streaming(&undefined, &undefined)).await;
 		assert_eq!(answered.code().as_deref(), Some("InvalidBytes"));
 	}
 
 	#[wasm_bindgen_test]
 	async fn a_duplex_handler_resolving_ok_answers_unknown() {
 		let undefined = JsValue::UNDEFINED;
-		let resolved = resolving_ok_handler().call_duplex(&undefined, &undefined, &undefined).await;
+		let resolved = settled(resolving_ok_handler().call_duplex(&undefined, &undefined, &undefined)).await;
 		assert_eq!(resolved.ok(), Some(TransitStatus::Unknown));
 	}
 
 	#[wasm_bindgen_test]
 	async fn a_handler_rejecting_with_ok_answers_unknown_on_both_serve_paths() {
-		let undefined = JsValue::UNDEFINED;
-		let streamed = rejecting_ok_handler().call_streaming(&undefined, &undefined).await;
-		let duplexed = rejecting_ok_handler().call_duplex(&undefined, &undefined, &undefined).await;
+		let streamed = served_streaming(rejecting_ok_handler()).await;
+		let duplexed = served_duplex(rejecting_ok_handler()).await;
 
-		let streamed_status = StreamHandler::answer(streamed).status();
-		let duplexed_status = duplexed.map_err(|rejection| TransitCode::of_js(&rejection));
-		assert_eq!(streamed_status, TransitStatus::Unknown);
-		assert_eq!(duplexed_status, Err(TransitStatus::Unknown));
+		assert!(matches!(
+			streamed,
+			Err(TransportError::OperationFailed(TransportFailure::Unknown))
+		));
+		assert!(matches!(
+			duplexed,
+			Err(TransportError::OperationFailed(TransportFailure::Unknown))
+		));
 	}
 }

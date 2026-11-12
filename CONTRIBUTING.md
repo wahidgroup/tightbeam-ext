@@ -4,12 +4,20 @@ The key words "MUST", "MUST NOT", "SHOULD", "SHOULD NOT", and "MAY" in this docu
 
 ## Getting Started
 
-Contributors MUST have [rustup](https://rustup.rs), Node.js, Docker (for the e2e stack), Git, and Make. Pin files are the source of truth:
+Contributors MUST have these tools:
 
-- Rust: [`rust-toolchain.toml`](rust-toolchain.toml) (channel, components, `wasm32-unknown-unknown`)
+- [rustup](https://rustup.rs), Node.js, Git, and Make
+- Docker, rsync, and lsof, which build and start the e2e stack
+- [jq](https://jqlang.github.io/jq/), which the scripts read `cargo metadata` with
+- [ShellCheck](https://www.shellcheck.net), which `make lint` runs over every shell script
+
+Pin files are the source of truth:
+
+- Rust: [`rust-toolchain.toml`](rust-toolchain.toml) (channel, components, and targets)
 - Node: [`.nvmrc`](.nvmrc)
+- npm: 12 or later, which `@wahidgroup/lint-rules` requires. CI pins it in [`.github/actions/node`](.github/actions/node/action.yml)
 
-`make setup` installs that Rust pin via `rustup toolchain install`, then each extension's tooling.
+`make setup` installs that Rust pin with its components and targets via `rustup toolchain install`, then each extension's tooling.
 
 ```bash
 make setup
@@ -28,16 +36,16 @@ Git hooks live in `.husky/` and are installed automatically by [husky-rs](https:
 
 Contributors MUST:
 
-- Use hard tabs everywhere except YAML (2 spaces), enforced by EditorConfig
+- Indent with hard tabs, except in YAML, which takes two spaces. rustfmt checks the Rust. prettier checks the `.mjs` and `.mts` repo scripts, and the sources of each npm package whose `lint` script runs prettier. `.editorconfig` sets the same indent in an editor, and it is the one home of the indent of the shell scripts
 - Pass `make lint` (and preferably `make ci`) before opening a PR
 - Rust: no `unwrap` / `expect` / `panic` in production code. Enum error types via tightbeam's `Errorizable`, no string-based errors. Prefer `From` / `TryFrom` and `?`
 - Keep test-support Rust code behind the `testing` cargo feature. It MUST NOT compile into a default build
-- Rust: write every integration test under `tests/` as a `tb_scenario!` of tightbeam, whose spec grades the trace of the run ([Tests](docs/development.md#tests))
+- Rust: follow the integration-test rule of [docs/development.md](docs/development.md#rust-integration-tests)
 
 ### Architecture notes
 
 - Each extension lives in its own directory (`ws/` for the WebSocket transport) containing its crates, the npm workspace, tests, and Docker stack.
-- The e2e stack allocates free host ports via `scripts/get-port.sh`. Tests MUST read endpoints from the environment, never hardcode ports.
+- The e2e stack allocates free host ports via `scripts/get-port.sh`. Tests MUST read endpoints from the environment and MUST NOT hardcode ports.
 
 ## Pull Requests
 
@@ -51,51 +59,9 @@ PR titles and commit headers MUST follow [Conventional Commits 1.0.0](https://ww
 <type>[optional scope][!]: <description>
 ```
 
-#### Type
+The `commit-msg` hook ([`.husky/commit-msg`](.husky/commit-msg)) holds the rule: the allowed types, the case of the type, the scope, and the description, and the length of the header. Its error message names each part. The `Title` job runs the same hook on the PR title in its `title` mode, which checks the subjects that Git writes for a commit too, such as `Merge` and `Revert`.
 
-The type MUST be lowercase and one of:
-
-| Type       | Purpose                                                 | Semver |
-| ---------- | ------------------------------------------------------- | ------ |
-| `feat`     | New feature                                             | MINOR  |
-| `fix`      | Bug fix                                                 | PATCH  |
-| `docs`     | Documentation only                                      | -      |
-| `style`    | Formatting, whitespace, no logic change                 | -      |
-| `refactor` | Code change that neither fixes a bug nor adds a feature | -      |
-| `perf`     | Performance improvement                                 | PATCH  |
-| `test`     | Adding or correcting tests                              | -      |
-| `build`    | Build system or dependency changes                      | -      |
-| `ci`       | CI configuration changes                                | -      |
-| `chore`    | Maintenance, no production code change                  | -      |
-| `revert`   | Revert a previous commit                                | -      |
-
-#### Scope
-
-The scope is OPTIONAL, MUST be lowercase (`[a-z0-9/-]+`), and identifies the affected area. Recommended scopes:
-
-- Crate: `grpc`, `wire`, `ws`, `wasm`
-- Package: `client`, `tests`
-- Cross-cutting: `deps`, `docs`, `ci`, `scripts`
-
-#### Description
-
-The description MUST:
-
-- Use imperative mood ("add" not "added" / "adds")
-- Start with a lowercase letter or digit (not Sentence case)
-- NOT end with a period
-- Keep the full header under 100 characters
-
-#### Breaking Changes
-
-Append `!` after the type or scope to indicate a breaking change:
-
-```
-feat!: drop support for Node 22
-refactor(client)!: rename exported type
-```
-
-#### Examples
+Write the description in the imperative mood, and append `!` after the type or the scope for a breaking change. Scope by crate (`grpc`, `wire`, `ws`, `wasm`), by package (`client`, `tests`), or across the repo (`deps`, `docs`, `ci`, `scripts`). These headers pass the hook:
 
 - `feat(wasm): expose the frame-integrity verdict binding`
 - `fix(ws): close the socket on handshake failure`
@@ -106,19 +72,9 @@ refactor(client)!: rename exported type
 
 ### Body
 
-The PR body MUST contain these five sections, each with non-empty content:
+The PR template at [`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md) holds the required sections, one `## ` heading each, and it auto-populates them. The `Body` job runs `scripts/check-pr-body.sh`, which requires every heading of the template with at least three characters of content. A release PR, whose head is the process branch of `scripts/release.sh`, is exempt.
 
-| Section               | Purpose                                                                 |
-| --------------------- | ----------------------------------------------------------------------- |
-| `## Summary`          | WHY this change exists and WHAT it accomplishes                         |
-| `## Related Issues`   | Issue links (`Fixes #N`, `Closes #N`, `Refs #N`, or `None`)             |
-| `## Changes Made`     | Bullet list of user/system-visible changes                              |
-| `## Testing`          | How a reviewer verifies the change (commands, steps, expected outcomes) |
-| `## Breaking Changes` | Migration path for consumers, or `None`                                 |
-
-The PR template at `.github/PULL_REQUEST_TEMPLATE.md` auto-populates these sections. Release PRs (head branch `process/<ext>/v*`) are exempt from body validation.
-
-Testing section SHOULD cite `make ci` (or the relevant `make` targets) when behavior changes.
+The Testing section SHOULD cite `make ci` (or the relevant `make` targets) when behavior changes.
 
 ### Metadata
 
@@ -136,12 +92,10 @@ Each PR MUST have:
 
 ## Releasing
 
-Extensions are versioned independently: every crate under an extension directory (e.g. `ws/`) declares its own `[package].version`, kept in lockstep within the extension. Maintainers release with:
+Extensions release independently. A maintainer releases one with:
 
 ```bash
-make release version=vX.Y.Z ext=ws
+make release <ext> version=vX.Y.Z
 ```
 
-Use `dry-run=1`, `allow-staged=1`, or `yank=1` as documented in `make help`. `ext` defaults to `ws`.
-
-A release bumps the extension's manifests, opens a release pull request, and on merge creates a signed `releases/<ext>/v<version>` tag that publishes that extension's publishable crates to crates.io (Cargo multi-package, dependency order - not the whole workspace). The deploy guard `check-yanked.sh` refuses yanked versions (`yanked/<ext>/v<version>`).
+[docs/development.md](docs/development.md#releases) specifies the release, its tags, its yank, and the order in which dependent extensions release.

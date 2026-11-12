@@ -1,10 +1,5 @@
-//! Shared behavior for the multiplexed echo server examples.
-//!
-//! Compiled only under the `testing` feature.
-//!
-//! Progressive-body echoes stamp the Open route onto the response frame
-//! id as `routed:<target>:<hops>` (empty target when unrouted) so Node
-//! e2e can assert `openStream` / `openStreamTo` without a colony.
+//! The echo bodies and commands of the multiplexed echo servers, as
+//! `docs/ws.md` (Demo servers) states it.
 
 use core::error::Error;
 use core::fmt;
@@ -15,15 +10,17 @@ use std::sync::Arc;
 use tightbeam::builder::{FrameBuilder, TypeBuilder};
 use tightbeam::crypto::profiles::TightbeamProfile;
 use tightbeam::der::{Any, Decode, Encode, EncodeValue, Length, Reader, Tag, Tagged, Writer};
-use tightbeam::marker::MaybeSend;
 use tightbeam::policy::TransitStatus;
 use tightbeam::transport::envelopes::GoAwayReason;
 use tightbeam::transport::error::TransportError;
-use tightbeam::transport::multiplex::{MuxDispatch, MuxHandle, ReplySink, StreamBody, StreamRoute};
+use tightbeam::transport::multiplex::{
+	CallContext, MuxDispatch, MuxHandle, MuxService, ReplySink, StreamBody, StreamRoute,
+};
 use tightbeam::transport::{ResponsePackage, TransportResult};
 use tightbeam::urn::Urn;
 use tightbeam::{Frame, Message, TightBeamError};
 
+use super::echo::EchoService;
 use super::env::{EnvError, EnvVar};
 use crate::serve::ServedMux;
 
@@ -59,7 +56,7 @@ impl FromStr for EchoBody {
 	///
 	/// # Errors
 	///
-	/// - [`UnknownBody`]: `name` is not `streaming`, `duplex`, or `unary`.
+	/// - The [`UnknownBody`] of a `name` that is not `streaming`, `duplex`, or `unary`.
 	fn from_str(name: &str) -> Result<Self, Self::Err> {
 		match name {
 			"streaming" => Ok(Self::Streaming),
@@ -76,7 +73,7 @@ impl EchoBody {
 	///
 	/// # Errors
 	///
-	/// - [`EnvError::Unparsed`]: the variable holds a value that names no
+	/// - [`EnvError::Unparsed`] -- the variable holds a value that names no
 	///   body, which [`UnknownBody`] describes.
 	pub fn from_env() -> Result<Self, EnvError> {
 		ECHO_BODY.parsed_or(Self::Streaming)
@@ -85,18 +82,23 @@ impl EchoBody {
 	/// Serve every stream of `served` with this handler, behind the gate of
 	/// its transport, until the connection ends.
 	///
-	/// In the [`Streaming`](Self::Streaming) and [`Unary`](Self::Unary)
-	/// bodies, a frame id can select an [`EchoCommand`] in place of the echo,
-	/// and the handle of `served` runs those commands. A stream of a kind the
-	/// body does not serve answers `Unimplemented`.
+	/// - In the [`Streaming`](Self::Streaming) and [`Unary`](Self::Unary)
+	///   bodies, a frame id can select a command in place of the echo, and the
+	///   handle of `served` runs those commands.
+	/// - The [`Duplex`](Self::Duplex) body runs the duplex echo of
+	///   [`EchoService`].
+	/// - A stream of a kind the body does not serve answers `Unimplemented`.
 	///
 	/// # Errors
 	///
-	/// Returns the [`TransportError`] that ends the responder.
+	/// - The [`TransportError`] of the failure that ends the responder.
 	pub async fn serve(self, served: ServedMux) -> TransportResult<()> {
 		let link = EchoLink(served.handle().clone());
-		let dispatch = EchoDispatch { body: self, link };
-		served.serve(dispatch, pending()).await
+		match self {
+			Self::Streaming => served.serve_dispatch(StreamingEcho(link), pending()).await,
+			Self::Unary => served.serve_dispatch(UnaryEcho(link), pending()).await,
+			Self::Duplex => served.serve(DuplexEcho, pending()).await,
+		}
 	}
 }
 
@@ -121,25 +123,19 @@ impl fmt::Display for UnknownBody {
 
 impl Error for UnknownBody {}
 
-/// A command that a frame id selects in place of the echo.
+/// A command that a frame id selects in place of the echo, parsed once from
+/// the id.
 ///
-/// Each command is a prefix of the id, so a client can tag the rest of the id.
-/// A prefix that extends another prefix is read first, so `call-me-stream:`
-/// and `call-me-duplex` win over `call-me`.
-///
-/// # Examples
-///
-/// ```
-/// use tightbeam_ws::testing::EchoCommand;
-///
-/// let command = EchoCommand::from(b"call-me-stream:urn:demo".as_slice());
-/// assert_eq!(command, EchoCommand::CallMeStream(b"urn:demo"));
-/// ```
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum EchoCommand<'a> {
+/// - Each command is a prefix of the id, so a client can tag the rest of the id.
+/// - A prefix that extends another one is read first, so `call-me-stream:`
+///   and `call-me-duplex` win over `call-me`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum EchoCommand {
 	/// `call-me-stream:<urn>` opens a progressive body to the client, routed
 	/// to the URN that follows the prefix, and relays the client's reply.
-	CallMeStream(&'a [u8]),
+	CallMeStream(Urn<'static>),
+	/// `call-me-stream:` followed by no URN answers `InvalidArgument`.
+	InvalidTarget,
 	/// `call-me-duplex` opens a duplex stream to the client, pushes the frame
 	/// DER as its body, and answers with the status the client's duplex
 	/// handler settled with.
@@ -157,10 +153,11 @@ pub enum EchoCommand<'a> {
 	Echo,
 }
 
-impl<'a> From<&'a [u8]> for EchoCommand<'a> {
-	fn from(id: &'a [u8]) -> Self {
+impl From<&[u8]> for EchoCommand {
+	fn from(id: &[u8]) -> Self {
 		if let Some(target) = id.strip_prefix(b"call-me-stream:") {
-			return Self::CallMeStream(target);
+			let parsed = from_utf8(target).ok().and_then(|target| Urn::from_str(target).ok());
+			return parsed.map_or(Self::InvalidTarget, Self::CallMeStream);
 		}
 		if id.starts_with(b"call-me-duplex") {
 			return Self::CallMeDuplex;
@@ -179,12 +176,13 @@ impl<'a> From<&'a [u8]> for EchoCommand<'a> {
 	}
 }
 
-impl EchoCommand<'_> {
+impl EchoCommand {
 	/// Run this command for `frame` over the connection that `handle` drives.
-	pub async fn run(self, handle: MuxHandle, frame: &Frame) -> ResponsePackage {
+	async fn run(self, handle: MuxHandle, frame: &Frame) -> ResponsePackage {
 		let link = EchoLink(handle);
 		match self {
 			Self::CallMeStream(target) => link.call_me_stream(frame, target).await,
+			Self::InvalidTarget => ResponsePackage::new(TransitStatus::InvalidArgument, None),
 			Self::CallMeDuplex => link.call_me_duplex(frame).await,
 			Self::CallMe => link.call_me(frame).await,
 			Self::DrainCalm => link.drain().await,
@@ -225,69 +223,52 @@ impl Message for RawBody {
 	type Profile = TightbeamProfile;
 }
 
-/// The streams of one echo connection, served by the kinds its body names.
-///
-/// The [`Streaming`](EchoBody::Streaming) body serves unary and streaming
-/// streams, so a demo echo covers frame RPC and streamed bodies on one
-/// connection. The [`Unary`](EchoBody::Unary) body serves unary streams, and
-/// the [`Duplex`](EchoBody::Duplex) body serves duplex streams. Every other
-/// kind answers [`TransportError::NotServed`], which the responder answers
-/// `Unimplemented`.
-struct EchoDispatch {
-	body: EchoBody,
-	link: EchoLink,
+/// The unary streams of the [`Unary`](EchoBody::Unary) body: each echoes its
+/// frame, or runs the [`EchoCommand`] its id selects. Every other kind answers
+/// through the defaults of [`MuxDispatch`].
+struct UnaryEcho(EchoLink);
+
+impl MuxDispatch for UnaryEcho {
+	async fn unary(&self, frame: Arc<Frame>) -> TransportResult<ResponsePackage> {
+		let link = self.0.clone();
+		let echoed = link.echo(frame).await;
+		Ok(echoed)
+	}
 }
 
-impl MuxDispatch for EchoDispatch {
-	fn unary(&self, frame: Arc<Frame>) -> impl Future<Output = TransportResult<ResponsePackage>> + MaybeSend {
-		let body = self.body;
-		let link = self.link.clone();
-		async move {
-			match body {
-				EchoBody::Streaming | EchoBody::Unary => {
-					let echoed = link.echo(frame).await;
-					Ok(echoed)
-				}
-				EchoBody::Duplex => Err(TransportError::NotServed),
-			}
-		}
+/// The unary and streaming streams of the [`Streaming`](EchoBody::Streaming)
+/// body, so a demo echo covers frame RPC and streamed bodies on one
+/// connection. A unary stream answers as on the [`Unary`](EchoBody::Unary)
+/// body.
+struct StreamingEcho(EchoLink);
+
+impl MuxDispatch for StreamingEcho {
+	async fn unary(&self, frame: Arc<Frame>) -> TransportResult<ResponsePackage> {
+		let link = self.0.clone();
+		let echoed = link.echo(frame).await;
+		Ok(echoed)
 	}
 
-	fn streaming(
-		&self,
-		body: StreamBody,
-		route: StreamRoute,
-	) -> impl Future<Output = TransportResult<ResponsePackage>> + MaybeSend {
-		let served = self.body;
-		let link = self.link.clone();
-		async move {
-			match served {
-				EchoBody::Streaming => {
-					let echoed = link.echo_streaming(body, route).await;
-					Ok(echoed)
-				}
-				EchoBody::Duplex | EchoBody::Unary => Err(TransportError::NotServed),
-			}
-		}
+	async fn streaming(&self, body: StreamBody, route: StreamRoute) -> TransportResult<ResponsePackage> {
+		let link = self.0.clone();
+		let echoed = link.echo_streaming(body, route).await;
+		Ok(echoed)
 	}
+}
 
+/// The duplex streams of the [`Duplex`](EchoBody::Duplex) body, which run the
+/// duplex echo of [`EchoService`]. Every other kind answers through the
+/// defaults of [`MuxService`].
+struct DuplexEcho;
+
+impl MuxService for DuplexEcho {
 	fn duplex(
 		&self,
 		body: StreamBody,
 		reply: ReplySink,
-		_route: StreamRoute,
-	) -> impl Future<Output = TransportResult<TransitStatus>> + MaybeSend {
-		let served = self.body;
-		async move {
-			match served {
-				EchoBody::Duplex => {
-					let echo = ChunkEcho { body, reply };
-					let status = echo.run().await;
-					Ok(status)
-				}
-				EchoBody::Streaming | EchoBody::Unary => Err(TransportError::NotServed),
-			}
-		}
+		cx: CallContext,
+	) -> impl Future<Output = Result<(), TightBeamError>> + Send {
+		EchoService.duplex(body, reply, cx)
 	}
 }
 
@@ -302,12 +283,11 @@ impl EchoLink {
 		command.run(self.0, &frame).await
 	}
 
-	/// Progressive-body echo: reassemble via [`StreamBody::into_frame`],
-	/// stamp the Open route onto the frame id ([`RouteStamp`]), then
-	/// [`echo`](Self::echo).
+	/// The echo of a progressive body, under the id that [`RouteStamp`] gives
+	/// its route.
 	///
-	/// Transport drain failures answer [`TransitStatus::Cancelled`]. Invalid
-	/// DER answers [`TransitStatus::InvalidArgument`].
+	/// - A body that fails to drain answers [`TransitStatus::Cancelled`].
+	/// - A body that holds no DER frame answers [`TransitStatus::InvalidArgument`].
 	async fn echo_streaming(self, body: StreamBody, route: StreamRoute) -> ResponsePackage {
 		let stamp = RouteStamp(&route);
 		match body.into_frame().await {
@@ -326,7 +306,7 @@ impl EchoLink {
 			Ok(answer) => ResponsePackage::new(TransitStatus::Ok, answer),
 			Err(error) => {
 				eprintln!("[echo-mux] call-back stream failed: {error}");
-				ResponsePackage::new(Self::relayed_status(&error), None)
+				ResponsePackage::new(Self::relayed(&error), None)
 			}
 		}
 	}
@@ -334,18 +314,12 @@ impl EchoLink {
 	/// Open a progressive body to the peer with `target` stamped on the Open,
 	/// push the request frame DER as the body, and relay the peer's Frame
 	/// reply.
-	async fn call_me_stream(&self, frame: &Frame, target: &[u8]) -> ResponsePackage {
-		let Ok(target) = from_utf8(target) else {
-			return ResponsePackage::new(TransitStatus::InvalidArgument, None);
-		};
-		let Ok(urn) = Urn::from_str(target) else {
-			return ResponsePackage::new(TransitStatus::InvalidArgument, None);
-		};
+	async fn call_me_stream(&self, frame: &Frame, target: Urn<'static>) -> ResponsePackage {
 		let Ok(der) = frame.to_der() else {
 			return ResponsePackage::new(TransitStatus::Internal, None);
 		};
 
-		let opened = self.0.open_stream_to(urn);
+		let opened = self.0.open_stream_to(target);
 		let Ok((sink, response)) = opened else {
 			return ResponsePackage::new(TransitStatus::Internal, None);
 		};
@@ -358,17 +332,17 @@ impl EchoLink {
 			Ok(answer) => ResponsePackage::new(TransitStatus::Ok, answer),
 			Err(error) => {
 				eprintln!("[echo-mux] routed call-back stream failed: {error}");
-				ResponsePackage::new(Self::relayed_status(&error), None)
+				ResponsePackage::new(Self::relayed(&error), None)
 			}
 		}
 	}
 
-	/// Open a duplex stream to the peer, push the request frame DER as its
-	/// body, read the peer's reply to its trailer, and answer with the status
-	/// the peer's duplex handler settled with.
+	/// Open a duplex stream to the peer with the request frame DER as its
+	/// body, and answer the status that the duplex handler of the peer settled
+	/// with.
 	///
-	/// A handler may settle before it reads the body, so a push or a close
-	/// that meets the ended stream still leaves the trailer to answer.
+	/// - A handler may settle before it reads the body, so a push that meets
+	///   the ended stream still reads the trailer.
 	async fn call_me_duplex(&self, frame: &Frame) -> ResponsePackage {
 		let Ok(der) = frame.to_der() else {
 			return ResponsePackage::new(TransitStatus::Internal, None);
@@ -384,23 +358,16 @@ impl EchoLink {
 			match reply.chunk().await {
 				Ok(Some(_)) => {}
 				Ok(None) => return ResponsePackage::new(TransitStatus::Ok, None),
-				Err(error) => return ResponsePackage::new(Self::relayed_status(&error), None),
+				Err(error) => return ResponsePackage::new(Self::relayed(&error), None),
 			}
 		}
 	}
 
-	/// The status that `error`, a call-back failure, relays to the requester.
-	///
-	/// A peer refusal keeps its status, so the requester observes the exact
-	/// code the call-back handler answered with. A transport fault or a local
-	/// failure is the server's own trouble and answers
-	/// [`TransitStatus::Internal`].
-	fn relayed_status(error: &TransportError) -> TransitStatus {
-		let TransportError::OperationFailed(failure) = error else {
-			return TransitStatus::Internal;
-		};
-
-		TransitStatus::try_from(*failure).unwrap_or(TransitStatus::Internal)
+	/// The status that `error`, a call-back failure, relays to the requester:
+	/// the status of a peer refusal, or [`TransitStatus::Internal`] for a
+	/// failure of the server.
+	fn relayed(error: &TransportError) -> TransitStatus {
+		error.transit_status().unwrap_or(TransitStatus::Internal)
 	}
 
 	/// Drain the session with a [`GoAwayReason::EnhanceYourCalm`] GoAway.
@@ -433,9 +400,9 @@ impl RouteStamp<'_> {
 
 	/// `frame` rebuilt under the id of the route.
 	///
-	/// A frame keeps its fields private, so the id cannot change in place.
-	/// The echo carries the version, order, and body the client sent, which
-	/// is all a progressive echo asserts.
+	/// A frame keeps its fields private, so the echo builds a copy under the
+	/// new id. The copy carries the version, order, and body the client sent,
+	/// which is all a progressive echo asserts.
 	fn restamp(&self, frame: &Frame) -> Result<Frame, TightBeamError> {
 		let body = RawBody(Any::from_der(frame.message())?);
 		let builder = FrameBuilder::<RawBody>::from(frame.version())
@@ -446,44 +413,25 @@ impl RouteStamp<'_> {
 	}
 }
 
-/// One duplex stream an echo pushes every chunk of straight back.
-struct ChunkEcho {
-	body: StreamBody,
-	reply: ReplySink,
-}
-
-impl ChunkEcho {
-	/// Echo every chunk until the body ends.
-	async fn run(mut self) -> TransitStatus {
-		loop {
-			match self.body.chunk().await {
-				Ok(Some(chunk)) => {
-					if self.reply.push(&chunk).await.is_err() {
-						return TransitStatus::Cancelled;
-					}
-				}
-				Ok(None) => return TransitStatus::Ok,
-				Err(_) => return TransitStatus::Cancelled,
-			}
-		}
-	}
-}
-
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use tightbeam::transport::error::TransportFailure;
-
-	#[test]
-	fn relayed_status_keeps_peer_refusal_code() {
-		let error = TransportError::OperationFailed(TransportFailure::Unavailable);
-		assert_eq!(EchoLink::relayed_status(&error), TransitStatus::Unavailable);
-	}
 
 	#[test]
 	fn an_unknown_echo_body_is_refused() {
 		let parsed = "echo".parse::<EchoBody>();
 		assert_eq!(parsed, Err(UnknownBody("echo".to_owned())));
+	}
+
+	#[test]
+	fn a_call_back_stream_id_routes_to_its_urn() -> Result<(), tightbeam::urn::UrnValidationError> {
+		let command = EchoCommand::from(b"call-me-stream:urn:tb:echo".as_slice());
+		let target: Urn<'static> = "urn:tb:echo".parse()?;
+		assert_eq!(command, EchoCommand::CallMeStream(target));
+
+		let unrouted = EchoCommand::from(b"call-me-stream:no urn".as_slice());
+		assert_eq!(unrouted, EchoCommand::InvalidTarget);
+		Ok(())
 	}
 
 	#[test]
@@ -493,8 +441,8 @@ mod tests {
 	}
 
 	#[test]
-	fn relayed_status_maps_non_operation_to_internal() {
-		let error = TransportError::ConnectionClosed;
-		assert_eq!(EchoLink::relayed_status(&error), TransitStatus::Internal);
+	fn a_call_back_target_that_is_not_utf8_is_invalid() {
+		let command = EchoCommand::from(b"call-me-stream:\xff".as_slice());
+		assert_eq!(command, EchoCommand::InvalidTarget);
 	}
 }

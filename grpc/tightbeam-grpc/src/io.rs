@@ -1,19 +1,10 @@
-//! gRPC message I/O for tightbeam.
-//!
-//! [`GrpcStream`] carries a tightbeam connection over one bidirectional gRPC
-//! call, the tunnel: each envelope travels as one gRPC message. It implements
-//! tightbeam's [`AsyncProtocolStream`] and splits into exclusive halves
-//! ([`SplittableStream`]) so a multiplexed connection can read and write
-//! concurrently.
-//!
-//! [`GrpcReadHalf`] and [`GrpcWriteHalf`] are the gRPC kinds of
-//! [`WireStream`] and [`WireSink`], and [`GrpcStream`] holds the
-//! [`WireDuplex`] of the two, so every read and write runs the envelope rules
-//! of [`tightbeam_wire`].
+//! The tunnel stream: each envelope travels as one gRPC message of one
+//! bidirectional call, under the envelope rules of [`tightbeam_wire`].
 //!
 //! # Sources
 //!
-//! - gRPC over HTTP2, `grpc/grpc` `doc/PROTOCOL-HTTP2.md`: <https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md>
+//! - gRPC over HTTP2, `grpc/grpc` `doc/PROTOCOL-HTTP2.md`:
+//!   <https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md>
 
 use std::error::Error;
 use std::io;
@@ -38,11 +29,11 @@ use crate::tunnel::{TunnelCodec, TUNNEL_PATH};
 
 /// A tightbeam stream over one tunnel, one envelope per gRPC message.
 ///
-/// The stream is the [`WireDuplex`] of its two halves, so every read and write
-/// settles into its liveness. A stream comes only from a dial or an accept of
-/// [`GrpcListener`](crate::protocol::GrpcListener), and each one sets the
-/// message ceiling of both directions of its call to the envelope ceiling of
-/// its endpoint.
+/// - Every read and write settles into the liveness of the [`WireDuplex`] of its two halves.
+/// - A dial or an accept of [`GrpcListener`](crate::protocol::GrpcListener)
+///   creates one, under the envelope ceiling of its endpoint in both
+///   directions, and `GrpcStream::loopback` creates the two ends of the
+///   loopback session of a coupler.
 ///
 /// # Examples
 ///
@@ -88,7 +79,7 @@ impl GrpcStream {
 		let called = client.streaming(requests, path, TunnelCodec).await;
 		let response = called.map_err(|status| EndClass::of(&status))?;
 
-		let read = GrpcReadHalf::open(response.into_inner(), None);
+		let read = GrpcReadHalf { inbound: Inbound::Dialed(Box::new(response.into_inner())) };
 		let outbound = Outbound::Dialed { sender, _client: SyncWrapper::new(client) };
 		let write = GrpcWriteHalf { outbound };
 		Ok(Self(WireDuplex::new(read, write)))
@@ -102,7 +93,7 @@ impl GrpcStream {
 		sender: Sender<Vec<u8>>,
 		answer: oneshot::Sender<Status>,
 	) -> Self {
-		let read = GrpcReadHalf::open(messages, Some(answer));
+		let read = GrpcReadHalf { inbound: Inbound::Accepted { messages: Box::new(messages), answer } };
 		let write = GrpcWriteHalf { outbound: Outbound::Accepted { sender } };
 		Self(WireDuplex::new(read, write))
 	}
@@ -125,8 +116,8 @@ impl GrpcStream {
 	/// `outbound`.
 	#[cfg(feature = "couple")]
 	fn looped(inbound: mpsc::Receiver<Vec<u8>>, outbound: Sender<Vec<u8>>) -> Self {
-		let read = GrpcReadHalf { inbound: Inbound::Loopback(inbound), answer: None };
-		let write = GrpcWriteHalf { outbound: Outbound::Loopback { sender: outbound } };
+		let read = GrpcReadHalf { inbound: Inbound::Loopback(inbound) };
+		let write = GrpcWriteHalf { outbound: Outbound::Accepted { sender: outbound } };
 		Self(WireDuplex::new(read, write))
 	}
 }
@@ -244,30 +235,31 @@ impl From<EndClass> for Wire {
 #[derive(Debug)]
 pub struct GrpcReadHalf {
 	inbound: Inbound,
-	/// The end of the response of an accepted call, which a status that fails
-	/// the inbound messages takes, so the peer reads the status of its own
-	/// fault. A dialed tunnel answers no call.
-	answer: Option<oneshot::Sender<Status>>,
 }
 
 #[derive(Debug)]
 enum Inbound {
-	Open(Box<Streaming<Vec<u8>>>),
+	/// The inbound messages of a dialed tunnel.
+	Dialed(Box<Streaming<Vec<u8>>>),
+	/// The inbound messages of an accepted tunnel call, and the end of its
+	/// response, which a status that fails the messages takes, so the peer
+	/// reads the status of its own fault.
+	Accepted {
+		messages: Box<Streaming<Vec<u8>>>,
+		answer: oneshot::Sender<Status>,
+	},
 	/// The read end of an in-process tunnel.
 	#[cfg(feature = "couple")]
 	Loopback(mpsc::Receiver<Vec<u8>>),
 	Ended(EndClass),
 }
 
-impl GrpcReadHalf {
-	fn open(messages: Streaming<Vec<u8>>, answer: Option<oneshot::Sender<Status>>) -> Self {
-		let inbound = Inbound::Open(Box::new(messages));
-		Self { inbound, answer }
-	}
-
-	/// End the response of an accepted call with `status`.
-	fn answer(&mut self, status: Status) {
-		if let Some(answer) = self.answer.take() {
+impl Inbound {
+	/// End the response of an accepted call with `status`, the fault of its
+	/// inbound messages. A dialed tunnel answers no call.
+	fn answer(self, status: Status) {
+		if let Self::Accepted { answer, .. } = self {
+			// A response that already ended takes no status.
 			let _ = answer.send(status);
 		}
 	}
@@ -278,8 +270,8 @@ impl GrpcReadHalf {
 /// ends it, is read once, and every later read returns the same end.
 impl WireStream for GrpcReadHalf {
 	async fn next_wire(&mut self) -> Wire {
-		let messages = match &mut self.inbound {
-			Inbound::Open(messages) => messages,
+		let read = match &mut self.inbound {
+			Inbound::Dialed(messages) | Inbound::Accepted { messages, .. } => messages.message().await,
 			#[cfg(feature = "couple")]
 			Inbound::Loopback(messages) => {
 				if let Some(envelope) = messages.recv().await {
@@ -292,17 +284,17 @@ impl WireStream for GrpcReadHalf {
 			Inbound::Ended(end) => return Wire::from(*end),
 		};
 
-		let end = match messages.message().await {
+		let (end, failed) = match read {
 			Ok(Some(envelope)) => return Wire::Envelope(envelope),
-			Ok(None) => EndClass::Closed,
-			Err(status) => {
-				let end = EndClass::of(&status);
-				self.answer(status);
-				end
-			}
+			Ok(None) => (EndClass::Closed, None),
+			Err(status) => (EndClass::of(&status), Some(status)),
 		};
 
-		self.inbound = Inbound::Ended(end);
+		let ended = core::mem::replace(&mut self.inbound, Inbound::Ended(end));
+		if let Some(status) = failed {
+			ended.answer(status);
+		}
+
 		Wire::from(end)
 	}
 }
@@ -310,9 +302,9 @@ impl WireStream for GrpcReadHalf {
 /// The write half of a tunnel, which sends each envelope as one message of
 /// the call.
 ///
-/// The channel to the call holds one envelope, and tonic batches the
-/// envelopes it takes from it up to its yield threshold of 32 KiB before
-/// HTTP/2 flow control applies.
+/// - The channel to the call holds one envelope, and tonic batches the
+///   envelopes it takes from it up to its yield threshold of 32 KiB before
+///   HTTP/2 flow control applies.
 #[derive(Debug)]
 pub struct GrpcWriteHalf {
 	outbound: Outbound,
@@ -323,23 +315,23 @@ enum Outbound {
 	/// The half of a dialed tunnel, which owns the client of its one call.
 	Dialed { sender: Sender<Vec<u8>>, _client: SyncWrapper<Grpc<Channel>> },
 	/// The half of an accepted tunnel, whose messages the server sends as its
-	/// response.
+	/// response, or the write end of an in-process tunnel.
 	Accepted { sender: Sender<Vec<u8>> },
-	/// The write end of an in-process tunnel.
-	#[cfg(feature = "couple")]
-	Loopback { sender: Sender<Vec<u8>> },
+}
+
+impl Outbound {
+	/// The channel to the call that each envelope of the half goes on.
+	fn sender(&self) -> &Sender<Vec<u8>> {
+		match self {
+			Self::Dialed { sender, .. } | Self::Accepted { sender } => sender,
+		}
+	}
 }
 
 impl WireSink for GrpcWriteHalf {
 	async fn send_envelope(&mut self, envelope: &[u8]) -> Result<(), WireFault> {
-		let sender = match &self.outbound {
-			Outbound::Dialed { sender, .. } | Outbound::Accepted { sender } => sender,
-			#[cfg(feature = "couple")]
-			Outbound::Loopback { sender } => sender,
-		};
-
 		let message = envelope.to_vec();
-		let sent = sender.send(message).await;
+		let sent = self.outbound.sender().send(message).await;
 		sent.map_err(|_| WireFault::Closed)
 	}
 }

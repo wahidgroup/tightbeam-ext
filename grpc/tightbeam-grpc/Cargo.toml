@@ -17,17 +17,30 @@ categories.workspace = true
 name = "tightbeam_grpc"
 
 [features]
-# The audit trail of a listener: each call that it refuses before any
-# session exists, on the trace that `GrpcListener::with_trace` attaches.
+# The audit trail of an edge, on the trace that `Edge::with_trace` attaches.
 instrument = ["tightbeam-rs/instrument"]
 # The coupler: stock gRPC callers on a TLS edge, served by colony servlets
 # through a loopback session into the gateway's own accept queue.
-couple = ["tightbeam-rs/colony", "dep:sha2", "dep:der"]
-# The test support of the crate: a TLS authority that mints certificates at
-# run time, and the staged profile that a scenario provisions with them.
+couple = [
+    "tightbeam-rs/colony",
+    "dep:sha2",
+    "dep:der",
+    "dep:p256",
+    "dep:base64",
+    "dep:serde_json",
+    "dep:tonic-web",
+    "dep:tower-layer",
+    "dep:rand_core",
+    "dep:tonic-reflection",
+    "dep:prost",
+    "dep:prost-types",
+    "dep:http-body",
+]
+# The test support of the crate: a TLS authority that creates certificates at
+# run time, and the material of the coupled edge of the e2e stack.
 testing = ["dep:p256", "dep:x509-cert", "dep:rand_core", "dep:sha2"]
-# Compiles the hop scenarios, which run against the docker stack in the grpc
-# e2e lane alone.
+# Compiles the hop and stock scenarios, which run against the docker stack in
+# the grpc e2e lane alone.
 e2e = []
 
 [[test]]
@@ -57,9 +70,9 @@ tightbeam-rs = { workspace = true, features = [
     "transport-policy",
 ] }
 tightbeam-wire = { version = "0.1.0", path = "../../wire/tightbeam-wire" }
-tonic = { version = "0.14.9", default-features = false, features = ["server", "channel"] }
+tonic = { version = "0.14.9", default-features = false, features = ["server", "channel", "gzip"] }
 tokio = { workspace = true, features = ["net", "rt", "sync", "time", "macros"] }
-tokio-stream = { version = "0.1.17", default-features = false }
+tokio-stream = { version = "0.1.17", default-features = false, features = ["sync"] }
 tokio-util = { version = "0.7.15", default-features = false }
 tower-service = "0.3.3"
 http = "1.3.1"
@@ -68,13 +81,12 @@ sync_wrapper = "1.0.2"
 h2 = "0.4.20"
 # TLS 1.3 alone, under the ring provider. The listener terminates TLS itself,
 # so tonic keeps no TLS feature.
-rustls = { version = "0.23.45", default-features = false, features = ["ring", "std"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std"] }
 tokio-rustls = { version = "0.26.5", default-features = false, features = ["ring"] }
 rustls-pki-types = { version = "1.15.1", features = ["std"] }
 hyper-util = { version = "0.1.21", default-features = false, features = ["tokio"] }
 
-# The test PKI of the `testing` feature. rustls verifies no secp256k1
-# signature, so the test certificates sign under P-256.
+# The test PKI of the `testing` feature, and the bearer keys of `couple`.
 p256 = { version = "0.13.2", optional = true, default-features = false, features = ["ecdsa", "pem", "pkcs8", "std"] }
 x509-cert = { version = "0.2.5", optional = true, default-features = false, features = ["builder", "hazmat", "pem", "std"] }
 rand_core = { version = "0.6.4", optional = true, features = ["getrandom"] }
@@ -82,13 +94,30 @@ rand_core = { version = "0.6.4", optional = true, features = ["getrandom"] }
 # algorithm of each test certificate.
 sha2 = { version = "0.10.9", optional = true, default-features = false, features = ["oid"] }
 der = { workspace = true, optional = true, features = ["alloc", "derive", "oid"] }
+# The bearer tokens of a coupled edge: ES256 under P-256, base64url, and the
+# JSON of each token and key set.
+base64 = { version = "0.22.1", optional = true, default-features = false, features = ["alloc"] }
+serde_json = { workspace = true, optional = true, features = ["std"] }
+# gRPC-Web, and the server reflection of a coupled edge.
+tonic-web = { version = "0.14.9", optional = true }
+tower-layer = { version = "0.3.3", optional = true }
+tonic-reflection = { version = "0.14.9", optional = true, default-features = false, features = ["server"] }
+# The descriptors that reflection serves, pruned to the routed methods.
+prost = { version = "0.14.4", optional = true }
+prost-types = { version = "0.14.4", optional = true }
+# The request body of a unary coupled call, which ends the call when it fails.
+http-body = { version = "1.1.0", optional = true }
 
 [dev-dependencies]
-# Self dev-dependency: turns the audit trail of the listener and the test PKI
-# on for every test build, so the scenarios need no feature flag.
+# Self dev-dependency: turns the instrument, testing, and couple features on
+# for every test build, so each scenario outside the e2e lane needs no feature
+# flag.
 tightbeam-grpc = { path = ".", features = ["instrument", "testing", "couple"] }
 tightbeam-rs = { workspace = true, features = ["testing", "testing-csp", "colony", "instrument"] }
 tightbeam-ws = { version = "0.5.0", path = "../../ws/tightbeam-ws", features = ["colony"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
-tonic = { version = "0.14.9", default-features = false, features = ["channel", "tls-ring"] }
+tonic = { version = "0.14.9", default-features = false, features = ["channel", "tls-ring", "gzip"] }
 futures-util = { workspace = true }
+
+[lints]
+workspace = true

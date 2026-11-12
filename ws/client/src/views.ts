@@ -1,15 +1,8 @@
 /**
- * Views of wasm handles that another holder owns.
- *
- * Every wasm handle that TypeScript code keeps past the call that received it
- * is a copy the holder owns, a handle the holder took, a hold through
- * `Owned` with a coded refusal, or a handle another holder owns, lent through
- * a view. A view has no `free` and no `[Symbol.dispose]`, so no caller can
- * release the handle under its owner. The owner is the engine of the realm,
- * or the frame that decoded the handle.
+ * The views of wasm handles that another holder owns, as the engine section of `docs/ws-client.md` describes.
  */
 
-import type { DigestInfo, DigestVerdict, Oid, ProfileOids } from "#wasm";
+import type { DigestInfo, IntegrityVerdict, Oid, ProfileOids } from "#wasm";
 
 import type { Owned } from "./owned.js";
 
@@ -33,7 +26,7 @@ export type DigestName = Pick<DigestInfo, "clone">;
 type OidRead = (operation: string) => Oid;
 
 /**
- * An object identifier that another holder owns, lent with no release.
+ * An object identifier that another holder owns and releases, lent as a view.
  */
 export class OidView implements OidName {
 	readonly #oid: OidRead;
@@ -64,7 +57,7 @@ export class OidView implements OidName {
 
 	/**
 	 * A view that reads through `hold`, so a read after the owner released
-	 * the hold refuses with the code of the hold, and never reaches the freed
+	 * the hold refuses with the code of the hold before it reaches the freed
 	 * handle.
 	 */
 	static held(hold: Owned<Oid>): OidView {
@@ -88,8 +81,9 @@ export class OidView implements OidName {
 	 */
 	equals(other: OidName): boolean {
 		const oid = this.#oid("equals");
-		const compare = (named: Oid): boolean => oid.equals(named);
-		const equal = Lent.oid(other, compare);
+		using named = other.clone();
+
+		const equal = oid.equals(named);
 		return equal;
 	}
 
@@ -106,7 +100,7 @@ export class OidView implements OidName {
 /**
  * The object identifiers of the tightbeam profile, read once from the
  * constants of `tightbeam-rs` and owned by the engine of the realm. Each
- * member is a view, so no caller can release it under the realm.
+ * member is a view, which the realm alone releases.
  */
 export class ProfileView {
 	/**
@@ -167,7 +161,7 @@ export class ProfileView {
 }
 
 /**
- * A digest that a frame owns, lent with no release.
+ * A digest that its holder owns, a frame or a builder, lent as a view that the glue reclaims with the holder.
  */
 export class DigestInfoView implements DigestName {
 	readonly #digest: DigestInfo;
@@ -183,11 +177,11 @@ export class DigestInfoView implements DigestName {
 	}
 
 	/**
-	 * A view of `digest`, which the caller keeps owning, and of the
-	 * `algorithmOid` it read from it, which the caller owns with it.
+	 * A view of `digest`, which the caller keeps owning. The view reads the algorithm of `digest` once, and the glue
+	 * reclaims that read with the view.
 	 */
-	static over(digest: DigestInfo, algorithmOid: Oid): DigestInfoView {
-		const algorithm = OidView.over(algorithmOid);
+	static over(digest: DigestInfo): DigestInfoView {
+		const algorithm = OidView.over(digest.algorithmOid);
 		const view = new DigestInfoView(digest, algorithm);
 		return view;
 	}
@@ -212,44 +206,10 @@ export class DigestInfoView implements DigestName {
 	 * The verdict of the engine on `recomputed`, which `algorithmOid` produced,
 	 * against this digest.
 	 */
-	verdict(algorithmOid: OidName, recomputed: Uint8Array): DigestVerdict {
-		const judge = (named: Oid): DigestVerdict =>
-			this.#digest.verdict(named, recomputed);
+	verdict(algorithmOid: OidName, recomputed: Uint8Array): IntegrityVerdict {
+		using named = algorithmOid.clone();
 
-		const verdict = Lent.oid(algorithmOid, judge);
+		const verdict = this.#digest.verdict(named, recomputed);
 		return verdict;
-	}
-}
-
-/**
- * A copy that one call borrows: cloned from a name the caller passed, and
- * freed as the call returns, however it returns. A holder that lends its own
- * handle to wasm this way never hands the handle itself to another holder.
- */
-export class Lent {
-	/**
-	 * The answer of `use` over a copy of `name`.
-	 */
-	static oid<R>(name: OidName, use: (oid: Oid) => R): R {
-		const copy = name.clone();
-		try {
-			const used = use(copy);
-			return used;
-		} finally {
-			copy.free();
-		}
-	}
-
-	/**
-	 * The answer of `use` over a copy of `name`.
-	 */
-	static digest<R>(name: DigestName, use: (digest: DigestInfo) => R): R {
-		const copy = name.clone();
-		try {
-			const used = use(copy);
-			return used;
-		} finally {
-			copy.free();
-		}
 	}
 }

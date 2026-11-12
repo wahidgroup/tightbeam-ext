@@ -1,11 +1,6 @@
 /**
  * A decoded tightbeam frame with its metadata, carried security infos, and
- * verification methods.
- *
- * The verdict methods recompute digests with any {@link Hasher}, and the
- * preimage accessors ({@link Frame.signaturePrehash},
- * {@link Frame.witnessInput}, {@link Frame.commitmentInput}) expose the exact
- * bytes to check signatures and digests with any external library.
+ * verification methods, as the frame section of `docs/ws-client.md` describes.
  */
 
 import type {
@@ -13,29 +8,23 @@ import type {
 	CompactnessInfo as CarriedCompactness,
 	ConfidentialityInfo as CarriedConfidentiality,
 	DigestInfo,
-	DigestVerdict,
 	FrameAssembly,
+	FrameBody,
 	FrameMatrix,
 	InspectedFrame,
+	IntegrityVerdict,
 	MessagePriority,
 	SignatureInfo as CarriedSignature,
 	Version,
 } from "#wasm";
 
-import type { BodyInflator, ZstdView } from "./compress.js";
+import type { BodyInflator, Inflation } from "./compress.js";
 import type { BodyDecryptor, FrameVerifier, Hasher } from "./crypto.js";
-import type { Engine, EngineModule, EngineParts } from "./engine.js";
+import type { EngineParts } from "./engine.js";
 import type { MessageCodec } from "./message.js";
-import { ValidationError } from "./builder/errors.js";
-import { CEILING } from "./compress.js";
+import { HeldInflator } from "./compress.js";
+import { ClientTransportError } from "./errors.js";
 import { DigestInfoView, OidView } from "./views.js";
-
-/**
- * An integrity-check outcome: the verdict of the engine on a carried digest,
- * or `"absent"` for a frame that carries nothing to check. Only `"verified"`
- * means the check passed.
- */
-export type IntegrityVerdict = DigestVerdict | "absent";
 
 /**
  * A link to a parent frame by the digest of its content (V2+).
@@ -63,7 +52,7 @@ export interface CompactnessInfo {
 
 /**
  * The confidentiality info carried by an encrypted frame: the CMS envelope
- * that seals the body ciphertext. The frame owns the `Oid` and lends it as a
+ * that seals the body ciphertext. The frame owns each `Oid` and lends it as a
  * view.
  */
 export interface ConfidentialityInfo {
@@ -71,6 +60,10 @@ export interface ConfidentialityInfo {
 	 * The content-encryption algorithm.
 	 */
 	readonly algorithmOid: OidView;
+	/**
+	 * The content type that the envelope authenticates for the sealed body.
+	 */
+	readonly contentOid: OidView;
 	/**
 	 * The DER `AuthEnvelopedData`, its content detached into the frame body.
 	 */
@@ -99,21 +92,248 @@ export interface SignatureInfo {
 export type { FrameMatrix } from "#wasm";
 
 /**
+ * The body of a frame by the layer a reader reverses first, with each `Oid`
+ * of its infos lent as a view.
+ */
+type BodyLayers =
+	| { readonly layer: "plain"; readonly der: Uint8Array }
+	| {
+			readonly layer: "compressed";
+			readonly data: Uint8Array;
+			readonly compactness: CompactnessInfo;
+	  }
+	| {
+			readonly layer: "sealed";
+			readonly ciphertext: Uint8Array;
+			readonly confidentiality: ConfidentialityInfo;
+			readonly compactness: CompactnessInfo | undefined;
+	  };
+
+/**
+ * The capabilities {@link Frame.open} reverses a body with, each in a field
+ * of its own name.
+ */
+export interface OpenOptions {
+	/**
+	 * Opens a sealed body.
+	 */
+	readonly opener?: BodyDecryptor;
+	/**
+	 * Inflates a compressed body.
+	 */
+	readonly inflator?: BodyInflator;
+}
+
+/**
+ * The body a frame carries, as the engine decided its layer once at the
+ * decode. It owns how a read reverses the layer.
+ */
+class CarriedBody {
+	readonly #body: BodyLayers;
+
+	private constructor(body: BodyLayers) {
+		this.#body = body;
+	}
+
+	/**
+	 * The body that the engine decoded as `carried`.
+	 */
+	static of(carried: FrameBody): CarriedBody {
+		switch (carried.layer) {
+			case "plain":
+				return new CarriedBody(carried);
+			case "compressed": {
+				const compactness = CarriedBody.compactnessOf(carried.compactness);
+				return new CarriedBody({ ...carried, compactness });
+			}
+			case "sealed": {
+				const confidentiality = CarriedBody.confidentialityOf(carried.confidentiality);
+				let compactness: CompactnessInfo | undefined;
+				if (carried.compactness !== undefined) {
+					compactness = CarriedBody.compactnessOf(carried.compactness);
+				}
+
+				return new CarriedBody({
+					...carried,
+					confidentiality,
+					compactness,
+				});
+			}
+			default: {
+				const unknown: never = carried;
+				return unknown;
+			}
+		}
+	}
+
+	/**
+	 * The compactness info with each `Oid` lent as a view.
+	 */
+	private static compactnessOf(carried: CarriedCompactness): CompactnessInfo {
+		const algorithmOid = OidView.over(carried.algorithmOid);
+		const contentOid = OidView.over(carried.contentOid);
+		const compactness = { ...carried, algorithmOid, contentOid };
+		return compactness;
+	}
+
+	/**
+	 * The confidentiality info with each `Oid` lent as a view.
+	 */
+	private static confidentialityOf(carried: CarriedConfidentiality): ConfidentialityInfo {
+		const algorithmOid = OidView.over(carried.algorithmOid);
+		const contentOid = OidView.over(carried.contentOid);
+		const confidentiality = { ...carried, algorithmOid, contentOid };
+		return confidentiality;
+	}
+
+	/**
+	 * The octets the frame carries as its body: the body DER, the compressed
+	 * octets, or the ciphertext.
+	 */
+	get octets(): Uint8Array {
+		const body = this.#body;
+		switch (body.layer) {
+			case "plain":
+				return body.der;
+			case "compressed":
+				return body.data;
+			case "sealed":
+				return body.ciphertext;
+			default: {
+				const unknown: never = body;
+				return unknown;
+			}
+		}
+	}
+
+	/**
+	 * How the body compressed, when it did, under the seal or not.
+	 */
+	get compactness(): CompactnessInfo | undefined {
+		const body = this.#body;
+		if (body.layer === "plain") {
+			return undefined;
+		}
+
+		return body.compactness;
+	}
+
+	/**
+	 * The envelope that seals the body, when sealed.
+	 */
+	get confidentiality(): ConfidentialityInfo | undefined {
+		const body = this.#body;
+		if (body.layer !== "sealed") {
+			return undefined;
+		}
+
+		return body.confidentiality;
+	}
+
+	/**
+	 * A copy of the body DER of a cleartext body.
+	 *
+	 * @throws TightbeamTransportError `OpaqueBody`, with the capability the
+	 * body needs on `layer`: `opener` for a sealed body, and `inflator` for a
+	 * compressed one.
+	 */
+	plain(): Uint8Array {
+		const body = this.#body;
+		switch (body.layer) {
+			case "plain":
+				return new Uint8Array(body.der);
+			case "compressed":
+				throw ClientTransportError.opaqueBody("inflator");
+			case "sealed":
+				throw ClientTransportError.opaqueBody("opener");
+			default: {
+				const unknown: never = body;
+				return unknown;
+			}
+		}
+	}
+
+	/**
+	 * The body DER once each layer is reversed: open a sealed body with
+	 * `opener`, then inflate a compressed one with `inflator`. The inflator
+	 * admits the compactness info before the opener decrypts.
+	 *
+	 * @throws as {@link plain} and {@link HeldInflator.admit} do.
+	 */
+	async open(options: OpenOptions): Promise<Uint8Array> {
+		const body = this.#body;
+		switch (body.layer) {
+			case "plain":
+				return new Uint8Array(body.der);
+			case "compressed": {
+				const inflation = CarriedBody.admitted(options, body.compactness);
+				const inflated = await inflation.inflate(new Uint8Array(body.data));
+				return inflated;
+			}
+			case "sealed": {
+				const opener = options.opener;
+				if (opener === undefined) {
+					throw ClientTransportError.opaqueBody("opener");
+				}
+
+				let inflation: Inflation | undefined;
+				if (body.compactness !== undefined) {
+					inflation = CarriedBody.admitted(options, body.compactness);
+				}
+
+				const envelopeDer = new Uint8Array(body.confidentiality.envelopeDer);
+				const ciphertext = new Uint8Array(body.ciphertext);
+				const plaintext = await opener.decrypt({
+					envelopeDer,
+					ciphertext,
+				});
+				if (inflation === undefined) {
+					return plaintext;
+				}
+
+				const inflated = await inflation.inflate(plaintext);
+				return inflated;
+			}
+			default: {
+				const unknown: never = body;
+				return unknown;
+			}
+		}
+	}
+
+	/**
+	 * The inflation that the inflator of `options` admits for a body that
+	 * `compactness` describes.
+	 *
+	 * @throws TightbeamTransportError `OpaqueBody`, which names `inflator` on `layer`, when `options` holds no
+	 * inflator.
+	 */
+	private static admitted(options: OpenOptions, compactness: CompactnessInfo): Inflation {
+		const inflator = options.inflator;
+		if (inflator === undefined) {
+			throw ClientTransportError.opaqueBody("inflator");
+		}
+
+		const held = HeldInflator.lent(inflator);
+		const inflation = held.admit(compactness);
+		return inflation;
+	}
+}
+
+/**
  * The decoded fields of one frame, read once from the wasm inspect payload.
  */
 class FrameFields {
 	readonly version: Version;
 	readonly id: Uint8Array;
 	readonly order: bigint;
-	readonly bodyDer: Uint8Array;
+	readonly body: CarriedBody;
 	readonly priority: MessagePriority | undefined;
 	readonly lifetime: bigint | undefined;
 	readonly previousFrame: PreviousFrame | undefined;
 	readonly matrix: FrameMatrix | undefined;
 	readonly messageIntegrity: DigestInfoView | undefined;
 	readonly frameIntegrity: DigestInfoView | undefined;
-	readonly compactness: CompactnessInfo | undefined;
-	readonly confidentiality: ConfidentialityInfo | undefined;
 	readonly signature: SignatureInfo | undefined;
 
 	/**
@@ -125,7 +345,7 @@ class FrameFields {
 		this.version = inspected.version;
 		this.id = inspected.id;
 		this.order = inspected.order;
-		this.bodyDer = inspected.bodyDer;
+		this.body = CarriedBody.of(inspected.body);
 		this.priority = inspected.priority;
 		this.lifetime = inspected.lifetime;
 		this.previousFrame = FrameFields.digestOf(inspected.previousFrame);
@@ -133,9 +353,6 @@ class FrameFields {
 		const messageIntegrity = inspected.messageIntegrity;
 		this.messageIntegrity = FrameFields.digestOf(messageIntegrity);
 		this.frameIntegrity = FrameFields.digestOf(inspected.frameIntegrity);
-		this.compactness = FrameFields.compactnessOf(inspected.compactness);
-		const confidentiality = inspected.confidentiality;
-		this.confidentiality = FrameFields.confidentialityOf(confidentiality);
 		this.signature = FrameFields.signatureOf(inspected.signature);
 	}
 
@@ -143,55 +360,19 @@ class FrameFields {
 	 * The view of a carried digest, or `undefined` for a field the frame
 	 * omits.
 	 */
-	private static digestOf(
-		carried: DigestInfo | undefined,
-	): DigestInfoView | undefined {
+	private static digestOf(carried: DigestInfo | undefined): DigestInfoView | undefined {
 		if (carried === undefined) {
 			return undefined;
 		}
 
-		const algorithmOid = carried.algorithmOid;
-		const view = DigestInfoView.over(carried, algorithmOid);
+		const view = DigestInfoView.over(carried);
 		return view;
-	}
-
-	/**
-	 * The compactness info with each `Oid` lent as a view.
-	 */
-	private static compactnessOf(
-		carried: CarriedCompactness | undefined,
-	): CompactnessInfo | undefined {
-		if (carried === undefined) {
-			return undefined;
-		}
-
-		const algorithmOid = OidView.over(carried.algorithmOid);
-		const contentOid = OidView.over(carried.contentOid);
-		const compactness = { ...carried, algorithmOid, contentOid };
-		return compactness;
-	}
-
-	/**
-	 * The confidentiality info with its `Oid` lent as a view.
-	 */
-	private static confidentialityOf(
-		carried: CarriedConfidentiality | undefined,
-	): ConfidentialityInfo | undefined {
-		if (carried === undefined) {
-			return undefined;
-		}
-
-		const algorithmOid = OidView.over(carried.algorithmOid);
-		const confidentiality = { ...carried, algorithmOid };
-		return confidentiality;
 	}
 
 	/**
 	 * The signature info with each `Oid` lent as a view.
 	 */
-	private static signatureOf(
-		carried: CarriedSignature | undefined,
-	): SignatureInfo | undefined {
+	private static signatureOf(carried: CarriedSignature | undefined): SignatureInfo | undefined {
 		if (carried === undefined) {
 			return undefined;
 		}
@@ -204,21 +385,11 @@ class FrameFields {
 	}
 
 	/**
-	 * Decode the frame `der` encodes through one wasm assembly of
-	 * `assemblies`, and free the assembly once its summary is read.
+	 * The fields of the frame that `assembly` decoded.
 	 */
-	static decode(
-		assemblies: EngineModule["FrameAssembly"],
-		der: Uint8Array,
-	): FrameFields {
-		const assembly = assemblies.decode(der);
-		try {
-			const inspected = assembly.summary();
-			const fields = new FrameFields(inspected);
-			return fields;
-		} finally {
-			assembly.free();
-		}
+	static of(assembly: FrameAssembly): FrameFields {
+		const fields = new FrameFields(assembly.summary());
+		return fields;
 	}
 }
 
@@ -226,8 +397,7 @@ class FrameFields {
  * What the engine answered for one preimage: its octets, or the refusal it
  * raised in their place.
  */
-type PreimageAnswer =
-	{ readonly octets: Uint8Array } | { readonly refusal: unknown };
+type PreimageAnswer = { readonly octets: Uint8Array } | { readonly refusal: unknown };
 
 /**
  * One preimage of a frame, as the engine answered it once.
@@ -271,7 +441,7 @@ class Preimage {
 }
 
 /**
- * The preimages that the verification of one frame reads, all read from one
+ * The preimages that the verification of one frame reads, read from the one
  * wasm decode of the frame.
  *
  * Each preimage holds the answer of the engine on its own, so a frame whose
@@ -301,68 +471,34 @@ class FramePreimages {
 	}
 
 	/**
-	 * Decode the frame `der` encodes through one wasm assembly of
-	 * `assemblies`, and free the assembly once its preimages are read.
+	 * The preimages of the frame that `assembly` decoded.
 	 */
-	static decode(
-		assemblies: EngineModule["FrameAssembly"],
-		der: Uint8Array,
-	): FramePreimages {
-		const assembly = assemblies.decode(der);
-		try {
-			const preimages = new FramePreimages(assembly);
-			return preimages;
-		} finally {
-			assembly.free();
-		}
+	static of(assembly: FrameAssembly): FramePreimages {
+		const preimages = new FramePreimages(assembly);
+		return preimages;
 	}
 }
 
 /**
- * The capabilities {@link Frame.open} reverses a body with, each in a field
- * of its own name.
- */
-export interface OpenOptions {
-	/**
-	 * Opens a sealed body.
-	 */
-	readonly opener?: BodyDecryptor;
-	/**
-	 * Inflates a compressed body.
-	 */
-	readonly inflator?: BodyInflator;
-}
-
-/**
- * An inflator paired with the compactness info it admitted.
- */
-interface Inflation {
-	readonly inflator: BodyInflator;
-	readonly compactness: CompactnessInfo;
-}
-
-/**
- * A tightbeam frame.
- *
- * - `Engine.frame` parses received bytes, and the fluent builder's `build()`
- *   makes one. Either way the bytes parse once, at construction.
- * - Every getter reads decoded state, and the frame holds no wasm object
- *   between calls.
+ * A tightbeam frame, which `Engine.frame` parses from received bytes and the
+ * builder's `build()` makes. The bytes parse once, at construction, and the
+ * frame lends each carried digest and identifier handle as a view that the
+ * glue reclaims with the frame.
  */
 export class Frame {
-	/**
-	 * The preimages, once the first read of one decoded them.
-	 */
-	#preimages: FramePreimages | undefined;
-
 	readonly #parts: EngineParts;
 
-	private constructor(
-		parts: EngineParts,
-		private readonly der: Uint8Array,
-		private readonly fields: FrameFields,
-	) {
+	readonly #der: Uint8Array;
+
+	readonly #fields: FrameFields;
+
+	readonly #preimages: FramePreimages;
+
+	private constructor(parts: EngineParts, der: Uint8Array, fields: FrameFields, preimages: FramePreimages) {
 		this.#parts = parts;
+		this.#der = der;
+		this.#fields = fields;
+		this.#preimages = preimages;
 	}
 
 	/**
@@ -370,33 +506,35 @@ export class Frame {
 	 * copy, so a later write to `der` leaves the frame as it parsed.
 	 *
 	 * @throws TightbeamTransportError with the code of the engine's refusal,
-	 * such as `SerializationError`, when the bytes are not a well-formed
-	 * frame.
+	 * such as `SerializationError`, for bytes that are no well-formed frame.
+	 *
+	 * @internal
 	 */
 	static decode(parts: EngineParts, der: Uint8Array): Frame {
 		// The constructor copies a Node `Buffer` too, whose `slice` is a view.
 		const owned = new Uint8Array(der);
+		using assembly = parts.glue.FrameAssembly.decode(owned);
 
-		const fields = FrameFields.decode(parts.glue.FrameAssembly, owned);
-		const frame = new Frame(parts, owned, fields);
+		const fields = FrameFields.of(assembly);
+		const preimages = FramePreimages.of(assembly);
+		const frame = new Frame(parts, owned, fields, preimages);
 		return frame;
 	}
 
 	/**
-	 * Parse the DER of a response frame through `engine`, or answer
-	 * `undefined` when the peer returned no response frame.
+	 * Parse the DER of a response frame through the engine `parts`, or
+	 * answer `undefined` when the peer returned no response frame.
 	 *
-	 * @throws ValidationError as {@link decode} does.
+	 * @throws TightbeamTransportError as {@link decode} does.
+	 *
+	 * @internal
 	 */
-	static response(
-		engine: Engine,
-		der: Uint8Array | undefined,
-	): Frame | undefined {
+	static response(parts: EngineParts, der: Uint8Array | undefined): Frame | undefined {
 		if (der === undefined) {
 			return undefined;
 		}
 
-		const frame = engine.frame(der);
+		const frame = Frame.decode(parts, der);
 		return frame;
 	}
 
@@ -404,15 +542,15 @@ export class Frame {
 	 * A copy of the frame DER, so a write to it leaves this frame unchanged.
 	 */
 	toDer(): Uint8Array {
-		const der = new Uint8Array(this.der);
+		const der = new Uint8Array(this.#der);
 		return der;
 	}
 
 	/**
-	 * Protocol version.
+	 * The protocol version of the frame, which bounds the metadata fields it carries.
 	 */
 	get version(): Version {
-		const version = this.fields.version;
+		const version = this.#fields.version;
 		return version;
 	}
 
@@ -421,7 +559,7 @@ export class Frame {
 	 * frame unchanged.
 	 */
 	get id(): Uint8Array {
-		const id = new Uint8Array(this.fields.id);
+		const id = new Uint8Array(this.#fields.id);
 		return id;
 	}
 
@@ -433,20 +571,18 @@ export class Frame {
 	 * time, the profile defaults to the current Unix time in seconds.
 	 */
 	get order(): bigint {
-		const order = this.fields.order;
+		const order = this.#fields.order;
 		return order;
 	}
 
 	/**
-	 * A copy of the raw frame body DER, so a write to it leaves what
-	 * {@link open} and {@link message} decode unchanged.
-	 *
-	 * When {@link confidential} is true, the octets are ciphertext. Open
-	 * them with {@link open}. Decode a cleartext body into a typed message
-	 * with {@link message}.
+	 * A copy of the octets the frame carries as its body, so a write to it
+	 * leaves what {@link open} decodes unchanged: the body DER, the
+	 * compressed octets when {@link compressed}, or the ciphertext when
+	 * {@link confidential}.
 	 */
 	get bodyDer(): Uint8Array {
-		const bodyDer = new Uint8Array(this.fields.bodyDer);
+		const bodyDer = new Uint8Array(this.#fields.body.octets);
 		return bodyDer;
 	}
 
@@ -454,7 +590,7 @@ export class Frame {
 	 * The frame carries a non-repudiation signature.
 	 */
 	get signed(): boolean {
-		const signed = this.fields.signature !== undefined;
+		const signed = this.#fields.signature !== undefined;
 		return signed;
 	}
 
@@ -462,7 +598,7 @@ export class Frame {
 	 * The metadata commits to the body (message integrity).
 	 */
 	get messageIntegrity(): boolean {
-		const messageIntegrity = this.fields.messageIntegrity !== undefined;
+		const messageIntegrity = this.#fields.messageIntegrity !== undefined;
 		return messageIntegrity;
 	}
 
@@ -470,7 +606,7 @@ export class Frame {
 	 * The envelope is witnessed (frame integrity).
 	 */
 	get frameIntegrity(): boolean {
-		const frameIntegrity = this.fields.frameIntegrity !== undefined;
+		const frameIntegrity = this.#fields.frameIntegrity !== undefined;
 		return frameIntegrity;
 	}
 
@@ -478,7 +614,7 @@ export class Frame {
 	 * The body is compressed.
 	 */
 	get compressed(): boolean {
-		const compressed = this.fields.compactness !== undefined;
+		const compressed = this.#fields.body.compactness !== undefined;
 		return compressed;
 	}
 
@@ -486,7 +622,7 @@ export class Frame {
 	 * The body is encrypted.
 	 */
 	get confidential(): boolean {
-		const confidential = this.fields.confidentiality !== undefined;
+		const confidential = this.#fields.body.confidentiality !== undefined;
 		return confidential;
 	}
 
@@ -494,7 +630,7 @@ export class Frame {
 	 * The carried message-commitment digest, when committed.
 	 */
 	get messageIntegrityInfo(): DigestInfoView | undefined {
-		const messageIntegrityInfo = this.fields.messageIntegrity;
+		const messageIntegrityInfo = this.#fields.messageIntegrity;
 		return messageIntegrityInfo;
 	}
 
@@ -502,7 +638,7 @@ export class Frame {
 	 * The carried witness digest, when witnessed.
 	 */
 	get frameIntegrityInfo(): DigestInfoView | undefined {
-		const frameIntegrityInfo = this.fields.frameIntegrity;
+		const frameIntegrityInfo = this.#fields.frameIntegrity;
 		return frameIntegrityInfo;
 	}
 
@@ -511,7 +647,7 @@ export class Frame {
 	 * it leaves what {@link open} inflates with unchanged.
 	 */
 	get compactnessInfo(): CompactnessInfo | undefined {
-		const carried = this.fields.compactness;
+		const carried = this.#fields.body.compactness;
 		if (carried === undefined) {
 			return undefined;
 		}
@@ -532,7 +668,7 @@ export class Frame {
 	 * to it leaves what {@link open} decrypts with unchanged.
 	 */
 	get confidentialityInfo(): ConfidentialityInfo | undefined {
-		const carried = this.fields.confidentiality;
+		const carried = this.#fields.body.confidentiality;
 		if (carried === undefined) {
 			return undefined;
 		}
@@ -547,7 +683,7 @@ export class Frame {
 	 * leaves this frame unchanged.
 	 */
 	get signatureInfo(): SignatureInfo | undefined {
-		const carried = this.fields.signature;
+		const carried = this.#fields.signature;
 		if (carried === undefined) {
 			return undefined;
 		}
@@ -561,7 +697,7 @@ export class Frame {
 	 * Message priority, when present (V2+).
 	 */
 	get priority(): MessagePriority | undefined {
-		const priority = this.fields.priority;
+		const priority = this.#fields.priority;
 		return priority;
 	}
 
@@ -569,7 +705,7 @@ export class Frame {
 	 * Time-to-live in seconds, when present (V2+).
 	 */
 	get lifetime(): bigint | undefined {
-		const lifetime = this.fields.lifetime;
+		const lifetime = this.#fields.lifetime;
 		return lifetime;
 	}
 
@@ -577,7 +713,7 @@ export class Frame {
 	 * Parent-frame link by content digest, when present (V2+).
 	 */
 	get previousFrame(): PreviousFrame | undefined {
-		const previousFrame = this.fields.previousFrame;
+		const previousFrame = this.#fields.previousFrame;
 		return previousFrame;
 	}
 
@@ -586,7 +722,7 @@ export class Frame {
 	 * leaves this frame unchanged.
 	 */
 	get matrix(): FrameMatrix | undefined {
-		const carried = this.fields.matrix;
+		const carried = this.#fields.matrix;
 		if (carried === undefined) {
 			return undefined;
 		}
@@ -602,7 +738,7 @@ export class Frame {
 	 * over {@link signaturePrehash}.
 	 */
 	tbs(): Uint8Array {
-		const tbs = this.preimages.tbs.copy();
+		const tbs = this.#preimages.tbs.copy();
 		return tbs;
 	}
 
@@ -614,7 +750,7 @@ export class Frame {
 	 * unsigned.
 	 */
 	signaturePrehash(): Uint8Array {
-		const prehash = this.preimages.prehash.copy();
+		const prehash = this.#preimages.prehash.copy();
 		return prehash;
 	}
 
@@ -623,59 +759,40 @@ export class Frame {
 	 * carried witness digest is computed over.
 	 */
 	witnessInput(): Uint8Array {
-		const witness = this.preimages.witness.copy();
+		const witness = this.#preimages.witness.copy();
 		return witness;
 	}
 
 	/**
-	 * The preimages of this frame, decoded once, on the first read of any:
-	 * the lazy cell holds the first decode, so no read decodes again.
-	 */
-	private get preimages(): FramePreimages {
-		const assemblies = this.#parts.glue.FrameAssembly;
-
-		this.#preimages ??= FramePreimages.decode(assemblies, this.der);
-		return this.#preimages;
-	}
-
-	/**
-	 * The message-commitment preimage under `salt`, computed over the
-	 * carried body DER.
+	 * The message-commitment preimage over the carried body DER, under `salt`,
+	 * the parse of the octets that `withMessageHasher` received.
 	 *
-	 * Pass a salt that parses the octets given to `withCommitment`.
-	 *
-	 * @throws ValidationError `FRAME_CONFIDENTIAL` or `FRAME_COMPRESSED` when
-	 * the frame is sealed or compressed, so its body still needs an open.
-	 * @throws an error whose `code` is `SerializationError` when the plaintext
-	 * body is not one DER value.
+	 * @throws TightbeamTransportError `OpaqueBody` for a sealed or compressed
+	 * body, and `SerializationError` for a body that is not one DER value.
 	 */
 	commitmentInput(salt: CommitmentSalt): Uint8Array {
-		const bodyDer = this.plainBodyDer();
+		const bodyDer = this.#fields.body.plain();
 		const commitmentInput = salt.preimage(bodyDer);
 		return commitmentInput;
 	}
 
 	/**
-	 * Verify the frame's non-repudiation signature through `verifier`.
-	 * Profile secp256k1 uses {@link Secp256k1VerifyingKey}; other schemes
-	 * supply their own {@link FrameVerifier} (or use
-	 * {@link signaturePrehash} / {@link signatureInfo} directly).
+	 * Verify the non-repudiation signature of the frame through `verifier`,
+	 * a {@link Secp256k1VerifyingKey} or a {@link FrameVerifier} of any scheme.
 	 *
-	 * @throws when the frame is unsigned, the algorithm differs, or the
-	 * signature does not verify.
+	 * @throws as a rejection, when the frame is unsigned, the algorithm
+	 * differs, or the signature does not verify.
 	 */
-	verify(verifier: FrameVerifier): void {
-		verifier.verifyFrame(this);
+	async verify(verifier: FrameVerifier): Promise<void> {
+		await verifier.verifyFrame(this);
 	}
 
 	/**
 	 * Check the carried witness digest by recomputing it with `hasher`
 	 * (profile SHA3-256 by default).
 	 */
-	async frameIntegrityVerdict(
-		hasher: Hasher = this.#parts.sha3_256,
-	): Promise<IntegrityVerdict> {
-		const carried = this.fields.frameIntegrity;
+	async frameIntegrityVerdict(hasher: Hasher = this.#parts.sha3_256): Promise<IntegrityVerdict> {
+		const carried = this.#fields.frameIntegrity;
 		if (carried === undefined) {
 			return "absent";
 		}
@@ -686,21 +803,17 @@ export class Frame {
 	}
 
 	/**
-	 * Check the carried message commitment against the disclosed `salt` by
-	 * recomputing it with `hasher` (profile SHA3-256 by default). The
-	 * commitment is over the plaintext, uncompressed body: open a sealed or
-	 * compressed frame first and check the commitment on the recovered body.
+	 * Check the carried commitment against the disclosed `salt` under `hasher`, the profile SHA3-256 by default. It
+	 * covers the uncompressed body DER, so open a sealed or compressed frame under a codec whose `decode` answers its
+	 * input, and check a present `messageIntegrityInfo` with `engine.opening(salt, bodyDer).verify`.
 	 *
-	 * @throws ValidationError `FRAME_CONFIDENTIAL` or `FRAME_COMPRESSED` when
-	 * the frame is sealed or compressed, so its body still needs an open.
-	 * @throws an error whose `code` is `SerializationError` when the plaintext
-	 * body is not one DER value.
+	 * @throws as {@link commitmentInput} does.
 	 */
 	async messageCommitmentVerdict(
 		salt: CommitmentSalt,
 		hasher: Hasher = this.#parts.sha3_256,
 	): Promise<IntegrityVerdict> {
-		const carried = this.fields.messageIntegrity;
+		const carried = this.#fields.messageIntegrity;
 		if (carried === undefined) {
 			return "absent";
 		}
@@ -718,219 +831,22 @@ export class Frame {
 		carried: DigestInfoView,
 		hasher: Hasher,
 		preimage: Uint8Array,
-	): Promise<DigestVerdict> {
+	): Promise<IntegrityVerdict> {
 		const recomputed = await hasher.digest(preimage);
 		const verdict = carried.verdict(hasher.algorithmOid, recomputed);
 		return verdict;
 	}
 
 	/**
-	 * Decode the cleartext body into a typed message under `codec` - the
-	 * profile `Opaque` codec for raw bytes, or the implementor's schema.
-	 * The codec runtime-validates the bytes and throws on mismatch.
+	 * Reverse the layers this frame carries, and decode the body under `codec`.
+	 * This is the one decode of a frame body.
 	 *
-	 * @throws ValidationError when the frame is encrypted or compressed
-	 * (use {@link open}).
+	 * @throws TightbeamTransportError `OpaqueBody` or `CompactnessRefused`, and
+	 * the refusal of the opener, the inflator, or the codec.
 	 */
-	message<T>(codec: MessageCodec<T>): T {
-		const bodyDer = this.plainBodyDer();
+	async open<T>(codec: MessageCodec<T>, options: OpenOptions = {}): Promise<T> {
+		const bodyDer = await this.#fields.body.open(options);
 		const message = codec.decode(bodyDer);
 		return message;
-	}
-
-	/**
-	 * The carried body, once the frame's own confidentiality and compactness
-	 * show it is plaintext.
-	 *
-	 * @throws ValidationError `FRAME_CONFIDENTIAL` when the frame is sealed.
-	 * @throws ValidationError `FRAME_COMPRESSED` when the frame is compressed.
-	 */
-	private plainBodyDer(): Uint8Array {
-		if (this.confidential) {
-			throw new ValidationError("FRAME_CONFIDENTIAL", [
-				{
-					path: "frame",
-					message: "The frame body is encrypted. Decode it with open",
-				},
-			]);
-		}
-		if (this.compressed) {
-			throw new ValidationError("FRAME_COMPRESSED", [
-				{
-					path: "frame",
-					message:
-						"The frame body is compressed. Decode it with open",
-				},
-			]);
-		}
-
-		return this.bodyDer;
-	}
-
-	/**
-	 * Reverse the layers this frame carries and decode the body under
-	 * `codec`: open a sealed body with `opener`, inflate a compressed one
-	 * with `inflator`, and decode the result.
-	 *
-	 * - The inflator admits the compactness info, its algorithm and its
-	 *   parameters, before the opener decrypts, so a body no inflator reverses
-	 *   costs no decryption.
-	 * - A capability the frame does not need goes unused, so an uncompressed
-	 *   cleartext frame opens under any options.
-	 *
-	 * @throws ValidationError with one of these codes:
-	 *
-	 * - `MISSING_OPENER`: the frame is sealed and no `opener` is given.
-	 * - `MISSING_INFLATOR`: the frame is compressed and no `inflator` is given.
-	 * - `COMPACTNESS_REFUSED`: the inflator does not admit the compactness info.
-	 *
-	 * @throws when the opener rejects the sealed body, the inflator rejects
-	 * the plaintext, or the codec rejects the decoded bytes.
-	 */
-	async open<T>(
-		codec: MessageCodec<T>,
-		options: OpenOptions = {},
-	): Promise<T> {
-		const inflation = this.admittedInflation(options.inflator);
-		const plaintext = await this.decrypted(options.opener);
-		if (inflation === undefined) {
-			const message = codec.decode(plaintext);
-			return message;
-		}
-
-		const bodyDer = await inflation.inflator.decompress(plaintext);
-		const message = codec.decode(bodyDer);
-		return message;
-	}
-
-	/**
-	 * Inflate the cleartext-but-compressed body with the engine `zstd`, on the
-	 * inflate path a native peer takes, and decode the result into a typed
-	 * message under `codec`. An uncompressed cleartext body decodes as it is.
-	 *
-	 * @throws an error whose `code` is `CompressionError` when `zstd` refuses
-	 * the body, `UnexpectedAlgorithm` or `InvalidMetadata` when the
-	 * compactness info names another algorithm or parameters `zstd` refuses,
-	 * and `Router` when the frame is sealed (use {@link open} with an opener
-	 * instead).
-	 * @throws when the codec rejects the decoded bytes.
-	 */
-	async inflateMessage<T>(
-		zstd: ZstdView,
-		codec: MessageCodec<T>,
-	): Promise<T> {
-		const bodyDer = this.#inflated(zstd);
-		const message = codec.decode(bodyDer);
-		return message;
-	}
-
-	/**
-	 * The body DER that the engine inflates within the ceiling of `zstd`,
-	 * through one assembly that the read frees.
-	 */
-	#inflated(zstd: ZstdView): Uint8Array {
-		const assemblies = this.#parts.glue.FrameAssembly;
-		const assembly = assemblies.decode(this.der);
-		try {
-			const bodyDer = assembly.inflate(zstd[CEILING]);
-			return bodyDer;
-		} finally {
-			assembly.free();
-		}
-	}
-
-	/**
-	 * Decrypt the encrypted body with any {@link BodyDecryptor} and decode
-	 * the plaintext into a typed message under `codec`.
-	 *
-	 * The profile decryptors are `Aes256Gcm` and `HpkeDecryptor`. The
-	 * profile codec for raw bytes is `Opaque`. A compressed-then-sealed
-	 * body also needs `inflator` to decompress the decrypted bytes.
-	 *
-	 * @throws ValidationError when the frame is not encrypted.
-	 * @throws as {@link open} does.
-	 */
-	async decryptMessage<T>(
-		decryptor: BodyDecryptor,
-		codec: MessageCodec<T>,
-		inflator?: BodyInflator,
-	): Promise<T> {
-		if (!this.confidential) {
-			throw new ValidationError("FRAME_NOT_CONFIDENTIAL", [
-				{
-					path: "frame",
-					message: "The frame body is not encrypted",
-				},
-			]);
-		}
-
-		const message = await this.open(codec, { opener: decryptor, inflator });
-		return message;
-	}
-
-	/**
-	 * The inflator for a compressed body, once it admits the carried
-	 * compactness info, or `undefined` for an uncompressed body.
-	 */
-	private admittedInflation(
-		inflator: BodyInflator | undefined,
-	): Inflation | undefined {
-		const compactness = this.compactnessInfo;
-		if (compactness === undefined) {
-			return undefined;
-		}
-		if (inflator === undefined) {
-			throw new ValidationError("MISSING_INFLATOR", [
-				{
-					path: "frame",
-					message:
-						"The frame body is compressed. Open it with an inflator",
-				},
-			]);
-		}
-
-		const algorithm = compactness.algorithmOid;
-		const reverses = algorithm.equals(inflator.algorithmOid);
-		const parameters = compactness.parametersDer;
-		if (!reverses || !inflator.admitsParameters(parameters)) {
-			throw new ValidationError("COMPACTNESS_REFUSED", [
-				{
-					path: "compactness",
-					message: `The inflator does not reverse a body compressed with ${compactness.algorithmOid}`,
-				},
-			]);
-		}
-
-		const inflation = { inflator, compactness };
-		return inflation;
-	}
-
-	/**
-	 * The body with any seal removed: a copy of the carried body when
-	 * cleartext, or the plaintext `opener` recovers from copies of the
-	 * sealed parts.
-	 */
-	private async decrypted(
-		opener: BodyDecryptor | undefined,
-	): Promise<Uint8Array> {
-		const confidentiality = this.confidentialityInfo;
-		const bodyDer = this.bodyDer;
-		if (confidentiality === undefined) {
-			return bodyDer;
-		}
-		if (opener === undefined) {
-			throw new ValidationError("MISSING_OPENER", [
-				{
-					path: "frame",
-					message:
-						"The frame body is encrypted. Open it with an opener",
-				},
-			]);
-		}
-
-		const envelopeDer = confidentiality.envelopeDer;
-		const sealed = { envelopeDer, ciphertext: bodyDer };
-		const plaintext = await opener.decrypt(sealed);
-		return plaintext;
 	}
 }

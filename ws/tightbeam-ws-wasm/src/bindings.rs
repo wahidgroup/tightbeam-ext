@@ -6,18 +6,17 @@ use js_sys::Uint8Array;
 use wasm_bindgen::prelude::*;
 
 use tightbeam::asn1::ObjectIdentifier;
+use tightbeam::core::IntegrityVerdict;
 use tightbeam::crypto::commitment::CommitmentSalt as EngineSalt;
-use tightbeam::crypto::subtle::ConstantTimeEq;
-use tightbeam::matrix::MatrixDyn;
+use tightbeam::matrix::{MatrixDyn, MatrixLike};
 use tightbeam::oids::{
 	AES_256_GCM, COMPRESSION_ZLIB, COMPRESSION_ZSTD, DATA, DHKEM_SECP256K1, HASH_SHA3_256, SIGNER_ECDSA_WITH_SHA3_256,
 };
 
 use crate::build::{
-	self, BodyDer, Compactness, CompactnessSummary, ConfidentialitySummary, DigestSummary, FrameConfig, FrameSummary,
-	MatrixSummary, NamedDigest, SecurityField, SignatureSummary, SignerKeyId,
+	self, BodyDer, Compactness, CompactnessSummary, ConfidentialitySummary, FrameBody, FrameConfig, FrameSummary,
+	NamedDigest, SecurityField, SignatureSummary, SignerKeyId,
 };
-use crate::compress::ZstdCompression;
 use crate::fault::{JsFault, RefusalCode, TransportCode};
 use crate::metadata::{PriorityLabel, VersionLabel};
 use crate::promise::{JsBytes, Record, WholeNumber};
@@ -68,6 +67,10 @@ export interface ConfidentialityInfo {
 	 */
 	readonly algorithmOid: Oid;
 	/**
+	 * The content type that the envelope authenticates for the sealed body.
+	 */
+	readonly contentOid: Oid;
+	/**
 	 * The DER `AuthEnvelopedData`, its content detached into the frame body.
 	 */
 	readonly envelopeDer: Uint8Array;
@@ -92,6 +95,54 @@ export interface SignatureInfo {
 }
 
 /**
+ * The body a frame carries, by the layer a reader reverses first: the seal
+ * before the compression, as tightbeam orders them.
+ */
+export type FrameBody =
+	| {
+			/**
+			 * A cleartext body that decodes as it is.
+			 */
+			readonly layer: "plain";
+			/**
+			 * The body DER.
+			 */
+			readonly der: Uint8Array;
+	  }
+	| {
+			/**
+			 * A cleartext body that a reader inflates before it decodes.
+			 */
+			readonly layer: "compressed";
+			/**
+			 * The compressed octets.
+			 */
+			readonly data: Uint8Array;
+			/**
+			 * How the body compressed.
+			 */
+			readonly compactness: CompactnessInfo;
+	  }
+	| {
+			/**
+			 * A sealed body that a reader opens first.
+			 */
+			readonly layer: "sealed";
+			/**
+			 * The ciphertext, detached from its envelope.
+			 */
+			readonly ciphertext: Uint8Array;
+			/**
+			 * The envelope that seals the body.
+			 */
+			readonly confidentiality: ConfidentialityInfo;
+			/**
+			 * How the body compressed under the seal, when it did.
+			 */
+			readonly compactness?: CompactnessInfo;
+	  };
+
+/**
  * Every field of a decoded frame. Each security field arrives whole or not
  * at all.
  */
@@ -109,9 +160,9 @@ export interface InspectedFrame {
 	 */
 	readonly order: bigint;
 	/**
-	 * The DER of the frame body, as the frame carries it.
+	 * The body, and the layer a reader reverses first.
 	 */
-	readonly bodyDer: Uint8Array;
+	readonly body: FrameBody;
 	/**
 	 * The message priority.
 	 */
@@ -137,14 +188,6 @@ export interface InspectedFrame {
 	 */
 	readonly frameIntegrity?: DigestInfo;
 	/**
-	 * How the body compressed.
-	 */
-	readonly compactness?: CompactnessInfo;
-	/**
-	 * The envelope that seals the body.
-	 */
-	readonly confidentiality?: ConfidentialityInfo;
-	/**
 	 * The non-repudiation signature over the frame.
 	 */
 	readonly signature?: SignatureInfo;
@@ -168,24 +211,20 @@ export interface CompressedBody {
 }
 "#;
 
-/// A digest a frame carries, admitted under the rule of [`NamedDigest`].
-impl TryFrom<DigestSummary> for DigestInfo {
-	type Error = JsFault;
-
-	/// # Errors
-	///
-	/// - `EmptyDigest` -- the carried digest holds no octets.
-	fn try_from(summary: DigestSummary) -> Result<Self, Self::Error> {
-		let inner = NamedDigest::new(summary.algorithm_oid, summary.digest)?;
-		Ok(Self { inner })
+impl From<NamedDigest> for DigestInfo {
+	fn from(inner: NamedDigest) -> Self {
+		Self { inner }
 	}
 }
 
-impl From<MatrixSummary> for JsValue {
-	fn from(summary: MatrixSummary) -> Self {
+/// The `FrameMatrix` shape of a carried matrix.
+struct JsMatrix(MatrixDyn);
+
+impl From<JsMatrix> for JsValue {
+	fn from(matrix: JsMatrix) -> Self {
 		let record = Record::new();
-		record.set("n", f64::from(summary.n()));
-		record.set_bytes("data", summary.data());
+		record.set("n", f64::from(matrix.0.n()));
+		record.set_bytes("data", matrix.0.as_bytes());
 		record.into()
 	}
 }
@@ -206,6 +245,7 @@ impl From<ConfidentialitySummary> for JsValue {
 	fn from(summary: ConfidentialitySummary) -> Self {
 		let record = Record::new();
 		record.set("algorithmOid", Oid::from(summary.algorithm_oid));
+		record.set("contentOid", Oid::from(summary.content_oid));
 		record.set_bytes("envelopeDer", &summary.envelope_der);
 		record.into()
 	}
@@ -221,34 +261,49 @@ impl From<SignatureSummary> for JsValue {
 	}
 }
 
+/// One object in the `FrameBody` shape, tagged by its `layer`.
+impl From<FrameBody> for JsValue {
+	fn from(body: FrameBody) -> Self {
+		let record = Record::new();
+		match body {
+			FrameBody::Plain(der) => {
+				record.set("layer", "plain");
+				record.set_bytes("der", &der);
+			}
+			FrameBody::Compressed { data, compactness } => {
+				record.set("layer", "compressed");
+				record.set_bytes("data", &data);
+				record.set("compactness", compactness);
+			}
+			FrameBody::Sealed { ciphertext, confidentiality, compactness } => {
+				record.set("layer", "sealed");
+				record.set_bytes("ciphertext", &ciphertext);
+				record.set("confidentiality", confidentiality);
+				record.set_present("compactness", compactness);
+			}
+		}
+
+		record.into()
+	}
+}
+
 /// One plain object in the `InspectedFrame` shape: each security field whole,
 /// or absent.
-impl TryFrom<FrameSummary> for JsValue {
-	type Error = JsFault;
-
-	/// # Errors
-	///
-	/// - `EmptyDigest` -- a digest field of the frame holds no octets.
-	fn try_from(summary: FrameSummary) -> Result<Self, Self::Error> {
-		let previous_frame = summary.previous_frame.map(DigestInfo::try_from).transpose()?;
-		let message_integrity = summary.message_integrity.map(DigestInfo::try_from).transpose()?;
-		let frame_integrity = summary.frame_integrity.map(DigestInfo::try_from).transpose()?;
-
+impl From<FrameSummary> for JsValue {
+	fn from(summary: FrameSummary) -> Self {
 		let record = Record::new();
 		record.set("version", VersionLabel::from(summary.version));
 		record.set_bytes("id", &summary.id);
 		record.set("order", summary.order);
-		record.set_bytes("bodyDer", &summary.body_der);
+		record.set("body", summary.body);
 		record.set_present("priority", summary.priority.map(PriorityLabel::from));
 		record.set_present("lifetime", summary.lifetime);
-		record.set_present("previousFrame", previous_frame);
-		record.set_present("matrix", summary.matrix);
-		record.set_present("messageIntegrity", message_integrity);
-		record.set_present("frameIntegrity", frame_integrity);
-		record.set_present("compactness", summary.compactness);
-		record.set_present("confidentiality", summary.confidentiality);
+		record.set_present("previousFrame", summary.previous_frame.map(DigestInfo::from));
+		record.set_present("matrix", summary.matrix.map(JsMatrix));
+		record.set_present("messageIntegrity", summary.message_integrity.map(DigestInfo::from));
+		record.set_present("frameIntegrity", summary.frame_integrity.map(DigestInfo::from));
 		record.set_present("signature", summary.signature);
-		Ok(record.into())
+		record.into()
 	}
 }
 
@@ -286,7 +341,27 @@ impl FrameComposer {
 		Ok(())
 	}
 
+	/// Assert the version the frame builds at, so the build refuses another
+	/// version before any security step runs.
+	///
+	/// # Errors
+	///
+	/// - `InvalidVersion` -- `version` is no member of `Version`.
+	#[wasm_bindgen(js_name = assertVersion)]
+	pub fn assert_version(
+		&mut self,
+		#[wasm_bindgen(unchecked_param_type = "Version")] version: JsValue,
+	) -> Result<(), JsFault> {
+		let version = VersionLabel::try_from(&version)?;
+		self.config.assert_version(version.into());
+		Ok(())
+	}
+
 	/// Set the opaque message identifier.
+	///
+	/// # Errors
+	///
+	/// - `InvalidBytes` -- `id` is not a `Uint8Array`.
 	#[wasm_bindgen(js_name = withId)]
 	pub fn with_id(&mut self, id: JsBytes) -> Result<(), JsFault> {
 		self.config.with_id(id.read()?);
@@ -438,8 +513,13 @@ impl FrameComposer {
 	/// the composer.
 	///
 	/// The frame carries the pinned version, or the floor of its structural
-	/// and declared fields. A pin below that floor throws an error whose
-	/// `code` is `UnsupportedField`.
+	/// and declared fields.
+	///
+	/// # Errors
+	///
+	/// - `UnsupportedField` -- a pin is below that floor.
+	/// - `VersionMismatch` -- the frame builds at another version than `assertVersion` named.
+	/// - `BuildError` -- the composer names no id.
 	#[wasm_bindgen(js_name = build)]
 	pub fn build(self) -> Result<FrameAssembly, JsFault> {
 		let assembly = self.config.assemble()?;
@@ -449,10 +529,9 @@ impl FrameComposer {
 
 /// One frame, decoded once and held between its assembly steps.
 ///
-/// Each step that installs a field consumes this object and returns the next
-/// one. The engine refuses a step behind a later one the frame holds, with
-/// the code `InstallOutOfOrder`, and a field the frame's version forbids,
-/// with the code `UnsupportedField`.
+/// - Each step that installs a field consumes this object and returns the next one.
+/// - The engine refuses a step behind a later one that the frame holds with `InstallOutOfOrder`.
+/// - It refuses a field that the version of the frame forbids with `UnsupportedField`.
 #[wasm_bindgen]
 pub struct FrameAssembly {
 	inner: build::FrameAssembly,
@@ -461,13 +540,29 @@ pub struct FrameAssembly {
 #[wasm_bindgen]
 impl FrameAssembly {
 	/// Decode the frame that `frameDer` encodes.
+	///
+	/// # Errors
+	///
+	/// - `SerializationError` -- the octets are no frame.
+	/// - `EmptyDigest` -- a digest field of the frame holds no octets.
 	#[wasm_bindgen(js_name = decode)]
 	pub fn decode(frame_der: JsBytes) -> Result<FrameAssembly, JsFault> {
 		let inner = build::FrameAssembly::decode(frame_der.read()?)?;
 		Ok(FrameAssembly { inner })
 	}
 
+	/// The octets the frame body holds now: the body DER, its compressed form
+	/// once `withCompactness` ran, or its ciphertext once sealed.
+	#[wasm_bindgen(getter, js_name = body)]
+	pub fn body(&self) -> Vec<u8> {
+		self.inner.body().to_vec()
+	}
+
 	/// The DER of the frame.
+	///
+	/// # Errors
+	///
+	/// - `SerializationError` -- the frame exceeds the DER length limit.
 	#[wasm_bindgen(js_name = encode)]
 	pub fn encode(&self) -> Result<Vec<u8>, JsFault> {
 		Ok(self.inner.encode()?)
@@ -477,11 +572,11 @@ impl FrameAssembly {
 	///
 	/// # Errors
 	///
-	/// - `EmptyDigest` -- a digest field of the frame holds no octets.
+	/// - `SerializationError` -- a carried field does not encode.
 	#[wasm_bindgen(js_name = summary, unchecked_return_type = "InspectedFrame")]
 	pub fn summary(&self) -> Result<JsValue, JsFault> {
 		let summary = self.inner.summary()?;
-		JsValue::try_from(summary)
+		Ok(summary.into())
 	}
 
 	/// The message-commitment preimage over the body this frame holds, under
@@ -508,6 +603,8 @@ impl FrameAssembly {
 	///
 	/// - `EmptyDigest` -- `digest` holds no octets.
 	/// - `InvalidBytes` -- `digest` is not a `Uint8Array`.
+	/// - `UnsupportedField` -- the frame's version predates the field.
+	/// - `InstallOutOfOrder` -- the frame holds a later step.
 	#[wasm_bindgen(js_name = withMessageIntegrity)]
 	pub fn with_message_integrity(self, algorithm_oid: &Oid, digest: JsBytes) -> Result<FrameAssembly, JsFault> {
 		let commitment = NamedDigest::new(algorithm_oid.value(), digest.read()?)?;
@@ -522,6 +619,9 @@ impl FrameAssembly {
 	/// # Errors
 	///
 	/// - `InvalidBytes` -- `data`, or a present `parametersDer`, is not a `Uint8Array`.
+	/// - `SerializationError` -- a present `parametersDer` is no DER.
+	/// - `InstallOutOfOrder` -- the frame holds a later step.
+	/// - `InvalidMetadata` -- the compactness info is malformed.
 	#[wasm_bindgen(js_name = withCompactness)]
 	pub fn with_compactness(
 		self,
@@ -542,32 +642,17 @@ impl FrameAssembly {
 		Ok(FrameAssembly { inner })
 	}
 
-	/// The body DER of this frame, inflated by the engine zstd within
-	/// `maxOutput`, the ceiling that `ZstdCompression.ceiling` answered: the
-	/// step a cleartext compressed frame takes before its body decodes. A frame
-	/// that carries no compactness answers its body.
-	///
-	/// # Errors
-	///
-	/// - `InvalidMaxOutput` -- `maxOutput` is no whole, non-negative number that the target
-	///   holds.
-	/// - `CompressionError` -- the engine zstd refuses the body. The refusal travels inside the
-	///   error of the inflate path, which the engine does not take apart.
-	/// - `InvalidMetadata`, `UnexpectedAlgorithm` -- the compactness info names another
-	///   algorithm, or parameters that the engine zstd refuses.
-	/// - `Router` -- the frame is sealed, so its body opens through a decrypt.
-	#[wasm_bindgen(js_name = inflate)]
-	pub fn inflate(
-		&self,
-		#[wasm_bindgen(unchecked_param_type = "number")] max_output: JsValue,
-	) -> Result<Vec<u8>, JsFault> {
-		let zstd = ZstdCompression::within(&max_output)?;
-		Ok(self.inner.inflate(&zstd)?)
-	}
-
 	/// Replace the frame body with the `ciphertext` of `sealed` and install
 	/// its `envelopeDer`, the DER `AuthEnvelopedData` that seals it, its
 	/// content detached (V1+ frames).
+	///
+	/// # Errors
+	///
+	/// - `InvalidBytes` -- `sealed.envelopeDer` or `sealed.ciphertext` is not a `Uint8Array`.
+	/// - `SerializationError` -- `envelopeDer` is no `AuthEnvelopedData`.
+	/// - `UnsupportedField` -- the frame's version predates the field.
+	/// - `InstallOutOfOrder` -- the frame holds a later step.
+	/// - `InvalidMetadata` -- the envelope carries the ciphertext inside it.
 	#[wasm_bindgen(js_name = withConfidentiality)]
 	pub fn with_confidentiality(
 		self,
@@ -580,6 +665,10 @@ impl FrameAssembly {
 
 	/// The frame-integrity (witness) preimage: hash it with any digest and
 	/// install the result with `withWitness`.
+	///
+	/// # Errors
+	///
+	/// - `SerializationError` -- the metadata fails to encode.
 	#[wasm_bindgen(js_name = witnessPreimage)]
 	pub fn witness_preimage(&self) -> Result<Vec<u8>, JsFault> {
 		Ok(self.inner.witness_preimage()?)
@@ -593,6 +682,8 @@ impl FrameAssembly {
 	///
 	/// - `EmptyDigest` -- `digest` holds no octets.
 	/// - `InvalidBytes` -- `digest` is not a `Uint8Array`.
+	/// - `UnsupportedField` -- the frame's version predates the field.
+	/// - `InstallOutOfOrder` -- the frame holds a later step.
 	#[wasm_bindgen(js_name = withWitness)]
 	pub fn with_witness(self, algorithm_oid: &Oid, digest: JsBytes) -> Result<FrameAssembly, JsFault> {
 		let witness = NamedDigest::new(algorithm_oid.value(), digest.read()?)?;
@@ -601,6 +692,10 @@ impl FrameAssembly {
 	}
 
 	/// The to-be-signed bytes of the frame (everything but the signature).
+	///
+	/// # Errors
+	///
+	/// - `SerializationError` -- the frame fails to encode.
 	#[wasm_bindgen(js_name = tbs)]
 	pub fn tbs(&self) -> Result<Vec<u8>, JsFault> {
 		Ok(self.inner.tbs()?)
@@ -624,6 +719,11 @@ impl FrameAssembly {
 	}
 
 	/// The digest a verifier checks the frame's signature against.
+	///
+	/// # Errors
+	///
+	/// - `MissingSignature` -- the frame is unsigned.
+	/// - `SerializationError` -- the frame or its signed attributes fail to encode.
 	#[wasm_bindgen(js_name = signaturePrehash)]
 	pub fn signature_prehash(&self) -> Result<Vec<u8>, JsFault> {
 		Ok(self.inner.signature_prehash()?)
@@ -648,6 +748,12 @@ impl Signing {
 
 	/// Attach `signature`, a DER `ECDSA-Sig-Value` over `prehash`, and
 	/// return the signed frame (V1+ frames). Consumes this draft.
+	///
+	/// # Errors
+	///
+	/// - `InvalidBytes` -- `signature` is not a `Uint8Array`.
+	/// - `SignatureError` -- the signature is no DER `ECDSA-Sig-Value`.
+	/// - `UnsupportedField` -- the frame's version predates signatures.
 	#[wasm_bindgen(js_name = complete)]
 	pub fn complete(self, signature: JsBytes) -> Result<FrameAssembly, JsFault> {
 		let signature = signature.read()?;
@@ -660,10 +766,11 @@ impl Signing {
 /// A commitment salt, parsed once: empty for a plain digest, or at least 16
 /// octets that hide the body.
 ///
-/// A salt commits one frame. [`take`](Self::take) moves the salt into a new
-/// handle and leaves this one an empty shell, which frees as any handle does.
-/// A holder that disposes its own handle therefore never reaches the salt it
-/// gave away, and an empty shell refuses every read with `CommitmentSpent`.
+/// - A salt commits one frame.
+/// - [`take`](Self::take) moves the salt into a new handle and leaves this one an empty shell, which frees
+///   as any handle does.
+/// - A holder that disposes its own handle therefore leaves the salt it gave away to the new handle.
+/// - An empty shell refuses every read with `CommitmentSpent`.
 #[wasm_bindgen]
 pub struct CommitmentSalt {
 	inner: Option<EngineSalt>,
@@ -675,7 +782,7 @@ impl CommitmentSalt {
 	/// # Errors
 	///
 	/// - `CommitmentSpent` -- the salt moved out of this handle.
-	pub(crate) fn salt(&self) -> Result<&EngineSalt, JsFault> {
+	fn salt(&self) -> Result<&EngineSalt, JsFault> {
 		let held = self.inner.as_ref();
 		held.ok_or_else(|| RefusalCode::CommitmentSpent.because("the salt moved out of this handle"))
 	}
@@ -831,16 +938,32 @@ impl Oid {
 	}
 }
 
-/// The outcome of judging a recomputed digest against a carried one.
-#[wasm_bindgen]
+/// The outcome of an integrity check, by the label JavaScript reads for each
+/// `IntegrityVerdict` of tightbeam.
+#[wasm_bindgen(js_name = IntegrityVerdict)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DigestVerdict {
+pub enum VerdictLabel {
 	/// The recomputed digest equals the carried one.
 	Verified = "verified",
+	/// The frame carries nothing to check.
+	Absent = "absent",
 	/// The hasher implements another algorithm than the digest names.
 	AlgorithmMismatch = "algorithm-mismatch",
 	/// The recomputed digest differs from the carried one.
 	Mismatch = "mismatch",
+}
+
+/// The label of each verdict. The match covers every verdict tightbeam
+/// defines, so a new verdict fails to compile here until it has a label.
+impl From<IntegrityVerdict> for VerdictLabel {
+	fn from(verdict: IntegrityVerdict) -> Self {
+		match verdict {
+			IntegrityVerdict::Verified => Self::Verified,
+			IntegrityVerdict::Absent => Self::Absent,
+			IntegrityVerdict::AlgorithmMismatch => Self::AlgorithmMismatch,
+			IntegrityVerdict::Mismatch => Self::Mismatch,
+		}
+	}
 }
 
 /// A digest and the algorithm that produced it: a digest field of a frame,
@@ -889,28 +1012,16 @@ impl DigestInfo {
 	}
 
 	/// Judge this digest against `recomputed`, the digest that the algorithm
-	/// `algorithmOid` produced over the preimage.
-	///
-	/// The verdict is `algorithm-mismatch` when `algorithmOid` names another
-	/// algorithm than this digest. Otherwise the octets compare in constant
-	/// time, so the time taken does not reveal where they first differ.
+	/// `algorithmOid` produced over the preimage, as [`NamedDigest::verdict`]
+	/// judges it.
 	///
 	/// # Errors
 	///
 	/// - `InvalidBytes` -- `recomputed` is not a `Uint8Array`.
 	#[wasm_bindgen(js_name = verdict)]
-	pub fn verdict(&self, algorithm_oid: &Oid, recomputed: JsBytes) -> Result<DigestVerdict, JsFault> {
-		if algorithm_oid.value() != self.inner.algorithm_oid() {
-			return Ok(DigestVerdict::AlgorithmMismatch);
-		}
-
-		let recomputed = recomputed.read()?;
-		let equal: bool = self.inner.digest().ct_eq(&recomputed).into();
-		if equal {
-			return Ok(DigestVerdict::Verified);
-		}
-
-		Ok(DigestVerdict::Mismatch)
+	pub fn verdict(&self, algorithm_oid: &Oid, recomputed: JsBytes) -> Result<VerdictLabel, JsFault> {
+		let verdict = self.inner.verdict(algorithm_oid.value(), recomputed.read()?)?;
+		Ok(VerdictLabel::from(verdict))
 	}
 }
 
@@ -1022,6 +1133,8 @@ mod tests {
 		let mut composer = FrameComposer::new();
 		let pinned = composer.with_version(JsValue::from_f64(2.0));
 		pinned.expect("V2 is a version");
+		let named = composer.with_id(bytes(b"assembly"));
+		named.expect("the id is bytes");
 
 		let built = composer.build();
 		built.expect("a V2 composer should build")

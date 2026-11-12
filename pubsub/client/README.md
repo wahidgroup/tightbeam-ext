@@ -8,9 +8,9 @@ This project is under active development. Public APIs MAY change without notice.
 
 ## Abstract
 
-This package is the client half of the `tightbeam-pubsub` extension. The Rust `TopicRegistry` pushes updates as server-initiated streams over the multiplexed connection of `@wahidgroup/tightbeam-ws-client`, and a `SubscriptionManager` turns those streams into typed subscriptions. The wire convention has its own page, [The Topic Registry and Wire Convention](../../docs/pubsub.md#wire-convention).
+This package is the client half of the `tightbeam-pubsub` extension. The Rust `TopicRegistry` pushes updates as server-initiated streams over the multiplexed connection of `@wahidgroup/tightbeam-ws-client`, and a `SubscriptionManager` turns those streams into typed subscriptions. The command convention has its own page, [The Topic Registry and Its Commands](https://github.com/wahidgroup/tightbeam-ext/blob/master/docs/pubsub.md#command-convention).
 
-The quick-start sample compiles as the `quick start` case of [`src/readme.test.ts`](src/readme.test.ts).
+The quick-start sample compiles in [`src/docs.test.ts`](https://github.com/wahidgroup/tightbeam-ext/blob/master/pubsub/client/src/docs.test.ts), which reads it from this README.
 
 ## Install
 
@@ -27,13 +27,10 @@ The package is published to GitHub Packages. Point the `@wahidgroup` scope there
 ## Quick start
 
 ```ts
-import { TightbeamWsClient } from "@wahidgroup/tightbeam-ws-client";
-import {
-	ClientPorts,
-	SubscriptionManager,
-} from "@wahidgroup/tightbeam-pubsub-client";
+import { Engine } from "@wahidgroup/tightbeam-ws-client";
+import { ClientPorts, SubscriptionManager } from "@wahidgroup/tightbeam-pubsub-client";
 
-const engine = await TightbeamWsClient.init();
+const engine = await Engine.load();
 const client = await engine.connectCleartext("ws://localhost:9110");
 const ports = ClientPorts.split(client);
 const manager = new SubscriptionManager(ports);
@@ -51,28 +48,28 @@ for await (const { message, frame } of prices) {
 
 ## Subscriptions
 
-A subscription delivers each update as the decoded payload, through a `for await` loop or an `onUpdate` handler, and a slow consumer slows only its own delivery. Implementation: [docs/pubsub-client.md](../../docs/pubsub-client.md#subscriptions).
+A subscription delivers each update as the decoded payload, through a `for await` loop or an `onUpdate` handler, and a slow consumer slows only its own delivery. Implementation: [docs/pubsub-client.md](https://github.com/wahidgroup/tightbeam-ext/blob/master/docs/pubsub-client.md#subscriptions).
 
 ## Payloads
 
-A codec types each topic payload. A payload can also be a full tightbeam frame under an `Envelope`, so the signature and seal of the publisher hold end to end through the broker. Implementation: [docs/pubsub-client.md](../../docs/pubsub-client.md#payload-shapes).
+A codec types each topic payload. A payload can also be a full tightbeam frame under an `Envelope`, so the signature and seal of the publisher hold end to end through the broker. Implementation: [docs/pubsub-client.md](https://github.com/wahidgroup/tightbeam-ext/blob/master/docs/pubsub-client.md#payload-shapes).
 
 ## Publish
 
-`publish` sends a payload to a topic on a server that enables client publish. Implementation: [docs/pubsub-client.md](../../docs/pubsub-client.md#publish).
+`publish` sends a payload to a topic on a server that enables client publish. Implementation: [docs/pubsub-client.md](https://github.com/wahidgroup/tightbeam-ext/blob/master/docs/pubsub-client.md#publish).
 
 ## Ordering and gaps
 
-A gate for each subscription checks the dense sequence of the registry, drops duplicates, and reports each gap. Implementation: [docs/pubsub-client.md](../../docs/pubsub-client.md#ordering-and-gaps).
+A gate for each subscription checks the dense sequence of the registry, drops duplicates, and reports each gap. Implementation: [docs/pubsub-client.md](https://github.com/wahidgroup/tightbeam-ext/blob/master/docs/pubsub-client.md#ordering-and-gaps).
 
 ## Reconnect replay
 
-The manager keeps the desired topic set across connections, and `reattach` replays it on a new client. Implementation: [docs/pubsub-client.md](../../docs/pubsub-client.md#reconnect-replay).
+The manager keeps the desired topic set across connections, and `reattach` replays it on a new client. Implementation: [docs/pubsub-client.md](https://github.com/wahidgroup/tightbeam-ext/blob/master/docs/pubsub-client.md#reconnect-replay).
 
 ## Non-topic streams
 
-A fallback handler serves the server pushes that no subscription matches. Implementation: [docs/pubsub-client.md](../../docs/pubsub-client.md#unmatched-pushes).
+A fallback handler serves the server pushes that no subscription matches. Implementation: [docs/pubsub-client.md](https://github.com/wahidgroup/tightbeam-ext/blob/master/docs/pubsub-client.md#unmatched-pushes).
 
 ## License
 
-Licensed under either of [MIT](./LICENSE-MIT) or [Apache-2.0](./LICENSE-APACHE) at your option.
+Licensed under either of [MIT](https://github.com/wahidgroup/tightbeam-ext/blob/master/pubsub/client/LICENSE-MIT) or [Apache-2.0](https://github.com/wahidgroup/tightbeam-ext/blob/master/pubsub/client/LICENSE-APACHE) at your option.

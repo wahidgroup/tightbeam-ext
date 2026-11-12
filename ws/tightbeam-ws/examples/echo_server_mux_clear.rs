@@ -1,19 +1,5 @@
-//! Multiplexed cleartext echo server for the tightbeam WebSocket transport.
-//!
-//! The server serves each client stream with the [`EchoBody`] that
-//! `TBWS_ECHO_BODY` names. In the `streaming` and `unary` bodies, a frame id
-//! can select an [`EchoCommand`] in place of the echo.
-//!
-//! Both endpoints MUST configure the same concurrency cap, because no handshake
-//! negotiates it. The connection carries NO confidentiality or integrity
-//! protection.
-//!
-//! Environment:
-//!   - `ECHO_WS_PORT`     listen port (default `9101`)
-//!   - `TBWS_ECHO_BODY`   the [`EchoBody`] to serve (default `streaming`)
-//!   - `MUX_STREAMS`      the symmetric concurrency cap, which [`DemoConfig`] reads
-//!
-//! [`EchoCommand`]: tightbeam_ws::testing::EchoCommand
+//! The multiplexed cleartext echo server of the e2e stack, as `docs/ws.md`
+//! (Demo servers) states it.
 
 use tightbeam::transport::handshake::negotiation::MuxSettings;
 use tightbeam_ws::io::WsTransport;
@@ -25,7 +11,7 @@ use tokio_tungstenite::MaybeTlsStream;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// The transport an accepted WebSocket connection follows.
+/// The transport of an accepted WebSocket connection.
 type ServerTransport = WsTransport<MaybeTlsStream<TcpStream>>;
 
 /// The variable that sets the listen port.
@@ -47,7 +33,7 @@ impl EchoConnection {
 
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
-	let port = PORT.parsed_or(9101u32)?;
+	let port: u16 = PORT.parsed()?;
 	let demo = DemoConfig::from_env()?;
 	let cap = demo.streams();
 	let body = EchoBody::from_env()?;
@@ -57,16 +43,7 @@ async fn main() -> Result<(), BoxError> {
 	println!("[echo-mux-clear] multiplexed cleartext tightbeam-ws echo server listening on ws://{addr}");
 
 	loop {
-		// A failed accept is the listener's own fault, such as a descriptor
-		// shortage, and it clears on retry.
-		let (transport, peer) = match listener.accept().await {
-			Ok(accepted) => accepted,
-			Err(error) => {
-				eprintln!("[echo-mux-clear] accept failed: {error}");
-				continue;
-			}
-		};
-
+		let (transport, peer) = listener.accept().await?;
 		tokio::spawn(async move {
 			let connection = EchoConnection(transport);
 			if let Err(error) = connection.serve(cap, body).await {

@@ -15,7 +15,7 @@ temp
 # Contains mutation testing data
 **/mutants.out*/
 
-# Node / e2e harness
+# Node modules, and the test output and HTML report folders of Playwright
 node_modules/
 **/tests/test-results
 **/tests/playwright-report

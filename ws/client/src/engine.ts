@@ -1,12 +1,6 @@
 /**
- * The loaded engine: the one proof that the WebAssembly module loaded, and
- * the owner of every synchronous wasm-backed parse and constructor.
- *
- * {@link Engine.load}, which `TightbeamWsClient.init` delegates to, is the
- * one way to make an {@link Engine}, so a call that needs the module before
- * it loaded does not type-check. The glue of each build loads through its own
- * {@link EngineLoader}, which imports it inside `load`, so an import of the
- * package never loads the glue.
+ * The loaded engine, the owner of every synchronous wasm-backed parse and
+ * constructor, as the engine section of `docs/ws-client.md` describes.
  */
 
 import type * as Glue from "#wasm";
@@ -19,7 +13,6 @@ import type {
 	MutualIdentity,
 	Oid,
 	SharedKey,
-	ZstdCompression,
 } from "#wasm";
 
 import { engineLoader } from "#engine";
@@ -28,7 +21,7 @@ import type { TransportError } from "./errors.js";
 import type { MessageCodec, PayloadCodec } from "./message.js";
 import type { OidName, OidView } from "./views.js";
 import { FrameBuilder } from "./builder/builder.js";
-import { OVER, TightbeamWsClient } from "./client.js";
+import { TightbeamWsClient } from "./client.js";
 import { Opening } from "./commitment.js";
 import {
 	Aes256Gcm,
@@ -39,11 +32,12 @@ import {
 	Sha3_256,
 } from "./crypto.js";
 import { Envelope } from "./envelope.js";
-import { BRANDED_CODE, ClientTransportError, DECIDES } from "./errors.js";
+import { ClientTransportError, TransportErrors } from "./errors.js";
 import { Frame } from "./frame.js";
 import { Codecs } from "./message.js";
+import { Once } from "./once.js";
 import { ZstdView } from "./compress.js";
-import { Lent, ProfileView } from "./views.js";
+import { ProfileView } from "./views.js";
 
 /**
  * The source the web build loads its binary from: a URL, a `Response`, the
@@ -64,42 +58,68 @@ export type EngineModule = Omit<typeof Glue, "default" | "initSync">;
  */
 export interface EngineLoader {
 	/**
-	 * Import and start the glue of this build.
+	 * Import and start the glue of this build once per realm, and answer the
+	 * same start to every later call. A failed start leaves the next call to
+	 * start again.
 	 *
-	 * @throws whatever the platform or the glue rejects with when the binary
-	 * is missing or does not start.
+	 * @throws the rejection of the platform or the glue when the binary fails.
 	 */
 	load(input?: EngineInput): Promise<EngineModule>;
 }
 
 /**
- * What the engine lends each class it builds, made once per engine and owned
- * by the realm: the glue of the loaded module, the content type `id-data`
- * that a sealed body takes when nothing names another, the profile hasher,
- * and the profile zstd at the default ceiling. Each handle is lent as a
- * view, so no class it reaches can release it.
+ * The key of the brand of the engine parts. The key is module-local, so only
+ * an {@link Engine} builds a value of {@link EngineParts}, and a static that
+ * takes the parts is reachable through the engine alone.
+ */
+const PARTS: unique symbol = Symbol("tightbeam engine parts");
+
+/**
+ * What the engine lends each class it builds, made once per engine. Each
+ * handle is a view that the realm owns, and only an {@link Engine} holds the
+ * parts, so a constructor that takes them runs after the load.
  */
 export interface EngineParts {
+	readonly [PARTS]: true;
+
+	/**
+	 * The engine that built the class, which a client answers on `engine`.
+	 */
+	readonly engine: Engine;
+
+	/**
+	 * The loaded module, which each built class calls into.
+	 */
 	readonly glue: EngineModule;
+
+	/**
+	 * The content type `id-data`, which a sealed body takes when nothing names
+	 * another.
+	 */
 	readonly data: OidView;
+
+	/**
+	 * The profile hasher, the default of each verdict that a frame judges.
+	 */
 	readonly sha3_256: Sha3_256;
+
+	/**
+	 * The profile zstd at the default ceiling.
+	 */
 	readonly zstd: ZstdView;
 }
 
 /**
- * The loaded engine.
- *
- * Every parse and constructor that calls into the module synchronously is a
- * method of this class, and only {@link Engine.load} builds one, once the
- * module loaded. A realm holds one engine, so every load after the first
- * resolves the same one.
+ * The loaded engine. Every parse and constructor that calls into the module
+ * synchronously is a method of this class, and only {@link Engine.load}
+ * builds one, once the module loaded. A realm holds one engine, so every load
+ * after the first resolves the same one.
  */
 export class Engine {
 	/**
-	 * The load in flight, or the engine it made. A failed load clears it, so
-	 * a later load starts again.
+	 * The load of the engine of this realm.
 	 */
-	static #loading: Promise<Engine> | undefined;
+	static readonly #loading = new Once<Engine>();
 
 	/**
 	 * The parts this engine lends the classes it builds.
@@ -107,9 +127,9 @@ export class Engine {
 	readonly #parts: EngineParts;
 
 	/**
-	 * The one zstd handle of the realm, which every `ZstdView` reaches.
+	 * The recognizer of the transport errors of this engine.
 	 */
-	readonly #zstd: ZstdCompression;
+	readonly #errors: TransportErrors;
 
 	/**
 	 * The object identifiers of the tightbeam profile, which the realm owns.
@@ -117,12 +137,12 @@ export class Engine {
 	readonly profile: ProfileView;
 
 	/**
-	 * The frame protocol versions, valued by their wire ordinals.
+	 * The frame protocol versions, valued by their encoded ordinals.
 	 */
 	readonly Version: EngineModule["Version"];
 
 	/**
-	 * The message priorities (V2+), valued by their wire ordinals.
+	 * The message priorities (V2+), valued by their encoded ordinals.
 	 */
 	readonly MessagePriority: EngineModule["MessagePriority"];
 
@@ -133,11 +153,8 @@ export class Engine {
 
 	/**
 	 * Frame-in-frame payloads: a codec whose messages are full tightbeam
-	 * frames, carried untouched inside the body of another frame.
-	 *
-	 * The pub/sub registry stamps its wrapper while the published inner frame
-	 * relays byte for byte, so the security its publisher applied survives the
-	 * broker and verifies on the subscriber.
+	 * frames, carried untouched inside the body of another frame, so the
+	 * security a publisher applied survives the pub/sub broker.
 	 */
 	readonly framed: MessageCodec<Frame>;
 
@@ -158,10 +175,17 @@ export class Engine {
 
 		const sha3_256 = Sha3_256.over(glue.Sha3_256, profile.sha3_256);
 		const handle = new glue.ZstdCompression();
-		const ceiling = handle.ceiling(undefined);
-		const zstd = ZstdView.over(handle, profile.zstd, ceiling);
-		this.#zstd = handle;
-		this.#parts = { glue, data: profile.data, sha3_256, zstd };
+		const zstd = ZstdView.over(handle, profile.zstd);
+
+		this.#parts = {
+			[PARTS]: true,
+			engine: this,
+			glue,
+			data: profile.data,
+			sha3_256,
+			zstd,
+		};
+		this.#errors = TransportErrors.over(glue.Codes);
 		this.profile = profile;
 		this.Version = glue.Version;
 		this.MessagePriority = glue.MessagePriority;
@@ -177,34 +201,21 @@ export class Engine {
 	}
 
 	/**
-	 * Load the engine of this realm once, through the loader of the build
-	 * condition, and resolve with it. A later load resolves the same engine
-	 * and ignores its `input`, as the glue does once it started.
+	 * Load the WebAssembly engine of this realm under the load rules of
+	 * `docs/ws-client.md`, and resolve with the {@link Engine} that proves it.
 	 *
 	 * @throws TightbeamTransportError `EngineUnavailable` when the binary is
 	 * missing or does not start, with the platform failure as its `cause`.
 	 */
 	static load(input?: EngineInput): Promise<Engine> {
-		const held = Engine.#loading;
-		if (held !== undefined) {
-			return held;
-		}
-
-		// The start is async, so a loader that throws as it is called rejects
-		// the start, and the catch clears the memo for every failure.
-		const loading = Engine.#start(input);
-		Engine.#loading = loading;
-		void loading.catch(() => {
-			Engine.#loading = undefined;
-		});
-
+		const loading = Engine.#loading.run(() => Engine.#start(input));
 		return loading;
 	}
 
 	/**
 	 * Start the glue from `input` and build the engine over it, or reject
-	 * with `EngineUnavailable`. {@link load} is the one caller of the loader,
-	 * so its memo is the one home of a single start per realm.
+	 * with `EngineUnavailable`. The loader starts the glue once per realm, and
+	 * the memo of {@link load} builds one engine over it.
 	 */
 	static async #start(input?: EngineInput): Promise<Engine> {
 		try {
@@ -216,28 +227,18 @@ export class Engine {
 		}
 	}
 
-	/**
-	 * The glue of the loaded module.
-	 */
 	get #glue(): EngineModule {
 		return this.#parts.glue;
 	}
 
 	/**
-	 * Narrow an unknown rejection to a structured {@link TransportError}: an
-	 * `Error` with the name brand of a transport error, whose `code` is a code
-	 * that the engine or the client declares. A forged error that carries the
-	 * brand and an unknown code does not narrow.
+	 * Narrow an unknown rejection to a structured {@link TransportError}: an `Error` with the name brand of a transport
+	 * error, whose `code` is a code that the engine or the client declares. The check answers `false` for a forged
+	 * error that carries the brand and an unknown code.
 	 */
 	isTransportError(value: unknown): value is TransportError {
-		const code = ClientTransportError[BRANDED_CODE](value);
-		if (code === undefined) {
-			return false;
-		}
-
-		const engineCode = this.#glue.Codes.has(code);
-		const declared = engineCode || ClientTransportError[DECIDES](code);
-		return declared;
+		const recognized = this.#errors.recognizes(value);
+		return recognized;
 	}
 
 	/**
@@ -271,29 +272,26 @@ export class Engine {
 	 * octets.
 	 */
 	digestInfo(algorithmOid: OidName, digest: Uint8Array): DigestInfo {
-		const digests = this.#glue.DigestInfo;
-		const of = (oid: Oid): DigestInfo => digests.of(oid, digest);
+		using named = algorithmOid.clone();
 
-		const info = Lent.oid(algorithmOid, of);
+		const info = this.#glue.DigestInfo.of(named, digest);
 		return info;
 	}
 
 	/**
 	 * The profile zstd compression, whose decompression stops at `maxOutput`
-	 * octets (16 MiB by default). The realm owns one zstd handle and lends it
-	 * as a view, and the view holds the ceiling the engine parsed, so a
-	 * ceiling leaves no handle behind.
+	 * octets, 16 MiB by default.
 	 *
-	 * @throws TightbeamTransportError `InvalidMaxOutput` when `maxOutput` is
-	 * no whole, non-negative number.
+	 * @throws TightbeamTransportError `InvalidMaxOutput` for a `maxOutput` that
+	 * is no whole, non-negative number.
 	 */
 	zstd(maxOutput?: number): ZstdView {
 		if (maxOutput === undefined) {
 			return this.#parts.zstd;
 		}
 
-		const ceiling = this.#zstd.ceiling(maxOutput);
-		const zstd = ZstdView.over(this.#zstd, this.profile.zstd, ceiling);
+		const bound = this.#glue.ZstdCompression.ceiling(maxOutput);
+		const zstd = ZstdView.over(bound, this.profile.zstd);
 		return zstd;
 	}
 
@@ -310,11 +308,20 @@ export class Engine {
 	}
 
 	/**
-	 * Begin building a frame, and seed its body with the raw bytes `message`
-	 * under the profile opaque wrapper when one is given.
+	 * Begin building a frame whose body carries the raw bytes `bytes` under
+	 * the profile opaque wrapper.
 	 */
-	frameBuilder(message?: Uint8Array): FrameBuilder {
-		const builder = FrameBuilder.of(this.#parts, message);
+	frameBuilder(bytes: Uint8Array): FrameBuilder {
+		const builder = FrameBuilder.bytes(this.#parts, bytes);
+		return builder;
+	}
+
+	/**
+	 * Begin building a frame whose body carries `message` under the schema of
+	 * `codec`.
+	 */
+	messageBuilder<T>(codec: MessageCodec<T>, message: T): FrameBuilder {
+		const builder = FrameBuilder.message(this.#parts, codec, message);
 		return builder;
 	}
 
@@ -337,12 +344,11 @@ export class Engine {
 	}
 
 	/**
-	 * The opening of a commitment over `bodyDer` under `salt`. The opening
-	 * takes the salt, so `salt` keeps an empty shell that frees as any handle
-	 * does.
+	 * The opening of a commitment over `bodyDer` under `salt`. It copies `bodyDer` and then takes the salt, so `salt`
+	 * keeps an empty shell.
 	 *
-	 * @throws TightbeamTransportError `CommitmentSpent` when the salt moved
-	 * out of `salt` already.
+	 * @throws TightbeamTransportError `CommitmentSpent` when the salt moved out of `salt` already.
+	 * @throws the refusal of the copy of `bodyDer`, such as for a detached buffer, and `salt` keeps its salt.
 	 */
 	opening(salt: CommitmentSalt, bodyDer: Uint8Array): Opening {
 		const opening = Opening.over(this.#parts, salt, bodyDer);
@@ -356,7 +362,7 @@ export class Engine {
 	 * not 32 octets, or names no key.
 	 */
 	signingKey(bytes: Uint8Array): Secp256k1SigningKey {
-		const key = Secp256k1SigningKey.fromBytes(this.#glue, bytes);
+		const key = Secp256k1SigningKey.fromBytes(this.#parts, bytes);
 		return key;
 	}
 
@@ -367,7 +373,7 @@ export class Engine {
 	 * name no secp256k1 point.
 	 */
 	verifyingKey(sec1: Uint8Array): Secp256k1VerifyingKey {
-		const key = Secp256k1VerifyingKey.fromSec1Bytes(this.#glue, sec1);
+		const key = Secp256k1VerifyingKey.fromSec1Bytes(this.#parts, sec1);
 		return key;
 	}
 
@@ -379,7 +385,7 @@ export class Engine {
 	 * octets.
 	 */
 	aes256Gcm(shared: SharedKey): Aes256Gcm {
-		const cipher = Aes256Gcm.fromKey(this.#glue, shared);
+		const cipher = Aes256Gcm.fromKey(this.#parts, shared);
 		return cipher;
 	}
 
@@ -390,8 +396,7 @@ export class Engine {
 	 * name no secp256k1 point.
 	 */
 	hpkeEncryptor(recipientPublicKey: Uint8Array): HpkeEncryptor {
-		const glue = this.#glue;
-		const encryptor = HpkeEncryptor.fromBytes(glue, recipientPublicKey);
+		const encryptor = HpkeEncryptor.fromBytes(this.#parts, recipientPublicKey);
 		return encryptor;
 	}
 
@@ -402,75 +407,46 @@ export class Engine {
 	 * not 32 octets, or names no key.
 	 */
 	hpkeDecryptor(secretKey: Uint8Array): HpkeDecryptor {
-		const decryptor = HpkeDecryptor.fromBytes(this.#glue, secretKey);
+		const decryptor = HpkeDecryptor.fromBytes(this.#parts, secretKey);
 		return decryptor;
 	}
 
 	/**
-	 * Open a server-authenticated multiplexed session to `url`, pinning
-	 * `serverCertDer` as the trusted server. Resolves once the handshake
-	 * completes and multiplexing is negotiated.
+	 * Open a server-authenticated multiplexed session to `url` that pins
+	 * `serverCertDer`, and resolve once the handshake negotiated multiplexing.
 	 *
-	 * @throws TightbeamTransportError, as the call throws, `InvalidStreamCap`
-	 * when the cap is no whole number from 1 to 2^32-1, and
-	 * `SessionOfferRequiresMutual` when the options name a session knob.
+	 * @throws TightbeamTransportError, as a rejection, for a url, certificate, option, or dial fault that the
+	 * connectors section of `docs/ws-client.md` lists. An abort rejects with the reason of the signal.
 	 */
-	async connect(
-		url: string,
-		serverCertDer: Uint8Array,
-		options?: ConnectOptions,
-	): Promise<TightbeamWsClient> {
-		const connector = this.#glue.MuxWsClient;
-		const dialing = connector.connect(url, serverCertDer, options);
-		const socket = await dialing;
-
-		const client = TightbeamWsClient[OVER](this, socket);
+	connect(url: string, serverCertDer: Uint8Array, options?: ConnectOptions): Promise<TightbeamWsClient> {
+		const parts = this.#parts;
+		const client = TightbeamWsClient.connect(parts, url, serverCertDer, options);
 		return client;
 	}
 
 	/**
-	 * As {@link connect}, and present a client identity for mutual
-	 * authentication. The proof of the certificate key is the raw 32-byte
-	 * secp256k1 scalar, or an external `TransportSigner` (WebAuthn, wallet,
-	 * KMS bridge) whose key stays in its JavaScript backend.
+	 * As {@link connect}, and present a client identity whose key is the raw
+	 * 32-byte secp256k1 scalar or an external `TransportSigner`.
 	 *
-	 * @throws TightbeamTransportError `InvalidBytes` when a certificate is
-	 * not a `Uint8Array`, `InvalidClientKey` when the key is neither the raw
-	 * scalar nor signer-shaped, and `InvalidStreamCap` as {@link connect}
-	 * does.
+	 * @throws TightbeamTransportError, as a rejection, for a url, identity, option, or dial fault that the connectors
+	 * section of `docs/ws-client.md` lists. An abort rejects as {@link connect} states.
 	 */
-	async connectMutual(
-		url: string,
-		identity: MutualIdentity,
-		options?: MutualConnectOptions,
-	): Promise<TightbeamWsClient> {
-		const connector = this.#glue.MuxWsClient;
-		const dialing = connector.connectMutual(url, identity, options);
-		const socket = await dialing;
-
-		const client = TightbeamWsClient[OVER](this, socket);
+	connectMutual(url: string, identity: MutualIdentity, options?: MutualConnectOptions): Promise<TightbeamWsClient> {
+		const parts = this.#parts;
+		const client = TightbeamWsClient.connectMutual(parts, url, identity, options);
 		return client;
 	}
 
 	/**
-	 * Open a cleartext multiplexed session to `url`. The promise resolves once
-	 * the socket is open, so a failed dial rejects here rather than on the
-	 * first emit.
+	 * Open a cleartext multiplexed session to `url`, which resolves once the socket is open and carries NO
+	 * confidentiality or integrity protection. Both endpoints MUST configure the same symmetric stream cap.
 	 *
-	 * - Cleartext multiplexing has no handshake negotiation, so the cap is
-	 *   symmetric and both endpoints MUST configure the same value.
-	 * - The connection carries NO confidentiality or integrity protection.
-	 *
-	 * @throws TightbeamTransportError as {@link connect} does.
+	 * @throws TightbeamTransportError, as a rejection, for a url, option, or dial fault that the connectors section of
+	 * `docs/ws-client.md` lists. An abort rejects as {@link connect} states.
 	 */
-	async connectCleartext(
-		url: string,
-		options?: CleartextConnectOptions,
-	): Promise<TightbeamWsClient> {
-		const dialing = this.#glue.MuxWsClient.connectCleartext(url, options);
-		const socket = await dialing;
-
-		const client = TightbeamWsClient[OVER](this, socket);
+	connectCleartext(url: string, options?: CleartextConnectOptions): Promise<TightbeamWsClient> {
+		const parts = this.#parts;
+		const client = TightbeamWsClient.connectCleartext(parts, url, options);
 		return client;
 	}
 }

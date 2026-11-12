@@ -1,15 +1,14 @@
 import { describe, expect, it } from "vitest";
 
 import { ClientTransportError } from "./errors.js";
-import { TightbeamWsClient } from "./index.js";
+import { Engine } from "./index.js";
 import { Owned } from "./owned.js";
 
 /**
- * The hold of a real glue handle. Every kind-3 holder releases through
- * {@link Owned}, so this one test proves the release for each of them.
+ * The hold of a real glue handle by {@link Owned}.
  */
 
-const engine = await TightbeamWsClient.init();
+const engine = await Engine.load();
 
 /**
  * The content type `id-data`, whose glue handle the test holds.
@@ -23,8 +22,6 @@ describe("Owned", () => {
 		hold[Symbol.dispose]();
 		expect(() => handle.toString()).toThrow();
 		expect(() => hold[Symbol.dispose]()).not.toThrow();
-		expect(() => hold.use("toString")).toThrow(
-			expect.objectContaining({ code: "KeyReleased" }),
-		);
+		expect(() => hold.use("toString")).toThrow(expect.objectContaining({ code: "KeyReleased" }));
 	});
 });

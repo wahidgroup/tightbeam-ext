@@ -3,20 +3,11 @@
  * by the Playwright specs and the Node vitest lane.
  */
 
-import { requireEnv } from "#ws-env";
-import { parseCount, readDialFacts } from "#ws-fixtures";
+import { ENVIRONMENT, Identities } from "#ws-env";
+import { DialFacts } from "#ws-fixtures";
 
-import { readTopicSecret } from "../fixtures.js";
-
-/**
- * The stack fact that bounds each subscriber queue of the demo servers.
- */
-const QUEUE_CAPACITY = "PUBSUB_QUEUE_CAPACITY";
-
-/**
- * The text of {@link QUEUE_CAPACITY}, which the stack always sets.
- */
-const queueCapacity = requireEnv(QUEUE_CAPACITY);
+import type { BoardMode } from "../fixtures.js";
+import { BoardQuery, TopicSecret } from "../fixtures.js";
 
 /**
  * Every stack fact of the pubsub suites, read once from the environment that
@@ -26,36 +17,53 @@ const queueCapacity = requireEnv(QUEUE_CAPACITY);
  */
 export const STACK = {
 	/**
-	 * The multiplexed encrypted pub/sub demo server: answers the `sub/` and
-	 * `unsub/` commands, publishes a frame's payload on a `pub/<topic>` id,
-	 * pushes a non-topic `notice` stream on a `poke` id, and forbids every
-	 * subscribe and every publish under `forbidden/`. The stack runs it
-	 * behind the demo session-budget paywall.
+	 * The endpoint of the demo server, which `docs/pubsub.md` (Testing)
+	 * describes.
 	 */
-	pubsubEndpoint: requireEnv("PUBSUB_WS_ENDPOINT"),
+	pubsubEndpoint: ENVIRONMENT.text("PUBSUB_WS_ENDPOINT"),
 
 	/**
-	 * The second demo server, whose custom `RelayBackplane` routes every
-	 * publish through the backend processor servlet (which uppercases the
-	 * payload) before sequencing and fan-out.
+	 * The endpoint of the second demo server, which relays every publish
+	 * through the processor servlet.
 	 */
-	pubsubProcessedEndpoint: requireEnv("PUBSUB_PROCESSED_WS_ENDPOINT"),
+	pubsubProcessedEndpoint: ENVIRONMENT.text("PUBSUB_PROCESSED_WS_ENDPOINT"),
 
 	/**
 	 * The demo server's per-subscriber queue bound (`PUBSUB_QUEUE_CAPACITY`
 	 * in `pubsub/scripts/stack-env.sh`). A publish burst one past this bound
 	 * forces a DropOldest eviction, so the gap tests size themselves from it.
 	 */
-	pubsubQueueCapacity: parseCount(QUEUE_CAPACITY, queueCapacity),
+	pubsubQueueCapacity: ENVIRONMENT.count("PUBSUB_QUEUE_CAPACITY"),
 
 	/**
 	 * The pre-shared key of the topic seal, which the processor seals its
 	 * rebuilt frames under.
 	 */
-	topicSecret: readTopicSecret(requireEnv),
+	topicSecret: TopicSecret.read(ENVIRONMENT),
 
 	/**
 	 * The stream cap of the stack, and the demo paywall of both demo servers.
 	 */
-	...readDialFacts(requireEnv),
+	dial: DialFacts.read(ENVIRONMENT),
+
+	/**
+	 * The path of the board page that dials the `endpoint` of `board` with the
+	 * demo identity and subscribes to its `topic` in its `mode`.
+	 */
+	boardPath(board: { readonly endpoint: string; readonly topic: string; readonly mode: BoardMode }): string {
+		const identities = Identities.stack;
+		const query = new BoardQuery({
+			...board,
+			identity: {
+				serverCertDer: identities.base64("server.cert.der"),
+				clientCertDer: identities.base64("client.cert.der"),
+				clientKey: identities.base64("client.key"),
+			},
+			dial: STACK.dial,
+			secret: STACK.topicSecret,
+		});
+
+		const path = `/${query.search()}`;
+		return path;
+	},
 } as const;

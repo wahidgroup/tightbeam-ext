@@ -1,17 +1,7 @@
 //! The shared specs of `tightbeam_ws::testing::specs` reject a run that
 //! breaks the behavior they grade, as tightbeam scenarios.
-//!
-//! Each transport of the repository grades its suites with these specs, so a
-//! spec that held for any run would prove nothing for any of them. Each
-//! scenario here breaks one behavior on purpose, completes its run, and
-//! expects the assertion layer to reject it: the violation is the spec at
-//! work.
 
 #![cfg(feature = "testing")]
-// The colony runtime macros expand `cfg(feature = ...)` probes against the
-// invoking crate's feature namespace. Those upstream feature names do not
-// exist in this crate, so the leaked cfg warnings carry no signal here.
-#![allow(unexpected_cfgs)]
 
 use core::num::NonZeroUsize;
 use std::str::FromStr;
@@ -47,7 +37,7 @@ fn rejected_by(spec: &'static BuiltAssertSpec) -> Result<ScenarioConfig, Scenari
 /// session on `trace`.
 async fn cleartext_echo(trace: &TraceCollector) -> Served {
 	let listener = WsListener::<DefaultCryptoProvider>::bind_cleartext("127.0.0.1:0").await?;
-	let addr = TightBeamSocketAddr(listener.local_addr()?);
+	let addr = TightBeamSocketAddr(listener.local_addr());
 	Ok((EchoService::serve(listener, None, trace), addr))
 }
 
@@ -67,8 +57,8 @@ async fn cleartext_exchange(addr: TightBeamSocketAddr) -> Result<Option<Frame>, 
 
 /// The identity of an encrypted server, which its client pins.
 fn server_identity() -> Identity {
-	let minted = Identity::mint("CN=spec probe,O=tightbeam-ws,C=US", 1, Duration::from_secs(3600));
-	minted.expect("a test identity mints")
+	let issued = Identity::mint("CN=spec probe,O=tightbeam-ws,C=US", 1, Duration::from_secs(3600));
+	issued.expect("a test identity issues")
 }
 
 /// A gate that refuses every call.
@@ -89,7 +79,7 @@ tb_scenario! {
 	environment ServiceClient {
 		server: |SetupEnv { trace, .. }| async move {
 			let listener = WsListener::<DefaultCryptoProvider>::bind_cleartext("127.0.0.1:0").await?;
-			let addr = TightBeamSocketAddr(listener.local_addr()?);
+			let addr = TightBeamSocketAddr(listener.local_addr());
 			let handle = server! {
 				protocol WsListener: listener,
 				policies: {
@@ -136,7 +126,7 @@ tb_scenario! {
 		context: server_identity(),
 		server: |SetupEnv { trace, context }| async move {
 			let loopback = TightBeamSocketAddr::from_str("127.0.0.1:0")?;
-			let (listener, addr) = <WsListener as EncryptedProtocol>::bind_with(loopback, context.server_config()?).await?;
+			let (listener, addr) = <WsListener as EncryptedProtocol>::bind_with(loopback, context.server_config()).await?;
 			Ok((EchoService::serve(listener, None, &trace), addr))
 		},
 		client: |ClientEnv { trace, context, addr }| async move {
@@ -172,43 +162,17 @@ tb_scenario! {
 
 #[cfg(feature = "colony")]
 mod colony {
-	use tightbeam::colony::SubmitWork;
-	use tightbeam::testing::error::TestingError;
+	use tightbeam::tb_scenario;
 	use tightbeam::testing::{ClusterEnv, SetupEnv};
-	use tightbeam::transport::tcp::r#async::TokioListener;
-	use tightbeam::{cluster, tb_scenario, TightBeamError};
-	use tightbeam_ws::protocol::WsListener;
 	use tightbeam_ws::testing::specs::{EdgeWorkSpec, UnservedWorkSpec};
-	use tightbeam_ws::testing::{WorkClient, WorkPlane};
+	use tightbeam_ws::testing::{WorkClient, WorkGateway, WorkPlane};
 
 	use super::rejected_by;
 
-	cluster! {
-		/// TCP colony gateway with a WebSocket edge accept plane.
-		pub ProbeGateway,
-		protocol: TokioListener,
-		edge: WsListener
-	}
-
 	/// The identities of the work plane of every scenario.
 	fn work_plane() -> WorkPlane {
-		let minted = WorkPlane::mint("tightbeam-ws");
-		minted.expect("the work plane identities mint")
-	}
-
-	/// Submit one probe work frame through the edge of `gateway` to the
-	/// servlet type `servlet`, and return how the submission ended.
-	async fn submit(
-		plane: &WorkPlane,
-		gateway: &ProbeGateway,
-		servlet: tightbeam::urn::Urn<'static>,
-	) -> Result<Result<tightbeam::Frame, TightBeamError>, TightBeamError> {
-		let unbound = TightBeamError::TestingError(TestingError::UnexpectedOutcome("the edge plane did not bind"));
-		let edge = gateway.edge_addr().copied().ok_or(unbound)?;
-		let mut client = plane.client().connect::<WsListener>(edge).await?;
-
-		let work = plane.client().work(b"spec-probe").await?;
-		Ok(client.submit_work_to(servlet, &work).await)
+		let issued = WorkPlane::mint("tightbeam-ws");
+		issued.expect("the work plane identities issue")
 	}
 
 	// The spec of served work rejects a run whose work names a servlet type
@@ -218,10 +182,10 @@ mod colony {
 		config: rejected_by(EdgeWorkSpec::latest()),
 		environment Cluster {
 			context: work_plane(),
-			start: |SetupEnv { trace, context }| async move { context.gateway::<ProbeGateway>(&trace, "127.0.0.1:0").await },
+			start: |SetupEnv { trace, context }| async move { context.gateway::<WorkGateway>(&trace, "127.0.0.1:0").await },
 			hives: |SetupEnv { trace, context }| vec![async move { context.hive(&trace).await }],
 			client: |ClusterEnv { context, cluster, .. }| async move {
-				let refused = submit(&context, &cluster, WorkClient::servlet("unserved")?).await?;
+				let refused = context.client().submit(&cluster, WorkClient::servlet("unserved")?, b"spec-probe").await?;
 				assert!(refused.is_err(), "unserved work MUST be refused, got {refused:?}");
 				cluster.stop();
 				Ok(())
@@ -236,10 +200,10 @@ mod colony {
 		config: rejected_by(UnservedWorkSpec::latest()),
 		environment Cluster {
 			context: work_plane(),
-			start: |SetupEnv { trace, context }| async move { context.gateway::<ProbeGateway>(&trace, "127.0.0.1:0").await },
+			start: |SetupEnv { trace, context }| async move { context.gateway::<WorkGateway>(&trace, "127.0.0.1:0").await },
 			hives: |SetupEnv { trace, context }| vec![async move { context.hive(&trace).await }],
 			client: |ClusterEnv { context, cluster, .. }| async move {
-				let served = submit(&context, &cluster, WorkClient::probe()?).await?;
+				let served = context.client().submit(&cluster, WorkClient::probe()?, b"spec-probe").await?;
 				assert!(served.is_ok(), "served work MUST reach the probe, got {served:?}");
 				cluster.stop();
 				Ok(())

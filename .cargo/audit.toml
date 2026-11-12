@@ -1,8 +1,8 @@
 # cargo-audit configuration (consumed by `make audit`).
 #
-# Advisories listed here are acknowledged but suppressed because no fixed
-# release exists. Each entry MUST carry a justification and be revisited when
-# an upstream fix ships.
+# Advisories listed here are acknowledged but suppressed, because each listed
+# advisory has no fix that this dependency graph can take. Each entry MUST
+# carry a justification and be revisited when an upstream fix ships.
 
 [advisories]
 ignore = [

@@ -20,8 +20,10 @@
 		"clean": "npm run clean --workspaces --if-present"
 	},
 	"devDependencies": {
+		"@wahidgroup/lint-rules": "0.2.0",
 		"eslint": "9.39.5",
-		"prettier": "3.9.6"
+		"prettier": "3.9.6",
+		"typescript": "6.0.3"
 	},
 	"license": "MIT OR Apache-2.0"
 }

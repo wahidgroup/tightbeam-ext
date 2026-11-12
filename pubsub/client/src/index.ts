@@ -1,40 +1,26 @@
 /**
- * Topic subscriptions for the tightbeam WebSocket client.
- *
- * Pairs with the `tightbeam-pubsub` Rust crate: `sub/<topic>` and
- * `unsub/<topic>` command streams manage membership, updates arrive as
- * server-initiated streams whose frame id is the topic, and
- * `end/<topic>` completes a subscription when the server quiesces.
+ * Topic subscriptions for the tightbeam WebSocket client. The page
+ * `docs/pubsub-client.md` specifies the package.
  */
 
-export { TopicGate } from "./gate.js";
-export type { GateVerdict } from "./gate.js";
-export {
-	ClientPorts,
-	MAX_DEFERRED,
-	PayloadShape,
-	SubscriptionError,
-	SubscriptionManager,
-} from "./manager.js";
+export { ClientPorts, MAX_DEFERRED, SubscriptionError, SubscriptionManager } from "./manager.js";
 export type {
-	CommandLane,
 	CommandPort,
-	DeferralBudget,
 	EndHandler,
 	GapHandler,
 	HandlerSubscription,
 	IteratingSubscription,
 	ManagerOptions,
-	PayloadSource,
+	PublishPayload,
 	ServePort,
-	ShapeUse,
 	SubscribeOptions,
-	Subscriber,
+	SubscribePayload,
 	SubscriptionErrorCode,
 	SubscriptionObservers,
 	SubscriptionState,
 	Update,
 	UpdateHandler,
 } from "./manager.js";
+export type { Gap } from "./gate.js";
 export { Command, Topic, TopicError } from "./topic.js";
-export type { CommandBody, TopicErrorCode } from "./topic.js";
+export type { CommandPayload, TopicErrorCode } from "./topic.js";

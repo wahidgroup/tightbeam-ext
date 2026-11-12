@@ -316,14 +316,15 @@ extension_crate_names() {
 	printf '%s' "$names"
 }
 
-# The crates of the extension that the release workflow publishes, one per
-# line. Cargo reads `publish = false` as an empty registry list.
+# The crates of the extension that the release workflow publishes to
+# crates.io, one per line. Cargo reads `publish = false` as an empty registry
+# list.
 extension_publishable_crates() {
 	cargo metadata --no-deps --format-version 1 --offline \
 		| jq -r --arg root "$(pwd -P)/${EXTENSION}/" '
 			.packages[]
 			| select(.manifest_path | startswith($root))
-			| select(.publish != [])
+			| select(.publish == null or (.publish | index("crates-io")))
 			| .name
 		'
 }

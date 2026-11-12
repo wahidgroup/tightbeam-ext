@@ -5,22 +5,21 @@ mod support;
 
 use std::path::PathBuf;
 use std::process::{Command, Output};
-use std::time::Duration;
 
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::CertificateDer;
 use tightbeam_grpc::couple::ClaimSigner;
 use tightbeam_grpc::protocol::GrpcAddr;
+use tightbeam_grpc::testing::CoupledStack;
 use tightbeam_ws::testing::IdentityFiles;
-use tonic::transport::{
-	Certificate as TonicCertificate, Channel, ClientTlsConfig, Endpoint, Identity as TonicIdentity,
-};
+use tonic::transport::{Certificate as TonicCertificate, ClientTlsConfig, Endpoint, Identity as TonicIdentity};
 
-use tightbeam::testing::error::TestingError;
 use tightbeam::testing::SetupEnv;
 use tightbeam::urn::Urn;
 use tightbeam::{exactly, tb_assert_spec, tb_scenario, urn, TightBeamError};
 use tightbeam_ws::testing::EnvVar;
+
+use support::{ScenarioClock, StockChannel, OPENING};
 
 /// The host port of the coupled edge, which the stack allocates.
 const COUPLED_PORT: EnvVar = EnvVar::new("GRPC_COUPLED_HOST_PORT");
@@ -41,16 +40,14 @@ const STOCK_ANSWER: Urn<'static> = urn!("test", "event:stock/answer");
 /// What the signed call read from the edge: `served` or `failed`.
 const SIGNED_ANSWER: Urn<'static> = urn!("test", "event:stock/signed");
 
-/// The signed method of the coupled edge.
-const PLACE: &str = "/orders.v1.Orders/Place";
-
-/// How long a case retries while the coupler opens its session.
-const OPENING: Duration = Duration::from_secs(20);
+/// What a call of the signing caller with no claim read from the edge:
+/// `denied` or `other`.
+const UNSIGNED_ANSWER: Urn<'static> = urn!("test", "event:stock/unsigned");
 
 /// The coupled edge of the stack, and the files that a stock caller loads.
 struct Stack {
 	port: u16,
-	certs: PathBuf,
+	files: CoupledStack,
 	proto: PathBuf,
 }
 
@@ -62,60 +59,55 @@ impl Stack {
 			.expect("the grpc e2e lane exports the port of the coupled edge");
 		let certs: PathBuf = CERT_DIR.parsed().expect("the grpc e2e lane exports the certificate directory");
 		let proto = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../docker/proto");
-		Self { port, certs: certs.join("coupled"), proto }
+		Self { port, files: CoupledStack::under(certs), proto }
 	}
 
 	/// One call of `Get` by grpcurl, on the host network, where the edge
-	/// certificate names loopback.
+	/// certificate names loopback, which grpcurl ends past [`OPENING`].
 	fn grpcurl(&self) -> std::io::Result<Output> {
-		let certs = format!("{}:/coupled:ro", self.certs.display());
+		let mounted = CoupledStack::at("/coupled");
+		let certs = format!("{}:{}:ro", self.files.dir().display(), mounted.dir().display());
 		let proto = format!("{}:/proto:ro", self.proto.display());
 		let request = format!(r#"{{"id":"{ORDER}"}}"#);
 		let target = format!("localhost:{}", self.port);
+		let method = CoupledStack::GET.trim_start_matches('/');
+		let (root, caller, key) = (mounted.root(), mounted.caller_chain(), mounted.caller_key());
 
 		Command::new("docker")
 			.args(["run", "--rm", "--network", "host", "-v", &certs, "-v", &proto, GRPCURL])
-			.args([
-				"-cacert",
-				"/coupled/root.pem",
-				"-cert",
-				"/coupled/caller.crt",
-				"-key",
-				"/coupled/caller.key",
-			])
+			.arg("-cacert")
+			.arg(root)
+			.arg("-cert")
+			.arg(caller)
+			.arg("-key")
+			.arg(key)
 			.args(["-servername", "localhost", "-import-path", "/proto", "-proto", "orders.proto"])
-			.args(["-d", &request, &target, "orders.v1.Orders/Get"])
+			.arg("-max-time")
+			.arg(OPENING.as_secs_f64().to_string())
+			.args(["-d", &request, &target, method])
 			.output()
 	}
 
-	/// The order id that grpcurl read, retried until the coupler serves.
+	/// The order id that grpcurl read, once the coupler serves.
 	async fn answer(&self) -> Result<String, TightBeamError> {
-		let deadline = tokio::time::Instant::now() + OPENING;
-		loop {
-			let output = self.grpcurl()?;
-			let printed = String::from_utf8_lossy(&output.stdout);
-			if output.status.success() && printed.contains(ORDER) {
-				return Ok(ORDER.to_owned());
-			}
-
-			if tokio::time::Instant::now() >= deadline {
-				eprintln!("grpcurl: {}", String::from_utf8_lossy(&output.stderr));
-				return Err(TightBeamError::TestingError(TestingError::UnexpectedOutcome(
-					"grpcurl never read its order",
-				)));
-			}
-
-			tokio::time::sleep(Duration::from_millis(500)).await;
+		self.signer_channel().await?.serving(&ScenarioClock::System).await?;
+		let output = self.grpcurl()?;
+		let printed = String::from_utf8_lossy(&output.stdout);
+		if output.status.success() && printed.contains(ORDER) {
+			return Ok(ORDER.to_owned());
 		}
+
+		eprintln!("grpcurl: {}", String::from_utf8_lossy(&output.stderr));
+		Err(support::unexpected("grpcurl did not read its order"))
 	}
 }
 
 impl Stack {
 	/// A tonic channel to the edge under the signing caller of the stack.
-	async fn signer_channel(&self) -> Result<Channel, TightBeamError> {
-		let read = |name: &str| std::fs::read_to_string(self.certs.join(name));
-		let root = TonicCertificate::from_pem(read("root.pem")?);
-		let identity = TonicIdentity::from_pem(read("signer.crt")?, read("signer.key")?);
+	async fn signer_channel(&self) -> Result<StockChannel, TightBeamError> {
+		let read = std::fs::read_to_string;
+		let root = TonicCertificate::from_pem(read(self.files.root())?);
+		let identity = TonicIdentity::from_pem(read(self.files.signer_chain())?, read(self.files.signer_key())?);
 		let tls = ClientTlsConfig::new()
 			.ca_certificate(root)
 			.domain_name("localhost")
@@ -123,51 +115,41 @@ impl Stack {
 
 		let edge = GrpcAddr::from(std::net::SocketAddr::from(([127, 0, 0, 1], self.port)));
 		let endpoint = Endpoint::from_shared(format!("https://{edge}")).map_err(support::unexpected)?;
-		endpoint
-			.tls_config(tls)
-			.map_err(support::unexpected)?
-			.connect()
-			.await
-			.map_err(support::unexpected)
+		let endpoint = endpoint.tls_config(tls).map_err(support::unexpected)?;
+		let channel = support::bounded(endpoint.connect()).await?.map_err(support::unexpected)?;
+		Ok(StockChannel::from(channel))
 	}
 
-	/// One signed call of `Place`, retried until the coupler serves.
+	/// One signed call of `Place`, once the coupler serves.
 	async fn signed(&self, body: &[u8]) -> Result<Vec<u8>, TightBeamError> {
 		let channel = self.signer_channel().await?;
-		let leaf = CertificateDer::from_pem_file(self.certs.join("signer.crt")).map_err(support::unexpected)?;
-		let identity = IdentityFiles::new(&self.certs, "claims")?.load()?;
-		let signer = ClaimSigner::new(identity.signing_identity()?, [], &leaf);
+		channel.serving(&ScenarioClock::System).await?;
+		let leaf = CertificateDer::from_pem_file(self.files.signer_chain()).map_err(support::unexpected)?;
+		let identity = IdentityFiles::new(self.files.dir(), CoupledStack::CLAIMS)?.load()?;
+		let signer = ClaimSigner::new(identity.signing_identity(), [], &leaf);
+		let place = CoupledStack::PLACE.parse().map_err(support::edge_error)?;
 
-		let deadline = tokio::time::Instant::now() + OPENING;
-		loop {
-			let claim = signer.sign(PLACE, body).await?;
-			let answer = support::call(&channel, PLACE, body, Some(&claim)).await;
-			match answer {
-				Ok(answer) => return Ok(answer),
-				Err(status) if tokio::time::Instant::now() >= deadline => {
-					eprintln!("signed call: {status:?}");
-					return Err(TightBeamError::TestingError(TestingError::UnexpectedOutcome(
-						"the signed call never served",
-					)));
-				}
-				Err(_) => tokio::time::sleep(Duration::from_millis(500)).await,
-			}
-		}
+		let claim = signer.sign(&place, body).await?;
+		let answer = channel.call(CoupledStack::PLACE, body, Some(&claim)).await?;
+		answer.map_err(support::unexpected)
 	}
 }
 
 tb_assert_spec! {
-	/// The signed call reads back the order it sent.
+	/// The signed call reads back the order it sent, and the same call with
+	/// no claim proves less than the route requires.
 	pub SignedCallSpec,
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(SIGNED_ANSWER, exactly!(1), equals!("served"))
+			(SIGNED_ANSWER, exactly!(1), equals!("served")),
+			(UNSIGNED_ANSWER, exactly!(1), equals!("denied"))
 		]
 	}
 }
 
-// A tonic caller signs a claim, which the edge and the servlet both verify.
+// A tonic caller signs a claim, which the edge and the servlet both verify,
+// and its call with no claim is denied.
 tb_scenario! {
 	name: a_signed_call_reaches_a_servlet_through_the_coupled_edge,
 	spec: SignedCallSpec,
@@ -178,6 +160,10 @@ tb_scenario! {
 			let answer = context.signed(&order).await;
 			let read = if answer.as_deref().ok() == Some(order.as_slice()) { "served" } else { "failed" };
 			trace.event_with(SIGNED_ANSWER, &[], read)?;
+
+			let unsigned = context.signer_channel().await?.call(CoupledStack::PLACE, &order, None).await?;
+			let denied = support::code_of(unsigned) == Some(tonic::Code::PermissionDenied);
+			trace.event_with(UNSIGNED_ANSWER, &[], if denied { "denied" } else { "other" })?;
 			answer.map(|_| ())
 		}
 	}

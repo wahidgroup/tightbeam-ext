@@ -1,13 +1,17 @@
-# asn extension targets: DER codec crates for TypeScript MessageCodec façades.
-# Invoked directly (make -C asn <target>) or through the repo root Makefile
-# (make test asn).
+# The targets of the asn extension, which the root Makefile composes: docs/development.md.
 
 .PHONY: setup check build test lint wasm client sbom smoke pack fixture-package
 
 REPO := ..
-CRATES := -p tightbeam-asn -p tightbeam-asn-derive -p tightbeam-asn-names
+CRATES := $(addprefix -p ,$(shell REPO_ROOT='$(abspath $(REPO))' bash -c '. "$$REPO_ROOT/scripts/lib/extension.sh" && extension_crates asn'))
+ifeq ($(strip $(CRATES)),)
+$(error scripts/lib/extension.sh lists no crate of asn)
+endif
 
 CARGO_FLAGS := $(if $(features),--features "$(features)") $(if $(no-default),--no-default-features)
+
+# The JavaScript conversions of `tightbeam-asn` and of each derive expansion, which compile for wasm32 alone.
+WASM_LINT := -p tightbeam-asn --target wasm32-unknown-unknown --lib --example fixture_package --test wasm_js_roundtrip
 
 # Local `make test` skips wasm-opt on the ws client dependency. `make ci`
 # passes wasm_opt=1 so CI still builds release-sized wasm.
@@ -17,11 +21,15 @@ else
 TEST_WASM_PACK_FLAGS := --no-opt
 endif
 
-# The wasm package of the fixture wire types, which the emit integration of
-# `tests/` reads: the `fixture_package` example, built for wasm32 and bound for
-# the web as a consumer's `wasm-pack` build is.
+# The `fixture_package` example, bound for the web as a `wasm-pack` build of a consumer is.
 FIXTURE_WASM := $(REPO)/target/wasm32-unknown-unknown/debug/examples/fixture_package.wasm
-FIXTURE_PACKAGE := $(REPO)/target/asn-fixture-package
+FIXTURE_PACKAGE := tests/fixture
+
+# The module that the emitter writes from the fixture package, beside the suite that imports it.
+FIXTURE_CODECS := tests/codecs.ts
+
+# The same example bound for Node, whose `.d.ts` is the one a nodejs build writes, with its emitted module inside it.
+FIXTURE_NODE_PACKAGE := $(FIXTURE_PACKAGE)/node
 
 ifneq ($(filter 1,$(fix)),)
 LINT_MODE := fix
@@ -47,10 +55,12 @@ ifeq ($(strip $(features)$(no-default)),)
 else
 	cargo test $(CRATES) $(CARGO_FLAGS)
 endif
-	@echo "Building the real declarations the emit integration reads..."
+	@echo "Building the ws client and the fixture package that the TypeScript suite imports..."
 	@$(MAKE) -C $(REPO)/ws client WASM_PACK_FLAGS="$(TEST_WASM_PACK_FLAGS)"
 	@$(MAKE) fixture-package
-	@echo "Running asn vitest emit integration..."
+	@echo "Type-checking the asn TypeScript suite..."
+	npm run typecheck
+	@echo "Running the asn TypeScript suite..."
 	npm run test
 	@echo "Running asn wasm32 JS round-trip tests..."
 	CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
@@ -61,10 +71,12 @@ lint: setup
 ifeq ($(LINT_MODE),fix)
 	cargo fmt $(CRATES)
 	cargo clippy $(CRATES) --all-targets --all-features
+	cargo clippy $(WASM_LINT)
 	npm run lint:fix
 else
 	cargo fmt $(CRATES) --check
 	cargo clippy $(CRATES) --all-targets --all-features -- -D warnings
+	cargo clippy $(WASM_LINT) -- -D warnings
 	npm run lint
 endif
 
@@ -72,9 +84,14 @@ wasm:
 	@echo "asn has no product wasm crate; nothing to do."
 
 fixture-package: setup
-	@echo "Building the asn fixture wasm package..."
+	@echo "Building the asn fixture wasm package and its codecs..."
 	cargo build -p tightbeam-asn --example fixture_package --target wasm32-unknown-unknown
 	wasm-bindgen --target web --out-dir $(FIXTURE_PACKAGE) --out-name asn_fixtures $(FIXTURE_WASM)
+	wasm-bindgen --target experimental-nodejs-module --out-dir $(FIXTURE_NODE_PACKAGE) --out-name asn_fixtures $(FIXTURE_WASM)
+	cargo run -p tightbeam-asn --features emit --bin tightbeam-asn-emit -- \
+		--from-dts $(FIXTURE_PACKAGE)/asn_fixtures.d.ts --out $(FIXTURE_CODECS) --import '#asn-wasm'
+	cargo run -p tightbeam-asn --features emit --bin tightbeam-asn-emit -- \
+		--from-dts $(FIXTURE_NODE_PACKAGE)/asn_fixtures.d.ts --out $(FIXTURE_NODE_PACKAGE)/codecs.ts --import './asn_fixtures.js'
 
 client:
 	@echo "asn has no npm client; nothing to do."

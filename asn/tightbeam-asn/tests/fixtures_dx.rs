@@ -1,8 +1,7 @@
-//! Fixture wire types prove AsnCodec Sequence, Enumerated, and Choice shapes,
-//! as tightbeam scenarios.
+//! The DER oracle of the fixture DER types, as tightbeam scenarios:
+//! [docs/asn.md][tests].
 //!
-//! Each scenario round-trips its values through DER and records, per value,
-//! whether the decode equals the value, so its spec grades every round trip.
+//! [tests]: https://github.com/wahidgroup/tightbeam-ext/blob/master/docs/asn.md#tests
 #![cfg(not(target_arch = "wasm32"))]
 
 use der::asn1::{OctetString, SetOfVec};
@@ -17,7 +16,7 @@ mod fixtures;
 
 use fixtures::{
 	sample_leaf_bundle, sample_nest_bundle, Ack, Doc, Envelope, ListPad, ListResult, NestBundle, Record, RegisterBody,
-	Request, Status, StatusReport,
+	Request, Routed, Status, StatusReport,
 };
 
 /// Whether one value decoded from its DER equal to itself.
@@ -40,14 +39,14 @@ tb_assert_spec! {
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(ROUND_TRIP, exactly!(7), equals!(true))
+			(ROUND_TRIP, exactly!(8), equals!(true))
 		]
 	}
 }
 
 // Every Sequence shape round-trips: a plain one, a nested one, one with an
-// enumerated field, an absent and a present optional, and an empty and a
-// filled list.
+// enumerated field, one with a Choice field, an absent and a present optional,
+// and an empty and a filled list.
 tb_scenario! {
 	name: sequence_der_round_trips,
 	spec: SequenceSpec,
@@ -58,6 +57,7 @@ tb_scenario! {
 			let payload = OctetString::new([1_u8, 2, 3])?;
 			round_trip(&trace, Envelope { doc: Doc { title: "nested".into() }, payload })?;
 			round_trip(&trace, StatusReport { title: "csr".into(), status: Status::RateLimited })?;
+			round_trip(&trace, Routed { r#type: Status::Ok, request: Request::List(ListPad { pad: 0 }) })?;
 			round_trip(&trace, Ack { error: None })?;
 			round_trip(&trace, Ack { error: Some(Status::InvalidRequest) })?;
 			round_trip(&trace, ListResult { records: Vec::new() })?;

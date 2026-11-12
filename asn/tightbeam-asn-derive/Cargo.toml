@@ -9,8 +9,8 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 readme = "README.md"
-keywords.workspace = true
-categories.workspace = true
+keywords = ["asn1", "der", "derive", "typescript", "tightbeam"]
+categories = ["encoding", "development-tools::procedural-macro-helpers"]
 
 [lib]
 proc-macro = true
@@ -20,3 +20,6 @@ tightbeam-asn-names = { version = "0.2.0", path = "../tightbeam-asn-names" }
 proc-macro2 = "1"
 quote = "1"
 syn = { version = "3.0.3", features = ["full"] }
+
+[lints]
+workspace = true

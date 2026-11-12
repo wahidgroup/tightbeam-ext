@@ -1,8 +1,5 @@
-//! The application side of a served multiplexed pub/sub connection.
-//!
-//! [`PubsubCommands::serve`](crate::PubsubCommands::serve) answers the wire
-//! commands and hands every other stream to an [`AppRoutes`] handler, with the
-//! [`ConnectionContext`] of the connection the stream arrived on.
+//! The application routes of a served connection, and what each route works
+//! with. The page `docs/pubsub.md` (Connection serve) states both.
 
 use core::future::{ready, Ready};
 use std::sync::Arc;
@@ -10,58 +7,59 @@ use std::sync::Arc;
 use tightbeam::policy::{SessionContext, TransitStatus};
 use tightbeam::transport::ResponsePackage;
 use tightbeam::Frame;
-use tightbeam_ws::serve::ServedMux;
 
 use crate::emit::Emitter;
-use crate::registry::ConnectionId;
+use crate::registry::Member;
 
-/// What one served connection's application handler works with: its registry
-/// id, its emitter, and the peer its handshake proved.
+/// What one served connection's application handler works with: its
+/// emitter, and its standing in the registry that admitted it.
 ///
-/// [`PubsubCommands::serve`](crate::PubsubCommands::serve) builds the context
-/// from the served connection, so every part names the same connection.
+/// [`PubsubCommands::serve`] builds the context when the registry admits the
+/// connection, so every part names the same connection of that registry.
+///
+/// [`PubsubCommands::serve`]: crate::PubsubCommands::serve
 #[derive(Clone)]
 pub struct ConnectionContext {
-	connection: ConnectionId,
+	member: Member,
 	emitter: Emitter,
-	session: SessionContext,
 }
 
 impl ConnectionContext {
-	/// The context of `served`, which the registry admitted as `connection`.
-	pub(crate) fn of(served: &ServedMux, connection: ConnectionId) -> Self {
-		let emitter = Emitter::from(served.handle().clone());
-		let session = served.session().clone();
-		Self { connection, emitter, session }
+	/// The context of the connection that `member` names, which emits through
+	/// `emitter`.
+	pub(crate) fn new(member: Member, emitter: Emitter) -> Self {
+		Self { member, emitter }
 	}
 
-	/// The registry id this connection's subscriptions hang off.
-	#[must_use]
-	pub fn connection(&self) -> ConnectionId {
-		self.connection
+	/// The standing of the connection in the registry that admitted it.
+	pub(crate) fn member(&self) -> &Member {
+		&self.member
 	}
 
-	/// The emitter of the connection, for server-initiated streams.
+	/// The emitter of the connection, for server-initiated streams. Each emit
+	/// ends within the [`emit_deadline`](crate::RegistryOptions::emit_deadline)
+	/// of the registry.
 	#[must_use]
 	pub fn emitter(&self) -> &Emitter {
 		&self.emitter
 	}
 
-	/// The peer that the handshake of the connection proved.
+	/// The peer that the handshake of the connection proved, while the
+	/// registry holds the connection. A connection that left or was expelled
+	/// answers `None`, as the commands read it.
 	#[must_use]
-	pub fn session(&self) -> &SessionContext {
-		&self.session
+	pub fn session(&self) -> Option<SessionContext> {
+		self.member.session()
 	}
 }
 
-/// The application handler for streams no wire command claims.
+/// The application handler for the unary streams that no command claims.
 ///
-/// Every `async fn(ConnectionContext, Arc<Frame>) -> ResponsePackage` and every
-/// closure of that shape is one. [`Unrouted`] serves a command-only
-/// connection.
-///
-/// `Sync` because the responder shares one handler across the
-/// connection's concurrent streams.
+/// - Every `async fn(ConnectionContext, Arc<Frame>) -> ResponsePackage` and every closure of
+///   that shape is one.
+/// - [`Unrouted`] serves a command-only connection.
+/// - It is `Sync`, because the responder shares one handler across the concurrent streams of
+///   the connection.
 pub trait AppRoutes<F>: Clone + Send + Sync + 'static {
 	/// Answer one stream that `context` received with `frame`.
 	fn route(&self, context: ConnectionContext, frame: Arc<Frame>) -> F;
@@ -76,24 +74,28 @@ where
 	}
 }
 
-/// The command-only application: every stream no wire command claims answers
+/// The command-only application: every stream no command claims answers
 /// `Unimplemented`.
 ///
 /// # Examples
 ///
 /// ```
-/// use tightbeam::transport::handshake::negotiation::MuxSettings;
-/// use tightbeam_pubsub::testing::MemoryLink;
+/// use tightbeam::transport::{EnvelopeSink, EnvelopeSource};
 /// use tightbeam_pubsub::{AllowAll, PubsubCommands, TopicRegistry, Unrouted};
+/// use tightbeam_ws::serve::AcceptedLink;
 ///
-/// # async fn serve() -> Result<(), Box<dyn std::error::Error>> {
-/// let (_client, server) = MemoryLink::default().served(MuxSettings::symmetric(4))?;
-/// let commands = PubsubCommands::new(TopicRegistry::default(), AllowAll);
+/// /// Serve `link` with the commands of `registry` alone.
+/// async fn serve<R, W>(registry: TopicRegistry, link: AcceptedLink<R, W>) -> Result<(), Box<dyn std::error::Error>>
+/// where
+/// 	R: EnvelopeSource + Send + 'static,
+/// 	W: EnvelopeSink + Send + 'static,
+/// {
+/// 	let commands = PubsubCommands::new(registry, AllowAll);
 ///
-/// // The wire commands answer, and every other stream answers Unimplemented.
-/// commands.serve(server, Unrouted).await?;
-/// # Ok(())
-/// # }
+/// 	// The commands answer, and every other stream answers Unimplemented.
+/// 	commands.serve(link, Unrouted).await?;
+/// 	Ok(())
+/// }
 /// ```
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Unrouted;
@@ -101,5 +103,24 @@ pub struct Unrouted;
 impl AppRoutes<Ready<ResponsePackage>> for Unrouted {
 	fn route(&self, _context: ConnectionContext, _frame: Arc<Frame>) -> Ready<ResponsePackage> {
 		ready(ResponsePackage::new(TransitStatus::Unimplemented, None))
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use crate::registry::TopicRegistry;
+	use crate::testing::nodes::Admitted;
+
+	#[tokio::test]
+	async fn a_context_reads_no_session_once_its_connection_left() {
+		let registry = TopicRegistry::default();
+		let admitted = Admitted::to(&registry).await;
+		let context = admitted.context().clone();
+		let held = context.session();
+
+		drop(admitted);
+
+		assert!(held.is_some());
+		assert!(context.session().is_none(), "a departed connection has no standing");
 	}
 }

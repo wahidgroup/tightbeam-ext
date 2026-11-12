@@ -1,80 +1,23 @@
-import { describe, expect, expectTypeOf, it } from "vitest";
+import { describe, expect, it } from "vitest";
 
-import type {
-	Frame,
-	MessageCodec,
-	OidName,
-} from "@wahidgroup/tightbeam-ws-client";
-import { TightbeamWsClient } from "@wahidgroup/tightbeam-ws-client";
+import type { Frame } from "@wahidgroup/tightbeam-ws-client";
+import { Engine } from "@wahidgroup/tightbeam-ws-client";
 
-import type {
-	ClientPorts,
-	CommandLane,
-	Entry,
-	ManagerOptions,
-	ServePort,
-	SubscribeOptions,
-} from "./manager.js";
-import {
-	Delivery,
-	Entries,
-	PayloadShape,
-	SubscriptionManager,
-} from "./manager.js";
+import type { Gap } from "./gate.js";
+import type { Entry, GapHandler, SubscribeOptions } from "./manager.js";
+import { DeferralBudget, Delivery, Entries, MAX_DEFERRED, PayloadShape } from "./manager.js";
+import { CONTENT_TYPE, codecNaming } from "./testing/codecs.js";
 import { Topic } from "./topic.js";
 
 /**
- * The owners of a subscription that need no peer: the payload shape, the
- * entry and its gate, and the entries of a manager, over real frames that the
- * real engine builds. The node lane of `pubsub/tests` runs every behavior
- * that needs a peer against the real relay.
+ * The owners of a subscription that need no peer, over frames that the real engine builds.
+ * The node lane of `pubsub/tests` runs each behavior that needs a peer, against the real relay.
  */
 
 /**
  * The engine that builds and decodes every frame in this suite.
  */
-const engine = await TightbeamWsClient.init();
-
-/**
- * The parameters the manager constructor takes.
- */
-type ManagerArguments = [ClientPorts, ManagerOptions?];
-
-/**
- * The method that moves a manager onto the ports of a new connection.
- */
-type Reattach = SubscriptionManager["reattach"];
-
-/**
- * Every public member of `ClientPorts`: its serve port, the engine it reads
- * from that port, and its lane factory.
- */
-type PortsMembers = "serving" | "engine" | "lane";
-
-/**
- * Every public member of `ServePort`: its one serve call, and the engine that
- * dialed the client.
- */
-type ServeMembers = "serve" | "engine";
-
-/**
- * Every public member of `CommandLane`: its topic, its idleness, its turns,
- * and the disposal that drops its deferred commands once its turns settle.
- */
-type LaneMembers =
-	"topic" | "idle" | "send" | "adopt" | typeof Symbol.asyncDispose;
-
-/**
- * Every public member of `SubscriptionManager`: its topics, its commands, and
- * its disposal.
- */
-type ManagerMembers =
-	| "topics"
-	| "subscribe"
-	| "publish"
-	| "unsubscribe"
-	| "reattach"
-	| typeof Symbol.asyncDispose;
+const engine = await Engine.load();
 
 /**
  * The topic of every entry in this suite.
@@ -87,68 +30,40 @@ const PRICES = Topic.parse("prices");
 const EMPTY_BODY = new Uint8Array(0);
 
 /**
- * A content type a codec names, as the dotted form of an object identifier.
+ * What the application of an entry receives, in the order it does: the stamp
+ * of each delivered update, and each gap its gap observer receives.
  */
-const CONTENT_TYPE = "1.2.840.113549.1.7.1";
-
-/**
- * A resync that the server answers at once.
- */
-const ANSWERED_RESYNC = (): Promise<void> => Promise.resolve();
-
-/**
- * What an entry hands the application, in the order it does: the stamp of
- * each delivered update, each resync it asks of the server, and each gap it
- * hands to the gap observer.
- */
-type Event = bigint | "resync" | readonly ["gap", bigint, bigint];
-
-/**
- * The subscribe options of an entry whose deliveries land in `events`.
- */
-function recording(events: Event[]): SubscribeOptions<Uint8Array> {
-	const options = {
-		codec: engine.opaque,
-		onUpdate: (_message: Uint8Array, update: Frame): void => {
-			events.push(update.order);
-		},
-	};
-	return options;
-}
+type Event = bigint | readonly ["gap", bigint, bigint];
 
 /**
  * The subscribe options of an entry whose deliveries and gaps land in
  * `events`.
  */
-function observing(events: Event[]): SubscribeOptions<Uint8Array> {
+type Recording = SubscribeOptions<Uint8Array> & { readonly onGap: GapHandler };
+
+/**
+ * The options of an entry whose deliveries and gaps land in `events`.
+ */
+function recording(events: Event[]): Recording {
 	const options = {
-		...recording(events),
-		onGap: (_topic: string, expected: bigint, received: bigint): void => {
-			events.push(["gap", expected, received]);
+		codec: engine.opaque,
+		onUpdate: (_message: Uint8Array, update: Frame): void => {
+			events.push(update.order);
+		},
+		onGap: (_topic: Topic, gap: Gap): void => {
+			events.push(["gap", gap.expected, gap.received]);
 		},
 	};
 	return options;
 }
 
 /**
- * A resync whose asks land in `events`.
- */
-function resyncInto(events: Event[]): () => Promise<void> {
-	return (): Promise<void> => {
-		events.push("resync");
-		return Promise.resolve();
-	};
-}
-
-/**
  * The entry of {@link PRICES} that `entries` opens under `options`.
  */
-function openPrices(
-	entries: Entries,
-	options: SubscribeOptions<Uint8Array>,
-): Entry {
+function openPrices(entries: Entries, options: Recording): Entry {
 	const delivery = Delivery.of(PRICES, options, engine);
-	const entry = entries.open(PRICES, delivery, options);
+	const observers = { onGap: options.onGap, onEnd: options.onEnd };
+	const entry = entries.open(PRICES, delivery, observers);
 	return entry;
 }
 
@@ -156,10 +71,7 @@ function openPrices(
  * A live entry of {@link PRICES}: its `sub/` left, and the server
  * acknowledged it.
  */
-function livePrices(
-	entries: Entries,
-	options: SubscribeOptions<Uint8Array>,
-): Entry {
+function livePrices(entries: Entries, options: Recording): Entry {
 	const entry = openPrices(entries, options);
 	entry.leaving();
 	entry.acknowledged();
@@ -199,17 +111,65 @@ function held(): Held {
 }
 
 /**
- * The profile opaque codec under the content type `contentOid`.
+ * Await `pending`, then record `mark` in `marks`, so a test reads the order
+ * in which its promises settled.
  */
-function codecNaming(contentOid: OidName): MessageCodec<Uint8Array> {
-	const codec = {
-		contentOid,
-		encode: (message: Uint8Array): Uint8Array =>
-			engine.opaque.encode(message),
-		decode: (bodyDer: Uint8Array): Uint8Array =>
-			engine.opaque.decode(bodyDer),
+async function marking(pending: Promise<void>, marks: string[], mark: string): Promise<void> {
+	await pending;
+	marks.push(mark);
+}
+
+/**
+ * The options of an entry whose handler waits for `holding` on the update
+ * stamped `stalled`, and whose deliveries and gaps land in `events`.
+ */
+function stalling(events: Event[], stalled: bigint, holding: Held): Recording {
+	const options = {
+		...recording(events),
+		onUpdate: async (_message: Uint8Array, update: Frame): Promise<void> => {
+			if (update.order === stalled) {
+				await holding.answer;
+			}
+
+			events.push(update.order);
+		},
 	};
-	return codec;
+	return options;
+}
+
+/**
+ * The options of an entry whose handler throws on the update stamped
+ * `poisoned`, and whose deliveries and gaps land in `events`.
+ */
+function poisoning(events: Event[], poisoned: bigint): Recording {
+	const options = {
+		...recording(events),
+		onUpdate: (_message: Uint8Array, update: Frame): void => {
+			if (update.order === poisoned) {
+				throw new Error("poisoned update");
+			}
+
+			events.push(update.order);
+		},
+	};
+	return options;
+}
+
+/**
+ * A budget whose every slot is drawn, with the first slot it gave out.
+ */
+function drained(): { budget: DeferralBudget; first: Disposable } {
+	const budget = new DeferralBudget();
+	const first = budget.draw();
+	if (first === undefined) {
+		throw new Error("an empty budget refused its first draw");
+	}
+
+	for (let drawn = 1; drawn < MAX_DEFERRED; drawn += 1) {
+		budget.draw();
+	}
+
+	return { budget, first };
 }
 
 /**
@@ -218,7 +178,7 @@ function codecNaming(contentOid: OidName): MessageCodec<Uint8Array> {
  */
 interface EarlierEnding {
 	readonly ending: string;
-	readonly end: (entries: Entries, earlier: Entry) => void;
+	readonly end: (entries: Entries, earlier: Entry) => Promise<void>;
 }
 
 /**
@@ -227,19 +187,17 @@ interface EarlierEnding {
 const EARLIER_ENDINGS: readonly EarlierEnding[] = [
 	{
 		ending: "unsubscribed",
-		end: (entries, earlier) => {
-			entries.end(earlier, "unsubscribed");
+		end: async (entries, earlier) => {
+			entries.end(earlier);
 		},
 	},
 	{
 		ending: "completed",
-		end: (entries) => {
-			entries.complete(PRICES);
-		},
+		end: (_entries, earlier) => earlier.complete(0n),
 	},
 	{
 		ending: "refused on replay",
-		end: (_entries, earlier) => {
+		end: async (_entries, earlier) => {
 			earlier.lapse();
 			earlier.leaving();
 			earlier.refused();
@@ -250,69 +208,160 @@ const EARLIER_ENDINGS: readonly EarlierEnding[] = [
 describe("PayloadShape", () => {
 	it("a decoding shape decodes an update after the caller frees its codec contentOid", async () => {
 		const contentOid = engine.oid(CONTENT_TYPE);
-		const source = { codec: codecNaming(contentOid) };
-		const shape = PayloadShape.of(source, engine, "decoding");
+		const payload = { codec: codecNaming(engine, contentOid) };
+		const shape = PayloadShape.decoding(payload, engine);
 
 		contentOid.free();
 
 		const pushed = await update(1);
-		expect(shape.decode(pushed)).toEqual(EMPTY_BODY);
+		await expect(shape.decode(pushed)).resolves.toEqual(EMPTY_BODY);
+	});
+});
+
+describe("DeferralBudget", () => {
+	it("refuses a draw once every slot is held", () => {
+		const { budget } = drained();
+
+		expect(budget.draw()).toBeUndefined();
+	});
+
+	it("a slot returns once, however often it is disposed", () => {
+		const { budget, first } = drained();
+
+		first[Symbol.dispose]();
+		first[Symbol.dispose]();
+
+		expect(budget.draw()).toBeDefined();
+		expect(budget.draw()).toBeUndefined();
 	});
 });
 
 describe("Entry gaps", () => {
-	it("resyncs before it delivers the revealing update", async () => {
+	it("hands a gap to its observer before it delivers the revealing update", async () => {
 		const events: Event[] = [];
 		const entry = livePrices(new Entries(), recording(events));
-		const resync = resyncInto(events);
 
-		await entry.receive(await update(1), resync);
-		await entry.receive(await update(3), resync);
-
-		expect(events).toEqual([1n, "resync", 3n]);
-	});
-
-	it("delivers a replayed order below the revealing update in order", async () => {
-		const events: Event[] = [];
-		const entry = livePrices(new Entries(), recording(events));
-		const resyncing = held();
-		await entry.receive(await update(1), ANSWERED_RESYNC);
-
-		const third = await update(3);
-		const awaitingResync = (): Promise<void> => resyncing.answer;
-		const revealing = entry.receive(third, awaitingResync);
-
-		await entry.receive(await update(2), ANSWERED_RESYNC);
-		resyncing.settle();
-		await revealing;
-
-		expect(events).toEqual([1n, 2n, 3n]);
-	});
-
-	it("hands a gap to its observer in place of the resync", async () => {
-		const events: Event[] = [];
-		const entry = livePrices(new Entries(), observing(events));
-		const resync = resyncInto(events);
-
-		await entry.receive(await update(1), resync);
-		await entry.receive(await update(3), resync);
+		await entry.receive(await update(1));
+		await entry.receive(await update(3));
 
 		expect(events).toEqual([1n, ["gap", 2n, 3n], 3n]);
+	});
+
+	it("delivers a stamp that arrives while the gap answer runs, in order", async () => {
+		const events: Event[] = [];
+		const answering = held();
+		const options = {
+			...recording(events),
+			onGap: async (_topic: Topic, gap: Gap) => {
+				events.push(["gap", gap.expected, gap.received]);
+				await answering.answer;
+			},
+		};
+		const entry = livePrices(new Entries(), options);
+		await entry.receive(await update(1));
+
+		const revealing = entry.receive(await update(3));
+		await entry.receive(await update(2));
+		answering.settle();
+		await revealing;
+
+		expect(events).toEqual([1n, ["gap", 2n, 3n], 2n, 3n]);
+	});
+
+	it("reveals a failed delivery as a gap on the next update", async () => {
+		const events: Event[] = [];
+		const entry = livePrices(new Entries(), poisoning(events, 1n));
+
+		const failed = entry.receive(await update(1));
+		await expect(failed).rejects.toThrow("poisoned update");
+		await entry.receive(await update(2));
+
+		expect(events).toEqual([["gap", 1n, 2n], 2n]);
 	});
 
 	it("a lapsed entry re-baselines, so its replay delivers the first stamp again", async () => {
 		const events: Event[] = [];
 		const entry = livePrices(new Entries(), recording(events));
-		await entry.receive(await update(1), ANSWERED_RESYNC);
+		await entry.receive(await update(1));
 
-		const lapsed = entry.lapse();
+		const replayed = entry.lapse();
 		entry.leaving();
 		entry.acknowledged();
 
-		await entry.receive(await update(1), ANSWERED_RESYNC);
+		await entry.receive(await update(1));
 
-		expect(lapsed).toBe(true);
+		expect(replayed?.id).toBe("sub/prices");
 		expect(events).toEqual([1n, 1n]);
+	});
+
+	it("a delivery of the lost connection leaves the baseline of the replay alone", async () => {
+		const events: Event[] = [];
+		const stalled = held();
+		const entry = livePrices(new Entries(), stalling(events, 5n, stalled));
+
+		const lost = entry.receive(await update(5));
+		entry.lapse();
+		entry.leaving();
+		entry.acknowledged();
+		stalled.settle();
+		await lost;
+
+		await entry.receive(await update(1));
+
+		expect(events).toEqual([5n, 1n]);
+	});
+});
+
+describe("Entry completion", () => {
+	it("reports the trailing updates that the end of its topic reveals as a gap", async () => {
+		const events: Event[] = [];
+		const ended: string[] = [];
+		const options = {
+			...recording(events),
+			onEnd: (topic: Topic): void => {
+				ended.push(topic.name);
+			},
+		};
+		const entries = new Entries();
+		const entry = livePrices(entries, options);
+		await entry.receive(await update(1));
+
+		await entry.complete(3n);
+
+		expect(events).toEqual([1n, ["gap", 2n, 4n]]);
+		expect(entry.state).toBe("ended");
+		expect(ended).toEqual(["prices"]);
+	});
+
+	it("completes at its baseline with no gap", async () => {
+		const events: Event[] = [];
+		const entries = new Entries();
+		const entry = livePrices(entries, recording(events));
+		await entry.receive(await update(1));
+		await entry.receive(await update(2));
+
+		await entry.complete(2n);
+
+		expect(events).toEqual([1n, 2n]);
+		expect(entry.state).toBe("ended");
+	});
+});
+
+describe("Entry reattach", () => {
+	it("a deferred entry re-baselines on reattach, so the restarted counter delivers", async () => {
+		const events: Event[] = [];
+		const entry = openPrices(new Entries(), recording(events));
+		entry.leaving();
+		await entry.receive(await update(5));
+		entry.deferred();
+
+		const replayed = entry.lapse();
+		entry.leaving();
+		entry.acknowledged();
+		await entry.receive(await update(1));
+
+		expect(replayed).toBeUndefined();
+		expect(events).toEqual([5n, 1n]);
 	});
 });
 
@@ -337,6 +386,14 @@ describe("Entry states", () => {
 		expect(entry.state).toBe("pending");
 	});
 
+	it("an entry that is not live lapses with no sub/ to replay", () => {
+		const entry = openPrices(new Entries(), recording([]));
+		entry.leaving();
+
+		expect(entry.lapse()).toBeUndefined();
+		expect(entry.state).toBe("pending");
+	});
+
 	it("a refused pending entry ends and leaves its topic to a later entry", () => {
 		const entries = new Entries();
 		const refused = openPrices(entries, recording([]));
@@ -349,67 +406,108 @@ describe("Entry states", () => {
 		expect(entries.names).toEqual(["prices"]);
 	});
 
-	it("a refused resync leaves a live entry live", () => {
-		const entry = livePrices(new Entries(), recording([]));
-		entry.leaving();
-		entry.refused();
-		expect(entry.state).toBe("live");
-	});
-
 	it("an ended entry wants no later sub/", () => {
 		const entries = new Entries();
 		const entry = livePrices(entries, recording([]));
-		entries.end(entry, "unsubscribed");
+		entries.end(entry);
 		expect(entry.wants()).toBe(false);
 	});
 
-	it.each(EARLIER_ENDINGS)(
-		"the release of an earlier entry $ending leaves a newer entry live",
-		({ end }) => {
-			const entries = new Entries();
-			const earlier = livePrices(entries, recording([]));
-			end(entries, earlier);
-			const newer = livePrices(entries, recording([]));
+	it("an entry ended before its first sub/ left still sends it, and wants no later one", () => {
+		const entries = new Entries();
+		const entry = openPrices(entries, recording([]));
+		entries.end(entry);
 
-			const released = entries.end(earlier, "unsubscribed");
+		const owed = entry.wants();
+		entry.leaving();
 
-			expect(released).toBe(false);
-			expect(newer.state).toBe("live");
-		},
-	);
+		expect(entry.state).toBe("ended");
+		expect(owed).toBe(true);
+		expect(entry.wants()).toBe(false);
+	});
 
-	it("a completion ends the entry and tells its end observer", () => {
+	it.each(EARLIER_ENDINGS)("the release of an earlier entry $ending leaves a newer entry live", async ({ end }) => {
+		const entries = new Entries();
+		const earlier = livePrices(entries, recording([]));
+		await end(entries, earlier);
+		const newer = livePrices(entries, recording([]));
+
+		const released = entries.end(earlier);
+
+		expect(released).toBe(false);
+		expect(newer.state).toBe("live");
+	});
+
+	it("a completion ends the entry and tells its end observer", async () => {
 		const ended: string[] = [];
 		const options = {
 			...recording([]),
-			onEnd: (topic: string): void => {
-				ended.push(topic);
+			onEnd: (topic: Topic): void => {
+				ended.push(topic.name);
 			},
 		};
 
 		const entries = new Entries();
 		const entry = livePrices(entries, options);
-		const completed = entries.complete(PRICES);
-		expect(completed).toBe(true);
+		await entry.complete(0n);
 		expect(entry.state).toBe("ended");
+		expect(entries.names).toEqual([]);
 		expect(ended).toEqual(["prices"]);
+	});
+
+	it("a completion of a replaced entry tells no end observer and leaves the newer entry live", async () => {
+		const ended: string[] = [];
+		const options = {
+			...recording([]),
+			onEnd: (topic: Topic): void => {
+				ended.push(topic.name);
+			},
+		};
+
+		const entries = new Entries();
+		const earlier = livePrices(entries, options);
+		entries.end(earlier);
+		const newer = livePrices(entries, recording([]));
+
+		await earlier.complete(0n);
+
+		expect(newer.state).toBe("live");
+		expect(ended).toEqual([]);
 	});
 });
 
-describe("SubscriptionManager ports", () => {
-	it("the manager cannot emit outside the lane", () => {
-		const managed = expectTypeOf<keyof SubscriptionManager>();
-		expectTypeOf<keyof ClientPorts>().toEqualTypeOf<PortsMembers>();
-		expectTypeOf<keyof ServePort>().toEqualTypeOf<ServeMembers>();
-		expectTypeOf<keyof CommandLane>().toEqualTypeOf<LaneMembers>();
-		managed.toEqualTypeOf<ManagerMembers>();
+describe("Entry settlement", () => {
+	it("an ended entry with no delivery in flight is settled", async () => {
+		const entries = new Entries();
+		const entry = livePrices(entries, recording([]));
+		entries.end(entry);
+
+		await expect(entry.settled()).resolves.toBeUndefined();
 	});
 
-	it("the manager and reattach take ports, not a client", () => {
-		const constructed = expectTypeOf(SubscriptionManager);
-		const reattached = expectTypeOf<Reattach>();
-		constructed.constructorParameters.toEqualTypeOf<ManagerArguments>();
-		reattached.parameters.toEqualTypeOf<[ClientPorts]>();
-		expectTypeOf<TightbeamWsClient>().not.toExtend<ClientPorts>();
+	it("an entry ended mid-delivery settles after that delivery does", async () => {
+		const started = held();
+		const released = held();
+		const settlement: string[] = [];
+		const options = {
+			...recording([]),
+			onUpdate: async (): Promise<void> => {
+				started.settle();
+				await released.answer;
+				settlement.push("handled");
+			},
+		};
+		const entries = new Entries();
+		const entry = livePrices(entries, options);
+
+		const delivering = entry.receive(await update(1));
+		await started.answer;
+		entries.end(entry);
+		const settling = marking(entry.settled(), settlement, "settled");
+		released.settle();
+
+		await Promise.all([delivering, settling]);
+
+		expect(settlement).toEqual(["handled", "settled"]);
 	});
 });

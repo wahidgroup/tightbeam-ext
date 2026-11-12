@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Echoes a usable TCP port. If a preferred port is given and free, it is
-# returned; otherwise an OS-assigned ephemeral port is emitted.
+# Print a free TCP port: the preferred port when it is free, or else a port that the OS assigns.
 #
 # Usage: ./scripts/get-port.sh [preferred-port]
 

@@ -20,13 +20,10 @@ export interface WasmObject {
 export type Refusal = (operation: string) => Error;
 
 /**
- * One wasm object, held by the TypeScript class that owns it until that class
- * releases it.
- *
- * The owner either frees the object or hands it to a wasm call that consumes
- * it, and the hold ends either way. A hold ends once, so no path frees the
- * object twice. The hold decides every call after the end, which it refuses
- * with the refusal it was built with.
+ * One wasm object, held by the TypeScript class that owns it until a free or
+ * a consuming wasm call ends the hold. A hold ends once, so the object frees
+ * once, and every call after the end refuses with the refusal the hold was
+ * built with.
  */
 export class Owned<T extends WasmObject> implements Disposable {
 	#held: T | undefined;

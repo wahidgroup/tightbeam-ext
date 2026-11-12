@@ -14,86 +14,39 @@ on:
     branches: [master]
 
 permissions:
+  contents: read
   pull-requests: read
 
 jobs:
+  # The title and body jobs each run the file that holds their rule.
   title:
     name: Title
     runs-on: ubuntu-latest
     steps:
-      - uses: amannn/action-semantic-pull-request@0723387faaf9b38adef4775cd42cfd5155ed6017 # v5.5.3
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/checkout@v4
         with:
-          types: |
-            feat
-            fix
-            docs
-            style
-            refactor
-            perf
-            test
-            build
-            ci
-            chore
-            revert
-          requireScope: false
-          # Lowercase start (not Sentence case); no trailing period - matches commit-msg / commitlint.
-          subjectPattern: ^[a-z0-9].+[^.]$
-          subjectPatternError: |
-            Description MUST start with a lowercase letter or digit and MUST NOT end with a period.
-            Example: "feat(scope): add new feature"
+          persist-credentials: false
+
+      - name: Check the title against the commit header rule
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          printf '%s\n' "$PR_TITLE" > "$RUNNER_TEMP/pr-title"
+          sh .husky/commit-msg "$RUNNER_TEMP/pr-title" title
 
   body:
     name: Body
-    if: ${{ !startsWith(github.head_ref, 'process/') }}
     runs-on: ubuntu-latest
     steps:
-      - name: Validate required sections
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Check the body against the PR template
         env:
           PR_BODY: ${{ github.event.pull_request.body }}
-        run: |
-          set -euo pipefail
-
-          required=("Summary" "Related Issues" "Changes Made" "Testing" "Breaking Changes")
-
-          body=$(printf '%s' "$PR_BODY" | perl -0pe 's/<!--.*?-->//gs')
-
-          missing=()
-          empty=()
-
-          for section in "${required[@]}"; do
-            if ! printf '%s\n' "$body" | grep -qE "^##[[:space:]]+${section}[[:space:]]*$"; then
-              missing+=("## ${section}")
-              continue
-            fi
-            content=$(printf '%s\n' "$body" | awk -v hdr="${section}" '
-              $0 ~ "^##[[:space:]]+"hdr"[[:space:]]*$" { capture=1; next }
-              /^##[[:space:]]/ { capture=0 }
-              capture { print }
-            ' | sed -E 's/^[[:space:]]*[-*][[:space:]]*$//' | tr -d '[:space:]')
-            if [ "${#content}" -lt 3 ]; then
-              empty+=("## ${section}")
-            fi
-          done
-
-          failed=0
-          if [ "${#missing[@]}" -gt 0 ]; then
-            echo "Missing required sections:"
-            printf '  - %s\n' "${missing[@]}"
-            failed=1
-          fi
-          if [ "${#empty[@]}" -gt 0 ]; then
-            echo "Empty required sections (must contain at least 3 non-whitespace chars):"
-            printf '  - %s\n' "${empty[@]}"
-            failed=1
-          fi
-          if [ "$failed" -eq 1 ]; then
-            echo ""
-            echo "See CONTRIBUTING.md for the PR body specification."
-            exit 1
-          fi
-          echo "PR body OK."
+          HEAD_REF: ${{ github.head_ref }}
+        run: ./scripts/check-pr-body.sh
 
   metadata:
     name: Metadata

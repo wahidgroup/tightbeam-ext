@@ -15,7 +15,7 @@ const LOADED: CustomInputResult = {
 	bodyHex: "cafe0042",
 };
 
-test("init with a custom module input loads the engine", async ({ page }) => {
+test("a load from a custom module input loads the engine", async ({ page }) => {
 	await page.goto("/engine.html");
 	await expect(page.locator("#status")).toHaveText("page ready");
 
@@ -23,25 +23,16 @@ test("init with a custom module input loads the engine", async ({ page }) => {
 	// dropped the input.
 	await page.route("**/*.wasm", (route) => route.abort());
 
-	const result: CustomInputResult = await page.evaluate(() =>
-		window.tbInitWithInput("cafe0042"),
-	);
+	const result: CustomInputResult = await page.evaluate(() => window.tbEngine.initWithInput("cafe0042"));
 	expect(result).toEqual(LOADED);
 });
 
-test("a failed load rejects init with EngineUnavailable, and a later init loads", async ({
-	page,
-}) => {
+test("a failed load rejects with EngineUnavailable, and a later load loads", async ({ page }) => {
 	await page.goto("/engine.html");
 	await expect(page.locator("#status")).toHaveText("page ready");
 
-	const refusal = await page.evaluate(
-		(source) => window.tbInitRefusal(source),
-		UNSERVED_BINARY,
-	);
-	const result: CustomInputResult = await page.evaluate(() =>
-		window.tbInitWithInput("cafe0042"),
-	);
+	const refusal = await page.evaluate((source) => window.tbEngine.initRefusal(source), UNSERVED_BINARY);
+	const result: CustomInputResult = await page.evaluate(() => window.tbEngine.initWithInput("cafe0042"));
 	expect(refusal).toBe("EngineUnavailable");
 	expect(result).toEqual(LOADED);
 });

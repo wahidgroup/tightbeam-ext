@@ -1,14 +1,5 @@
 //! Encrypted round trips over the WebSocket transport, as tightbeam
 //! scenarios.
-//!
-//! The first case proves the HPKE handshake completes through the
-//! `Protocol` / `EncryptedProtocol` / `AsyncListenerTrait` implementations
-//! under a self-signed test identity. The second proves the DER identity
-//! fixtures are loadable and drive a real handshake: issue a server identity,
-//! serialize it to a DER certificate and a raw key, reload it the way the echo
-//! server and browser client do, then complete an encrypted frame round trip.
-//! Both ends record on the trace, and the shared spec grades the handshake of
-//! each end and the one request that the gate admits.
 
 #![cfg(feature = "testing")]
 
@@ -16,10 +7,8 @@ use core::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tightbeam::crypto::policy::Secp256k1Policy;
 use tightbeam::crypto::profiles::DefaultCryptoProvider;
-use tightbeam::crypto::x509::store::{CertificateTrust, CertificateTrustBuilder, NoRevocation, TrustBuilder};
-use tightbeam::crypto::x509::KeyCurves;
+use tightbeam::crypto::x509::store::CertificateTrust;
 use tightbeam::prelude::TightBeamSocketAddr;
 use tightbeam::testing::{ClientEnv, SetupEnv, TestCertificate, TestFrame, TestIdentity, TestKey};
 use tightbeam::trace::TraceCollector;
@@ -27,7 +16,7 @@ use tightbeam::transport::{EncryptedProtocol, TransportEncryptionConfig};
 use tightbeam::{tb_scenario, TightBeamError};
 use tightbeam_ws::protocol::WsListener;
 use tightbeam_ws::testing::specs::EncryptedRoundTripSpec;
-use tightbeam_ws::testing::{EchoService, Identity};
+use tightbeam_ws::testing::{EchoService, Identity, Pinned};
 use tokio::task::JoinHandle;
 
 /// The server of a scenario, and the socket address it bound.
@@ -62,7 +51,7 @@ async fn echoed(
 /// reloaded from them, as the generator writes it and its peers reload it.
 fn reloaded_identity() -> Identity {
 	let issued = Identity::mint("CN=fixture echo,O=tightbeam-ws,C=US", 1, Duration::from_secs(3600));
-	let issued = issued.expect("a test identity mints");
+	let issued = issued.expect("a test identity issues");
 	let cert_der = issued.certificate_der().expect("the certificate encodes as DER");
 	let key_bytes = issued.signing_key_bytes();
 
@@ -82,9 +71,8 @@ tb_scenario! {
 			echo(config, &trace).await
 		},
 		client: |ClientEnv { trace, addr, context }| async move {
-			let trust = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
-			let trust = trust.with_certificate(TestCertificate::self_signed(&context))?;
-			echoed(addr, Arc::new(trust.build()), &trace).await
+			let trust = Pinned::from(TestCertificate::self_signed(&context)).trust()?;
+			echoed(addr, trust, &trace).await
 		}
 	}
 }
@@ -96,7 +84,7 @@ tb_scenario! {
 	spec: EncryptedRoundTripSpec,
 	environment ServiceClient {
 		context: reloaded_identity(),
-		server: |SetupEnv { trace, context }| async move { echo(context.server_config()?, &trace).await },
+		server: |SetupEnv { trace, context }| async move { echo(context.server_config(), &trace).await },
 		client: |ClientEnv { trace, addr, context }| async move { echoed(addr, context.trust_anchor()?, &trace).await }
 	}
 }

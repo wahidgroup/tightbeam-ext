@@ -1,33 +1,35 @@
-//! The outbound adapter: coupled calls relayed to a stock gRPC server. Every
-//! act that can refuse runs before the call of the server.
+//! The outbound adapter to a stock gRPC server: it admits and grants a call,
+//! calls the server, and then encodes and signs the reply.
 
 use core::fmt;
 use core::time::Duration;
+use std::sync::Arc;
 
-use http::uri::PathAndQuery;
+use tightbeam::clock::{Clock, Lapse};
 use tightbeam::crypto::sign::SigningIdentity;
-#[cfg(feature = "instrument")]
-use tightbeam::trace::TraceCollector;
+use tightbeam::der;
+use tightbeam::transport::multiplex::{ReplySink, StreamBody};
 use tightbeam::transport::TransportError;
 use tightbeam::{Frame, TightBeamError};
-use tokio::time::Instant;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::client::Grpc;
-use tonic::metadata::MetadataValue;
+use tonic::codec::CompressionEncoding;
 use tonic::transport::Channel;
-use tonic::{Code, Request};
+use tonic::{Code, Status};
 
-use super::admit::{AdmissionTrust, AdmittedCall};
-use super::claim::CallClaim;
-use super::routes::{Grants, Routes};
-use crate::edge::{DialTls, EdgeError};
 #[cfg(feature = "instrument")]
-use crate::events::{BACKEND_CALL_REFUSED, BACKEND_CALL_RELAYED};
-use crate::protocol::GrpcAddr;
-use crate::tunnel::TunnelCodec;
+use tightbeam::trace::TraceCollector;
 
-/// The deadline of a call of the backend, unless [`Backend::with_timeout`]
-/// sets one.
-const DEFAULT_BACKEND_TIMEOUT: Duration = Duration::from_secs(30);
+use super::admit::{AdmissionTrust, AdmittedCall, Origin};
+use super::error::CoupleError;
+use super::message::CoupledReply;
+use super::routes::{Carriage, Grants, Policy, Routes};
+use super::stream::{AdmittedStream, AdmittedStreamParts, StreamAnswers, StreamRequests};
+use crate::deadline::Deadline;
+use crate::edge::{DialTls, TlsEndpoint};
+use crate::protocol::GrpcAddr;
+use crate::tunnel::{EdgeAudit, TunnelCodec};
 
 /// The channel of an adapter to its stock gRPC backend, which connects on its
 /// first call, and connects again after a failure.
@@ -42,99 +44,130 @@ impl BackendChannel {
 	///
 	/// # Errors
 	///
-	/// - [`TransportError::InvalidAddress`] -- tonic refuses the URI of
-	///   `addr`, or TLS cannot name its host.
+	/// - [`TransportError::InvalidAddress`] -- tonic refuses the URI of `addr`.
 	pub fn new(addr: &GrpcAddr, tls: &DialTls) -> Result<Self, TransportError> {
-		let (endpoint, dialer) = tls.endpoint(addr)?;
+		let TlsEndpoint { endpoint, dialer } = tls.endpoint(addr)?;
 		let channel = endpoint.connect_with_connector_lazy(dialer);
 		Ok(Self { channel })
 	}
 
-	/// Step 3, the pivot: call `permitted` on the backend within `timeout`,
-	/// which covers the wait for the channel as well as the call.
-	async fn call(&self, permitted: &Permitted, timeout: Duration) -> Answered {
-		let started = Instant::now();
-		let exchanged = tokio::time::timeout(timeout, self.exchange(permitted, timeout, started)).await;
-		exchanged
-			.unwrap_or_else(|_| Answered::status(Code::DeadlineExceeded, "the backend passed the deadline".to_owned()))
+	/// The pivot: call `admitted` on the backend within `timeout`, or within
+	/// what remains of the deadline of the call when that is sooner. The bound
+	/// covers the wait for the channel as well as the call.
+	///
+	/// # Errors
+	///
+	/// - The [`der::Error`] of an answer that does not encode.
+	async fn call(&self, admitted: &AdmittedCall, timeout: Duration) -> Result<CoupledReply, der::Error> {
+		let deadline = admitted.origin().bounded(timeout);
+		let exchanged = deadline.bound(self.exchange(admitted, &deadline)).await;
+		let answered = exchanged.unwrap_or_else(|lapse| Err(Backend::lapsed(lapse)));
+		match answered {
+			Ok(body) => CoupledReply::ok(body),
+			Err(status) => CoupledReply::of_status(&status, Vec::new()),
+		}
 	}
 
-	/// Wait for the channel, then call `permitted` with its principal and its
-	/// forwarded claim in the metadata, and what remains of `timeout` since
-	/// `started` as its `grpc-timeout`.
-	async fn exchange(&self, permitted: &Permitted, timeout: Duration, started: Instant) -> Answered {
-		let mut grpc = Grpc::new(self.channel.clone());
-		if let Err(error) = grpc.ready().await {
-			return Answered::status(Code::Unavailable, error.to_string());
-		}
+	/// Wait for the channel, then call `admitted` within `deadline`: the
+	/// response body, or the status that ended the call.
+	async fn exchange(&self, admitted: &AdmittedCall, deadline: &Deadline) -> Result<Vec<u8>, Status> {
+		let mut grpc = self.ready().await?;
+		let origin = admitted.origin();
+		let path = origin.method().path_and_query();
+		let request = origin.request(admitted.body().to_vec(), deadline);
+		let response = grpc.unary(request, path, TunnelCodec).await?;
+		Ok(response.into_inner())
+	}
 
-		let admitted = &permitted.admitted;
-		let Ok(path) = PathAndQuery::try_from(admitted.method()) else {
-			return Answered::status(Code::Internal, "the method is no path".to_owned());
+	/// The pivot of a stream: relay `requests` to the backend and each of its
+	/// answers to `answers`, within `timeout` or what remains of the deadline
+	/// of the stream when that is sooner, then end `answers` with the status
+	/// of the backend.
+	///
+	/// # Errors
+	///
+	/// - The [`TightBeamError`] of a request part that does not admit, which ends the stream.
+	/// - The [`TightBeamError`] of an answer part that does not build, sign, or send, such as one past the
+	///   count of its method or the part ceiling.
+	async fn stream(
+		&self,
+		head: &Origin,
+		mut requests: StreamRequests,
+		mut answers: StreamAnswers,
+		timeout: Duration,
+	) -> Result<Code, TightBeamError> {
+		let deadline = head.bounded(timeout);
+		let relayed = self.exchange_stream(head, &mut requests, &mut answers, &deadline);
+		let status = match deadline.bound(relayed).await {
+			Ok(Ok(status)) => status,
+			Ok(Err(refused)) => return Err(refused),
+			Err(lapse) => Backend::lapsed(lapse),
 		};
 
-		let mut request = Request::new(admitted.body().to_vec());
-		request.set_timeout(timeout.saturating_sub(started.elapsed()));
-
-		let principal = admitted.principal().to_string();
-		let metadata = request.metadata_mut();
-		metadata.insert_bin(Backend::PRINCIPAL_KEY, MetadataValue::from_bytes(principal.as_bytes()));
-
-		if let Some(claim) = admitted.claim() {
-			metadata.insert_bin(CallClaim::METADATA_KEY, MetadataValue::from_bytes(claim));
-		}
-
-		match grpc.unary(request, path, TunnelCodec).await {
-			Ok(response) => Answered { code: Code::Ok, message: None, body: response.into_inner() },
-			Err(status) => Answered::status(status.code(), status.message().to_owned()),
-		}
-	}
-}
-
-/// Why the adapter refuses an admitted call before it calls the backend.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Refusal {
-	/// The backend routes no such method.
-	Unrouted,
-	/// No grant names the principal for the method, or the call proves less
-	/// assurance than the route requires.
-	Denied,
-}
-
-impl Refusal {
-	/// The status of the signed reply that answers the refusal.
-	const fn code(self) -> Code {
-		match self {
-			Self::Unrouted => Code::Unimplemented,
-			Self::Denied => Code::PermissionDenied,
-		}
+		answers.end(requests, &status).await?;
+		Ok(status.code())
 	}
 
-	/// The name that the audit trail records the refusal under.
-	const fn as_str(self) -> &'static str {
-		match self {
-			Self::Unrouted => "unrouted",
-			Self::Denied => "denied",
+	/// Wait for the channel, then run the stream of `head` both ways at once
+	/// within `deadline`: the status that ended it, or the refusal of a
+	/// request part or of an answer part.
+	async fn exchange_stream(
+		&self,
+		head: &Origin,
+		requests: &mut StreamRequests,
+		answers: &mut StreamAnswers,
+		deadline: &Deadline,
+	) -> Result<Status, TightBeamError> {
+		let (sender, outbound) = mpsc::channel(1);
+		let forward = async move {
+			while let Some(message) = requests.next().await? {
+				if sender.send(message).await.is_err() {
+					break;
+				}
+			}
+
+			// The drop of the sender ends the requests, and the answer ends
+			// the stream.
+			drop(sender);
+			core::future::pending::<Result<Status, TightBeamError>>().await
+		};
+
+		let answer = async {
+			let mut grpc = match self.ready().await {
+				Ok(grpc) => grpc,
+				Err(status) => return Ok(status),
+			};
+			let path = head.method().path_and_query();
+			let request = head.request(ReceiverStream::new(outbound), deadline);
+			let response = match grpc.streaming(request, path, TunnelCodec).await {
+				Ok(response) => response,
+				Err(status) => return Ok(status),
+			};
+
+			let mut inbound = response.into_inner();
+			loop {
+				match inbound.message().await {
+					Ok(Some(message)) => answers.send(message).await?,
+					Ok(None) => return Ok(Status::new(Code::Ok, "")),
+					Err(status) => return Ok(status),
+				}
+			}
+		};
+
+		tokio::select! {
+			answered = answer => answered,
+			refused = forward => refused,
 		}
 	}
-}
 
-/// Step 2: a call that its principal may make on the backend.
-struct Permitted {
-	admitted: AdmittedCall,
-}
-
-/// Step 3: the answer of the backend, or the status that ended its call.
-struct Answered {
-	code: Code,
-	message: Option<String>,
-	body: Vec<u8>,
-}
-
-impl Answered {
-	/// An answer of the status `code` with `message` and no body.
-	fn status(code: Code, message: String) -> Self {
-		Self { code, message: Some(message), body: Vec::new() }
+	/// The client of the channel, once the channel is ready, which accepts
+	/// gzip answers.
+	async fn ready(&self) -> Result<Grpc<Channel>, Status> {
+		let grpc = Grpc::new(self.channel.clone());
+		let mut grpc = grpc.accept_compressed(CompressionEncoding::Gzip);
+		let ready = grpc.ready().await;
+		ready.map_err(|error| Status::unavailable(error.to_string()))?;
+		Ok(grpc)
 	}
 }
 
@@ -144,33 +177,39 @@ impl Answered {
 ///
 /// # Examples
 ///
-/// ```no_run
-/// use tightbeam::crypto::sign::SigningIdentity;
+/// ```
 /// use tightbeam_grpc::couple::{AdmissionTrust, Assurance, Backend, BackendChannel, Grants, Principal, Routes};
+/// # use tightbeam_grpc::testing::TlsAuthority;
+/// # use tightbeam_ws::testing::Identity;
+/// # #[tokio::main(flavor = "current_thread")]
+/// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// # let lifetime = core::time::Duration::from_secs(60);
+/// # let dial = TlsAuthority::mint("CN=ledger root", lifetime)?.dial()?;
+/// # let channel = BackendChannel::new(&"localhost:7443".parse()?, &dial)?;
+/// # let (admission, signer) = (AdmissionTrust::new(), Identity::mint("CN=adapter", 1, lifetime)?.signing_identity());
 ///
-/// # fn backend(channel: BackendChannel, admission: AdmissionTrust, signer: SigningIdentity) -> Result<(), tightbeam_grpc::edge::EdgeError> {
 /// let routes = Routes::new().unary("/ledger.v1.Ledger/Post", (), Assurance::Signed)?;
-/// let grants = Grants::deny_all().grant(Principal::subject("CN=web,O=acme")?, "/ledger.v1.Ledger/Post");
+/// let grants = Grants::deny_all().grant(Principal::subject("CN=web,O=acme")?, "/ledger.v1.Ledger/Post")?;
 /// let backend = Backend::new(channel, routes, grants, admission, signer)?;
 /// # Ok(())
 /// # }
 /// ```
 pub struct Backend {
 	channel: BackendChannel,
-	routes: Routes<()>,
-	grants: Grants,
+	policy: Policy<()>,
 	admission: AdmissionTrust,
 	signer: SigningIdentity,
 	timeout: Duration,
-	#[cfg(feature = "instrument")]
-	trace: Option<TraceCollector>,
+	/// The trail of each relay of the adapter, each call that its policy
+	/// refuses, and each later part of a stream that its policy permits which
+	/// fails to admit or to send, and so ends the stream.
+	audit: EdgeAudit,
 }
 
 impl Backend {
-	/// The binary metadata key that carries the principal of each call: the
-	/// UTF-8 of its SPIFFE ID, or of its subject in the string form of
-	/// RFC 4514.
-	pub const PRINCIPAL_KEY: &'static str = "tightbeam-principal-bin";
+	/// The deadline of a call of the backend, unless [`Backend::with_timeout`]
+	/// sets one.
+	pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 	/// An adapter that relays to `channel` the methods of `routes` that
 	/// `grants` grant, admits calls under `admission`, and signs its replies
@@ -178,46 +217,51 @@ impl Backend {
 	///
 	/// # Errors
 	///
-	/// - [`EdgeError::NoRoute`] -- `routes` routes no method.
-	/// - [`EdgeError::Method`] -- a grant names a method that no route serves.
+	/// - [`CoupleError::NoRoute`] -- `routes` routes no method.
+	/// - [`CoupleError::Method`] -- a grant names a method that no route serves.
 	pub fn new(
 		channel: BackendChannel,
 		routes: Routes<()>,
 		grants: Grants,
 		admission: AdmissionTrust,
 		signer: SigningIdentity,
-	) -> Result<Self, EdgeError> {
-		routes.cover(&grants)?;
+	) -> Result<Self, CoupleError> {
+		let policy = Policy::new(routes, grants)?;
 		Ok(Self {
 			channel,
-			routes,
-			grants,
+			policy,
 			admission,
 			signer,
-			timeout: DEFAULT_BACKEND_TIMEOUT,
-			#[cfg(feature = "instrument")]
-			trace: None,
+			timeout: Self::DEFAULT_TIMEOUT,
+			audit: EdgeAudit::default(),
 		})
 	}
 
-	/// Give each call of the backend at most `timeout`, in place of 30 seconds.
+	/// Give each call of the backend at most `timeout`, in place of
+	/// [`Backend::DEFAULT_TIMEOUT`].
 	#[must_use]
 	pub fn with_timeout(mut self, timeout: Duration) -> Self {
 		self.timeout = timeout;
 		self
 	}
 
-	/// Record each relay and each refusal of the adapter on `trace`.
-	#[cfg(feature = "instrument")]
+	/// Run the timeout of each call of the backend, and the deadline that
+	/// each admitted call carries, on `clock`, in place of
+	/// [`SystemClock`](tightbeam::clock::SystemClock).
 	#[must_use]
-	pub fn with_trace(mut self, trace: TraceCollector) -> Self {
-		self.trace = Some(trace);
+	pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+		self.admission = self.admission.with_clock(clock);
 		self
 	}
 
-	/// The trust that the adapter admits its calls under.
-	pub fn admission(&self) -> &AdmissionTrust {
-		&self.admission
+	/// Record on `trace` each relay of the adapter, each call that its policy
+	/// refuses, and each later part of a stream that its policy permits which
+	/// fails to admit or to send, and so ends the stream.
+	#[cfg(feature = "instrument")]
+	#[must_use]
+	pub fn with_trace(mut self, trace: TraceCollector) -> Self {
+		self.audit = EdgeAudit::on(Some(trace));
+		self
 	}
 
 	/// Relay the coupled call of `frame` to the backend, and answer with the
@@ -230,56 +274,62 @@ impl Backend {
 	/// - The [`TightBeamError`] of a reply that does not build or sign.
 	pub async fn relay(&self, frame: &Frame) -> Result<Option<Frame>, TightBeamError> {
 		let admitted = AdmittedCall::admit(frame, &self.admission)?;
-		if let Some(refusal) = self.refusal_of(&admitted) {
-			self.record_refusal(refusal);
-			let message = Some(refusal.as_str().to_owned());
-			return admitted.answer(refusal.code(), message, Vec::new(), &self.signer).await;
+		let origin = admitted.origin();
+		let permitted = self
+			.policy
+			.permit(origin.principal(), origin.method(), Carriage::Unary, origin.assurance());
+		if let Err(refusal) = permitted {
+			self.audit.denied(refusal);
+			let refused = CoupledReply::of_status(&refusal.status(), Vec::new())?;
+			return admitted.answer(refused, &self.signer).await;
 		}
 
-		let permitted = Permitted { admitted };
-		let answered = self.channel.call(&permitted, self.timeout).await;
+		let answered = self.channel.call(&admitted, self.timeout).await?;
+		self.audit.relayed(admitted.origin().method(), answered.code());
 
-		self.record_relay(permitted.admitted.method(), answered.code);
-
-		let Answered { code, message, body } = answered;
-		permitted.admitted.answer(code, message, body, &self.signer).await
+		admitted.answer(answered, &self.signer).await
 	}
 
-	/// Step 2: why the adapter refuses `admitted`, or `None` when the backend
-	/// routes its method, a grant names its principal for the method, and the
-	/// route accepts what it proves.
-	fn refusal_of(&self, admitted: &AdmittedCall) -> Option<Refusal> {
-		let Some(route) = self.routes.route(admitted.method()) else {
-			return Some(Refusal::Unrouted);
-		};
+	/// Relay the coupled stream of `body`, which `reply` answers, to the
+	/// backend: each request as it arrives, and each answer of the backend
+	/// signed under the adapter. The answer ends with the status of the
+	/// backend, or the status that refused or ended the stream.
+	///
+	/// # Errors
+	///
+	/// - The errors of [`AdmittedStream::admit`] and [`StreamRequests::next`], which end the stream.
+	/// - The [`TightBeamError`] of an answer part that does not build, sign, or send.
+	pub async fn relay_stream(&self, body: StreamBody, reply: ReplySink) -> Result<(), TightBeamError> {
+		let stream = AdmittedStream::admit(body, reply, &self.admission, self.signer.clone()).await?;
+		let carriage = Carriage::Stream(stream.shape());
+		let AdmittedStreamParts { origin: head, requests, answers } = stream.split();
+		let permitted = self.policy.permit(head.principal(), head.method(), carriage, head.assurance());
+		if let Err(refusal) = permitted {
+			self.audit.denied(refusal);
+			return answers.end(requests, &refusal.status()).await;
+		}
 
-		let granted = self.grants.permits(admitted.principal(), admitted.method());
-		let accepted = route.accepts(admitted.assurance());
-		(!granted || !accepted).then_some(Refusal::Denied)
-	}
-
-	#[cfg(feature = "instrument")]
-	fn record_refusal(&self, refusal: Refusal) {
-		if let Some(trace) = &self.trace {
-			// The trace refuses an event only under the fault that the
-			// `testing-fault` feature of tightbeam injects, and the relay
-			// answers either way.
-			let _ = trace.emit_event_with_value(BACKEND_CALL_REFUSED, refusal.as_str(), refusal.as_str());
+		let relayed = self.channel.stream(&head, requests, answers, self.timeout).await;
+		match relayed {
+			Ok(code) => {
+				self.audit.relayed(head.method(), code);
+				Ok(())
+			}
+			Err(refused) => {
+				self.audit.part_refused();
+				Err(refused)
+			}
 		}
 	}
 
-	#[cfg(not(feature = "instrument"))]
-	fn record_refusal(&self, _refusal: Refusal) {}
-
-	#[cfg(feature = "instrument")]
-	fn record_relay(&self, method: &str, code: Code) {
-		if let Some(trace) = &self.trace {
-			let _ = trace.emit_event_with_value(BACKEND_CALL_RELAYED, method.to_owned(), code as i32 as u32);
+	/// The status of a call whose bound on the backend lapsed: 4 once its
+	/// deadline passed, and 13 when the clock gave the wait no timer.
+	fn lapsed(lapse: Lapse) -> Status {
+		match lapse {
+			Lapse::Passed => Status::deadline_exceeded("the backend passed the deadline"),
+			Lapse::NoTimer => Status::internal("the clock of the adapter gave the call no timer"),
 		}
 	}
-
-	#[cfg(not(feature = "instrument"))]
-	fn record_relay(&self, _method: &str, _code: Code) {}
 }
 
 impl fmt::Debug for Backend {

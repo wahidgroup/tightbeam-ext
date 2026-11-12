@@ -2,44 +2,17 @@
  * Browser page that the live and processed board specs drive.
  *
  * The page connects to a demo server over mutual-auth HPKE, pays the demo
- * session-budget invoice, and subscribes to one topic. {@link publishEnvelope}
- * and {@link receiveEnvelope} declare the layers of each direction, and
- * {@link renderUpdate} adds each update to the board.
- *
- * # Query parameters
- *
- * - `endpoint`: the demo server to connect to.
- * - `topic`: the topic to subscribe to and publish on.
- * - `cert`: the server certificate to pin, in base64.
- * - `clientCert`, `clientKey`: the client identity to present, in base64.
- * - The dial facts and the topic seal of the stack, under the names the stack
- *   writes them, which {@link readDialFacts} and {@link readTopicSecret}
- *   parse.
- * - `seal=1`: seal notes under the topic seal.
- * - `processed=1`: receive the frames that the backend servlet rebuilds.
+ * session-budget invoice, and subscribes to one topic. Its query string is a
+ * {@link BoardQuery}, which the spec writes and the page reads once.
  */
 
-import type {
-	Aes256Gcm,
-	Envelope,
-	Frame,
-	Secp256k1SigningKey,
-} from "@wahidgroup/tightbeam-ws-client";
-import { TightbeamWsClient } from "@wahidgroup/tightbeam-ws-client";
-import {
-	ClientPorts,
-	SubscriptionManager,
-} from "@wahidgroup/tightbeam-pubsub-client";
+import type { Envelope, Frame } from "@wahidgroup/tightbeam-ws-client";
+import { Engine } from "@wahidgroup/tightbeam-ws-client";
+import { ClientPorts, SubscriptionManager } from "@wahidgroup/tightbeam-pubsub-client";
 
 import type { Note } from "#ws-fixtures";
-import {
-	NotePayload,
-	base64ToBytes,
-	mutualSessionOptions,
-	queryFacts,
-	readDialFacts,
-} from "#ws-fixtures";
-import { readTopicSecret } from "../fixtures.js";
+import { NotePayload } from "#ws-fixtures";
+import { BoardQuery } from "../fixtures.js";
 
 function element<T extends HTMLElement>(id: string): T {
 	const found = document.querySelector<T>(`#${id}`);
@@ -58,142 +31,66 @@ const publishForm = element<HTMLFormElement>("publish-form");
 const payloadInput = element<HTMLInputElement>("payload");
 
 /**
- * The envelope this page publishes under: `notes` signed, and sealed under
- * the topic `cipher` when the board runs sealed.
+ * Render one unwrapped note: its text, the sequence of its wrapper, and
+ * whether the inner frame it arrived in carries a signature and a sealed
+ * body. Those are properties of the delivered frame, so a frame the servlet
+ * rebuilt shows as unsigned whatever the page declared.
  */
-function publishEnvelope(
-	seal: boolean,
-	notes: Envelope<Note>,
-	cipher: Aes256Gcm,
-	publisherKey: Secp256k1SigningKey,
-): Envelope<Note> {
-	const signed = notes.signed(publisherKey);
-	if (seal) {
-		const sealed = signed.sealed(cipher);
-		return sealed;
-	}
-
-	return signed;
-}
-
-/**
- * The envelope this page receives under. The plain board expects its
- * own publishes back untouched. The processed board expects the
- * servlet's rebuild: sealed under the pre-shared topic `cipher` and unsigned.
- */
-function receiveEnvelope(
-	seal: boolean,
-	processed: boolean,
-	notes: Envelope<Note>,
-	cipher: Aes256Gcm,
-	publisherKey: Secp256k1SigningKey,
-): Envelope<Note> {
-	if (processed) {
-		const sealed = notes.sealed(cipher);
-		return sealed;
-	}
-
-	const published = publishEnvelope(seal, notes, cipher, publisherKey);
-	return published;
-}
-
-/**
- * Render one unwrapped note: its text, the wrapper's sequence, and the
- * receiving envelope's declarations (which `unwrap` enforced, so the
- * badges are proven properties, not probes).
- */
-function renderUpdate(
-	note: Note,
-	wrapper: Frame,
-	receiving: Envelope<Note>,
-): void {
+function renderUpdate(note: Note, frames: { readonly inner: Frame; readonly wrapper: Frame }): void {
+	const { inner, wrapper } = frames;
 	const item = document.createElement("li");
 	item.dataset.order = String(wrapper.order);
-	item.dataset.verified = String(receiving.authenticated);
-	item.dataset.sealed = String(receiving.confidential);
+	item.dataset.signed = String(inner.signed);
+	item.dataset.sealed = String(inner.confidential);
 	item.textContent = note.text;
 	board.append(item);
 }
 
 /**
- * Publish `text` as a typed note under the publishing envelope through
- * the wire's `pub/` command.
+ * Publish the `text` of `post` as a typed note on its `topic`, under the
+ * publishing envelope, through a `pub/` command.
  */
 async function publish(
 	manager: SubscriptionManager,
-	topic: string,
-	text: string,
-	publishing: Envelope<Note>,
+	post: { readonly topic: string; readonly text: string },
+	publishing: Envelope<Note, true, boolean>,
 ): Promise<void> {
 	const published = Number(publishedCount.textContent);
 	const sequence = published + 1;
 
-	await manager.publish(
-		topic,
-		{ author: "board", text },
-		{ envelope: publishing },
-	);
+	await manager.publish(post.topic, { author: "board", text: post.text }, { envelope: publishing });
 
 	publishedCount.textContent = String(sequence);
 }
 
 async function main(): Promise<void> {
-	const params = new URLSearchParams(window.location.search);
-	const endpoint = params.get("endpoint");
-	const topic = params.get("topic");
-	const cert = params.get("cert");
-	const clientCert = params.get("clientCert");
-	const clientKey = params.get("clientKey");
-	if (
-		endpoint === null ||
-		topic === null ||
-		cert === null ||
-		clientCert === null ||
-		clientKey === null
-	) {
-		status.textContent =
-			"missing endpoint, topic, cert, clientCert, or clientKey query parameter";
-		return;
-	}
+	const query = BoardQuery.fromQuery(window.location.search);
 
-	const seal = params.get("seal") === "1";
-	const processed = params.get("processed") === "1";
-	const facts = queryFacts(window.location.search);
-	const dial = readDialFacts(facts);
-	const secret = readTopicSecret(facts);
-
-	const engine = await TightbeamWsClient.init();
+	const engine = await Engine.load();
 	const publisherKey = engine.signingKey(new Uint8Array(32).fill(1));
-	const cipher = engine.aes256Gcm(secret);
+	const cipher = engine.aes256Gcm(query.secret.shared);
 	const codec = engine.wrapping(NotePayload);
 	const notes = engine.envelope(codec);
+	const envelopes = query.envelopes(notes, cipher, publisherKey);
 
-	const publishing = publishEnvelope(seal, notes, cipher, publisherKey);
-	const receiving = receiveEnvelope(
-		seal,
-		processed,
-		notes,
-		cipher,
-		publisherKey,
-	);
-
-	const identity = {
-		serverCertDer: base64ToBytes(cert),
-		clientCertDer: base64ToBytes(clientCert),
-		clientKey: base64ToBytes(clientKey),
-	};
-
-	const options = mutualSessionOptions(dial.paywall);
-	const client = await engine.connectMutual(endpoint, identity, options);
+	const identity = query.mutualIdentity();
+	const options = query.dial.paywall.sessionOptions();
+	const client = await engine.connectMutual(query.endpoint, identity, options);
 	const ports = ClientPorts.split(client);
 	const manager = new SubscriptionManager(ports);
-	await manager.subscribe(topic, {
-		envelope: receiving,
-		onUpdate: (note, wrapper) => {
-			renderUpdate(note, wrapper, receiving);
+
+	/*
+	 * The board takes each inner frame whole, so it renders what the frame
+	 * carries, then unwraps it under the receiving envelope.
+	 */
+	await manager.subscribe(query.topic, {
+		codec: engine.framed,
+		onUpdate: async (inner, wrapper) => {
+			const note = await envelopes.receiving.unwrap(inner);
+			renderUpdate(note, { inner, wrapper });
 		},
-		onGap: (_gapTopic, expected, received) => {
-			gapReport.textContent = `gap: expected ${expected}, received ${received}`;
+		onGap: (_gapTopic, gap) => {
+			gapReport.textContent = `gap: expected ${gap.expected}, received ${gap.received}`;
 		},
 		onEnd: () => {
 			status.textContent = "completed";
@@ -204,7 +101,7 @@ async function main(): Promise<void> {
 
 	publishForm.addEventListener("submit", (event) => {
 		event.preventDefault();
-		void publish(manager, topic, payloadInput.value, publishing);
+		void publish(manager, { topic: query.topic, text: payloadInput.value }, envelopes.publishing);
 	});
 }
 

@@ -1,10 +1,7 @@
-//! The fixture wire types of the integration tests as a wasm package.
+//! The fixture DER types as the wasm package of a consumer, which the
+//! TypeScript suite of asn imports: [docs/asn.md][tests].
 //!
-//! A consumer derives `AsnCodec` on its wire types, builds the crate for
-//! `wasm32`, and runs `tightbeam-asn-emit` over the `.d.ts` that the build
-//! writes. This example is that crate for the fixture types, so the emit
-//! integration of `asn/tests` reads the declarations and runs the exports
-//! that a real build writes.
+//! [tests]: https://github.com/wahidgroup/tightbeam-ext/blob/master/docs/asn.md#tests
 
 #[path = "../tests/fixtures/mod.rs"]
 pub mod fixtures;

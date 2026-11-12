@@ -38,7 +38,7 @@
 		"build:wasm": "wasm-pack build ../tightbeam-ws-wasm --target web --out-dir ../client/wasm --out-name tightbeam_ws_wasm $WASM_PACK_FLAGS && rm -f wasm/.gitignore",
 		"build:wasm:node": "wasm-pack build ../tightbeam-ws-wasm --target nodejs --out-dir ../client/wasm-node --out-name tightbeam_ws_wasm $WASM_PACK_FLAGS && rm -f wasm-node/.gitignore",
 		"build": "npm run build:wasm && npm run build:wasm:node && rm -rf dist && tsc -p tsconfig.build.json",
-		"typecheck": "tsc --noEmit && tsc --noEmit -p scripts/tsconfig.json",
+		"typecheck": "tsc --noEmit && tsc --noEmit -p scripts/tsconfig.json && tsc -p published/tsconfig.json",
 		"test": "vitest run",
 		"test:watch": "vitest",
 		"lint": "eslint . && prettier --check .",
@@ -53,8 +53,7 @@
 		"@noble/curves": "2.2.0",
 		"@noble/hashes": "2.2.0",
 		"@types/node": "24.0.4",
-		"@wahidgroup/lint-rules": "0.1.2",
-		"typescript": "5.9.3",
+		"@wahidgroup/lint-rules": "0.2.0",
 		"vitest": "4.1.12"
 	},
 	"publishConfig": {

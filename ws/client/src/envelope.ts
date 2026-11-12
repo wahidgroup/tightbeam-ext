@@ -1,78 +1,96 @@
 /**
- * Composed frame processing: declare the layers once - serialization,
- * compression, sealing, signing - and use the same declaration in both
- * directions.
+ * The typed message envelope, which declares the layers of a frame once for both directions, as the envelopes section
+ * of `docs/ws-client.md` describes.
  */
 
-import type {
-	BodyDecryptor,
-	BodyEncryptor,
-	FrameVerifier,
-	Signatory,
-} from "./crypto.js";
-import type { ValidationCode } from "./builder/errors.js";
 import type { BodyCompressor, BodyInflator } from "./compress.js";
+import type { BodyDecryptor, BodyEncryptor, FrameVerifier, Signatory } from "./crypto.js";
 import type { EngineParts } from "./engine.js";
 import type { Frame } from "./frame.js";
 import type { MessageCodec } from "./message.js";
 import { FrameBuilder } from "./builder/builder.js";
-import { ValidationError } from "./builder/errors.js";
 import { HeldCompressor, HeldInflator } from "./compress.js";
+import { ClientTransportError } from "./errors.js";
 import { HeldCodec } from "./message.js";
 
 /**
- * The declared layers. Each direction is optional so one-sided parties
- * compose only their half: a subscriber holds a verifying key and a
- * decryptor, a publisher a signatory and an encryptor. Symmetric
- * implementations (`Aes256Gcm`, the engine `ZstdCompression`) declare both at
- * once.
+ * The halves of authenticity: the signatory that signs each frame the
+ * envelope builds, and the verifier that each frame it unwraps MUST verify
+ * under.
  */
-interface Layers {
+export interface SignatureHalves {
 	readonly signer?: Signatory;
 	readonly verifier?: FrameVerifier;
+}
+
+/**
+ * The halves of confidentiality: the encryptor that seals each frame the
+ * envelope builds, and the decryptor that opens each frame it unwraps.
+ */
+export interface SealHalves {
 	readonly sealer?: BodyEncryptor;
 	readonly opener?: BodyDecryptor;
+}
+
+/**
+ * The halves of compression: the compressor of each frame the envelope
+ * builds, and the inflator of each compressed frame it unwraps.
+ */
+export interface CompressionHalves {
 	readonly compressor?: BodyCompressor;
 	readonly inflator?: BodyInflator;
 }
 
 /**
- * A typed message envelope: the codec plus the declared security and
- * transport layers, immutable and reusable across every frame of a
- * conversation.
- *
- * ```ts
- * const notes = engine
- *     .envelope(Notes)
- *     .signed(publisherKey)
- *     .sealed(engine.aes256Gcm({ key: topicKey, keyId: topicKeyId }));
- *
- * const sent = await notes.frame(note).withId("note-1").build();
- * const received = await notes.unwrap(relayed); // Note
- * ```
+ * `true` when the halves `H` hold the member `K` of type `V`.
  */
-export class Envelope<T> {
+type Holds<H, K extends PropertyKey, V> = H extends Readonly<Record<K, V>> ? true : false;
+
+/**
+ * `true` when both `A` and `B` are `true`.
+ */
+type Both<A extends boolean, B extends boolean> = A extends true ? B : false;
+
+/**
+ * The declared layers, each with the halves its declaration named.
+ */
+interface Layers {
+	readonly signature?: SignatureHalves;
+	readonly seal?: SealHalves;
+	readonly compressor?: HeldCompressor;
+	readonly inflator?: HeldInflator;
+}
+
+/**
+ * The key of the record of which directions an envelope runs. A symbol key
+ * keeps the record in the emitted declarations, where a private member loses
+ * its type.
+ */
+declare const DIRECTIONS: unique symbol;
+
+/**
+ * A typed message envelope: the codec plus its security and transport layers, immutable and reusable across every frame
+ * of a conversation. `Sends` records whether each declared layer holds the send half that {@link frame} needs, and
+ * `Receives` records the receive halves that {@link unwrap} needs. The envelopes section of `docs/ws-client.md` shows
+ * an envelope that frames and unwraps a message.
+ */
+export class Envelope<T, Sends extends boolean = true, Receives extends boolean = true> {
+	/**
+	 * Which directions the declared layers can run, recorded in the type
+	 * alone.
+	 */
+	declare readonly [DIRECTIONS]: [Sends, Receives];
+
 	readonly #parts: EngineParts;
 
-	private constructor(
-		parts: EngineParts,
-		private readonly codec: MessageCodec<T>,
-		private readonly layers: Layers,
-	) {
-		this.#parts = parts;
-	}
+	readonly #codec: MessageCodec<T>;
 
-	/**
-	 * The refusal of a frame that breaks a declared layer, with the code
-	 * `code`.
-	 */
-	private static refusal(
-		code: ValidationCode,
-		message: string,
-	): ValidationError {
-		const issues = [{ path: "envelope", message }];
-		const refused = new ValidationError(code, issues);
-		return refused;
+	readonly #layers: Layers;
+
+	private constructor(parts: EngineParts, codec: MessageCodec<T>, layers: Layers) {
+		this.#parts = parts;
+		this.#codec = codec;
+		this.#layers = layers;
 	}
 
 	/**
@@ -80,80 +98,72 @@ export class Envelope<T> {
 	 * with no layers declared: declare the layers once (`signed`, `sealed`,
 	 * `compressed`), then build with `frame(message)` and receive with
 	 * `unwrap(frame)`. `unwrap` enforces the declared layers.
+	 *
+	 * @internal
 	 */
 	static over<T>(parts: EngineParts, codec: MessageCodec<T>): Envelope<T> {
 		const held = HeldCodec.of(codec);
-		const begun = new Envelope(parts, held, {});
+		const begun = new Envelope<T>(parts, held, {});
 		return begun;
 	}
 
-	private with(patch: Partial<Layers>): Envelope<T> {
-		const next = new Envelope(this.#parts, this.codec, {
-			...this.layers,
-			...patch,
-		});
+	#with<S extends boolean, R extends boolean>(patch: Partial<Layers>): Envelope<T, S, R> {
+		const layers = { ...this.#layers, ...patch };
+		const next = new Envelope<T, S, R>(this.#parts, this.#codec, layers);
 		return next;
 	}
 
 	/**
-	 * Declare authenticity with the wrap-side capability: `frame()` signs
-	 * with `signatory`, and `unwrap()` REQUIRES a valid signature.
-	 *
-	 * A signatory with {@link Signatory.verifier} (profile
-	 * `Secp256k1SigningKey`) declares both directions. Any other
-	 * {@link Signatory} needs {@link verified} alongside it, or must
-	 * expose its own `verifier`, before `unwrap()` can check the signature.
+	 * Declare authenticity: `frame()` signs with `halves.signer`, and
+	 * `unwrap()` REQUIRES a signature that verifies under `halves.verifier`.
+	 * A party without the signing key names the verifier alone, and a wallet
+	 * or a passkey that cannot verify names the signer alone.
 	 */
-	signed(signatory: Signatory): Envelope<T> {
-		const next = this.with({ signer: signatory });
+	signed<H extends SignatureHalves>(
+		halves: H,
+	): Envelope<T, Both<Sends, Holds<H, "signer", Signatory>>, Both<Receives, Holds<H, "verifier", FrameVerifier>>> {
+		const { signer, verifier } = halves;
+		const next = this.#with<
+			Both<Sends, Holds<H, "signer", Signatory>>,
+			Both<Receives, Holds<H, "verifier", FrameVerifier>>
+		>({ signature: { signer, verifier } });
 		return next;
 	}
 
 	/**
-	 * Declare authenticity with the unwrap-side capability: `unwrap()`
-	 * REQUIRES a signature verifying under `verifier`. The read-only half
-	 * of {@link signed}, for parties without the signing key.
+	 * Declare confidentiality: `frame()` seals the body with `halves.sealer`,
+	 * and `unwrap()` REJECTS a cleartext frame and opens a sealed one with
+	 * `halves.opener`. `Aes256Gcm` is both halves, and an HPKE pair splits
+	 * between the publisher and the recipient.
 	 */
-	verified(verifier: FrameVerifier): Envelope<T> {
-		const next = this.with({ verifier });
+	sealed<H extends SealHalves>(
+		halves: H,
+	): Envelope<T, Both<Sends, Holds<H, "sealer", BodyEncryptor>>, Both<Receives, Holds<H, "opener", BodyDecryptor>>> {
+		const { sealer, opener } = halves;
+		const next = this.#with<
+			Both<Sends, Holds<H, "sealer", BodyEncryptor>>,
+			Both<Receives, Holds<H, "opener", BodyDecryptor>>
+		>({ seal: { sealer, opener } });
 		return next;
 	}
 
 	/**
-	 * Declare confidentiality: `frame()` seals the body, and `unwrap()`
-	 * REJECTS a cleartext frame. `keys` contributes whichever halves it
-	 * implements - `Aes256Gcm` both, an HPKE pair one each.
+	 * Declare compression: `frame()` compresses the body with
+	 * `halves.compressor`, and `unwrap()` inflates a compressed frame with
+	 * `halves.inflator`. Compression is a transport optimization rather than a
+	 * security property, so an uncompressed received frame still unwraps.
 	 */
-	sealed(keys: BodyEncryptor | BodyDecryptor): Envelope<T> {
-		let patch: Partial<Layers> = {};
-		if ("encrypt" in keys) {
-			patch = { ...patch, sealer: keys };
+	compressed(halves: CompressionHalves): Envelope<T, Sends, Receives> {
+		const { compressor, inflator } = halves;
+		let patch: Pick<Layers, "compressor" | "inflator"> = {};
+		if (compressor !== undefined) {
+			patch = { ...patch, compressor: new HeldCompressor(compressor) };
 		}
-		if ("decrypt" in keys) {
-			patch = { ...patch, opener: keys };
-		}
-
-		const next = this.with(patch);
-		return next;
-	}
-
-	/**
-	 * Declare compression: `frame()` compresses the body, and `unwrap()`
-	 * inflates a compressed one. Compression is a transport optimization,
-	 * not a security property, so an uncompressed received frame still unwraps.
-	 */
-	compressed(compression: BodyCompressor | BodyInflator): Envelope<T> {
-		let patch: Partial<Layers> = {};
-		if ("compress" in compression) {
-			const compressor = new HeldCompressor(compression);
-			patch = { ...patch, compressor };
-		}
-		if ("decompress" in compression) {
-			const inflator = new HeldInflator(compression);
-			patch = { ...patch, inflator };
+		if (inflator !== undefined) {
+			patch = { ...patch, inflator: HeldInflator.copyOf(inflator) };
 		}
 
-		const next = this.with(patch);
+		const next = this.#with<Sends, Receives>(patch);
 		return next;
 	}
 
@@ -161,83 +171,71 @@ export class Envelope<T> {
 	 * Begin a frame carrying `message` with every declared layer applied,
 	 * returning the builder for metadata and `build()`.
 	 *
-	 * @throws ValidationError when a declared layer is missing its
-	 * wrap-side capability (a verify-only or open-only envelope MUST NOT
-	 * silently send unsigned or cleartext frames).
+	 * @throws TightbeamTransportError `EnvelopeSender` when a declared layer
+	 * holds no send half, which the type refuses for a TypeScript caller.
 	 */
-	frame(message: T): FrameBuilder {
-		if (this.authenticityDeclared() && this.layers.signer === undefined) {
-			throw Envelope.refusal(
-				"ENVELOPE_SIGNER",
-				"The envelope declares authenticity but has no signatory: " +
-					"declare signed(signatory) to build frames",
-			);
-		}
-		if (this.sealedDeclared() && this.layers.sealer === undefined) {
-			throw Envelope.refusal(
-				"ENVELOPE_SEALER",
-				"The envelope declares confidentiality but has no encryptor: " +
-					"declare sealed(encryptor) to build frames",
-			);
+	frame(this: Envelope<T, true, Receives>, message: T): FrameBuilder {
+		const { signature, seal, compressor } = this.#layers;
+		const signer = signature?.signer;
+		const sealer = seal?.sealer;
+		const unsigned = signature !== undefined && signer === undefined;
+		const unsealed = seal !== undefined && sealer === undefined;
+		if (unsigned || unsealed) {
+			throw ClientTransportError.envelopeSender();
 		}
 
-		const begun = FrameBuilder.of(this.#parts);
-		let builder = begun.withMessage(this.codec, message);
-		if (this.layers.compressor !== undefined) {
-			builder = builder.withCompressor(this.layers.compressor);
+		let builder = FrameBuilder.message(this.#parts, this.#codec, message);
+		if (compressor !== undefined) {
+			builder = builder.withCompressor(compressor);
 		}
-		if (this.layers.sealer !== undefined) {
-			builder = builder.withEncryptor(this.layers.sealer);
+		if (sealer !== undefined) {
+			builder = builder.withEncryptor(sealer);
 		}
-		if (this.layers.signer !== undefined) {
-			builder = builder.withSigner(this.layers.signer);
+		if (signer !== undefined) {
+			builder = builder.withSigner(signer);
 		}
 
 		return builder;
 	}
 
 	/**
-	 * Reverse the declared layers on a received frame: verify, open,
-	 * inflate, decode - and enforce them.
+	 * Verify, open, inflate, and decode a received frame under the declared
+	 * layers, as the envelopes section of `docs/ws-client.md` describes.
 	 *
-	 * - The envelope decides policy: a declared signature MUST verify, and a
-	 *   declared seal MUST be present.
-	 * - The frame decides how its body opens, through {@link Frame.open}.
-	 *
-	 * @throws ValidationError in each of these cases:
-	 *
-	 * - A declared signature or seal is absent (a downgrade).
-	 * - A declared layer is missing its unwrap-side capability.
-	 * - The frame carries a layer the envelope cannot reverse.
-	 *
-	 * @throws when the signature does not verify, the opener rejects the
-	 * ciphertext, the inflator rejects the body, or the codec rejects the
-	 * decoded bytes.
+	 * @throws TightbeamTransportError `EnvelopeUnsigned` or `EnvelopeCleartext`
+	 * for a declared layer the frame lacks, and as {@link Frame.open} does.
 	 */
-	async unwrap(received: Frame): Promise<T> {
-		this.checkAuthenticity(received);
-
-		if (this.sealedDeclared() && !received.confidential) {
-			throw Envelope.refusal(
-				"ENVELOPE_CLEARTEXT",
-				"The envelope declares confidentiality but the frame body " +
-					"is cleartext: refusing the downgrade",
-			);
+	async unwrap(this: Envelope<T, Sends, true>, received: Frame): Promise<T> {
+		const { signature, seal, inflator } = this.#layers;
+		const verifier = signature?.verifier;
+		const opener = seal?.opener;
+		const unverified = signature !== undefined && verifier === undefined;
+		const unopened = seal !== undefined && opener === undefined;
+		if (unverified || unopened) {
+			throw ClientTransportError.envelopeReceiver();
 		}
 
-		const message = await received.open(this.codec, {
-			opener: this.layers.opener,
-			inflator: this.layers.inflator,
-		});
+		if (verifier !== undefined) {
+			if (!received.signed) {
+				throw ClientTransportError.envelopeUnsigned();
+			}
+
+			await received.verify(verifier);
+		}
+		if (opener !== undefined && !received.confidential) {
+			throw ClientTransportError.envelopeCleartext();
+		}
+
+		const message = await received.open(this.#codec, { opener, inflator });
 		return message;
 	}
 
 	/**
 	 * The envelope declares authenticity: frames it builds are signed,
-	 * and frames it unwraps MUST verify.
+	 * and frames it unwraps MUST be.
 	 */
 	get authenticated(): boolean {
-		const declared = this.authenticityDeclared();
+		const declared = this.#layers.signature !== undefined;
 		return declared;
 	}
 
@@ -246,67 +244,7 @@ export class Envelope<T> {
 	 * sealed, and frames it unwraps MUST be.
 	 */
 	get confidential(): boolean {
-		const declared = this.sealedDeclared();
+		const declared = this.#layers.seal !== undefined;
 		return declared;
-	}
-
-	/**
-	 * Authenticity is declared by either half.
-	 */
-	private authenticityDeclared(): boolean {
-		const { signer, verifier } = this.layers;
-		const declared = signer !== undefined || verifier !== undefined;
-		return declared;
-	}
-
-	/**
-	 * Confidentiality is declared by either half.
-	 */
-	private sealedDeclared(): boolean {
-		const { sealer, opener } = this.layers;
-		const declared = sealer !== undefined || opener !== undefined;
-		return declared;
-	}
-
-	/**
-	 * The verifier for `unwrap()`: the explicit declaration, or the
-	 * signatory's own verify half, resolved at the unwrap.
-	 */
-	private resolveVerifier(): FrameVerifier | undefined {
-		if (this.layers.verifier !== undefined) {
-			return this.layers.verifier;
-		}
-
-		return this.layers.signer?.verifier;
-	}
-
-	/**
-	 * Enforce declared authenticity: the frame MUST carry a signature
-	 * verifying under the declared (or derived) verifier.
-	 */
-	private checkAuthenticity(received: Frame): void {
-		if (!this.authenticityDeclared()) {
-			return;
-		}
-
-		const verifier = this.resolveVerifier();
-		if (verifier === undefined) {
-			throw Envelope.refusal(
-				"ENVELOPE_VERIFIER",
-				"The envelope declares authenticity but its signatory " +
-					"exposes no verifier: declare verified(verifier) to " +
-					"unwrap frames",
-			);
-		}
-
-		if (!received.signed) {
-			throw Envelope.refusal(
-				"ENVELOPE_UNSIGNED",
-				"The envelope declares authenticity but the frame is " +
-					"unsigned: refusing the downgrade",
-			);
-		}
-
-		received.verify(verifier);
 	}
 }

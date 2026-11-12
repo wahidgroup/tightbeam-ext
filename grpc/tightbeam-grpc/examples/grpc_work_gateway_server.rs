@@ -1,9 +1,5 @@
-//! Cluster work-plane gateway with a gRPC edge, for the e2e stack.
-//!
-//! This process runs a cluster gateway, a hive, and the work probe of
-//! `tightbeam_ws::testing`, which speak encrypted TCP to each other. The
-//! gateway accepts clients on an encrypted gRPC edge, and the stack puts an
-//! Envoy hop in front of it, so the e2e suite crosses a real h2c proxy.
+//! Cluster work-plane gateway with a gRPC edge, for the e2e stack, behind the
+//! Envoy hop of `docs/grpc.md` (Hop requirements).
 //!
 //! Environment:
 //!   - `TBWS_SERVER_CERT`  path to the gateway certificate DER, beside its key
@@ -11,8 +7,8 @@
 //!   - `GRPC_EDGE_PORT`    listen port of the edge
 
 // The colony runtime macros expand `cfg(feature = ...)` probes against the
-// invoking crate's feature namespace. Those upstream feature names do not
-// exist in this crate, so the leaked cfg warnings carry no signal here.
+// invoking crate's feature namespace, which holds the features of this crate
+// alone, so the leaked cfg warnings carry no signal here.
 #![allow(unexpected_cfgs)]
 
 use core::future::pending;
@@ -21,8 +17,8 @@ use std::sync::Arc;
 use tightbeam::cluster;
 use tightbeam::colony::cluster::Cluster;
 use tightbeam::trace::TraceCollector;
-use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam_grpc::protocol::GrpcListener;
+use tightbeam_ws::protocol::WsListener;
 use tightbeam_ws::testing::{EnvVar, Identity, IdentityFiles, WorkClient, WorkPlane, WorkStack};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -35,10 +31,10 @@ const PORT: EnvVar = EnvVar::new("GRPC_EDGE_PORT");
 const WORK_CERT: EnvVar = EnvVar::new("TBWS_WORK_CERT");
 
 cluster! {
-	/// TCP colony gateway with a gRPC edge accept plane. Hives register over
-	/// TCP, and clients submit work over the tunnel.
+	/// WebSocket colony gateway with a gRPC edge accept plane. Hives register
+	/// over WebSocket, and clients submit work over the tunnel.
 	pub WorkPlaneGateway,
-	protocol: TokioListener,
+	protocol: WsListener,
 	edge: GrpcListener
 }
 
@@ -54,10 +50,10 @@ async fn main() -> Result<(), BoxError> {
 	let stack = WorkStack::<WorkPlaneGateway>::start(&trace, &plane, edge).await?;
 
 	let gateway = stack.gateway();
-	let edge = gateway.edge_addr().ok_or("edge plane did not bind")?;
+	let edge = WorkClient::edge_of(gateway)?;
 	let probe = WorkClient::probe()?;
 	println!(
-		"[grpc-work-gateway] cluster work-plane gateway: colony tcp://{} edge h2c://{edge} (servlet: {probe})",
+		"[grpc-work-gateway] cluster work-plane gateway: colony ws://{} edge h2c://{edge} (servlet: {probe})",
 		gateway.addr().0
 	);
 

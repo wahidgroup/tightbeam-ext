@@ -5,7 +5,7 @@
 services:
   # Cluster work-plane gateway with a gRPC edge
   grpc-work-gateway:
-    image: ${ECHO_IMAGE:-tightbeam-ws-echo:dev}
+    image: ${ECHO_IMAGE:?}
     command: ["grpc-work-gateway-server"]
     environment:
       GRPC_EDGE_PORT: "9120"
@@ -26,12 +26,12 @@ services:
       retries: 30
 
   grpc-coupled-gateway:
-    image: ${ECHO_IMAGE:-tightbeam-ws-echo:dev}
+    image: ${ECHO_IMAGE:?}
     command: ["grpc-coupled-gateway-server"]
     environment:
       GRPC_COUPLED_PORT: "9122"
       TBWS_SERVER_CERT: /certs/server.cert.der
-      COUPLED_CERT_DIR: /certs/coupled
+      CERT_DIR: /certs
     volumes:
       - ${CERT_DIR:?}:/certs:ro
     ports:
@@ -56,6 +56,7 @@ services:
         condition: service_healthy
     ports:
       - "${GRPC_ENVOY_HOST_PORT:-9121}:10000"
+      - "127.0.0.1:${GRPC_ENVOY_ADMIN_HOST_PORT:-9901}:9901"
     # The image has no HTTP client, so the probe asks the admin endpoint over
     # a bash socket. The admin answers HTTP/1.1 alone.
     healthcheck:

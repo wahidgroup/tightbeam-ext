@@ -1,28 +1,24 @@
 /**
- * Topic names and the commands that name them.
- *
- * The wire constants have one home, Rust `Topic`. Its `wire_contract`
- * example renders the octet limit and the command prefixes into
- * `wire.generated.json`, which `make -C pubsub client` writes before `tsc`
- * compiles this package. A topic is non-empty, fits in that limit of UTF-8
- * octets, matches exactly, and starts outside the reserved command prefixes,
- * so topics and commands stay distinct.
+ * Topic names and the commands that name them. The page
+ * `docs/pubsub-client.md` (Topics) states the rules and their one home.
  */
 
-import type {
-	Engine,
-	Frame,
-	FrameBuilder,
-} from "@wahidgroup/tightbeam-ws-client";
+import type { Engine, Frame, FrameBuilder } from "@wahidgroup/tightbeam-ws-client";
 
 import WIRE from "./wire.generated.json" with { type: "json" };
 
 /**
- * Every reserved command prefix of the wire contract.
+ * Every reserved command prefix of the rendered contract.
  */
 const RESERVED_PREFIXES = Object.values(WIRE.prefixes);
 
 const UTF8 = new TextEncoder();
+
+/**
+ * The decoder of each push id. It reads exact UTF-8, so a leading U+FEFF
+ * stays part of the name, and it throws on octets that are not UTF-8.
+ */
+const PUSH_ID = new TextDecoder("utf-8", { ignoreBOM: true, fatal: true });
 
 /**
  * The body of a command without a payload: the id is the whole message.
@@ -30,25 +26,23 @@ const UTF8 = new TextEncoder();
 const EMPTY_BODY = new Uint8Array(0);
 
 /**
- * Builds the frame of a command from a builder that already carries the
- * command id.
+ * The body of a command: it begins the frame builder of the command, which
+ * the command then names, and holds what that body reads until the command
+ * settles.
  */
-export type CommandBody = (command: FrameBuilder) => Promise<Frame>;
+export interface CommandPayload extends Disposable {
+	/**
+	 * Begin the builder of the frame that carries this body, through `engine`,
+	 * for a command that names `topic`.
+	 */
+	begin(engine: Engine, topic: Topic): FrameBuilder | Promise<FrameBuilder>;
+}
 
 /**
- * The body of a `sub/`, `unsub/`, or `end/` command.
+ * The body of a `sub/` or `unsub/` command, which holds nothing.
  */
-const NO_PAYLOAD: CommandBody = (command) => {
-	const empty = command.withMessage(EMPTY_BODY);
-	const built = empty.build();
-	return built;
-};
-
-/**
- * What a command holds for its body and frees as it settles: nothing for a
- * command without a payload.
- */
-const NOTHING_HELD: Disposable = {
+const NO_PAYLOAD: CommandPayload = {
+	begin: (engine) => engine.frameBuilder(EMPTY_BODY),
 	[Symbol.dispose](): void {
 		// A command without a payload holds no handle.
 	},
@@ -56,21 +50,16 @@ const NOTHING_HELD: Disposable = {
 
 /**
  * Builds one {@link Command}. The static block of `Command` assigns it, and
- * only {@link Topic} and {@link Command.parse} call it, so every command
- * names a parsed topic under a prefix of the wire contract.
+ * only {@link Topic} calls it, so every command names a parsed topic under a
+ * prefix of the rendered contract.
  */
-let mint: (
-	prefix: string,
-	topic: Topic,
-	body: CommandBody,
-	held: Disposable,
-) => Command;
+let create: (prefix: string, topic: Topic, payload: CommandPayload) => Command;
 
 /**
  * Why the server-side `Topic` validation refuses a name, spelled as the
  * variants of the Rust `TopicError`.
  */
-export type TopicErrorCode = "Empty" | "TooLong" | "ReservedPrefix";
+export type TopicErrorCode = "Empty" | "NotUtf8" | "TooLong" | "ReservedPrefix";
 
 /**
  * A name the server-side `Topic` validation refuses. A `TypeError`, so a
@@ -97,20 +86,27 @@ export class TopicError extends TypeError {
  * passed the check before any command frame is built.
  */
 export class Topic {
-	private constructor(
-		/**
-		 * The validated name.
-		 */
-		readonly name: string,
-	) {}
+	readonly #name: string;
+
+	private constructor(name: string) {
+		this.#name = name;
+	}
+
+	/**
+	 * The validated name.
+	 */
+	get name(): string {
+		return this.#name;
+	}
 
 	/**
 	 * Parse `name` under the server-side `Topic` validation. A `Topic`
 	 * passes through, because it already passed the check.
 	 *
-	 * @throws TopicError with code `Empty` for an empty name, `TooLong` for
-	 * a name past the octet limit of Rust `Topic::MAX_LEN`, and
-	 * `ReservedPrefix` for a name that starts with a command prefix.
+	 * @throws TopicError with code `Empty` for an empty name.
+	 * @throws TopicError with code `NotUtf8` for a name with a lone surrogate, which has no UTF-8 form.
+	 * @throws TopicError with code `TooLong` for a name past the octet limit of Rust `Topic::MAX_LEN`.
+	 * @throws TopicError with code `ReservedPrefix` for a name that starts with a command prefix.
 	 */
 	static parse(name: Topic | string): Topic {
 		if (name instanceof Topic) {
@@ -119,6 +115,13 @@ export class Topic {
 
 		if (name.length === 0) {
 			throw new TopicError("Empty", "a topic name must be non-empty");
+		}
+
+		// The encoder writes U+FFFD for a lone surrogate, so the server would
+		// hold another name than the one the manager routes by.
+		if (!name.isWellFormed()) {
+			const message = "a topic name must be well-formed UTF-16: it holds a lone surrogate";
+			throw new TopicError("NotUtf8", message);
 		}
 
 		const octets = UTF8.encode(name).length;
@@ -143,7 +146,7 @@ export class Topic {
 	 */
 	subscribe(): Command {
 		const prefix = WIRE.prefixes.subscribe;
-		const command = mint(prefix, this, NO_PAYLOAD, NOTHING_HELD);
+		const command = create(prefix, this, NO_PAYLOAD);
 		return command;
 	}
 
@@ -152,16 +155,16 @@ export class Topic {
 	 */
 	unsubscribe(): Command {
 		const prefix = WIRE.prefixes.unsubscribe;
-		const command = mint(prefix, this, NO_PAYLOAD, NOTHING_HELD);
+		const command = create(prefix, this, NO_PAYLOAD);
 		return command;
 	}
 
 	/**
-	 * The `pub/` command of this topic, whose frame `body` builds over what
-	 * `held` holds, freed as the command settles.
+	 * The `pub/` command of this topic, whose frame carries `payload`, freed
+	 * as the command settles.
 	 */
-	publish(body: CommandBody, held: Disposable): Command {
-		const command = mint(WIRE.prefixes.publish, this, body, held);
+	publish(payload: CommandPayload): Command {
+		const command = create(WIRE.prefixes.publish, this, payload);
 		return command;
 	}
 }
@@ -184,12 +187,89 @@ function acceptedTopic(name: string): Topic | undefined {
 }
 
 /**
- * One wire command: a prefix of the wire contract and the topic it names.
+ * The name that the push id `id` spells in UTF-8, or `undefined` for octets
+ * that are not UTF-8.
+ */
+function spelledName(id: Uint8Array): string | undefined {
+	try {
+		const name = PUSH_ID.decode(id);
+		return name;
+	} catch (refusal) {
+		if (refusal instanceof TypeError) {
+			return undefined;
+		}
+
+		throw refusal;
+	}
+}
+
+/**
+ * What the id of one push of the server names, parsed once.
  *
- * {@link Topic.subscribe}, {@link Topic.unsubscribe}, and
- * {@link Topic.publish} build the commands a client sends, and
- * {@link Command.parse} reads the id of one the server sends. The
- * constructor is private, so no command carries a hand-built prefix.
+ * - `end`: `end/<topic>`, the completion of `topic`.
+ * - `update`: a topic name, an update of that topic.
+ */
+export interface Push {
+	readonly kind: "end" | "update";
+	readonly topic: Topic;
+}
+
+/**
+ * The parse of the id of a push, and its route.
+ */
+export const Push = {
+	/**
+	 * The push that the frame id octets `id` name, or `undefined` for an id
+	 * that names no topic.
+	 */
+	parse(id: Uint8Array): Push | undefined {
+		const name = spelledName(id);
+		if (name === undefined) {
+			return undefined;
+		}
+
+		const end = WIRE.prefixes.end;
+		if (name.startsWith(end)) {
+			const completed = acceptedTopic(name.slice(end.length));
+			if (completed === undefined) {
+				return undefined;
+			}
+
+			return { kind: "end", topic: completed };
+		}
+
+		const updated = acceptedTopic(name);
+		if (updated === undefined) {
+			return undefined;
+		}
+
+		return { kind: "update", topic: updated };
+	},
+
+	/**
+	 * Hand `frame`, whose id parsed as `push`, to the receiver of its topic:
+	 * the completion of the topic at the order of the frame, or an update.
+	 */
+	route(
+		push: Push,
+		receiver: { complete(order: bigint): Promise<void>; receive(update: Frame): Promise<void> },
+		frame: Frame,
+	): Promise<void> {
+		switch (push.kind) {
+			case "end":
+				return receiver.complete(frame.order);
+			case "update":
+				return receiver.receive(frame);
+		}
+	},
+};
+
+/**
+ * One command a client sends: a prefix of the rendered contract and the topic
+ * it names.
+ *
+ * - {@link Topic.subscribe}, {@link Topic.unsubscribe}, and {@link Topic.publish} build each one.
+ * - The constructor is private, so every command carries a prefix of the contract.
  */
 export class Command implements Disposable {
 	/**
@@ -199,53 +279,23 @@ export class Command implements Disposable {
 
 	readonly #prefix: string;
 
-	readonly #body: CommandBody;
-
 	/**
-	 * What the body holds, which {@link [Symbol.dispose]} frees as the command
+	 * The body, whose hold {@link [Symbol.dispose]} frees as the command
 	 * settles.
 	 */
-	readonly #held: Disposable;
+	readonly #payload: CommandPayload;
 
 	static {
-		mint = (prefix, topic, body, held): Command => {
-			const command = new Command(prefix, topic, body, held);
+		create = (prefix, topic, payload): Command => {
+			const command = new Command(prefix, topic, payload);
 			return command;
 		};
 	}
 
-	private constructor(
-		prefix: string,
-		topic: Topic,
-		body: CommandBody,
-		held: Disposable,
-	) {
+	private constructor(prefix: string, topic: Topic, payload: CommandPayload) {
 		this.#prefix = prefix;
 		this.topic = topic;
-		this.#body = body;
-		this.#held = held;
-	}
-
-	/**
-	 * Parse the frame id `id` as a command: a reserved prefix, then a valid
-	 * topic name. Every other id answers `undefined`, such as the id of a
-	 * topic update. A parsed command carries no payload.
-	 */
-	static parse(id: string): Command | undefined {
-		const opens = (reserved: string): boolean => id.startsWith(reserved);
-		const prefix = RESERVED_PREFIXES.find(opens);
-		if (prefix === undefined) {
-			return undefined;
-		}
-
-		const name = id.slice(prefix.length);
-		const topic = acceptedTopic(name);
-		if (topic === undefined) {
-			return undefined;
-		}
-
-		const command = mint(prefix, topic, NO_PAYLOAD, NOTHING_HELD);
-		return command;
+		this.#payload = payload;
 	}
 
 	/**
@@ -257,23 +307,11 @@ export class Command implements Disposable {
 	}
 
 	/**
-	 * The topic an `end/` command completes, which the server sends when it
-	 * quiesces. Each command a client sends answers `undefined`.
-	 */
-	get completed(): Topic | undefined {
-		if (this.#prefix === WIRE.prefixes.end) {
-			return this.topic;
-		}
-
-		return undefined;
-	}
-
-	/**
 	 * Build the frame of the command through the builder of `engine`.
 	 */
-	frame(engine: Engine): Promise<Frame> {
-		const named = engine.frameBuilder().withId(this.id);
-		const built = this.#body(named);
+	async frame(engine: Engine): Promise<Frame> {
+		const begun = await this.#payload.begin(engine, this.topic);
+		const built = await begun.withId(this.id).build();
 		return built;
 	}
 
@@ -283,6 +321,6 @@ export class Command implements Disposable {
 	 * because its replay builds the frame again.
 	 */
 	[Symbol.dispose](): void {
-		this.#held[Symbol.dispose]();
+		this.#payload[Symbol.dispose]();
 	}
 }

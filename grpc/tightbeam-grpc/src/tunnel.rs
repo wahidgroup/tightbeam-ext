@@ -1,33 +1,12 @@
 //! The tunnel call: one bidirectional gRPC call that carries one tightbeam
-//! connection.
-//!
-//! The call travels on [`TUNNEL_PATH`] under `application/grpc`, which tonic
-//! writes on both ends, and each of its messages is the DER of one envelope,
-//! unwrapped. The service of the edge parses the head of each call once, and
-//! hands a call on the tunnel path to [`TunnelService`], which claims its lane
-//! as a [`TunnelCall`]. Every call that the edge cannot carry refuses:
-//!
-//! | The call | Refused with |
-//! | --- | --- |
-//! | A method other than `POST` | HTTP 405, with `Allow: POST` |
-//! | A content type outside `application/grpc` and its `+` subtypes | HTTP 415 |
-//! | A path that the edge serves no call on | `grpc-status` 12, `UNIMPLEMENTED` |
-//! | A connection with no free slot, or a full queue | `grpc-status` 14, `UNAVAILABLE` |
-//!
-//! tonic refuses the rest: an encoding other than identity with status 12, a
-//! compressed message with no encoding with status 13, and a message past the
-//! envelope ceiling with status 11.
-//!
-//! Under the `instrument` feature, each refusal of the table records on the
-//! audit trail of the listener as [`TUNNEL_REFUSED`], before the server
-//! answers it.
-//!
-//! [`TUNNEL_REFUSED`]: crate::events::TUNNEL_REFUSED
+//! connection. `docs/grpc.md` lists what the edge refuses.
 //!
 //! # Sources
 //!
-//! - gRPC over HTTP2, `grpc/grpc` `doc/PROTOCOL-HTTP2.md`: <https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md>
-//! - RFC 9110, HTTP Semantics, June 2022, sections 8.3.1, 15.5.6, and 15.5.16: <https://www.rfc-editor.org/rfc/rfc9110>
+//! - gRPC over HTTP2, `grpc/grpc` `doc/PROTOCOL-HTTP2.md`:
+//!   <https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md>
+//! - RFC 9110, HTTP Semantics, June 2022, sections 8.3.1, 15.5.6, and 15.5.16:
+//!   <https://www.rfc-editor.org/rfc/rfc9110>
 
 use core::future::Future;
 use core::pin::Pin;
@@ -39,7 +18,7 @@ use bytes::{Buf, BufMut};
 use http::header::ALLOW;
 use http::request::Parts;
 use http::{HeaderValue, Request as HttpRequest, Response as HttpResponse, StatusCode};
-use tokio::sync::mpsc::{self, Receiver, Sender};
+use tokio::sync::mpsc::{self, Receiver};
 use tokio::sync::oneshot;
 use tokio_stream::Stream;
 use tonic::body::Body;
@@ -48,14 +27,23 @@ use tonic::server::{Grpc, StreamingService};
 use tonic::{Request, Response, Status};
 
 #[cfg(feature = "instrument")]
-use std::sync::{Arc, Mutex, PoisonError};
+use std::borrow::Cow;
 
 #[cfg(feature = "instrument")]
-use tightbeam::trace::TraceCollector;
-
+use tightbeam::trace::{EventValue, TraceCollector};
 #[cfg(feature = "instrument")]
-use crate::events::TUNNEL_REFUSED;
-use crate::incoming::{Claim, GrpcConnectInfo, Ticket};
+use tightbeam::urn::Urn;
+
+#[cfg(feature = "couple")]
+use tonic::Code;
+
+#[cfg(feature = "couple")]
+use crate::couple::{AccessRefusal, MethodPath};
+#[cfg(feature = "instrument")]
+use crate::events::EDGE_REFUSED;
+#[cfg(all(feature = "instrument", feature = "couple"))]
+use crate::events::{BACKEND_CALL_REFUSED, BACKEND_CALL_RELAYED};
+use crate::incoming::{Arrivals, Claim, GrpcConnectInfo, LaneRefusal, Ticket};
 use crate::io::GrpcStream;
 
 /// The path of the tunnel call, which a proxy in front of the server routes.
@@ -109,92 +97,227 @@ impl Decoder for TunnelCodec {
 	}
 }
 
-/// Why the tunnel refuses a call.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Refusal {
+/// Why the edge refuses a request that is no gRPC call, which it answers
+/// with an HTTP status.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HeadRefusal {
 	/// The method is not `POST`.
 	Method,
 	/// The content type is not `application/grpc` or a subtype of it.
 	MediaType,
-	/// The edge serves no call on the path.
-	Path,
-	/// The connection has no free slot, or the queue is full.
-	Busy,
-	/// The request carries no connection of this server, which only a fault
-	/// of the server itself can cause.
-	Unconnected,
 }
 
-impl Refusal {
+impl HeadRefusal {
 	/// The name that the audit trail records the refusal under.
 	#[cfg(feature = "instrument")]
-	const fn as_str(&self) -> &'static str {
+	pub(crate) fn as_str(&self) -> &'static str {
 		match self {
 			Self::Method => "method",
 			Self::MediaType => "media-type",
-			Self::Path => "path",
-			Self::Busy => "busy",
-			Self::Unconnected => "unconnected",
 		}
 	}
-}
 
-/// The audit trail of the refusals of one listener, which every connection
-/// task of its server shares: the trace that the listener attaches after it
-/// binds, under the `instrument` feature. A trail with no trace, or a build
-/// without the feature, records nothing.
-#[derive(Clone, Default)]
-pub(crate) struct RefusalAudit {
-	#[cfg(feature = "instrument")]
-	trace: Arc<Mutex<Option<TraceCollector>>>,
-}
-
-impl RefusalAudit {
-	/// Record every later refusal on `trace`, in place of the trace of an
-	/// earlier attach.
-	#[cfg(feature = "instrument")]
-	pub(crate) fn attach(&self, trace: TraceCollector) {
-		let mut attached = self.trace.lock().unwrap_or_else(PoisonError::into_inner);
-		*attached = Some(trace);
-	}
-
-	/// Record `refusal` on the trail.
-	pub(crate) fn refused(&self, refusal: &Refusal) {
-		#[cfg(feature = "instrument")]
-		{
-			let attached = self.trace.lock().unwrap_or_else(PoisonError::into_inner);
-			if let Some(trace) = attached.as_ref() {
-				let name = refusal.as_str();
-				// The trace refuses an event only under the fault that the
-				// `testing-fault` feature of tightbeam injects, and the server
-				// answers the refusal either way.
-				let _ = trace.emit_event_with_value(TUNNEL_REFUSED, name, name);
-			}
-		}
-
-		#[cfg(not(feature = "instrument"))]
-		let _ = refusal;
-	}
-}
-
-/// The response of each refusal.
-impl From<Refusal> for HttpResponse<Body> {
-	fn from(refusal: Refusal) -> Self {
-		match refusal {
-			Refusal::Method => {
-				let mut response = Self::new(Body::default());
+	/// The response of the refusal: HTTP 405 with `Allow: POST`, or HTTP 415.
+	fn response(&self) -> HttpResponse<Body> {
+		let mut response = HttpResponse::new(Body::default());
+		match self {
+			Self::Method => {
 				*response.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
 				response.headers_mut().insert(ALLOW, HeaderValue::from_static("POST"));
-				response
 			}
-			Refusal::MediaType => {
-				let mut response = Self::new(Body::default());
-				*response.status_mut() = StatusCode::UNSUPPORTED_MEDIA_TYPE;
-				response
-			}
-			Refusal::Path => Status::unimplemented("the edge serves no call on this path").into_http(),
-			Refusal::Busy => Status::unavailable("the server has no free slot for a tunnel").into_http(),
-			Refusal::Unconnected => Status::internal("the call carries no connection of this server").into_http(),
+			Self::MediaType => *response.status_mut() = StatusCode::UNSUPPORTED_MEDIA_TYPE,
+		}
+
+		response
+	}
+}
+
+/// Why the edge refuses a gRPC call before any session exists, which it
+/// answers with a status.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CallRefusal {
+	/// The edge serves no call on the path.
+	Path,
+	/// The request carries no connection of this server, which only a fault
+	/// of the server itself can cause.
+	Unconnected,
+	/// The lane of the connection refuses the tunnel, for this reason.
+	Lane(LaneRefusal),
+	/// The queue of tunnels for a caller of `accept` is full.
+	QueueFull,
+}
+
+impl CallRefusal {
+	/// The name that the audit trail records the refusal under.
+	#[cfg(feature = "instrument")]
+	pub(crate) fn as_str(&self) -> &'static str {
+		match self {
+			Self::Path => "path",
+			Self::Unconnected => "unconnected",
+			Self::Lane(refusal) => refusal.as_str(),
+			Self::QueueFull => "queue-full",
+		}
+	}
+
+	/// The gRPC status that a caller reads of the refusal.
+	fn status(&self) -> Status {
+		match self {
+			Self::Path => Status::unimplemented("the edge serves no call on this path"),
+			Self::Unconnected => Status::internal("the call carries no connection of this server"),
+			Self::Lane(_) => Status::unavailable("the connection cannot carry a tunnel now"),
+			Self::QueueFull => Status::unavailable("the server has no room for another tunnel"),
+		}
+	}
+}
+
+/// A refusal of the lane of a connection is the refusal of its tunnel call.
+impl From<LaneRefusal> for CallRefusal {
+	fn from(refusal: LaneRefusal) -> Self {
+		Self::Lane(refusal)
+	}
+}
+
+/// What the audit trail of an edge records as refused before any session
+/// exists: a request, a call, or a connection that never reached the HTTP/2
+/// server.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EdgeRefusal {
+	/// A request that is no gRPC call, which the edge answers with its HTTP
+	/// status.
+	Head(HeadRefusal),
+	/// A call that the edge answers with its status.
+	Call(CallRefusal),
+	/// A connection whose TLS handshake failed.
+	Tls,
+	/// A connection that passed neither its PROXY header nor its TLS
+	/// handshake before the deadline of its lane.
+	Late,
+	/// A connection whose wait for its PROXY header and its TLS handshake the
+	/// clock of the edge gave no timer.
+	NoTimer,
+}
+
+#[cfg(feature = "instrument")]
+impl EdgeRefusal {
+	/// The name that the audit trail records the refusal under.
+	pub(crate) fn as_str(&self) -> &'static str {
+		match self {
+			Self::Head(refusal) => refusal.as_str(),
+			Self::Call(refusal) => refusal.as_str(),
+			Self::Tls => "tls",
+			Self::Late => "late",
+			Self::NoTimer => "no-timer",
+		}
+	}
+}
+
+impl From<HeadRefusal> for EdgeRefusal {
+	fn from(refusal: HeadRefusal) -> Self {
+		Self::Head(refusal)
+	}
+}
+
+impl From<CallRefusal> for EdgeRefusal {
+	fn from(refusal: CallRefusal) -> Self {
+		Self::Call(refusal)
+	}
+}
+
+/// The audit trail of one listener or of one backend adapter, under the
+/// `instrument` feature. A trail with no trace, or a build without the
+/// feature, records nothing.
+///
+/// - A listener fixes the trace of its profile when it binds, and every
+///   connection task of its server and its coupler share it.
+/// - A `couple::Backend` holds one on the trace of `Backend::with_trace`.
+#[derive(Default)]
+pub(crate) struct EdgeAudit {
+	#[cfg(feature = "instrument")]
+	trace: Option<TraceCollector>,
+}
+
+/// A clone records on the trace of the original.
+impl Clone for EdgeAudit {
+	fn clone(&self) -> Self {
+		Self {
+			#[cfg(feature = "instrument")]
+			trace: self.trace.as_ref().map(TraceCollector::share),
+		}
+	}
+}
+
+impl EdgeAudit {
+	/// The trail that records on `trace`.
+	#[cfg(feature = "instrument")]
+	pub(crate) fn on(trace: Option<TraceCollector>) -> Self {
+		Self { trace }
+	}
+
+	/// Record `refusal`, then give its HTTP response.
+	pub(crate) fn answer(&self, refusal: HeadRefusal) -> HttpResponse<Body> {
+		self.refuse(refusal.into());
+		refusal.response()
+	}
+
+	/// Record `refusal`, then give the status that ends its call.
+	pub(crate) fn status(&self, refusal: CallRefusal) -> Status {
+		self.refuse(refusal.into());
+		refusal.status()
+	}
+
+	/// Record `refusal` as [`EDGE_REFUSED`].
+	#[cfg(feature = "instrument")]
+	pub(crate) fn refuse(&self, refusal: EdgeRefusal) {
+		self.record(EDGE_REFUSED, refusal.as_str(), refusal.as_str());
+	}
+
+	#[cfg(not(feature = "instrument"))]
+	pub(crate) fn refuse(&self, _refusal: EdgeRefusal) {}
+
+	/// Record the relay of a call of `method` of the backend adapter, which
+	/// the backend ended with `code`, as [`BACKEND_CALL_RELAYED`].
+	#[cfg(all(feature = "instrument", feature = "couple"))]
+	pub(crate) fn relayed(&self, method: &MethodPath, code: Code) {
+		self.record(BACKEND_CALL_RELAYED, method.as_str().to_owned(), code as i32 as u32);
+	}
+
+	#[cfg(all(not(feature = "instrument"), feature = "couple"))]
+	pub(crate) fn relayed(&self, _method: &MethodPath, _code: Code) {}
+
+	/// Record a call that the policy of the backend adapter refused for
+	/// `refusal`, as [`BACKEND_CALL_REFUSED`].
+	#[cfg(all(feature = "instrument", feature = "couple"))]
+	pub(crate) fn denied(&self, refusal: AccessRefusal) {
+		self.record(BACKEND_CALL_REFUSED, refusal.as_str(), refusal.as_str());
+	}
+
+	#[cfg(all(not(feature = "instrument"), feature = "couple"))]
+	pub(crate) fn denied(&self, _refusal: AccessRefusal) {}
+
+	/// Record a part of a stream of the backend adapter that failed to admit
+	/// or to send, which ended the stream, as [`BACKEND_CALL_REFUSED`] with
+	/// `part`.
+	#[cfg(all(feature = "instrument", feature = "couple"))]
+	pub(crate) fn part_refused(&self) {
+		self.record(BACKEND_CALL_REFUSED, "part", "part");
+	}
+
+	#[cfg(all(not(feature = "instrument"), feature = "couple"))]
+	pub(crate) fn part_refused(&self) {}
+
+	/// Record `event` with `label` and `value`.
+	#[cfg(feature = "instrument")]
+	pub(crate) fn record(
+		&self,
+		event: Urn<'static>,
+		label: impl Into<Cow<'static, str>>,
+		value: impl Into<EventValue>,
+	) {
+		if let Some(trace) = &self.trace {
+			// The trace refuses an event only under the fault that the
+			// `testing-fault` feature of tightbeam injects, and the edge
+			// carries on either way.
+			let _ = trace.emit_event_with_value(event, label, value);
 		}
 	}
 }
@@ -216,7 +339,7 @@ impl TunnelCall {
 		let stream = GrpcStream::accepted(messages, sender, answer);
 
 		let tunnel = Tunnel { stream, peer: self.peer, holder: Holder::Call(self.claim.ticket()) };
-		let responses = Responses { messages: receiver, ending: Ending::Watching(ending), _claim: self.claim };
+		let responses = Responses { messages: receiver, ending: Ending::Watching(ending), claim: Some(self.claim) };
 		(tunnel, responses)
 	}
 }
@@ -227,12 +350,12 @@ impl TunnelCall {
 	///
 	/// # Errors
 	///
-	/// - [`Refusal::Unconnected`] -- the head carries no connection of this server.
-	/// - [`Refusal::Busy`] -- the lane refuses the tunnel.
-	pub(crate) fn claim(head: &Parts) -> Result<Self, Refusal> {
-		let connection = head.extensions.get::<GrpcConnectInfo>().ok_or(Refusal::Unconnected)?;
-		let claim = connection.lane.claim_tunnel().ok_or(Refusal::Busy)?;
-		Ok(Self { claim, peer: connection.peer })
+	/// - [`CallRefusal::Unconnected`] -- the head carries no connection of this server.
+	/// - [`CallRefusal::Lane`] -- the lane refuses the tunnel.
+	pub(crate) fn claim(head: &Parts) -> Result<Self, CallRefusal> {
+		let connection = head.extensions.get::<GrpcConnectInfo>().ok_or(CallRefusal::Unconnected)?;
+		let claim = connection.claim_tunnel()?;
+		Ok(Self { peer: claim.peer(), claim })
 	}
 }
 
@@ -253,6 +376,18 @@ enum Holder {
 	Loopback,
 }
 
+impl Holder {
+	/// Hand the stream to a caller: `false` when its call ended, or a later
+	/// call on its connection replaced it.
+	fn redeem(&self) -> bool {
+		match self {
+			Self::Call(ticket) => ticket.redeem(),
+			#[cfg(feature = "couple")]
+			Self::Loopback => true,
+		}
+	}
+}
+
 impl Tunnel {
 	/// The in-process tunnel `stream` of the coupler of the listener bound at
 	/// `local`.
@@ -267,12 +402,7 @@ impl Tunnel {
 	/// `None` when the call ended, or a later call on its connection replaced
 	/// it, before a caller took it.
 	pub(crate) fn into_stream(self) -> Option<(GrpcStream, SocketAddr)> {
-		let live = match &self.holder {
-			Holder::Call(ticket) => ticket.redeem(),
-			#[cfg(feature = "couple")]
-			Holder::Loopback => true,
-		};
-		live.then_some((self.stream, self.peer))
+		self.holder.redeem().then_some((self.stream, self.peer))
 	}
 }
 
@@ -292,7 +422,9 @@ enum Ending {
 pub(crate) struct Responses {
 	messages: Receiver<Vec<u8>>,
 	ending: Ending,
-	_claim: Claim,
+	/// The claim of the call, which the end of the response drops, before
+	/// the server writes its trailers.
+	claim: Option<Claim>,
 }
 
 impl Stream for Responses {
@@ -300,22 +432,35 @@ impl Stream for Responses {
 
 	fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
 		let this = self.get_mut();
-		if let Ending::Watching(answer) = &mut this.ending {
+		let next = this.poll_message(cx);
+		if let Poll::Ready(None) = next {
+			this.claim = None;
+		}
+
+		next
+	}
+}
+
+impl Responses {
+	/// The next message of the response, the status that ends it, or `None`
+	/// at its end.
+	fn poll_message(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<Vec<u8>, Status>>> {
+		if let Ending::Watching(answer) = &mut self.ending {
 			match Pin::new(answer).poll(cx) {
 				Poll::Ready(Ok(status)) => {
-					this.ending = Ending::Answered;
+					self.ending = Ending::Answered;
 					return Poll::Ready(Some(Err(status)));
 				}
-				Poll::Ready(Err(_)) => this.ending = Ending::Quiet,
+				Poll::Ready(Err(_)) => self.ending = Ending::Quiet,
 				Poll::Pending => {}
 			}
 		}
 
-		if let Ending::Answered = this.ending {
+		if let Ending::Answered = self.ending {
 			return Poll::Ready(None);
 		}
 
-		let message = this.messages.poll_recv(cx);
+		let message = self.messages.poll_recv(cx);
 		message.map(|envelope| envelope.map(Ok))
 	}
 }
@@ -324,16 +469,16 @@ impl Stream for Responses {
 /// a caller of `accept`.
 #[derive(Clone)]
 pub(crate) struct TunnelService {
-	queue: Sender<Arrival>,
+	queue: Arrivals,
 	ceiling: usize,
-	refusals: RefusalAudit,
+	audit: EdgeAudit,
 }
 
 impl TunnelService {
 	/// A service that queues each tunnel on `queue`, with every message of
-	/// its call held to `ceiling`, and records each refusal on `refusals`.
-	pub(crate) fn new(queue: Sender<Arrival>, ceiling: usize, refusals: RefusalAudit) -> Self {
-		Self { queue, ceiling, refusals }
+	/// its call held to `ceiling`, and records each refusal on `audit`.
+	pub(crate) fn new(queue: Arrivals, ceiling: usize, audit: EdgeAudit) -> Self {
+		Self { queue, ceiling, audit }
 	}
 }
 
@@ -343,7 +488,7 @@ impl TunnelService {
 	pub(crate) async fn serve(&self, call: TunnelCall, request: HttpRequest<Body>) -> HttpResponse<Body> {
 		let grpc = Grpc::new(TunnelCodec).max_decoding_message_size(self.ceiling);
 		let mut grpc = grpc.max_encoding_message_size(self.ceiling);
-		let admission = Admission { call: Some(call), queue: self.queue.clone(), refusals: self.refusals.clone() };
+		let admission = Admission { call: Some(call), queue: self.queue.clone(), audit: self.audit.clone() };
 
 		grpc.streaming(admission, request).await
 	}
@@ -355,8 +500,8 @@ struct Admission {
 	/// tonic calls the admission once, but its trait takes `&mut self`, so the
 	/// call moves out of an option.
 	call: Option<TunnelCall>,
-	queue: Sender<Arrival>,
-	refusals: RefusalAudit,
+	queue: Arrivals,
+	audit: EdgeAudit,
 }
 
 impl StreamingService<Vec<u8>> for Admission {
@@ -367,20 +512,12 @@ impl StreamingService<Vec<u8>> for Admission {
 	fn call(&mut self, request: Request<Streaming<Vec<u8>>>) -> Self::Future {
 		let call = self.call.take();
 		let queue = self.queue.clone();
-		let refusals = self.refusals.clone();
+		let audit = self.audit.clone();
 
 		Box::pin(async move {
 			let call = call.ok_or_else(|| Status::internal("the tunnel admits one call"))?;
 			let (tunnel, responses) = call.admit(request.into_inner());
-
-			// A live tunnel holds a slot, so only tunnels that ended before a
-			// caller took them can fill the queue, and the call then refuses
-			// as busy.
-			if queue.try_send(Ok(tunnel)).is_err() {
-				refusals.refused(&Refusal::Busy);
-				return Err(Status::unavailable("the server has no free slot for a tunnel"));
-			}
-
+			queue.queue(tunnel).map_err(|refusal| audit.status(refusal))?;
 			Ok(Response::new(responses))
 		})
 	}
@@ -402,25 +539,30 @@ mod tests {
 	#[test]
 	fn a_head_with_no_connection_claims_no_lane() -> Result<(), http::Error> {
 		let refused = TunnelCall::claim(&unconnected()?).err();
-		assert_eq!(refused, Some(Refusal::Unconnected));
+		assert_eq!(refused, Some(CallRefusal::Unconnected));
 		Ok(())
 	}
 
 	#[test]
-	fn each_refusal_answers_its_status() {
-		let method = HttpResponse::from(Refusal::Method);
+	fn a_request_that_is_no_grpc_call_answers_its_http_status() {
+		let method = HeadRefusal::Method.response();
 		assert_eq!(method.status(), StatusCode::METHOD_NOT_ALLOWED);
 		assert_eq!(method.headers().get(ALLOW).map(HeaderValue::as_bytes), Some(&b"POST"[..]));
+		assert_eq!(HeadRefusal::MediaType.response().status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+	}
 
-		let media = HttpResponse::from(Refusal::MediaType);
-		assert_eq!(media.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
-
-		let statuses = [(Refusal::Path, "12"), (Refusal::Busy, "14"), (Refusal::Unconnected, "13")];
-		for (refusal, expected) in statuses {
-			let response = HttpResponse::from(refusal);
+	tightbeam::tb_cases! {
+		fn a_refused_grpc_call_answers_its_status((refusal, expected): (CallRefusal, &str)) {
+			let response = refusal.status().into_http::<Body>();
 			let status = response.headers().get("grpc-status").map(HeaderValue::as_bytes);
-			assert_eq!(response.status(), StatusCode::OK);
-			assert_eq!(status, Some(expected.as_bytes()));
+			assert_eq!((response.status(), status), (StatusCode::OK, Some(expected.as_bytes())));
+		}
+
+		cases {
+			an_unserved_path => (CallRefusal::Path, "12"),
+			no_free_slot => (CallRefusal::Lane(LaneRefusal::NoSlot), "14"),
+			a_full_queue => (CallRefusal::QueueFull, "14"),
+			no_connection => (CallRefusal::Unconnected, "13"),
 		}
 	}
 }

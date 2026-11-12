@@ -10,8 +10,11 @@ repository.workspace = true
 homepage.workspace = true
 documentation = "https://docs.rs/tightbeam-asn-names"
 readme = "README.md"
-keywords.workspace = true
-categories.workspace = true
+keywords = ["typescript", "identifier", "asn1", "tightbeam"]
+categories = ["encoding", "no-std"]
 
 [lib]
 name = "tightbeam_asn_names"
+
+[lints]
+workspace = true

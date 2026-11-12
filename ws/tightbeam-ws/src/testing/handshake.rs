@@ -1,7 +1,5 @@
-//! Certificate pinning for the e2e stack's example servers and native
+//! Certificate pinning for the demo servers of the e2e stack and their native
 //! clients.
-//!
-//! Compiled only under the `testing` feature.
 
 use std::fs;
 use std::path::Path;
@@ -16,7 +14,7 @@ use tightbeam::der::Decode;
 use tightbeam::x509::Certificate;
 use tightbeam::TightBeamError;
 
-use crate::error::Result;
+use super::Result;
 
 /// A certificate that a peer pins as the one identity it accepts.
 ///
@@ -34,7 +32,7 @@ use crate::error::Result;
 /// let pinned = Pinned::from_der(&identity.certificate_der()?)?;
 /// let _trust = pinned.trust()?;
 /// assert_eq!(pinned.validators()?.len(), 1);
-/// # Ok::<(), tightbeam_ws::Error>(())
+/// # Ok::<(), tightbeam_ws::testing::Error>(())
 /// ```
 pub struct Pinned(Certificate);
 
@@ -49,8 +47,7 @@ impl Pinned {
 	///
 	/// # Errors
 	///
-	/// - [`Error::Tightbeam`](crate::Error::Tightbeam): `der` is not a DER
-	///   certificate.
+	/// - [`Error::Ws`](super::Error::Ws) -- `der` is not a DER certificate.
 	pub fn from_der(der: &[u8]) -> Result<Self> {
 		let certificate = Certificate::from_der(der).map_err(TightBeamError::from)?;
 		Ok(Self(certificate))
@@ -61,7 +58,7 @@ impl Pinned {
 	///
 	/// # Errors
 	///
-	/// - [`Error::Io`](crate::Error::Io): the file does not read.
+	/// - [`Error::Ws`](super::Error::Ws) -- the file does not read.
 	/// - The errors of [`from_der`](Self::from_der).
 	pub fn read(path: impl AsRef<Path>) -> Result<Self> {
 		let der = fs::read(path)?;
@@ -73,8 +70,7 @@ impl Pinned {
 	///
 	/// # Errors
 	///
-	/// - [`Error::Tightbeam`](crate::Error::Tightbeam): the store refuses the
-	///   certificate.
+	/// - [`Error::Ws`](super::Error::Ws) -- the store refuses the certificate.
 	pub fn trust(&self) -> Result<Arc<dyn CertificateTrust>> {
 		let builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
 		let store = builder.with_certificate(self.0.clone()).map_err(TightBeamError::from)?.build();
@@ -86,8 +82,7 @@ impl Pinned {
 	///
 	/// # Errors
 	///
-	/// - [`Error::Tightbeam`](crate::Error::Tightbeam): the fingerprint of the
-	///   certificate fails to compute.
+	/// - [`Error::Ws`](super::Error::Ws) -- the fingerprint of the certificate fails to compute.
 	pub fn validators(&self) -> Result<Vec<Arc<dyn CertificateValidation>>> {
 		let certificate = self.0.clone();
 		let pinned = RuntimeCertificatePinning::<Sha3_256>::from_certificates([certificate]);

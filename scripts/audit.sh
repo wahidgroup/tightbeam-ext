@@ -5,7 +5,7 @@ set -euo pipefail
 # selected project that has one (npm audit).
 #
 # Usage: audit.sh [project...]   (default: every project)
-# Mode: AUDIT_MODE=fix runs `npm audit fix`; cargo audit is check-only.
+# Mode: AUDIT_MODE=fix runs `npm audit fix`. cargo audit only checks.
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 MODE="${AUDIT_MODE:-check}"

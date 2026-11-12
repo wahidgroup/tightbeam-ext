@@ -1,0 +1,19 @@
+name: Node toolchain
+description: The Node of .nvmrc with the GitHub Packages registry for the @wahidgroup scope, and the npm that @wahidgroup/lint-rules requires.
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@v4
+      with:
+        node-version-file: .nvmrc
+        cache: npm
+        cache-dependency-path: "*/package-lock.json"
+        registry-url: https://npm.pkg.github.com
+        scope: "@wahidgroup"
+
+    # The engines field of @wahidgroup/lint-rules asks for npm 12 or later, and
+    # each workspace .npmrc sets engine-strict, so the npm that Node bundles fails `npm ci`.
+    - name: Pin npm
+      shell: bash
+      run: npm install --global npm@12.0.2

@@ -14,8 +14,7 @@ use tightbeam_asn::emit::CodecPairs;
 /// The names of the codec pairs that a parse discovered, joined by commas.
 const DISCOVERED: Urn<'static> = urn!("test", "event:asn-emit/discovered");
 
-/// The fixture `name`. `sample.d.ts` is the parser input of the refusal path,
-/// an encode with no decode, which a real wasm build never declares.
+/// The fixture `name`.
 fn fixture(name: &str) -> PathBuf {
 	PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name)
 }
@@ -30,7 +29,9 @@ tb_assert_spec! {
 	}
 }
 
-// Only the types with both an encode and a decode export are discovered.
+// Only the types with both exports, each in the declaration of the derive, are
+// discovered. An export that names no type, a pair of another signature, and a
+// pair of a name that the emitted module uses are skipped.
 tb_scenario! {
 	name: sample_dts_discovers_codec_pairs,
 	spec: CodecPairsSpec,
@@ -38,7 +39,8 @@ tb_scenario! {
 		exec: |SetupEnv { trace, .. }| -> Result<(), TightBeamError> {
 			let dts = fs::read_to_string(fixture("sample.d.ts"))?;
 			let pairs: CodecPairs = dts.parse().map_err(io::Error::other)?;
-			trace.event_with(DISCOVERED, &[], pairs.names().join(","))?;
+			let names: Vec<&str> = pairs.names().iter().map(|name| name.as_str()).collect();
+			trace.event_with(DISCOVERED, &[], names.join(","))?;
 			Ok(())
 		}
 	}

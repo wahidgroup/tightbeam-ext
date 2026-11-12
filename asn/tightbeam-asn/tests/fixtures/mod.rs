@@ -71,6 +71,16 @@ pub enum Request {
 	List(ListPad),
 }
 
+/// Sequence carrying an Enumerated field and a Choice field.
+#[derive(Clone, Debug, Eq, PartialEq, Sequence, AsnCodec)]
+#[asn_codec(js_name = "Routed")]
+pub struct Routed {
+	/// Nested Enumerated under a raw identifier, whose JS key drops the `r#`.
+	pub r#type: Status,
+	/// Nested Choice carried beside the Enumerated.
+	pub request: Request,
+}
+
 /// Nested identity-shaped Sequence for list-result fixture coverage.
 #[derive(Clone, Debug, Eq, PartialEq, Sequence, AsnCodec)]
 #[asn_codec(js_name = "Record")]
@@ -143,7 +153,8 @@ pub struct NestBundle {
 	pub nested: Option<Vec<u8>>,
 	/// OPTIONAL SEQUENCE OF nested Sequence values.
 	pub deeper: Option<Vec<Record>>,
-	/// SET OF UTF-8 strings as a JS Array.
+	/// SET OF UTF-8 strings as a JS Array, such as the glob `src/**/*.rs`,
+	/// whose `*/` the derive writes as `*\/` in the JSDoc.
 	pub tags: SetOfVec<String>,
 	/// SEQUENCE OF INTEGER values, at most three.
 	pub triple: SequenceOf<u8, 3>,

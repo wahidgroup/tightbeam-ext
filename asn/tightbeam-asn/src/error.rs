@@ -1,10 +1,10 @@
-//! The failure of a conversion between a JavaScript value and a wire type.
+//! The failure of a conversion between a JavaScript value and a DER type.
 
 use alloc::format;
 use alloc::string::{String, ToString};
 use core::fmt;
 
-/// A value that does not fit its wire type, named by its path in the message.
+/// A value that does not fit its DER type, named by its path in the message.
 ///
 /// The path reads as a TypeScript access, such as `records[1].subject`, and is
 /// empty when the failure is the value handed to the codec itself.

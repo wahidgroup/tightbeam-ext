@@ -2,23 +2,6 @@ import { describe, expect, it } from "vitest";
 
 import { PullChannel } from "./channel.js";
 
-/**
- * Whether `promise` settled once the microtask queue drained, observed
- * without awaiting it: the marker arrives on a macrotask, so a promise
- * resolved any number of microtask hops earlier still wins the race.
- */
-async function settled(promise: Promise<unknown>): Promise<boolean> {
-	const MARKER = Symbol("pending");
-	const marker = new Promise<symbol>((resolve) => {
-		setTimeout(() => {
-			resolve(MARKER);
-		}, 0);
-	});
-
-	const outcome = await Promise.race([promise, marker]);
-	return outcome !== MARKER;
-}
-
 describe("PullChannel", () => {
 	it("delivers items in FIFO order", async () => {
 		const channel = new PullChannel<string>();
@@ -32,13 +15,21 @@ describe("PullChannel", () => {
 
 	it("holds the producer until the consumer takes the item", async () => {
 		const channel = new PullChannel<string>();
-
-		const offered = channel.put("held");
-		expect(await settled(offered)).toBe(false);
+		const settled: string[] = [];
+		const settle = async (offered: Promise<void>, label: string): Promise<void> => {
+			await offered;
+			settled.push(label);
+		};
+		const first = settle(channel.put("one"), "put one");
+		const second = settle(channel.put("two"), "put two");
 
 		await channel.next();
+		await first;
+		settled.push("took one");
+		await channel.next();
+		await second;
 
-		expect(await settled(offered)).toBe(true);
+		expect(settled).toEqual(["put one", "took one", "put two"]);
 	});
 
 	it("hands a waiting consumer the item as it arrives", async () => {
@@ -71,12 +62,13 @@ describe("PullChannel", () => {
 		expect((await waiting).done).toBe(true);
 	});
 
-	it("releases producers immediately once finished", async () => {
+	it("queues nothing once finished", async () => {
 		const channel = new PullChannel<string>();
 		channel.finish();
 
-		const offered = channel.put("late");
-		expect(await settled(offered)).toBe(true);
+		await channel.put("late");
+
+		expect(await channel.next()).toEqual({ value: undefined, done: true });
 	});
 
 	it("releases a parked producer on finish", async () => {
@@ -85,7 +77,8 @@ describe("PullChannel", () => {
 
 		channel.finish();
 
-		expect(await settled(offered)).toBe(true);
+		await offered;
+		expect(await channel.next()).toEqual({ value: "parked", done: false });
 	});
 
 	it("still drains an item whose producer finish released", async () => {

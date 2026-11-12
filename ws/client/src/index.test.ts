@@ -2,10 +2,10 @@ import { describe, expect, expectTypeOf, it } from "vitest";
 
 import { readFileSync } from "node:fs";
 
-import type { MutualConnectOptions } from "./index.js";
-import { ClientTransportError, TightbeamWsClient } from "./index.js";
+import type { MutualConnectOptions, TightbeamWsClient } from "./index.js";
+import { Engine } from "./index.js";
 
-const engine = await TightbeamWsClient.init();
+const engine = await Engine.load();
 
 /**
  * The octets of the identity fixture `name` under `src/testing`: a server
@@ -18,11 +18,11 @@ function fixture(name: string): Uint8Array {
 }
 
 /*
- * The connector boundary guards reject before any dial, so the URL and
- * certificates below never leave the process.
+ * The URL names a closed loopback port, so a dial that passes the connector guards rejects before its handshake.
  */
 const UNREACHED_URL = "ws://127.0.0.1:1";
-const UNREACHED_CERT = new Uint8Array(1);
+const SERVER_CERT = fixture("server.cert.der");
+const CLIENT_CERT = fixture("client.cert.der");
 const SCALAR = new Uint8Array(32).fill(1);
 const PROFILE_SIGNATURE_OID = "1.2.840.10045.4.3.2";
 
@@ -46,14 +46,13 @@ const CAPPED_DIALS = [
 	{
 		name: "connect",
 		dial: (cap: number): Promise<TightbeamWsClient> =>
-			engine.connect(UNREACHED_URL, UNREACHED_CERT, {
+			engine.connect(UNREACHED_URL, SERVER_CERT, {
 				maxPeerStreams: cap,
 			}),
 	},
 	{
 		name: "connectCleartext",
-		dial: (cap: number): Promise<TightbeamWsClient> =>
-			engine.connectCleartext(UNREACHED_URL, { streams: cap }),
+		dial: (cap: number): Promise<TightbeamWsClient> => engine.connectCleartext(UNREACHED_URL, { streams: cap }),
 	},
 	{
 		name: "connectMutual",
@@ -61,8 +60,8 @@ const CAPPED_DIALS = [
 			engine.connectMutual(
 				UNREACHED_URL,
 				{
-					serverCertDer: UNREACHED_CERT,
-					clientCertDer: UNREACHED_CERT,
+					serverCertDer: SERVER_CERT,
+					clientCertDer: CLIENT_CERT,
 					clientKey: SCALAR,
 				},
 				{ maxPeerStreams: cap },
@@ -71,16 +70,13 @@ const CAPPED_DIALS = [
 ] as const;
 
 describe.each(CAPPED_DIALS)("$name stream cap guard", ({ dial }) => {
-	it.each(COERCIBLE_CAPS)(
-		"rejects $label as an InvalidStreamCap transport error",
-		async ({ cap }) => {
-			const dialed = dial(cap);
-			await expect(dialed).rejects.toMatchObject({
-				name: ClientTransportError.NAME,
-				code: "InvalidStreamCap",
-			});
-		},
-	);
+	it.each(COERCIBLE_CAPS)("rejects $label as an InvalidStreamCap transport error", async ({ cap }) => {
+		const dialed = dial(cap);
+		await expect(dialed).rejects.toMatchObject({
+			name: "TightbeamTransportError",
+			code: "InvalidStreamCap",
+		});
+	});
 });
 
 /*
@@ -119,7 +115,7 @@ const FOREIGN_KEYS = [
 	{
 		label: "an ArrayBuffer scalar",
 		key: new ArrayBuffer(32),
-		code: "InvalidSigner",
+		code: "InvalidCallback",
 	},
 	{
 		label: "a scalar of 31 octets",
@@ -129,7 +125,7 @@ const FOREIGN_KEYS = [
 	{
 		label: "a signer missing signPrehash",
 		key: { ...SIGNER, signPrehash: undefined },
-		code: "InvalidSigner",
+		code: "InvalidCallback",
 	},
 	{
 		label: "a signer missing publicKeyDer",
@@ -155,34 +151,54 @@ const FOREIGN_KEYS = [
 ] as const;
 
 describe("connectMutual client key guard", () => {
-	it.each(FOREIGN_KEYS)(
-		"rejects $label with the code $code",
-		async ({ key, code }) => {
-			const dialed = loosely.connectMutual(UNREACHED_URL, {
-				serverCertDer: UNREACHED_CERT,
-				clientCertDer: UNREACHED_CERT,
-				clientKey: key,
-			});
+	it.each(FOREIGN_KEYS)("rejects $label with the code $code", async ({ key, code }) => {
+		const dialed = loosely.connectMutual(UNREACHED_URL, {
+			serverCertDer: SERVER_CERT,
+			clientCertDer: CLIENT_CERT,
+			clientKey: key,
+		});
 
-			await expect(dialed).rejects.toMatchObject({
-				name: ClientTransportError.NAME,
-				code,
-			});
-		},
-	);
+		await expect(dialed).rejects.toMatchObject({
+			name: "TightbeamTransportError",
+			code,
+		});
+	});
 });
 
 describe("connectMutual certificate guard", () => {
 	it("rejects a numeric certificate as an InvalidBytes transport error", async () => {
 		const dialed = loosely.connectMutual(UNREACHED_URL, {
 			serverCertDer: 7,
-			clientCertDer: UNREACHED_CERT,
+			clientCertDer: CLIENT_CERT,
 			clientKey: SCALAR,
 		});
 
 		await expect(dialed).rejects.toMatchObject({
-			name: ClientTransportError.NAME,
+			name: "TightbeamTransportError",
 			code: "InvalidBytes",
+		});
+	});
+
+	it.each([
+		{
+			name: "connect",
+			dial: (): Promise<TightbeamWsClient> => engine.connect(UNREACHED_URL, new Uint8Array(1)),
+			path: "serverCertDer",
+		},
+		{
+			name: "connectMutual",
+			dial: (): Promise<TightbeamWsClient> =>
+				engine.connectMutual(UNREACHED_URL, {
+					serverCertDer: SERVER_CERT,
+					clientCertDer: new Uint8Array(1),
+					clientKey: SCALAR,
+				}),
+			path: "identity.clientCertDer",
+		},
+	])("$name refuses octets that are no certificate before any dial", async ({ dial, path }) => {
+		await expect(dial()).rejects.toMatchObject({
+			code: "InvalidCertificate",
+			path,
 		});
 	});
 });
@@ -204,7 +220,7 @@ describe("connectMutual identity read", () => {
 		key.fill(0);
 
 		await expect(dialed).rejects.toMatchObject({
-			code: "InvalidMessage",
+			code: "PeerClosedBeforeHandshake",
 		});
 	});
 });
@@ -214,12 +230,12 @@ describe("session offer mutual-only guard", () => {
 		const budgets = { clientToServer: 1, serverToClient: 1 };
 		const dialed = engine.connect(
 			UNREACHED_URL,
-			UNREACHED_CERT,
+			SERVER_CERT,
 			// @ts-expect-error A mutual-only field fails at runtime.
 			{ budgets },
 		);
 		await expect(dialed).rejects.toMatchObject({
-			name: ClientTransportError.NAME,
+			name: "TightbeamTransportError",
 			code: "SessionOfferRequiresMutual",
 		});
 	});
@@ -232,7 +248,7 @@ describe("session offer mutual-only guard", () => {
 			{ approveReceipt },
 		);
 		await expect(dialed).rejects.toMatchObject({
-			name: ClientTransportError.NAME,
+			name: "TightbeamTransportError",
 			code: "SessionOfferRequiresMutual",
 		});
 	});

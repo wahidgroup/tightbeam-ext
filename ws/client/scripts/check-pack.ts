@@ -1,10 +1,6 @@
 /**
- * Assert that `npm pack` holds what `package.json` names:
- *
- * - Every packed path sits under a `files` entry, or is `package.json`.
- * - Every `files` entry appears in the pack.
- * - Every packed output under the build's `outDir` is one that
- *   tsconfig.build.json compiles from a source it includes.
+ * Assert that `npm pack` holds what `package.json` names, as the package
+ * section of `docs/ws-client.md` lists.
  */
 
 import type { SpawnSyncOptionsWithStringEncoding } from "node:child_process";
@@ -124,11 +120,8 @@ function isPresent(entry: string): boolean {
 }
 
 /**
- * The build outputs `tsc` writes for tsconfig.build.json, as `tsc` itself
- * resolves the config: one `.js` and one `.d.ts` per source it compiles,
- * and a copy of each JSON source under its own name, under its `outDir`. The
- * config's own excludes decide which sources those are, so test sources and
- * fixtures stay out of the set.
+ * The build outputs that `tsc` writes for tsconfig.build.json, as `tsc` resolves the config: one `.js` and one `.d.ts`
+ * per source it compiles, and a copy of each JSON source, under its `outDir`.
  */
 const showArgs = ["tsc", "-p", "tsconfig.build.json", "--showConfig"];
 const showOptions: SpawnSyncOptionsWithStringEncoding = {
@@ -212,6 +205,4 @@ if (failed) {
 	process.exit(1);
 }
 
-console.log(
-	`ok pack matches files (${packed.length} paths, ${allowEntries.length} files entries)`,
-);
+console.log(`ok pack matches files (${packed.length} paths, ${allowEntries.length} files entries)`);

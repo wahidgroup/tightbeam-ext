@@ -1,16 +1,5 @@
-//! The envelope rules of `tightbeam_wire`, run against the browser kind,
-//! [`GlooStream`], under a JavaScript host.
-//!
-//! Each case opens a real `gloo` WebSocket to a peer served by `ws`, the
-//! RFC 6455 server of the ws workspace, over a loopback socket, so the host
-//! WebSocket, `gloo`, the stream, and the peer all run as they do in a page.
-//!
-//! # Sources
-//!
-//! - RFC 6455, The WebSocket Protocol, December 2011, section 5.2 (the frame
-//!   opcodes): <https://datatracker.ietf.org/doc/html/rfc6455>
-//! - `ws` 8.18.3, the WebSocket server of the ws workspace:
-//!   <https://github.com/websockets/ws>
+//! The envelope rules of `tightbeam_wire` against `GlooStream`, over a real
+//! `gloo` WebSocket, as the tests section of `docs/ws-wasm.md` describes.
 #![cfg(target_arch = "wasm32")]
 
 use core::ops::Deref;
@@ -18,11 +7,17 @@ use core::ops::Deref;
 use gloo_net::websocket::futures::WebSocket;
 use js_sys::Promise;
 use tightbeam::transport::{AsyncProtocolStream, TransportError, TransportFailure};
+use tightbeam_ws_wasm::clock::BrowserClock;
 use tightbeam_ws_wasm::GlooStream;
 use wasm_bindgen::prelude::wasm_bindgen;
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 use wasm_bindgen_test::wasm_bindgen_test;
+
+#[path = "support/patience.rs"]
+mod patience;
+
+use patience::settled;
 
 #[wasm_bindgen(inline_js = r#"
 const { createRequire } = process.getBuiltinModule('node:module');
@@ -174,13 +169,13 @@ impl Drop for Served {
 /// A stream under test, and the peer that accepted its socket.
 async fn connected() -> (GlooStream, Served) {
 	let listening = JsFuture::from(listen());
-	let listened = listening.await.expect("the peer should listen");
+	let listened = settled(listening).await.expect("the peer should listen");
 	let peer = Served(listened.unchecked_into());
 
 	let url = peer.url();
 	let socket = WebSocket::open(&url).expect("the host should open the socket");
 	let accepting = JsFuture::from(peer.accepted());
-	accepting.await.expect("the peer should accept the socket");
+	settled(accepting).await.expect("the peer should accept the socket");
 
 	(GlooStream::from(socket), peer)
 }
@@ -188,7 +183,7 @@ async fn connected() -> (GlooStream, Served) {
 /// The next frame the client sent, as its opcode and payload.
 async fn next_frame(peer: &Served) -> (u8, Vec<u8>) {
 	let arriving = JsFuture::from(peer.next_frame());
-	let arrived = arriving.await.expect("the client should send a frame");
+	let arrived = settled(arriving).await.expect("the client should send a frame");
 	let frame: Frame = arrived.unchecked_into();
 
 	(frame.opcode(), frame.payload())
@@ -200,7 +195,7 @@ async fn a_text_message_is_skipped() -> Result<(), JsValue> {
 	peer.send(TEXT, b"noise");
 	peer.send(BINARY, &[1, 2, 3]);
 
-	let envelope = stream.read_frame(CAP).await;
+	let envelope = settled(stream.read_frame(CAP)).await;
 	assert!(matches!(envelope, Ok(bytes) if bytes == [1, 2, 3]));
 	Ok(())
 }
@@ -210,8 +205,7 @@ async fn an_envelope_past_the_cap_is_size_exceeded() -> Result<(), JsValue> {
 	let (mut stream, peer) = connected().await;
 	peer.send(BINARY, &[0; CAP + 1]);
 
-	let refused = stream.read_frame(CAP).await;
-
+	let refused = settled(stream.read_frame(CAP)).await;
 	let size_exceeded = matches!(refused, Err(TransportError::OperationFailed(TransportFailure::SizeExceeded)));
 	assert!(size_exceeded);
 	Ok(())
@@ -222,8 +216,24 @@ async fn a_close_ends_the_read_as_connection_closed() -> Result<(), JsValue> {
 	let (mut stream, peer) = connected().await;
 	peer.close();
 
-	let closed = stream.read_frame(CAP).await;
+	let closed = settled(stream.read_frame(CAP)).await;
 	assert!(matches!(closed, Err(TransportError::ConnectionClosed)));
+	Ok(())
+}
+
+#[wasm_bindgen_test]
+async fn a_lost_connection_ends_the_read_as_connection_closed() -> Result<(), JsValue> {
+	let listening = JsFuture::from(listen());
+	let listened = settled(listening).await.expect("the peer should listen");
+	let peer = Served(listened.unchecked_into());
+	let url = peer.url();
+	drop(peer);
+
+	let socket = WebSocket::open(&url).expect("the host should open the socket");
+	let mut stream = GlooStream::from(socket);
+
+	let lost = settled(stream.read_frame(CAP)).await;
+	assert!(matches!(lost, Err(TransportError::ConnectionClosed)));
 	Ok(())
 }
 
@@ -231,7 +241,7 @@ async fn a_close_ends_the_read_as_connection_closed() -> Result<(), JsValue> {
 async fn an_envelope_leaves_as_one_binary_message() -> Result<(), JsValue> {
 	let (mut stream, peer) = connected().await;
 
-	let sent = stream.write_frame(&[1, 2, 3]).await;
+	let sent = settled(stream.write_frame(&[1, 2, 3])).await;
 	let received = next_frame(&peer).await;
 	assert!(sent.is_ok());
 	assert_eq!(received, (BINARY, vec![1, 2, 3]));

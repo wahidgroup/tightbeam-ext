@@ -1,8 +1,6 @@
 #![doc = include_str!("../README.md")]
 
-// This module compiles every Rust example of the page under `docs/` that
-// specifies this crate as a doctest, so a renamed item fails the build
-// instead of leaving the page stale.
+// This module compiles every Rust sample of `docs/pubsub.md` as a doctest.
 #[cfg(doctest)]
 #[doc = include_str!("../../../docs/pubsub.md")]
 mod docs_pubsub {}
@@ -21,14 +19,13 @@ mod topic;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 
-pub use backplane::{Backplane, BackplaneFault, DeliverError, Local, NodeSink, UpdateSink};
+pub use backplane::{Backplane, BackplaneFault, DeliverError, Local, PublishError};
 pub use dispatch::PubsubCommands;
-pub use emit::{Emitter, LinkLost, Settled};
+pub use emit::{EmitDeadline, Emitter, LinkLost, Settled};
+pub use frame::OpaqueFrame;
 pub use policy::{
 	AccessVerdict, AllowAll, DeliveryPolicy, DeliveryVerdict, DropOldest, PublishPolicy, SubscribePolicy,
 };
-pub use registry::{
-	ConnectionId, EmitDeadline, PublishError, RegisterError, RegistryOptions, RegistryView, SubscriberId, TopicRegistry,
-};
+pub use registry::{Delivered, Drained, NodeSink, RegistryOptions, RegistryView, TopicRegistry};
 pub use serve::{AppRoutes, ConnectionContext, Unrouted};
 pub use topic::{Topic, TopicError, END_PREFIX, PUB_PREFIX, SUB_PREFIX, UNSUB_PREFIX};

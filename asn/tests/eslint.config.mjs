@@ -4,5 +4,5 @@ import base from "@wahidgroup/lint-rules/eslint/base";
 import { realDependencies } from "../../scripts/eslint/real-dependencies.mjs";
 
 export default defineConfig(...base, realDependencies, {
-  ignores: [".work/"],
+	ignores: ["codecs.ts", "fixture/"],
 });

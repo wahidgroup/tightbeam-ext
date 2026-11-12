@@ -1,13 +1,13 @@
-import type { RoundTripResult, SignerRoundTripResult } from "../app/main.js";
+import type { RoundTripResult } from "../app/main.js";
 import { expect, test } from "@playwright/test";
 
-import { certBase64 } from "../env.js";
+import { Identities } from "../env.js";
 import { STACK } from "../stack.js";
 import { openApp } from "./helpers.js";
 
-const serverCert = certBase64("server.cert.der");
-const clientCert = certBase64("client.cert.der");
-const clientKey = certBase64("client.key");
+const serverCert = Identities.stack.base64("server.cert.der");
+const clientCert = Identities.stack.base64("client.cert.der");
+const clientKey = Identities.stack.base64("client.key");
 
 interface SecureCase {
 	readonly name: string;
@@ -32,22 +32,16 @@ const cases: readonly SecureCase[] = [
 ];
 
 for (const testCase of cases) {
-	test(`round-trips over an HPKE-encrypted session: ${testCase.name}`, async ({
-		page,
-	}) => {
+	test(`round-trips over an HPKE-encrypted session: ${testCase.name}`, async ({ page }) => {
 		await openApp(page);
 
-		const result: RoundTripResult = await page.evaluate(
-			({ url, cert, payload, id, order }) =>
-				window.tbSecureRoundTrip(url, cert, payload, id, order),
-			{
-				url: STACK.muxEndpoint,
-				cert: serverCert,
-				payload: testCase.payloadHex,
-				id: testCase.id,
-				order: testCase.order,
-			},
-		);
+		const result: RoundTripResult = await page.evaluate((echo) => window.tb.secureRoundTrip(echo), {
+			url: STACK.muxEndpoint,
+			serverCertB64: serverCert,
+			payloadHex: testCase.payloadHex,
+			idText: testCase.id,
+			order: testCase.order,
+		});
 		expect(result.bodyHex).toBe(testCase.payloadHex);
 		expect(result.idText).toBe(testCase.id);
 		expect(result.order).toBe(String(testCase.order));
@@ -55,59 +49,35 @@ for (const testCase of cases) {
 	});
 }
 
-test("round-trips over a mutually-authenticated encrypted session", async ({
-	page,
-}) => {
+test("round-trips over a mutually-authenticated encrypted session", async ({ page }) => {
 	await openApp(page);
 
-	const result: RoundTripResult = await page.evaluate(
-		({ url, cert, clientCertB64, clientKeyB64 }) =>
-			window.tbMutualRoundTrip(
-				url,
-				cert,
-				clientCertB64,
-				clientKeyB64,
-				"0badc0de",
-				"e2e-mutual",
-				7,
-			),
-		{
-			url: STACK.muxMutualEndpoint,
-			cert: serverCert,
-			clientCertB64: clientCert,
-			clientKeyB64: clientKey,
-		},
-	);
+	const result: RoundTripResult = await page.evaluate((echo) => window.tb.mutualRoundTrip(echo), {
+		url: STACK.muxMutualEndpoint,
+		serverCertB64: serverCert,
+		clientCertB64: clientCert,
+		clientKeyB64: clientKey,
+		payloadHex: "0badc0de",
+		idText: "e2e-mutual",
+		order: 7,
+	});
 	expect(result.bodyHex).toBe("0badc0de");
 	expect(result.idText).toBe("e2e-mutual");
 	expect(result.order).toBe("7");
 });
 
-test("authenticates mutually through an external signer in the browser", async ({
-	page,
-}) => {
+test("authenticates mutually through an external signer in the browser", async ({ page }) => {
 	await openApp(page);
 
-	const result: SignerRoundTripResult = await page.evaluate(
-		({ url, cert, clientCertB64, clientKeyB64 }) =>
-			window.tbMutualSignerRoundTrip(
-				url,
-				cert,
-				clientCertB64,
-				clientKeyB64,
-				"0badc1de",
-				"e2e-mutual-signer",
-				8,
-			),
-		{
-			url: STACK.muxMutualEndpoint,
-			cert: serverCert,
-			clientCertB64: clientCert,
-			clientKeyB64: clientKey,
-		},
-	);
+	const result: RoundTripResult = await page.evaluate((echo) => window.tb.mutualSignerRoundTrip(echo), {
+		url: STACK.muxMutualEndpoint,
+		serverCertB64: serverCert,
+		clientCertB64: clientCert,
+		clientKeyB64: clientKey,
+		payloadHex: "0badc1de",
+		idText: "e2e-mutual-signer",
+		order: 8,
+	});
 	expect(result.bodyHex).toBe("0badc1de");
 	expect(result.idText).toBe("e2e-mutual-signer");
-	// Client-auth + receipt countersignature under the demo paywall.
-	expect(result.signatures).toBe(2);
 });

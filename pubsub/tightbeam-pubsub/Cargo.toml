@@ -17,23 +17,18 @@ categories.workspace = true
 name = "tightbeam_pubsub"
 
 [features]
-# Test-support code builds frames a client would (including sealed
-# bodies), so it needs tightbeam's AEAD surface. Its in-memory link runs no
-# handshake, so it builds the served link from its parts.
-testing = ["tightbeam-rs/aead", "tightbeam-ws/link-parts"]
-# The audit trail of each served connection: its admission and departure, its
-# expulsion, each refused command, and each dropped update, on the trace of
-# the transport its link was accepted on.
+# The loopback WebSocket link and peer, and the backplane contract suite.
+testing = ["instrument", "tightbeam-ws/socket"]
+# The audit trail of each served connection.
 instrument = ["tightbeam-rs/instrument", "tightbeam-ws/instrument"]
 
 [[example]]
 name = "pubsub_demo_server"
-required-features = ["testing"]
 test = true
 
 [[example]]
-name = "pubsub_processor_server"
-required-features = ["testing"]
+name = "wire_contract"
+test = true
 
 [dependencies]
 tightbeam-rs = { workspace = true, features = [
@@ -48,11 +43,11 @@ tokio = { workspace = true, features = ["rt", "sync", "macros", "time"] }
 tightbeam-ws = { version = "0.5.0", path = "../../ws/tightbeam-ws", default-features = false, features = ["serve"] }
 
 [dev-dependencies]
-# Self dev-dependency: turns the `testing` feature and the audit trail on for
-# every test and example build, so integration tests need no feature gate.
-tightbeam-pubsub = { path = ".", features = ["testing", "instrument"] }
-# The manual clock that drives a link in the deadline tests.
-tightbeam-rs = { workspace = true, features = ["testing", "testing-csp"] }
+# Self dev-dependency: turns the `testing` feature on for every test and
+# example build.
+tightbeam-pubsub = { path = ".", features = ["testing"] }
+# The manual clock of the deadline tests, and the cipher of a sealed body.
+tightbeam-rs = { workspace = true, features = ["aead", "testing", "testing-csp"] }
 husky-rs = { workspace = true }
 tightbeam-ws = { version = "0.5.0", path = "../../ws/tightbeam-ws", features = ["testing"] }
 tokio-tungstenite = { workspace = true, features = ["connect", "handshake"] }
@@ -64,3 +59,6 @@ tokio = { workspace = true, features = [
 	"time",
 	"test-util",
 ] }
+
+[lints]
+workspace = true

@@ -1,15 +1,5 @@
-//! The specs of the shared suites, which the scenarios of every transport of
-//! the repository grade their traces with.
-//!
-//! Each spec states what one shared suite records when it runs over a
-//! transport that carries it unchanged, so a transport whose scenarios meet
-//! the spec behaves as the other transports do. The suite that each spec
-//! grades lives beside it in this module's parent: [`EchoService`],
-//! [`ReadOutcome`], and, under `colony`, [`WorkPlane`].
-//!
-//! [`EchoService`]: super::EchoService
-//! [`ReadOutcome`]: super::ReadOutcome
-//! [`WorkPlane`]: super::WorkPlane
+//! The specs that grade the shared suites on every transport, as
+//! `docs/ws.md` (Test support) states it.
 
 use tightbeam::instrumentation::events;
 use tightbeam::{exactly, tb_assert_spec};
@@ -48,12 +38,10 @@ tb_assert_spec! {
 }
 
 tb_assert_spec! {
-	/// The stream kinds of [`EchoService::through_pool`] over one pooled,
-	/// multiplexed connection to the shared echo: the pool dials once, each
-	/// end completes one handshake, the server accepts the one connection,
-	/// and its gate admits each of the three streams.
-	///
-	/// [`EchoService::through_pool`]: super::EchoService::through_pool
+	/// A run of [`EchoService::through_pool`](super::EchoService::through_pool)
+	/// over one pooled, multiplexed connection to the shared echo: the pool
+	/// dials once, each end completes one handshake, the server accepts the
+	/// one connection, and its gate admits each of the three streams.
 	pub PooledMuxSpec,
 	V(1,0,0): {
 		mode: Accept,
