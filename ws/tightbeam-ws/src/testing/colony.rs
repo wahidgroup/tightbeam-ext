@@ -1,11 +1,8 @@
 //! The colony configuration and the work probe of the work-plane gateways, as
 //! `docs/ws.md` (Cluster work plane) states it.
 
-// The colony macros expand `cfg(feature = ...)` probes that name upstream
-// features, which this crate declares under other names.
-#![allow(unexpected_cfgs)]
-
 use core::fmt::Write;
+use core::future::Future;
 use core::hash::Hash;
 use core::num::NonZeroUsize;
 use core::time::Duration;
@@ -16,7 +13,7 @@ use der::Sequence;
 use tightbeam::builder::TypeBuilder;
 use tightbeam::clock::UnixMillis;
 use tightbeam::colony::cluster::{Cluster, ClusterConfig, ClusterGateway, ClusterTlsConfig, EdgePlane};
-use tightbeam::colony::hive::{Hive, HiveConfig, HiveTlsConfig};
+use tightbeam::colony::hive::{Hive, HiveConfig, HiveTlsConfig, ServletBox};
 use tightbeam::colony::servlet::ServletConfig;
 use tightbeam::colony::urn::ColonyNamespace;
 use tightbeam::colony::SubmitWork;
@@ -25,7 +22,6 @@ use tightbeam::crypto::x509::store::CertificateTrust;
 use tightbeam::crypto::x509::KeyPurposes;
 use tightbeam::marker::MaybeSend;
 use tightbeam::policy::TransitStatus;
-use tightbeam::prelude::TightBeamSocketAddr;
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::handshake::negotiation::TransportOffer;
 use tightbeam::transport::handshake::PeerAuthentication;
@@ -35,7 +31,7 @@ use tightbeam::transport::{
 	Protocol,
 };
 use tightbeam::urn::Urn;
-use tightbeam::{cluster, compose, hive, servlet, Beamable, Frame, Message, TightBeamError, Version};
+use tightbeam::{cluster, compose, Beamable, Frame, Message, TightBeamError, Version};
 
 use super::{Error, Identity, Result as WsResult};
 use crate::protocol::WsListener;
@@ -68,9 +64,27 @@ impl WorkBody {
 		self.body.as_bytes()
 	}
 
-	/// The answer of the probe to this body: `pong:<payload-hex>:<valid>`,
-	/// where `valid` is whether the end-to-end signature of the request
-	/// verified on the bytes the servlet received.
+	/// The answer of the probe to this body, which arrived in `frame`, signed
+	/// end to end under `identity`.
+	///
+	/// - The answer is `pong:<payload-hex>:<valid>`, under the id of `frame`.
+	/// - `valid` is whether the end-to-end signature of `frame` verifies under `identity`.
+	///
+	/// # Errors
+	///
+	/// - The [`TightBeamError`] of an answer that fails to build or to sign.
+	pub async fn answered(&self, frame: &Frame, identity: &Identity) -> Result<Frame, TightBeamError> {
+		let reply = self.answer(identity.verifies(frame))?;
+		let mut signed = compose! {
+			V1: id: frame.metadata().id(),
+				message: reply
+		}?;
+
+		signed.sign_with_provider(&identity.signing_identity()).await?;
+		Ok(signed)
+	}
+
+	/// The body of the answer of the probe: `pong:<payload-hex>:<valid>`.
 	fn answer(&self, signature_valid: bool) -> Result<Self, TightBeamError> {
 		let mut text = String::from("pong:");
 		for byte in self.as_bytes() {
@@ -78,6 +92,7 @@ impl WorkBody {
 			// no signal.
 			let _ = write!(text, "{byte:02x}");
 		}
+
 		let _ = write!(text, ":{signature_valid}");
 
 		let body = OctetString::new(text.into_bytes())?;
@@ -85,30 +100,96 @@ impl WorkBody {
 	}
 }
 
-servlet! {
+/// A servlet that serves the work probe, with the hive that hosts it over
+/// the colony protocol of the servlet, as [`work_probe!`](crate::work_probe)
+/// declares them.
+pub trait WorkProbe: ServletBox + Sized + 'static {
+	/// The hive that hosts the probe.
+	type Hive: Hive;
+
+	/// Start a probe under `config` that records on `trace`.
+	///
+	/// # Errors
+	///
+	/// - The [`TightBeamError`] of a servlet that fails to start.
+	fn start(
+		trace: Arc<TraceCollector>,
+		config: ServletConfig<<Self::Hive as Hive>::Protocol, WorkBody, DefaultCryptoProvider, Identity>,
+	) -> impl Future<Output = Result<Self, TightBeamError>> + Send;
+
+	/// A provisional hive under `config`, on a new registry.
+	///
+	/// # Errors
+	///
+	/// - The [`TightBeamError`] of a hive that fails to build.
+	fn hive(config: HiveConfig) -> Result<Self::Hive, TightBeamError>;
+}
+
+/// Declare the work probe servlet `$servlet` and the hive `$hive` that hosts
+/// it over the colony protocol `$protocol`, with [`WorkProbe`] on the
+/// servlet.
+///
+/// [`WorkProbe`]: crate::testing::WorkProbe
+#[macro_export]
+macro_rules! work_probe {
+	(
+		$(#[$servlet_meta:meta])*
+		pub $servlet:ident,
+		$(#[$hive_meta:meta])*
+		pub $hive:ident,
+		protocol: $protocol:path $(,)?
+	) => {
+		$crate::tightbeam::servlet! {
+			$(#[$servlet_meta])*
+			pub $servlet<$crate::testing::WorkBody, EnvConfig = $crate::testing::Identity>,
+			protocol: $protocol,
+			handle: |request, frame, ctx| async move {
+				request.answered(&frame, ctx.env_config()).await.map(Some)
+			}
+		}
+
+		$crate::tightbeam::hive! {
+			$(#[$hive_meta])*
+			pub $hive,
+			protocol: $protocol
+		}
+
+		impl $crate::testing::WorkProbe for $servlet {
+			type Hive = $hive;
+
+			fn start(
+				trace: ::std::sync::Arc<$crate::tightbeam::trace::TraceCollector>,
+				config: $crate::tightbeam::colony::servlet::ServletConfig<
+					$protocol,
+					$crate::testing::WorkBody,
+					$crate::tightbeam::crypto::profiles::DefaultCryptoProvider,
+					$crate::testing::Identity,
+				>,
+			) -> impl ::core::future::Future<
+				Output = ::core::result::Result<Self, $crate::tightbeam::TightBeamError>,
+			> + ::core::marker::Send {
+				<Self as $crate::tightbeam::colony::servlet::Servlet<
+					$crate::testing::WorkBody,
+					$crate::testing::Identity,
+				>>::start(trace, config)
+			}
+
+			fn hive(
+				config: $crate::tightbeam::colony::hive::HiveConfig,
+			) -> ::core::result::Result<$hive, $crate::tightbeam::TightBeamError> {
+				$hive::new(::core::option::Option::Some(config))
+			}
+		}
+	};
+}
+
+work_probe! {
 	/// Answers each work body with a `pong:<payload-hex>:<valid>` echo that
 	/// the work identity of its configuration signs.
 	///
 	/// - `valid` is whether the end-to-end signature of the client verified on the bytes that the servlet
 	///   received, so a gateway that forwards the frame unchanged answers `true`.
-	pub WorkProbeServlet<WorkBody, EnvConfig = Identity>,
-	protocol: WsListener,
-	handle: |req, frame, ctx| async move {
-		let identity = ctx.env_config();
-		let signature_valid = identity.verifies(&frame);
-		let reply = req.answer(signature_valid)?;
-
-		let mut signed = compose! {
-			V1: id: frame.metadata().id(),
-				message: reply
-		}?;
-
-		signed.sign_with_provider(&identity.signing_identity()).await?;
-		Ok(Some(signed))
-	}
-}
-
-hive! {
+	pub WorkProbeServlet,
 	/// The hive that hosts the work probe over the WebSocket colony.
 	pub WorkProbeHive,
 	protocol: WsListener
@@ -168,17 +249,17 @@ impl Identity {
 		Ok(config)
 	}
 
-	/// Servlet config: an encrypted WebSocket listener under this identity,
-	/// with a mux offer that matches the hive pool, and `env` as the
-	/// configuration its handler reads.
-	pub fn servlet_config<M: Message, Env>(
+	/// Servlet config: an encrypted listener of protocol `P` under this
+	/// identity, with a mux offer that matches the hive pool, and `env` as
+	/// the configuration its handler reads.
+	pub fn servlet_config<P: Protocol, M: Message, Env>(
 		&self,
 		env: Arc<Env>,
-	) -> ServletConfig<WsListener, M, DefaultCryptoProvider, Env> {
+	) -> ServletConfig<P, M, DefaultCryptoProvider, Env> {
 		let signing = self.signing_identity();
 		let offer = TransportOffer::mux(COLONY_STREAMS);
 
-		let builder = ServletConfig::<WsListener, M, DefaultCryptoProvider>::builder();
+		let builder = ServletConfig::<P, M, DefaultCryptoProvider>::builder();
 		let builder = builder.with_identity(signing, vec![]).with_mux_offer(Some(offer));
 		builder.with_config(env).build()
 	}
@@ -192,8 +273,8 @@ impl Identity {
 	pub async fn signed_work(&self, id: &[u8], payload: impl Into<Vec<u8>>) -> WsResult<Frame> {
 		let body = WorkBody::new(payload)?;
 		let order = UnixMillis::now().get();
-		let mut frame = Version::V1.compose().with_id(id).with_order(order).with_message(body).build()?;
 
+		let mut frame = Version::V1.compose().with_id(id).with_order(order).with_message(body).build()?;
 		frame.sign_with_provider(&self.signing_identity()).await?;
 		Ok(frame)
 	}
@@ -268,19 +349,19 @@ impl WorkPlane {
 		G::start(Arc::new(trace.share()), config).await
 	}
 
-	/// A hive under the transport identity that hosts the work probe under the
-	/// servlet type of this plane, signing each answer under the work identity,
-	/// established over the WebSocket colony and ready to register with a
-	/// gateway.
+	/// A hive of the probe `S` under the transport identity that hosts the work
+	/// probe under the servlet type of this plane, signing each answer under
+	/// the work identity, established over the colony of `S` and ready to
+	/// register with a gateway.
 	///
 	/// # Errors
 	///
 	/// - The [`TightBeamError`] of a config that fails to build, or of a
 	///   servlet or a hive that fails to start.
-	pub async fn hive(&self, trace: &TraceCollector) -> Result<WorkProbeHive, TightBeamError> {
+	pub async fn hive<S: WorkProbe>(&self, trace: &TraceCollector) -> Result<S::Hive, TightBeamError> {
 		let work = Arc::clone(&self.client.work);
 		let servlet_config = self.transport.servlet_config(Arc::clone(&work));
-		let served = WorkProbeServlet::start(Arc::new(trace.share()), servlet_config).await?;
+		let served = S::start(Arc::new(trace.share()), servlet_config).await?;
 
 		// A hive restarts a servlet that stops under the same identity and mux
 		// offer, because the pool of the hive pins that identity and dials the
@@ -288,10 +369,10 @@ impl WorkPlane {
 		let transport = Arc::clone(&self.transport);
 		let restart = move |trace| {
 			let config = transport.servlet_config(Arc::clone(&work));
-			async move { WorkProbeServlet::start(trace, config).await }
+			S::start(trace, config)
 		};
 
-		let mut hive = WorkProbeHive::new(Some(self.transport.hive_config()?))?;
+		let mut hive = S::hive(self.transport.hive_config()?)?;
 		hive.register(self.probe.clone(), served, restart)?;
 		hive.establish(Arc::new(trace.share())).await?;
 		Ok(hive)
@@ -363,8 +444,8 @@ impl WorkClient {
 	}
 
 	/// A pool of the protocol `P` that pins the transport identity of the
-	/// gateway and records its pool and session events on `trace`, with one
-	/// exclusive connection per destination.
+	/// gateway and records its pool and session events on `trace`. It holds
+	/// one exclusive connection across all destinations.
 	pub fn pool<P>(&self, trace: &TraceCollector) -> Arc<ConnectionPool<P>>
 	where
 		P: Protocol + Send + Sync,
@@ -446,14 +527,19 @@ impl WorkClient {
 	}
 }
 
-/// A gateway of type `G` with a hive that serves the work probe, over the
-/// WebSocket colony of one [`WorkPlane`].
-pub struct WorkStack<G> {
+/// A gateway of type `G` with a hive of the probe `S`, over the colony of
+/// the gateway and of one [`WorkPlane`].
+pub struct WorkStack<G, S: WorkProbe> {
 	gateway: G,
-	hive: WorkProbeHive,
+	hive: S::Hive,
 }
 
-impl<G: Cluster<Address = TightBeamSocketAddr>> WorkStack<G> {
+impl<G, S> WorkStack<G, S>
+where
+	G: Cluster,
+	G::Protocol: Protocol<Address = G::Address>,
+	S: WorkProbe<Hive: Hive<Protocol = G::Protocol>>,
+{
 	/// Start the gateway of `plane`, with its edge at `edge`, and register the
 	/// hive of `plane` with it.
 	///
@@ -465,7 +551,7 @@ impl<G: Cluster<Address = TightBeamSocketAddr>> WorkStack<G> {
 	///   status other than [`TransitStatus::Ok`].
 	pub async fn start(trace: &TraceCollector, plane: &WorkPlane, edge: impl Into<String>) -> WsResult<Self> {
 		let gateway = plane.gateway::<G>(trace, edge).await?;
-		let hive = plane.hive(trace).await?;
+		let hive = plane.hive::<S>(trace).await?;
 
 		let registered = hive.register_with_cluster(gateway.addr()).await?;
 		if registered.status != TransitStatus::Ok {

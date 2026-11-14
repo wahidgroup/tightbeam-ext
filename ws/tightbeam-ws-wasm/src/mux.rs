@@ -472,6 +472,7 @@ impl MuxWsClient {
 	/// - `InvalidText` -- `url` is not a string.
 	/// - The errors of the options parse, among them `InvalidStreamCap`.
 	/// - `InvalidBytes` -- a certificate or `options.authorization` is not a `Uint8Array`.
+	/// - `InvalidBytes` at `identity.clientKey` -- the raw scalar is a `Uint8Array` over a detached buffer.
 	/// - `InvalidCertificate` -- a certificate is no DER certificate.
 	/// - `InvalidClientKey` -- the key is neither a `Uint8Array` nor an object.
 	/// - `InvalidSigningKey` -- the scalar is not 32 octets, or names no key.
@@ -910,13 +911,16 @@ impl MuxWsClient {
 
 #[cfg(test)]
 mod tests {
+	use core::future::{pending, Future};
+
 	use futures_util::future::ready;
 	use futures_util::FutureExt;
-	use js_sys::{Function, Object, Reflect, Uint8Array};
+	use js_sys::{Function, Object, Promise, Reflect, Uint8Array};
 	use tightbeam::der::Encode;
+	use tightbeam::marker::MaybeSend;
 	use tightbeam::testing::{TestCertificate, TestFrame, TestKey};
-	use tightbeam::transport::multiplex::{MuxHandle, MuxRole};
-	use tightbeam::transport::TransportError;
+	use tightbeam::transport::multiplex::{MuxDispatch, MuxHandle, MuxRole, StreamBody, StreamRoute};
+	use tightbeam::transport::{ResponsePackage, TransportError, TransportResult};
 	use wasm_bindgen::{JsCast, JsValue};
 	use wasm_bindgen_futures::JsFuture;
 	use wasm_bindgen_test::wasm_bindgen_test;
@@ -925,7 +929,7 @@ mod tests {
 	use super::{MuxWsClient, ServeClaim};
 	use crate::dial::Dial;
 	use crate::fault::Refused;
-	use crate::loopback::{settled, Served};
+	use crate::loopback::{self, settled, Served, PAST_INITIAL_CREDIT};
 	use crate::promise::JsBytes;
 	use crate::protocol::BrowserSocket;
 	use crate::socket::tests::UNREACHED_URL;
@@ -978,6 +982,38 @@ mod tests {
 	/// A progressive request stream on `client`.
 	fn open_stream(client: &MuxWsClient) -> MuxRequestStream {
 		client.open_stream().expect("a client with headroom should open a stream")
+	}
+
+	/// A streaming dispatch that holds each body unread, so its peer gets no
+	/// credit past the first window, and that calls `arrived` as a stream
+	/// dispatches.
+	struct Unread {
+		arrived: Function,
+	}
+
+	impl MuxDispatch for Unread {
+		fn streaming(
+			&self,
+			body: StreamBody,
+			_route: StreamRoute,
+		) -> impl Future<Output = TransportResult<ResponsePackage>> + MaybeSend {
+			let _ = self.arrived.call0(&JsValue::UNDEFINED);
+
+			async move {
+				let _unread = body;
+				pending().await
+			}
+		}
+	}
+
+	/// An [`Unread`] dispatch, and the promise that settles once it
+	/// dispatched a stream.
+	fn unread() -> (Unread, Promise) {
+		let mut resolve = None;
+
+		let arrival = Promise::new(&mut |settle, _reject| resolve = Some(settle));
+		let arrived = resolve.expect("the promise executor runs at once");
+		(Unread { arrived }, arrival)
 	}
 
 	/// A serve handler that accepts each stream without a body.
@@ -1104,6 +1140,7 @@ mod tests {
 		let _hold = served.hold().await;
 		let opened = probe.open_stream().expect("a session with headroom should open a stream");
 		let (_sink, response) = opened;
+
 		drop(client);
 
 		// The hold keeps the close of the socket open, so only the drop of the
@@ -1117,12 +1154,33 @@ mod tests {
 	async fn a_live_stream_keeps_the_socket_of_a_freed_client() {
 		let (client, monitor, _probe) = connecting_client();
 		let stream = open_stream(&client);
+
 		drop(client);
 
 		let chunk = Uint8Array::from([1u8].as_slice());
 		let pushed = settled(JsFuture::from(stream.push(chunk.unchecked_into()))).await;
 		assert!(pushed.is_ok());
 		assert_eq!(monitor.ready_state(), Socket::CONNECTING);
+	}
+
+	#[wasm_bindgen_test]
+	async fn a_freed_stream_ends_the_push_that_waits_on_credit_and_frees_its_slot() {
+		let (client, _probe, served) = open_client().await;
+		let (dispatch, arrival) = unread();
+
+		loopback::serve(served.session(1).await, dispatch);
+
+		let stream = open_stream(&client);
+		let pushing = JsFuture::from(stream.push(bytes(&vec![0x5a; PAST_INITIAL_CREDIT])));
+		let arrived = settled(JsFuture::from(arrival)).await;
+		arrived.expect("the server should dispatch the stream");
+
+		drop(stream);
+
+		let slot = settled(JsFuture::from(client.wait_for_stream_slot(JsValue::UNDEFINED))).await;
+		let pushed = settled(pushing).await;
+		assert!(slot.is_ok());
+		assert_eq!(pushed.code().as_deref(), Some("StreamClosed"));
 	}
 
 	#[wasm_bindgen_test]

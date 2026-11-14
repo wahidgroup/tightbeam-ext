@@ -110,14 +110,15 @@ impl StreamParts {
 		Ok(framed.as_bytes().to_vec())
 	}
 
-	/// The message that `part` carries, or `None` for the end of an answer.
+	/// What `part` carries: its message, or as `Err` the reply of the end part
+	/// that ends an answer.
 	///
 	/// # Errors
 	///
 	/// - The [`TightBeamError`] of a frame that holds no part of a stream.
-	pub fn message_of(part: &Frame) -> Result<Option<Vec<u8>>, TightBeamError> {
+	pub fn message_of(part: &Frame) -> Result<Result<Vec<u8>, CoupledReply>, TightBeamError> {
 		let part: CoupledPart = part.decode_message()?;
-		Ok(part.part.carried().ok().map(OctetString::into_bytes))
+		Ok(part.part.carried().map(OctetString::into_bytes))
 	}
 }
 

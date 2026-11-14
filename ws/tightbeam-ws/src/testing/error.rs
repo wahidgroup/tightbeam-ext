@@ -88,7 +88,7 @@ impl From<TightBeamError> for Error {
 /// - A count that an event watch waited out becomes a timed-out I/O failure that holds the wait as its inner
 ///   error.
 /// - [`io::Error::get_ref`] reads that inner error. The `source()` of an I/O failure answers the source of
-///   its inner error, and skips the inner error itself (std 1.94.0 `io/error.rs:1072-1079`).
+///   its inner error, and skips the inner error itself, as the std `Error` impl of `io::Error` does.
 impl From<Error> for TightBeamError {
 	fn from(error: Error) -> Self {
 		match error {

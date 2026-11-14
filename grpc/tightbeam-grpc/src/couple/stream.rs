@@ -8,12 +8,13 @@ use core::pin::Pin;
 use core::task::{ready, Context, Poll};
 
 use tightbeam::builder::TypeBuilder;
+use tightbeam::clock::Lapse;
 use tightbeam::crypto::sign::SigningIdentity;
 use tightbeam::der::asn1::OctetString;
 use tightbeam::der::{Decode, Encode};
 use tightbeam::policy::TransitStatus;
 use tightbeam::transport::multiplex::{ReplySink, RequestSink, StreamBody};
-use tightbeam::transport::{TransportError, TransportFailure};
+use tightbeam::transport::{TransportError, TransportFailure, TransportResult};
 use tightbeam::{Frame, TightBeamError, Version};
 use tokio::sync::mpsc;
 use tokio::sync::OwnedSemaphorePermit;
@@ -24,12 +25,12 @@ use tonic::{Code, Status};
 
 use super::admit::{AdmissionFault, AdmissionTrust, AdmittedHead, AdmittedSigner, Origin};
 use super::fault::CallFault;
-use super::loopback::OpenedDuplex;
+use super::loopback::{CancelLease, OpenedDuplex};
 use super::message::{CoupledPart, CoupledReply, PartWire, StreamTerms};
 use super::routes::{Arity, Servlet, Shape, StreamShape};
 use super::saga::{CallEnding, CallHold};
 use super::voucher::{HeadPart, RequestId};
-use crate::deadline::Deadline;
+use crate::deadline::{Deadline, StreamLapse};
 
 /// The bytes of the length that leads each part.
 const PREFIX: usize = 4;
@@ -105,18 +106,29 @@ impl PartFault {
 		}
 	}
 
-	/// The refusal that ends the stream of a servlet when a request part fails
-	/// so. A stream ends on a transport status, which the caller reads. A
-	/// count of requests that the method does not take is unimplemented, as
-	/// gRPC answers a cardinality violation.
-	pub(super) fn of_request(self) -> TightBeamError {
-		let status = match self {
+	/// The status that ends the stream of a servlet when a request part fails
+	/// so, which the caller reads. A count of requests that the method does
+	/// not take is unimplemented, as gRPC answers a cardinality violation.
+	fn request_status(self) -> TransitStatus {
+		match self {
 			Self::Broken(_) => TransitStatus::Unavailable,
 			Self::Malformed => TransitStatus::InvalidArgument,
 			Self::Breach => TransitStatus::Unimplemented,
 			Self::Refused => TransitStatus::Unauthenticated,
-		};
-		TransportError::from(status).into()
+		}
+	}
+
+	/// The refusal that fails the stream of a servlet with the status of a
+	/// request part that fails so, before the stream admits.
+	pub(super) fn of_request(self) -> TightBeamError {
+		TransportError::from(self.request_status()).into()
+	}
+
+	/// The refusal of a request part of an admitted stream that fails so, which
+	/// the servlet ends the stream on with the status of the part.
+	fn refusal(self) -> StreamRefusal {
+		let code = Code::from_i32(self.request_status() as i32);
+		StreamRefusal::Ends(Status::new(code, "a request part of the stream does not admit"))
 	}
 }
 
@@ -171,16 +183,41 @@ impl PartBuffer {
 struct PartReader {
 	body: StreamBody,
 	buffer: PartBuffer,
+	/// The unit of the cancel budget of the loopback session that the answer
+	/// of a coupled stream holds until its stream ends.
+	lease: Option<CancelLease>,
 }
 
 impl PartReader {
 	fn new(body: StreamBody, ceiling: usize) -> Self {
-		Self { body, buffer: PartBuffer::new(ceiling) }
+		Self { body, buffer: PartBuffer::new(ceiling), lease: None }
+	}
+
+	/// The parts of the answer of a coupled stream, which holds `lease`.
+	fn leased(body: StreamBody, ceiling: usize, lease: CancelLease) -> Self {
+		Self { lease: Some(lease), ..Self::new(body, ceiling) }
 	}
 
 	/// Read each later part under `ceiling`.
 	fn bound(&mut self, ceiling: usize) {
 		self.buffer.ceiling = ceiling;
+	}
+
+	/// The next chunk of the stream. The end or the failure of the stream
+	/// settles the lease, because a stream that ended owes no cancel.
+	///
+	/// # Errors
+	///
+	/// - The [`TransportError`] of the stream.
+	async fn chunk(&mut self) -> TransportResult<Option<Vec<u8>>> {
+		let chunk = self.body.chunk().await;
+		if !matches!(chunk, Ok(Some(_))) {
+			if let Some(lease) = &mut self.lease {
+				lease.settle();
+			}
+		}
+
+		chunk
 	}
 
 	/// The frame of the next part, or `None` once the stream ends between
@@ -195,7 +232,7 @@ impl PartReader {
 				return Ok(Some(frame));
 			}
 
-			match self.body.chunk().await {
+			match self.chunk().await {
 				Ok(Some(chunk)) => self.buffer.extend(&chunk),
 				Ok(None) if self.buffer.is_empty() => return Ok(None),
 				Ok(None) => return Err(PartFault::Broken(None)),
@@ -216,11 +253,6 @@ impl PartReader {
 			Err(PartFault::Broken(_)) if self.buffer.is_empty() => Ok(None),
 			read => read,
 		}
-	}
-
-	/// Read the stream to its end, or to its failure, and drop what it carries.
-	async fn drain(&mut self) {
-		while let Ok(Some(_)) = self.body.chunk().await {}
 	}
 }
 
@@ -280,12 +312,23 @@ impl PartOrder {
 	/// # Errors
 	///
 	/// - [`PartFault::Breach`] -- status 0 short of the arity of the side.
-	fn end(&mut self, code: Code) -> Result<u64, PartFault> {
+	fn next_end(&self, code: Code) -> Result<u64, PartFault> {
 		if code == Code::Ok && !self.closes() {
 			return Err(PartFault::Breach);
 		}
 
-		Ok(self.take())
+		Ok(self.next)
+	}
+
+	/// Read the part that ends this side with `code`.
+	///
+	/// # Errors
+	///
+	/// - The errors of [`PartOrder::next_end`].
+	fn end(&mut self, code: Code) -> Result<(), PartFault> {
+		self.next_end(code)?;
+		self.take();
+		Ok(())
 	}
 
 	/// End this side with no part, as the requests of a stream end.
@@ -478,9 +521,11 @@ impl<F: Error + 'static> Error for SendFault<F> {
 }
 
 impl SendFault<TransportError> {
-	/// How the requests of the coupler end when a request part fails so. A
-	/// push that the stream resolved under is severed, and any other failure
-	/// is a fault of the call.
+	/// How the requests of the coupler end when a request part or their close
+	/// fails so. A push or a close that the stream resolved under is severed,
+	/// and any other failure is a fault of the call. A wait of the push past
+	/// the read deadline of the session stalls the call, and one that the
+	/// clock gave no timer is internal.
 	fn of_request(self) -> ForwardEnd {
 		match self {
 			Self::Breach => ForwardEnd::Fault(CallFault::Shape),
@@ -489,18 +534,52 @@ impl SendFault<TransportError> {
 			Self::Channel(
 				TransportError::OperationFailed(TransportFailure::Cancelled) | TransportError::ConnectionClosed,
 			) => ForwardEnd::Severed,
-			Self::Channel(_) => ForwardEnd::Fault(CallFault::Unavailable),
+			Self::Channel(error) => match error.lapse() {
+				Some(Lapse::Passed) => ForwardEnd::Fault(CallFault::Stalled),
+				Some(Lapse::NoTimer) => ForwardEnd::Fault(CallFault::Internal),
+				None => ForwardEnd::Fault(CallFault::Unavailable),
+			},
 		}
 	}
 }
 
-/// How the requests of a coupled stream stop short of their close.
+/// How the requests of a coupled stream end.
 enum ForwardEnd {
+	/// The close of the requests landed, so the answer of the stream decides
+	/// the call.
+	Closed,
 	/// The fault that ends the call.
 	Fault(CallFault),
 	/// The stream resolved under a push or the close, as when the servlet
 	/// ended it first, so the answer of the stream decides the call.
 	Severed,
+}
+
+impl ForwardEnd {
+	/// What the end of the requests leaves the relay to race against the
+	/// answer: the fault of the call at once, and a wait that never ends for
+	/// requests that leave the call to the answer.
+	async fn settle(self) -> Result<CoupledReply, CallFault> {
+		match self {
+			Self::Fault(fault) => Err(fault),
+			Self::Closed | Self::Severed => core::future::pending().await,
+		}
+	}
+}
+
+impl SendFault<AnswerFault> {
+	/// The status that ends a stream whose answer part does not send so on a
+	/// clean sink, as the peer reads it too: 12 for a count of messages that
+	/// the method does not take, 8 for a part past its ceiling, and 13 for a
+	/// frame that does not build or sign.
+	fn status(&self) -> Status {
+		match self {
+			Self::Breach => Status::unimplemented("the method takes no further response message, or none yet"),
+			Self::Oversize => Status::resource_exhausted("the answer part passes the part ceiling of the stream"),
+			Self::Build(_) => Status::internal("the answer part does not build or sign"),
+			Self::Channel(_) => Status::unavailable("the stream refused the answer part"),
+		}
+	}
 }
 
 /// An answer part that does not send ends its stream with the status that
@@ -528,7 +607,8 @@ trait PartChannel {
 }
 
 /// The requests of a coupler, whose relay sends no part after a push that it
-/// ends: it drops the sink, or closes it once the answer decided the call.
+/// ends: it drops the sink, or closes it once the requests end or the answer
+/// decided the call.
 impl PartChannel for RequestSink {
 	type Fault = TransportError;
 
@@ -604,6 +684,16 @@ impl AnswerChannel {
 	fn new(reply: ReplySink) -> Self {
 		Self { reply, state: AnswerState::Open }
 	}
+
+	/// The refusal of an answer part that does not send for `fault`: a sink
+	/// that every push landed on ends the stream with the status of the
+	/// fault, and a cut or failed one breaks it.
+	fn refusal(&self, fault: SendFault<AnswerFault>) -> StreamRefusal {
+		match self.state {
+			AnswerState::Open => StreamRefusal::Ends(fault.status()),
+			AnswerState::Cut | AnswerState::Failed => StreamRefusal::Breaks(fault.into()),
+		}
+	}
 }
 
 /// The channel stays cut from the start of a push until it lands, and fails
@@ -624,6 +714,7 @@ impl PartChannel for AnswerChannel {
 			Ok(()) => AnswerState::Open,
 			Err(_) => AnswerState::Failed,
 		};
+
 		pushed.map_err(AnswerFault::Transport)
 	}
 }
@@ -633,8 +724,8 @@ impl PartChannel for AnswerChannel {
 /// requests of a coupler end by a close, and the answers of a servlet by an
 /// end part.
 ///
-/// - A message takes its order once its push lands, so a refused part leaves
-///   no gap.
+/// - A part takes its order once its push lands, so a refused part leaves no
+///   gap.
 struct PartSink<S> {
 	sink: S,
 	order: PartOrder,
@@ -661,6 +752,20 @@ impl<S: PartChannel> PartSink<S> {
 		Ok(())
 	}
 
+	/// Send `end` as the part that ends this side, which takes its order once
+	/// its push lands.
+	///
+	/// # Errors
+	///
+	/// - [`SendFault::Breach`] -- `end` is status 0, and the side takes a message that never came.
+	/// - The [`SendFault`] of a part that does not send.
+	async fn end(&mut self, end: CoupledReply) -> Result<(), SendFault<S::Fault>> {
+		let order = self.order.next_end(end.code()).map_err(|_| SendFault::Breach)?;
+		self.push(order, PartWire::End(end)).await?;
+		self.order.take();
+		Ok(())
+	}
+
 	/// Sign `part` at `order` and push it.
 	///
 	/// # Errors
@@ -674,36 +779,99 @@ impl<S: PartChannel> PartSink<S> {
 	}
 }
 
-impl PartSink<RequestSink> {
-	/// End the requests of a coupler.
+/// The requests of a coupled stream, which the relay owns apart from the race
+/// of its two directions. A close in flight stays here when that race drops
+/// the forward that started it, so the tail lands it.
+enum Requests {
+	/// The requests take the next part.
+	Open(Box<PartSink<RequestSink>>),
+	/// The close of the requests is in flight.
+	Closing(Pin<Box<dyn Future<Output = TransportResult<()>> + Send>>),
+	/// The close of the requests ended.
+	Closed,
+}
+
+impl Requests {
+	/// Send `body` as the next request message.
+	///
+	/// # Errors
+	///
+	/// - [`SendFault::Breach`] -- the requests closed already.
+	/// - The [`SendFault`] of a part that does not send.
+	async fn send(&mut self, body: Vec<u8>) -> Result<(), SendFault<TransportError>> {
+		match self {
+			Self::Open(parts) => parts.send(body).await,
+			Self::Closing(_) | Self::Closed => Err(SendFault::Breach),
+		}
+	}
+
+	/// End the requests by a close, once their count keeps to the arity of
+	/// the method.
 	///
 	/// # Errors
 	///
 	/// - [`SendFault::Breach`] -- the arity of the side takes a message that never came.
-	/// - [`SendFault::Channel`] -- the stream failed.
-	async fn close(self) -> Result<(), SendFault<TransportError>> {
-		self.order.finish().map_err(|_| SendFault::Breach)?;
-		self.sink.close().await.map_err(SendFault::Channel)
+	/// - [`SendFault::Channel`] -- the stream refused the close.
+	async fn close(&mut self) -> Result<(), SendFault<TransportError>> {
+		if let Self::Open(parts) = self {
+			parts.order.finish().map_err(|_| SendFault::Breach)?;
+		}
+
+		self.closed().await.map_err(SendFault::Channel)
 	}
 
-	/// End the requests of a call that its answer decided, whatever their
-	/// count, so a servlet that holds its stream until they end lets it go. A
-	/// close that fails meets a stream that resolved already, whose end the
-	/// relay then reads.
-	async fn release(self) {
-		let _ = self.sink.close().await;
+	/// Close the requests of a call that its answer decided, whatever their
+	/// count, so a servlet that holds its stream until they end lets it go.
+	/// A close that fails leaves the stream to its end, which the relay then
+	/// reads, or to the cancel of its drop.
+	async fn release(mut self) {
+		let _ = self.closed().await;
+	}
+
+	/// Drive the close of the requests to its end, from either state before
+	/// it.
+	///
+	/// # Errors
+	///
+	/// - The [`TransportError`] of a close that the stream refused.
+	async fn closed(&mut self) -> TransportResult<()> {
+		*self = match core::mem::replace(self, Self::Closed) {
+			Self::Open(parts) => Self::Closing(Box::pin(parts.sink.close())),
+			held => held,
+		};
+
+		let Self::Closing(closing) = self else {
+			return Ok(());
+		};
+
+		let closed = closing.as_mut().await;
+		*self = Self::Closed;
+		closed
 	}
 }
 
 impl PartSink<AnswerChannel> {
-	/// End the answers of a servlet with `end`, the status of an answer.
+	/// End the answers of a servlet with `end`, the status of an answer. An
+	/// end that the sink refuses while every push landed, of status 0 short
+	/// of the count of the method or past the part ceiling, ends them with
+	/// the status of that refusal in its place.
+	///
+	/// Gives the code of the end part that ended the answers.
 	///
 	/// # Errors
 	///
-	/// - The [`SendFault`] of a part that does not send.
-	async fn end(mut self, end: CoupledReply) -> Result<(), SendFault<AnswerFault>> {
-		let order = self.order.end(end.code()).map_err(|_| SendFault::Breach)?;
-		self.push(order, PartWire::End(end)).await
+	/// - The [`TightBeamError`] of answers that broke, or of an end that does not encode.
+	async fn close(mut self, end: CoupledReply) -> Result<Code, TightBeamError> {
+		let code = end.code();
+		let refused = match self.end(end).await {
+			Ok(()) => return Ok(code),
+			Err(fault) => self.sink.refusal(fault),
+		};
+
+		let end = CoupledReply::of_status(&refused.status()?, Vec::new())?;
+		let code = end.code();
+		self.end(end).await?;
+		Ok(code)
 	}
 }
 
@@ -793,6 +961,62 @@ pub struct AdmittedStreamParts {
 	pub answers: StreamAnswers,
 }
 
+/// Why a side of an admitted stream goes no further, which
+/// [`StreamRefusal::end`] answers.
+#[derive(Debug)]
+pub enum StreamRefusal {
+	/// A part does not admit or does not send while every answer part landed,
+	/// so the servlet ends the answer with this status.
+	Ends(Status),
+	/// A push of the answer stopped before it landed, or failed, so no part
+	/// follows, and the stream fails with this error.
+	Breaks(TightBeamError),
+}
+
+impl StreamRefusal {
+	/// End `answers` as the refusal says: with the status of a part that does
+	/// not admit or send, so the stream ends clean, or with the error of
+	/// answers that broke.
+	///
+	/// # Errors
+	///
+	/// - [`StreamRefusal::Breaks`] -- the error that it carries.
+	/// - The errors of [`StreamAnswers::end`].
+	pub async fn end(self, answers: StreamAnswers) -> Result<(), TightBeamError> {
+		answers.end(&self.status()?).await
+	}
+
+	/// The status that ends the answer, or the error of answers that broke.
+	///
+	/// # Errors
+	///
+	/// - [`StreamRefusal::Breaks`] -- the error that it carries.
+	fn status(self) -> Result<Status, TightBeamError> {
+		match self {
+			Self::Ends(status) => Ok(status),
+			Self::Breaks(error) => Err(error),
+		}
+	}
+}
+
+impl fmt::Display for StreamRefusal {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		match self {
+			Self::Ends(status) => write!(f, "a part of the stream ends it with status {}", status.code() as i32),
+			Self::Breaks(_) => f.write_str("the answer of the stream broke"),
+		}
+	}
+}
+
+impl Error for StreamRefusal {
+	fn source(&self) -> Option<&(dyn Error + 'static)> {
+		match self {
+			Self::Breaks(error) => Some(error),
+			Self::Ends(_) => None,
+		}
+	}
+}
+
 /// The messages that the caller of an admitted stream sends, each verified
 /// under the signer of its head and in order.
 pub struct StreamRequests {
@@ -803,19 +1027,16 @@ impl StreamRequests {
 	/// The next message of the caller, or `None` once the caller ends its
 	/// requests.
 	///
-	/// Each error ends the stream with a status that the caller reads.
-	///
 	/// # Errors
 	///
-	/// Each refusal is the [`TightBeamError`] of its status:
-	///
-	/// - [`TransitStatus::Unauthenticated`] -- a part does not verify under the signer of the head, answers
-	///   another call, comes out of order, or does not decode as a part.
-	/// - [`TransitStatus::InvalidArgument`] -- a part is malformed, or carries an end.
-	/// - [`TransitStatus::Unimplemented`] -- a count of requests that the method does not take.
-	/// - [`TransitStatus::Unavailable`] -- the stream failed.
-	pub async fn next(&mut self) -> Result<Option<Vec<u8>>, TightBeamError> {
-		let message = self.parts.request().await.map_err(PartFault::of_request)?;
+	/// - [`StreamRefusal::Ends`] -- a part does not admit, with its status:
+	///   - [`TransitStatus::Unauthenticated`] -- the part does not verify under the signer of the head,
+	///     answers another call, comes out of order, or does not decode as a part.
+	///   - [`TransitStatus::InvalidArgument`] -- the part is malformed, or carries an end.
+	///   - [`TransitStatus::Unimplemented`] -- a count of requests that the method does not take.
+	///   - [`TransitStatus::Unavailable`] -- the stream failed.
+	pub async fn next(&mut self) -> Result<Option<Vec<u8>>, StreamRefusal> {
+		let message = self.parts.request().await.map_err(PartFault::refusal)?;
 		Ok(message.map(OctetString::into_bytes))
 	}
 }
@@ -831,44 +1052,52 @@ impl StreamAnswers {
 	///
 	/// # Errors
 	///
-	/// - [`TransitStatus::ResourceExhausted`] -- the part passes the ceiling that the head of the stream
-	///   declared.
-	/// - [`TransitStatus::Unimplemented`] -- the method takes no further response message.
-	/// - [`TransitStatus::DeadlineExceeded`] -- an earlier push stopped before it landed.
-	/// - [`TransitStatus::Unavailable`] -- an earlier push failed on the stream.
-	/// - The [`TightBeamError`] of a part that does not build, sign, or send.
-	pub async fn send(&mut self, body: impl Into<Vec<u8>>) -> Result<(), TightBeamError> {
-		Ok(self.answers.send(body.into()).await?)
+	/// - [`StreamRefusal::Ends`] -- the part does not send while every answer part landed, with its status:
+	///   - [`TransitStatus::ResourceExhausted`] -- the part passes the ceiling that the head of the stream
+	///     declared.
+	///   - [`TransitStatus::Unimplemented`] -- the method takes no further response message.
+	///   - [`TransitStatus::Internal`] -- the part does not build or sign.
+	/// - [`StreamRefusal::Breaks`] -- an earlier push stopped before it landed, with
+	///   [`TransitStatus::DeadlineExceeded`], or failed, with [`TransitStatus::Unavailable`], or this push
+	///   failed with the [`TightBeamError`] of the stream.
+	pub async fn send(&mut self, body: impl Into<Vec<u8>>) -> Result<(), StreamRefusal> {
+		let sent = self.answers.send(body.into()).await;
+		sent.map_err(|fault| self.answers.sink.refusal(fault))
 	}
 
-	/// End the answer of the stream of `requests` with status 0.
+	/// End the answer with status 0.
 	///
 	/// # Errors
 	///
 	/// - The errors of [`StreamAnswers::end`].
-	pub async fn finish(self, requests: StreamRequests) -> Result<(), TightBeamError> {
-		self.end(requests, &Status::new(Code::Ok, "")).await
+	pub async fn finish(self) -> Result<(), TightBeamError> {
+		self.end(&Status::new(Code::Ok, "")).await
 	}
 
-	/// End the answer of the stream of `requests` with `status`: its code, its
-	/// message, and its details.
+	/// End the answer with `status`: its code, its message, and its details.
 	///
-	/// The end then holds the stream until the caller ends its requests, and
-	/// drops each request that comes, so a gateway relays the last answer part
-	/// before the stream ends. A coupler ends its requests once it reads that
-	/// part.
+	/// - Status 0, when the method takes a response message that never came, ends the answer with 12.
+	/// - An end part past the ceiling that the head declared ends the answer with 8.
 	///
 	/// # Errors
 	///
-	/// - [`TransitStatus::Unimplemented`] -- `status` is 0, and the method takes a response message that
-	///   never came.
-	/// - The errors of [`StreamAnswers::send`].
-	pub async fn end(self, requests: StreamRequests, status: &Status) -> Result<(), TightBeamError> {
+	/// - [`TransitStatus::DeadlineExceeded`] -- an earlier push stopped before it landed.
+	/// - [`TransitStatus::Unavailable`] -- an earlier push failed on the stream.
+	/// - The [`TightBeamError`] of an end part that does not encode, build, sign, or send.
+	pub async fn end(self, status: &Status) -> Result<(), TightBeamError> {
+		self.close(status).await.map(drop)
+	}
+
+	/// End the answer as [`StreamAnswers::end`] does, and give the code of the
+	/// end part that ended it, which differs from that of `status` when the
+	/// end of `status` does not send.
+	///
+	/// # Errors
+	///
+	/// - The errors of [`StreamAnswers::end`].
+	pub(crate) async fn close(self, status: &Status) -> Result<Code, TightBeamError> {
 		let end = CoupledReply::of_status(status, Vec::new())?;
-		self.answers.end(end).await?;
-		let StreamRequests { mut parts } = requests;
-		parts.reader.drain().await;
-		Ok(())
+		self.answers.close(end).await
 	}
 }
 
@@ -880,6 +1109,9 @@ pub(crate) struct OpenStream {
 	terms: StreamTerms,
 	sink: RequestSink,
 	body: StreamBody,
+	/// The unit of the cancel budget of the loopback session that the stream
+	/// holds until it ends.
+	lease: CancelLease,
 	/// The relay permit of the coupler, which the stream holds to its end.
 	permit: OwnedSemaphorePermit,
 }
@@ -889,8 +1121,8 @@ impl OpenStream {
 	/// sink of `opened`, and whose answer arrives on its body, under the relay
 	/// `permit`.
 	pub(crate) fn new(hold: CallHold, head: &HeadPart, opened: OpenedDuplex, permit: OwnedSemaphorePermit) -> Self {
-		let OpenedDuplex { sink, body } = opened;
-		Self { hold, request_id: *head.id(), terms: *head.terms(), sink, body, permit }
+		let OpenedDuplex { sink, body, lease } = opened;
+		Self { hold, request_id: *head.id(), terms: *head.terms(), sink, body, lease, permit }
 	}
 }
 
@@ -926,42 +1158,31 @@ impl StreamRelay {
 	}
 
 	/// Relay the stream until its last answer part decides it, its deadline
-	/// passes, or the caller drops its response, close the tail of a decided
-	/// stream, free its slot and its relay permit, record its end, and give
-	/// the status that ends the response.
-	///
-	/// - A caller that drops its response while the tail closes stops the
-	///   tail, and the decided end stays.
+	/// passes, or the caller drops its response, then end it by its tail,
+	/// free its slot and its relay permit, record its end, and give the
+	/// status that ends the response.
 	async fn run(self, answers: mpsc::Sender<Vec<u8>>) -> Result<(), Status> {
 		let Self { open, requests, signer, ending } = self;
-		let OpenStream { hold, request_id, terms, sink, body, permit } = open;
+		let OpenStream { hold, request_id, terms, sink, body, lease, permit } = open;
 		let ceiling = terms.ceiling();
 		let expires = hold.expires();
 
 		let order = PartOrder::requests(request_id.as_bytes(), terms.shape());
-		let upstream = PartSink::new(sink, order, signer, ceiling);
-		let reader = PartReader::new(body, ceiling);
+		let mut upstream = Requests::Open(Box::new(PartSink::new(sink, order, signer, ceiling)));
+		let reader = PartReader::leased(body, ceiling, lease);
 		let order = PartOrder::answers(request_id.as_bytes(), terms.shape());
 		let verifier = PartVerifier::Pinned(hold.servlet().clone());
-		let downstream = PartStream { reader, order, verifier };
+		let mut downstream = PartStream { reader, order, verifier };
 
 		let gone = answers.clone();
-		let relayed = expires.bound(Self::relay(requests, upstream, downstream, answers));
+		let relayed = expires.bound(Self::relay(requests, &mut upstream, &mut downstream, answers));
 		let decided = tokio::select! {
 			relayed = relayed => relayed.unwrap_or_else(|lapse| Err(lapse.into())),
 			() = gone.closed() => Err(CallFault::Cancelled),
 		};
 
-		let end = match decided {
-			Ok((end, tail)) => {
-				let closed = tokio::select! {
-					closed = tail.close(expires) => closed,
-					() = gone.closed() => Ok(()),
-				};
-				closed.map(|()| end)
-			}
-			Err(fault) => Err(fault),
-		};
+		let tail = StreamTail { upstream, downstream };
+		let end = tail.end(decided, expires).await;
 
 		drop((hold, permit));
 		ending.end(end.as_ref().map(CoupledReply::code).map_err(|fault| *fault));
@@ -972,57 +1193,51 @@ impl StreamRelay {
 
 	/// Each direction of the stream on its own, until the answer reads its
 	/// last part or a request fails with a fault of the call. Requests that
-	/// end, or that the stream resolved under, leave the end to the answer.
-	/// A decided stream gives its end and its tail.
+	/// close, or that the stream resolved under, leave the end to the answer.
+	/// Both directions stay with the relay, so an end of either leaves the
+	/// stream to its tail.
 	async fn relay(
 		requests: Streaming<Vec<u8>>,
-		upstream: PartSink<RequestSink>,
-		mut downstream: PartStream,
+		upstream: &mut Requests,
+		downstream: &mut PartStream,
 		answers: mpsc::Sender<Vec<u8>>,
-	) -> Result<(CoupledReply, StreamTail), CallFault> {
-		let mut upstream = Some(upstream);
-		let forward = async {
-			if let Err(ForwardEnd::Fault(fault)) = Self::forward(requests, &mut upstream).await {
-				return Err(fault);
-			}
-
-			core::future::pending::<Result<CoupledReply, CallFault>>().await
-		};
-
-		let end = tokio::select! {
-			end = Self::answer(&mut downstream, answers) => end,
+	) -> Result<CoupledReply, CallFault> {
+		let forward = async { Self::forward(requests, upstream).await.settle().await };
+		tokio::select! {
+			end = Self::answer(downstream, answers) => end,
 			end = forward => end,
-		}?;
-
-		Ok((end, StreamTail { upstream, downstream }))
+		}
 	}
 
-	/// Send each request of the caller on as a signed part, then close the
-	/// requests, which `upstream` holds until then.
+	/// Send each request of the caller on `upstream` as a signed part, then
+	/// close the requests, and give how they ended:
 	///
-	/// # Errors
-	///
+	/// - [`ForwardEnd::Closed`] -- the close landed.
 	/// - [`ForwardEnd::Severed`] -- the stream resolved under a push or the close.
 	/// - [`ForwardEnd::Fault`] -- the fault of the call:
 	///   - [`CallFault::Shape`] -- the caller sends a count of messages that the method does not take.
 	///   - [`CallFault::Oversize`] -- a part passes the ceiling of the edge.
 	///   - [`CallFault::Refused`] -- tonic refuses a request message, such as one past the ceiling.
-	///   - [`CallFault::Internal`] -- a part does not build or sign.
+	///   - [`CallFault::Internal`] -- a part does not build or sign, or the clock of the session gave a
+	///     push or the close no timer.
+	///   - [`CallFault::Stalled`] -- a push or the close waited past the read deadline of the session.
 	///   - [`CallFault::Unavailable`] -- the stream to the servlet refused a part.
-	async fn forward(
-		mut requests: Streaming<Vec<u8>>,
-		upstream: &mut Option<PartSink<RequestSink>>,
-	) -> Result<(), ForwardEnd> {
-		let refused = |status: Status| ForwardEnd::Fault(status.into());
-		if let Some(sink) = upstream.as_mut() {
-			while let Some(message) = requests.message().await.map_err(refused)? {
-				sink.send(message).await.map_err(SendFault::of_request)?;
+	async fn forward(mut requests: Streaming<Vec<u8>>, upstream: &mut Requests) -> ForwardEnd {
+		loop {
+			let message = match requests.message().await {
+				Ok(Some(message)) => message,
+				Ok(None) => break,
+				Err(status) => return ForwardEnd::Fault(status.into()),
+			};
+
+			if let Err(fault) = upstream.send(message).await {
+				return fault.of_request();
 			}
 		}
 
-		match upstream.take() {
-			Some(sink) => sink.close().await.map_err(SendFault::of_request),
-			None => Ok(()),
+		match upstream.close().await {
+			Ok(()) => ForwardEnd::Closed,
+			Err(fault) => fault.of_request(),
 		}
 	}
 
@@ -1049,17 +1264,38 @@ impl StreamRelay {
 	}
 }
 
-/// What follows the last answer part of a coupled stream, which that part
-/// decided: the requests that are still open, and the rest of the stream.
+/// A coupled stream once its relay ends: the requests, which may still be
+/// open or closing, and the rest of the answer.
+///
+/// - A stream that its tail leaves before its end drops, which cancels it on
+///   the loopback session.
 struct StreamTail {
-	upstream: Option<PartSink<RequestSink>>,
+	upstream: Requests,
 	downstream: PartStream,
 }
 
 impl StreamTail {
-	/// End the requests that are still open, then read the stream to its end
-	/// before `expires`. The tail may only refuse a part that follows the last
-	/// one, and a tail that passes `expires` keeps the decided end.
+	/// End the stream as `decided` says. A stream that its last answer part
+	/// decided closes its tail before `expires`, as [`StreamTail::close`]
+	/// does, and gives the decided end. Any other stream drops at once, with
+	/// the fault that ended it.
+	///
+	/// # Errors
+	///
+	/// - The [`CallFault`] of `decided`, or the errors of [`StreamTail::close`].
+	async fn end(
+		self,
+		decided: Result<CoupledReply, CallFault>,
+		expires: &Deadline,
+	) -> Result<CoupledReply, CallFault> {
+		let end = decided?;
+		self.close(expires).await.map(|()| end)
+	}
+
+	/// Close the requests of a stream that its last answer part decided, then
+	/// read the stream to its end before `expires`. The tail may only refuse
+	/// a part that follows the last one, and a tail that passes `expires`
+	/// keeps the decided end.
 	///
 	/// # Errors
 	///
@@ -1067,10 +1303,7 @@ impl StreamTail {
 	async fn close(self, expires: &Deadline) -> Result<(), CallFault> {
 		let Self { upstream, mut downstream } = self;
 		let tail = async move {
-			if let Some(open) = upstream {
-				open.release().await;
-			}
-
+			upstream.release().await;
 			downstream.finish().await
 		};
 

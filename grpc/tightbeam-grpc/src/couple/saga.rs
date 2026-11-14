@@ -37,7 +37,7 @@ use super::error::CoupleError;
 use super::fault::CallFault;
 use super::ledger::{ClaimLedger, MemoryLedger};
 use super::limits::{CallLimits, GrpcTimeout, MAX_SPAN};
-use super::loopback::{Duplex, GatewayPin, Held, LoopbackSession, SendFailure};
+use super::loopback::{Duplex, GatewayPin, Held, LoopbackSession, MuxSession, SendFailure};
 use super::message::{CoupledCall, CoupledReply, OriginProof, StreamTerms, VouchedOrigin};
 use super::metadata::{CallMetadata, MetadataKey};
 use super::method::MethodPath;
@@ -341,8 +341,13 @@ impl<P: HandshakeProvider + Send + Sync + 'static> LiveCoupler<P> {
 		let ledger = Arc::clone(&config.ledger);
 		let guard = ReplayGuard::new(ledger, config.replay_window, config.limits.timeout(), recorder.clone(), &clock);
 		let lanes = Arc::new(Semaphore::new(config.limits.lanes().get()));
-		let relays = Arc::new(Semaphore::new(config.limits.relays().map_or(0, core::num::NonZeroUsize::get)));
+
+		// Open streams hold at most half the places of the loopback session, so
+		// its unary calls keep the other half.
+		let relays = config.limits.relays().map_or(0, core::num::NonZeroUsize::get);
+		let relays = Arc::new(Semaphore::new(relays.min(MuxSession::STREAM_PLACES)));
 		let requests = AtomicU64::new(0);
+
 		Self {
 			config,
 			callers,
@@ -1046,6 +1051,8 @@ impl<P: HandshakeProvider + Send + Sync + 'static> Spent<WorkRequest, Held<P>> {
 	/// - [`CallFault::Unavailable`] -- the session failed.
 	/// - [`CallFault::Deadline`] -- no stream came free, or no reply came, within the deadline, or the
 	///   clock gave a wait of the send no timer.
+	/// - [`CallFault::Stalled`] -- a wait of the send passed a read deadline of the session, as that fault
+	///   states.
 	/// - [`CallFault::Internal`] -- the reply does not decode.
 	async fn send(self) -> Result<Submitted, CallFault> {
 		let Self { hold, work, spent, session } = self;
@@ -1074,6 +1081,8 @@ impl Spent<HeadPart, Duplex> {
 	/// - [`CallFault::Unavailable`] -- the session failed.
 	/// - [`CallFault::Deadline`] -- the push of the head passed the deadline, or the clock gave the push no
 	///   timer.
+	/// - [`CallFault::Stalled`] -- the push of the head passed a read deadline of the session, as that
+	///   fault states.
 	async fn open(self, permit: OwnedSemaphorePermit) -> Result<OpenStream, CallFault> {
 		let Self { hold, work, spent, session } = self;
 		match session.push_head(&work, hold.expires()).await {

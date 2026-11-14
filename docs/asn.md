@@ -116,6 +116,7 @@ An Enumerated enum maps to a number, typed as the union of its discriminants. A 
 - an enum with no variant, an enum that mixes unit variants with other variants, or a Choice variant other than one unnamed field, such as `List(Body, Pad)` or `List { body: Body }`
 - an Enumerated enum without `#[repr(u8)]`
 - an Enumerated discriminant that is no integer literal, or that falls past `u8`
+- a Sequence field or a Choice variant named `__proto__`, because a JavaScript object reads that key as its prototype and not as an own key
 
 The build of the deriving crate refuses the shapes that only the `JsLeaf` constants show:
 
@@ -173,6 +174,18 @@ impl JsLeaf for Glob {
 #[derive(Sequence, AsnCodec)]
 pub struct Search {
 	pub glob: Glob,
+}
+```
+
+A Sequence field named `__proto__` fails the build:
+
+```rust,compile_fail
+use tightbeam_asn::der::Sequence;
+use tightbeam_asn::AsnCodec;
+
+#[derive(Sequence, AsnCodec)]
+pub struct Doc {
+	pub __proto__: String,
 }
 ```
 

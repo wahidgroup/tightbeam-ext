@@ -6,19 +6,14 @@
 //!   - `TBWS_WORK_CERT`    path to the shared work certificate DER, beside its key
 //!   - `GRPC_EDGE_PORT`    listen port of the edge
 
-// The colony runtime macros expand `cfg(feature = ...)` probes against the
-// invoking crate's feature namespace, which holds the features of this crate
-// alone, so the leaked cfg warnings carry no signal here.
-#![allow(unexpected_cfgs)]
-
 use core::future::pending;
 use std::sync::Arc;
 
 use tightbeam::cluster;
 use tightbeam::colony::cluster::Cluster;
 use tightbeam::trace::TraceCollector;
+use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam_grpc::protocol::GrpcListener;
-use tightbeam_ws::protocol::WsListener;
 use tightbeam_ws::testing::{EnvVar, Identity, IdentityFiles, WorkClient, WorkPlane, WorkStack};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -30,11 +25,19 @@ const PORT: EnvVar = EnvVar::new("GRPC_EDGE_PORT");
 /// beside its signing key.
 const WORK_CERT: EnvVar = EnvVar::new("TBWS_WORK_CERT");
 
+tightbeam_ws::work_probe! {
+	/// The work probe of the gateway, over the TCP colony.
+	pub TcpWorkProbe,
+	/// The hive that hosts the work probe over the TCP colony.
+	pub TcpWorkHive,
+	protocol: TokioListener
+}
+
 cluster! {
-	/// WebSocket colony gateway with a gRPC edge accept plane. Hives register
-	/// over WebSocket, and clients submit work over the tunnel.
+	/// TCP colony gateway with a gRPC edge accept plane. Hives register over
+	/// TCP, and clients submit work over the tunnel.
 	pub WorkPlaneGateway,
-	protocol: WsListener,
+	protocol: TokioListener,
 	edge: GrpcListener
 }
 
@@ -47,13 +50,13 @@ async fn main() -> Result<(), BoxError> {
 
 	let trace = TraceCollector::default();
 	let edge = format!("0.0.0.0:{port}");
-	let stack = WorkStack::<WorkPlaneGateway>::start(&trace, &plane, edge).await?;
+	let stack = WorkStack::<WorkPlaneGateway, TcpWorkProbe>::start(&trace, &plane, edge).await?;
 
 	let gateway = stack.gateway();
 	let edge = WorkClient::edge_of(gateway)?;
 	let probe = WorkClient::probe()?;
 	println!(
-		"[grpc-work-gateway] cluster work-plane gateway: colony ws://{} edge h2c://{edge} (servlet: {probe})",
+		"[grpc-work-gateway] cluster work-plane gateway: colony tcp://{} edge h2c://{edge} (servlet: {probe})",
 		gateway.addr().0
 	);
 

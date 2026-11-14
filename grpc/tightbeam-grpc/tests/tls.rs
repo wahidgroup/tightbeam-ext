@@ -1,10 +1,5 @@
 //! Tunnels over a TLS 1.3 edge.
 
-// The colony runtime macros expand `cfg(feature = ...)` probes against the
-// invoking crate's feature namespace, which holds the features of this crate
-// alone, so the leaked cfg warnings carry no signal here.
-#![allow(unexpected_cfgs)]
-
 mod support;
 
 use std::time::Duration;
@@ -15,6 +10,7 @@ use tightbeam::instrumentation::events;
 use tightbeam::testing::{ClientEnv, ClusterEnv, SetupEnv, TestFrame};
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::policy::RestartLinearBackoff;
+use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::transport::TransportLimits;
 use tightbeam::{client, cluster, exactly, tb_assert_spec, tb_scenario};
 use tightbeam_grpc::edge::{Dial, Edge};
@@ -22,12 +18,13 @@ use tightbeam_grpc::events::EDGE_REFUSED;
 use tightbeam_grpc::protocol::{GrpcAddr, GrpcListener, HEALTH_CHECK_PATH};
 use tightbeam_grpc::staged_profile;
 use tightbeam_grpc::testing::TlsAuthority;
-use tightbeam_ws::protocol::WsListener;
 use tightbeam_ws::testing::specs::{CleartextRoundTripSpec, EdgeWorkSpec, EncryptedRoundTripSpec};
 use tightbeam_ws::testing::{EchoService, EventWatch, Identity, WorkClient, WorkPlane};
 use tokio::net::TcpStream;
 
-use support::{bounded, edge_error, mint_error, server_identity, Coupled, EchoServer, Graded, LIFETIME, SERVING};
+use support::{
+	bounded, edge_error, mint_error, server_identity, Coupled, EchoServer, Graded, TcpWorkProbe, LIFETIME, SERVING,
+};
 
 /// The subject of the identity of each encrypted echo.
 const ECHO: &str = "CN=tunnel echo,O=tightbeam-grpc,C=US";
@@ -75,9 +72,9 @@ type TrustedEchoListener = GrpcListener<DefaultCryptoProvider, TrustedEcho>;
 type TlsGatewayListener = GrpcListener<DefaultCryptoProvider, TlsGatewayEdge>;
 
 cluster! {
-	/// WebSocket colony gateway with a gRPC edge accept plane over TLS.
+	/// TCP colony gateway with a gRPC edge accept plane over TLS.
 	pub TlsGateway,
-	protocol: WsListener,
+	protocol: TokioListener,
 	edge: TlsGatewayListener
 }
 
@@ -305,7 +302,7 @@ tb_scenario! {
 	environment Cluster {
 		context: tls_work_plane(),
 		start: |SetupEnv { trace, context }| async move { context.gateway::<TlsGateway>(&trace, "127.0.0.1:0").await },
-		hives: |SetupEnv { trace, context }| vec![async move { context.hive(&trace).await }],
+		hives: |SetupEnv { trace, context }| vec![async move { context.hive::<TcpWorkProbe>(&trace).await }],
 		client: |ClusterEnv { context, cluster, .. }| async move {
 			let probe = context.client();
 			let mut client = probe.connect::<TlsGatewayListener>(WorkClient::edge_of(&cluster)?).await?;

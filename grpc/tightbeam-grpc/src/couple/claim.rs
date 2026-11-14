@@ -20,9 +20,11 @@ use tightbeam::clock::{Clock, Lapse, UnixMillis};
 use tightbeam::colony::cluster::FreshnessWindow;
 use tightbeam::crypto::sign::SigningIdentity;
 use tightbeam::crypto::x509::store::CertificateTrust;
-use tightbeam::crypto::x509::{Certificate, ErasedSigning, KeyPurposes, PeerCertificate};
+use tightbeam::crypto::x509::{CanonicalKey, Certificate, ErasedSigning, KeyPurposes, PeerCertificate};
 use tightbeam::der::asn1::OctetString;
+use tightbeam::der::oid::db::rfc5912::ID_EC_PUBLIC_KEY;
 use tightbeam::der::{Decode, Encode};
+use tightbeam::spki::SubjectPublicKeyInfoOwned;
 use tightbeam::{Frame, TightBeamError, Version};
 use tonic::metadata::{MetadataMap, MetadataValue};
 
@@ -225,7 +227,7 @@ impl CallClaim {
 
 		claims.verify_presented(&issuers, &signer).map_err(refused)?;
 
-		let signer_key = signer.to_der().map_err(|_| CallFault::ClaimRefused)?;
+		let signer_key = SignerKey::of(&signer.tbs_certificate.subject_public_key_info)?;
 		let named = Principal::of(&signer);
 		let peer = PeerCertificate::<ErasedSigning>::parse(signer, KeyPurposes::HOUSE.signer).map_err(refused)?;
 
@@ -253,16 +255,55 @@ impl CallClaim {
 /// is compared.
 struct Opened {
 	body: ClaimBody,
-	signer_key: Vec<u8>,
+	signer_key: SignerKey,
 	order: UnixMillis,
 	forwarded: Vec<u8>,
+}
+
+/// The public key that the frame of a claim verifies under, in its canonical
+/// form, which names the key under each certificate of it and in either SEC 1
+/// form of its point.
+#[derive(Debug)]
+struct SignerKey(CanonicalKey);
+
+impl SignerKey {
+	/// The key that `spki` holds.
+	///
+	/// # Errors
+	///
+	/// - [`CallFault::ClaimRefused`] -- `spki` holds an elliptic-curve point in a form that RFC 5480
+	///   section 2.2 refuses, such as the compact form, which `CanonicalKey` keeps as it arrived.
+	fn of(spki: &SubjectPublicKeyInfoOwned) -> Result<Self, CallFault> {
+		let form = spki.subject_public_key.raw_bytes().first();
+		let refused = spki.algorithm.oid == ID_EC_PUBLIC_KEY && !matches!(form, Some(0x02..=0x04));
+		if refused {
+			return Err(CallFault::ClaimRefused);
+		}
+
+		let canonical = CanonicalKey::of(spki).map_err(|_| CallFault::ClaimRefused)?;
+		Ok(Self(canonical))
+	}
+
+	/// The key of the spend of the claim of this signer at `order`: the
+	/// SHA-256 of this key and the order.
+	fn claim_key(&self, order: UnixMillis) -> ClaimKey {
+		let key = Sha256::new()
+			.chain_update(self.0.as_der())
+			.chain_update(order.get().to_be_bytes());
+		ClaimKey::new(key.finalize().into())
+	}
+
+	/// The SHA-256 of this key, which names the signer of each of its spends.
+	fn digest(&self) -> SignerDigest {
+		SignerDigest::new(Sha256::digest(self.0.as_der()).into())
+	}
 }
 
 /// A claim that verified for its call on the connection of its caller. Only
 /// [`CallClaim::verify`] builds one, and the coupler spends it once.
 #[derive(Debug)]
 pub(crate) struct VerifiedClaim {
-	signer_key: Vec<u8>,
+	signer_key: SignerKey,
 	order: UnixMillis,
 	forwarded: Vec<u8>,
 }
@@ -273,19 +314,16 @@ impl VerifiedClaim {
 		&self.forwarded
 	}
 
-	/// Spend the claim under `guard` by `deadline`, the deadline of its call:
-	/// its key is the SHA-256 of its signer and its order.
+	/// Spend the claim under `guard` by `deadline`, the deadline of its call,
+	/// under the key of [`SignerKey::claim_key`], so every certificate of the
+	/// signer key names one spend.
 	///
 	/// # Errors
 	///
 	/// - The errors of [`ReplayGuard::spend`].
 	pub(crate) async fn spend(&self, guard: &ReplayGuard, deadline: &Deadline) -> Result<SpentClaim, CallFault> {
-		let key = Sha256::new()
-			.chain_update(&self.signer_key)
-			.chain_update(self.order.get().to_be_bytes());
-		let key = ClaimKey::new(key.finalize().into());
-		let signer = SignerDigest::new(Sha256::digest(&self.signer_key).into());
-		guard.spend(key, signer, self.order, deadline).await
+		let key = self.signer_key.claim_key(self.order);
+		guard.spend(key, self.signer_key.digest(), self.order, deadline).await
 	}
 }
 
@@ -479,11 +517,18 @@ mod tests {
 
 	use tightbeam::clock::{Clock, ManualClock, SystemClock};
 	use tightbeam::colony::hive::gates::REPLAY_GUARD_CAPACITY;
+	use tightbeam::crypto::policy::Secp256k1Policy;
+	use tightbeam::crypto::sign::ecdsa::Secp256k1SigningKey;
+	use tightbeam::crypto::x509::ext::pkix::{KeyUsage, KeyUsages};
+	use tightbeam::crypto::x509::store::{CertificateTrustBuilder, NoRevocation, TrustBuilder};
+	use tightbeam::crypto::x509::KeyCurves;
+	use tightbeam::testing::{TestCertificate, TestIdentity, TestKey};
 	use tightbeam::trace::TraceCollector;
 
 	use super::*;
 	use crate::couple::{LedgerFuture, MemoryLedger};
 	use crate::events::COUPLED_CLAIM_FORGOTTEN;
+	use crate::testing::TlsAuthority;
 	use crate::tunnel::EdgeAudit;
 
 	#[tokio::test]
@@ -512,7 +557,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn an_expiry_past_the_clock_refuses_its_spend() {
-		let claim = VerifiedClaim { signer_key: vec![7; 32], order: UnixMillis::now(), forwarded: Vec::new() };
+		let claim = claim(UnixMillis::now());
 		let recorder = CallRecorder::new(EdgeAudit::default());
 		let clock: Arc<dyn Clock> = Arc::new(SystemClock);
 		let guard = ReplayGuard::new(Arc::new(MemoryLedger::new()), Duration::MAX, Duration::MAX, recorder, &clock);
@@ -520,9 +565,11 @@ mod tests {
 		assert_eq!(claim.spend(&guard, &deadline).await.err(), Some(CallFault::Internal));
 	}
 
-	/// A claim of `signer_key` at `order`.
-	fn claim(signer_key: &[u8], order: UnixMillis) -> VerifiedClaim {
-		VerifiedClaim { signer_key: signer_key.to_vec(), order, forwarded: Vec::new() }
+	/// A claim of the signer of [`TestKey::insecure_fixed_signing`] at `order`.
+	fn claim(order: UnixMillis) -> VerifiedClaim {
+		let certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
+		let signer_key = SignerKey::of(&certificate.tbs_certificate.subject_public_key_info);
+		VerifiedClaim { signer_key: signer_key.expect("a fixed key signs"), order, forwarded: Vec::new() }
 	}
 
 	#[tokio::test]
@@ -536,7 +583,7 @@ mod tests {
 		let start = clock.unix().get();
 		let capacity = u64::try_from(REPLAY_GUARD_CAPACITY).expect("the capacity fits a u64");
 		for back in 0..=capacity {
-			let spent = claim(&[7; 32], UnixMillis::new(start - back)).spend(&guard, &deadline).await;
+			let spent = claim(UnixMillis::new(start - back)).spend(&guard, &deadline).await;
 			let expected = if back < capacity {
 				None
 			} else {
@@ -546,8 +593,9 @@ mod tests {
 		}
 
 		manual.advance(window + Duration::from_millis(1));
+
 		let deadline = Deadline::after(&clock, window);
-		let fresh = claim(&[7; 32], clock.unix()).spend(&guard, &deadline).await;
+		let fresh = claim(clock.unix()).spend(&guard, &deadline).await;
 		assert!(
 			fresh.is_ok(),
 			"the spends that expired on the clock of the edge MUST free the share"
@@ -651,6 +699,59 @@ mod tests {
 		]
 		.concat();
 		assert_eq!(body.to_der()?, expected);
+		Ok(())
+	}
+
+	/// One claim frame that its signer presents under each certificate of its
+	/// one key spends once. Another certificate of the key, or the other SEC 1
+	/// form of its point, is a replay, and a point in the compact form is
+	/// refused.
+	#[tokio::test]
+	async fn a_frame_under_another_certificate_of_its_key_is_a_replay() -> Result<(), Box<dyn std::error::Error>> {
+		// The point of this key has the even y-coordinate, the one point that
+		// its compact form names, so that form verifies the frame.
+		let key = TestKey::negation_of(&TestKey::insecure_fixed_signing());
+		let authority = Secp256k1SigningKey::random(&mut OsRng);
+		let root = TestCertificate::authority(&authority, "claims root")?;
+		let signing = KeyUsage(KeyUsages::DigitalSignature.into());
+		let issued = TestCertificate::issued(&authority, "claims root", &key, "web", 1, signing)?;
+		let renewed = TestCertificate::issued(&authority, "claims root", &key, "web", 2, signing)?;
+		let compressed = TestCertificate::signed_by(TestCertificate::with_compressed_key(renewed.clone()), &authority);
+		let compact = TestCertificate::signed_by(TestCertificate::with_compact_key(renewed.clone()), &authority);
+		let builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
+		let claims = builder.with_certificate(root)?.build();
+
+		let lifetime = Duration::from_secs(60);
+		let tls_leaf = TlsAuthority::mint("CN=edge root", lifetime)?.caller("CN=web", None)?;
+		let tls_leaf = tls_leaf.leaf();
+		let method: MethodPath = "/orders.v1.Orders/Place".parse()?;
+		let identity = TestIdentity::presenting(issued.clone(), &key);
+		let claim = ClaimSigner::new(identity, [], tls_leaf).sign(&method, b"order").await?;
+		let under = |signer| -> Result<CallClaim, tightbeam::der::Error> {
+			let envelope = ClaimEnvelope { signer, ..claim.envelope.clone() };
+			Ok(CallClaim { encoded: envelope.to_der()?, envelope })
+		};
+		let (replayed, refused) = (Some(CallFault::Replayed), Some(CallFault::ClaimRefused));
+		let presented = [
+			(claim.clone(), None, "the first spend MUST take the key"),
+			(under(renewed)?, replayed, "another certificate MUST replay"),
+			(under(compressed)?, replayed, "the compressed point MUST replay"),
+			(under(compact)?, refused, "a compact point MUST be refused"),
+		];
+
+		let principal = Principal::of(&issued).ok_or("the signer names a principal")?;
+		let leaf = LeafDigest::of(tls_leaf.as_ref());
+		let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+		let recorder = CallRecorder::new(EdgeAudit::default());
+		let guard = ReplayGuard::new(Arc::new(MemoryLedger::new()), lifetime, lifetime, recorder, &clock);
+		let deadline = Deadline::after(&clock, lifetime);
+		for (claim, expected, reason) in presented {
+			let spent = match claim.verify(&principal, &leaf, &method, b"order", &claims) {
+				Ok(verified) => verified.spend(&guard, &deadline).await.err(),
+				Err(refused) => Some(refused),
+			};
+			assert_eq!(spent, expected, "{reason}");
+		}
 		Ok(())
 	}
 }
