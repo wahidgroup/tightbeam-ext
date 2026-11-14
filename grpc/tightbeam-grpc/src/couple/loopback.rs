@@ -5,7 +5,7 @@ use core::convert::Infallible;
 use core::future::{pending, ready, Future};
 use core::marker::PhantomData;
 use core::pin::pin;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 
@@ -44,22 +44,23 @@ enum State<P: HandshakeProvider + Send + Sync + 'static> {
 }
 
 impl<P: HandshakeProvider + Send + Sync + 'static> State<P> {
-	/// Whether the state carries calls.
+	/// Whether the state carries calls, as a session that renews does.
 	fn is_live(&self) -> bool {
-		self.ready().is_some()
+		!matches!(self.offer(), Offer::Closed)
 	}
 
-	/// What a call sends on, or `None` while the state carries no call: a
-	/// multiplexed session that carries a new call, or the transport of a
-	/// single session that may carry another exchange. A held single session
-	/// is read once its call releases it.
-	fn ready(&self) -> Option<Ready<P>> {
+	/// What the state offers a new call: a multiplexed session that takes it,
+	/// the transport of a single session that may carry another exchange, or
+	/// a session that renews. A held single session is read once its call
+	/// releases it.
+	fn offer(&self) -> Offer<P> {
 		match self {
-			Self::Mux(session) if session.carries() => Some(Ready::Mux(Arc::clone(session))),
+			Self::Mux(session) if session.admits() => Offer::Ready(Ready::Mux(Arc::clone(session))),
+			Self::Mux(session) if session.carries() => Offer::Renewing,
 			Self::Single(transport) if transport.try_lock().map_or(true, |transport| transport.is_leasable()) => {
-				Some(Ready::Single(Arc::clone(transport)))
+				Offer::Ready(Ready::Single(Arc::clone(transport)))
 			}
-			Self::Mux(_) | Self::Single(_) | Self::Opening | Self::Backoff => None,
+			Self::Mux(_) | Self::Single(_) | Self::Opening | Self::Backoff => Offer::Closed,
 		}
 	}
 
@@ -73,32 +74,35 @@ impl<P: HandshakeProvider + Send + Sync + 'static> State<P> {
 	}
 }
 
-/// A multiplexed loopback session, and the share of the cancel budget of the
-/// gateway that its calls hold.
+/// What a state offers a new call.
+enum Offer<P: HandshakeProvider + Send + Sync + 'static> {
+	/// A session that takes the call.
+	Ready(Ready<P>),
+	/// A session that renews, whose next session takes the call.
+	Renewing,
+	/// No session.
+	Closed,
+}
+
+/// A multiplexed loopback session, and the cancels that its calls left with
+/// the gateway.
 ///
 /// - The gateway serves the session under the cancel budget of tightbeam,
 ///   `DEFAULT_MUX_CANCEL_BUDGET`, and ends it with a GoAway at the first
 ///   rapid cancel past it (`docs/grpc.md`, Streams).
-/// - Each call holds one unit of the budget while it is open, under a
-///   [`CancelLease`] that arms at the start of its first push. An armed call
-///   keeps its unit and counts a cancel, rapid or not, because the start of
-///   its handler lies at the gateway. A unary send that ends with a reply,
-///   or with a failure that [`SendFailure::leaves_live`] reads as resolving
-///   its stream, gives the unit back, as a stream whose body ended does.
+/// - Each open call holds a place under a [`CancelLease`], which counts a
+///   cancel, rapid or not, when the call ends while it may be live at the
+///   gateway, because the start of its handler lies there.
 /// - A `Timeout` cancel of the gateway, and an answer of the gateway of
 ///   `DEADLINE_EXCEEDED`, read as a stall, so their calls count a cancel
 ///   that the gateway never charged, which only renews the session sooner.
-/// - At most half the budget is open at once, so the cancels reach
-///   [`MuxSession::RENEWAL`], and the session renews, before a call waits on
-///   a unit that cancels hold.
+/// - A session whose cancels reach [`MuxSession::RENEWAL`] takes no new
+///   call, so the cancels of its open calls stay within the budget.
 pub(crate) struct MuxSession {
 	/// The drivers of the session, whose drop ends it once no call holds it.
 	spawned: SpawnedMux,
-	/// The places of the open calls: the half of the budget that cancels do
-	/// not take before the session renews.
+	/// The places of the open calls.
 	open: Arc<Semaphore>,
-	/// The units of the budget that open calls hold or that cancels spent.
-	held: AtomicU32,
 	/// The cancels that the calls of the session left with the gateway.
 	cancels: AtomicU32,
 	/// The wake of the task once the cancels reach [`MuxSession::RENEWAL`].
@@ -111,7 +115,7 @@ impl MuxSession {
 	const RENEWAL: u32 = DEFAULT_MUX_CANCEL_BUDGET / 2;
 
 	/// The places of the open calls of a session: the half of the budget that
-	/// cancels do not take before the session renews.
+	/// the cancels of a renewing session may still take.
 	const PLACES: u32 = DEFAULT_MUX_CANCEL_BUDGET - Self::RENEWAL;
 
 	/// The open streams of a coupler at most: half the places of a session,
@@ -122,35 +126,41 @@ impl MuxSession {
 		Self {
 			spawned,
 			open: Arc::new(Semaphore::new(Self::PLACES as usize)),
-			held: AtomicU32::new(0),
 			cancels: AtomicU32::new(0),
 			renewal: Notify::new(),
 		}
 	}
 
-	/// Whether the session carries a new call: its drivers run, and its
-	/// cancels left a unit of the budget.
+	/// Whether the session carries its open calls: its drivers run.
 	fn carries(&self) -> bool {
-		!self.spawned.drivers.is_finished() && self.cancels.load(Ordering::Acquire) < DEFAULT_MUX_CANCEL_BUDGET
+		!self.spawned.drivers.is_finished()
 	}
 
-	/// A unit of the budget for one call, once a place among the open calls
-	/// comes free within `expires`. The unit owes no cancel until
-	/// [`CancelLease::arm`].
+	/// Whether the session takes a new call: it carries, and does not renew.
+	fn admits(&self) -> bool {
+		self.carries() && !self.renews_now()
+	}
+
+	/// Whether the cancels of the session reached [`MuxSession::RENEWAL`].
+	fn renews_now(&self) -> bool {
+		self.cancels.load(Ordering::Acquire) >= Self::RENEWAL
+	}
+
+	/// A place for one call, once one comes free within `expires`. The lease
+	/// owes no cancel until it arms.
 	///
 	/// # Errors
 	///
-	/// - [`LeaseFault::Lapsed`] -- no place came free within `expires`, or the clock gave the wait no timer.
-	/// - [`LeaseFault::Spent`] -- open calls and cancels hold the whole budget.
-	async fn lease(self: &Arc<Self>, expires: &Deadline) -> Result<CancelLease, LeaseFault> {
+	/// - [`Refusal::Renewing`] -- the session renews.
+	/// - [`Refusal::Fault`] -- no place came free within `expires`, or the clock gave the wait no timer.
+	async fn lease(self: &Arc<Self>, expires: &Deadline) -> Result<CancelLease, Refusal> {
 		let place = expires.bound(Arc::clone(&self.open).acquire_owned()).await;
-		let place = place.map_err(LeaseFault::Lapsed)?.map_err(|_| LeaseFault::Spent)?;
-		let taken = self.held.fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
-			(held < DEFAULT_MUX_CANCEL_BUDGET).then_some(held + 1)
-		});
-		taken.map_err(|_| LeaseFault::Spent)?;
+		let place = place?.map_err(|_| CallFault::Unavailable)?;
+		if self.renews_now() {
+			return Err(Refusal::Renewing);
+		}
 
-		Ok(CancelLease { session: Arc::clone(self), place: Some(place), owed: false })
+		Ok(CancelLease { session: Arc::clone(self), place: Some(place), owed: AtomicBool::new(false) })
 	}
 
 	/// Resolve once `session` has left the cancels after which it renews, and
@@ -163,78 +173,77 @@ impl MuxSession {
 	}
 }
 
-/// Why a call of a multiplexed session gets no unit of the cancel budget, so
-/// nothing of it leaves.
+/// Why a session takes no new call.
 #[derive(Debug)]
-enum LeaseFault {
-	/// No place among the open calls came free within the deadline of the
-	/// call, or the clock gave the wait no timer.
-	Lapsed(Lapse),
-	/// Open calls and cancels hold the whole budget.
-	Spent,
+enum Refusal {
+	/// The session renews, so the next session takes the call.
+	Renewing,
+	/// The call fails with this fault.
+	Fault(CallFault),
 }
 
-/// A call with no unit fails as a send that never left: expired with its
-/// deadline, and unavailable on a spent session.
-impl From<LeaseFault> for SendFailure {
-	fn from(fault: LeaseFault) -> Self {
-		match fault {
-			LeaseFault::Lapsed(_) => Self::Expired,
-			LeaseFault::Spent => Self::Transport(TransportError::OperationFailed(TransportFailure::Unavailable)),
-		}
+impl From<CallFault> for Refusal {
+	fn from(fault: CallFault) -> Self {
+		Self::Fault(fault)
 	}
 }
 
-/// A stream with no unit fails with the lapse of its wait, or as unavailable
-/// on a spent session.
-impl From<LeaseFault> for CallFault {
-	fn from(fault: LeaseFault) -> Self {
-		match fault {
-			LeaseFault::Lapsed(lapse) => lapse.into(),
-			LeaseFault::Spent => Self::Unavailable,
-		}
+impl From<Lapse> for Refusal {
+	fn from(lapse: Lapse) -> Self {
+		Self::Fault(lapse.into())
 	}
 }
 
-/// The unit of the cancel budget that one call of a multiplexed session
-/// holds, its place among the open calls, and the session, which the call
-/// keeps open.
+/// The place that one call of a multiplexed session holds among its open
+/// calls, and the session, which the call keeps open.
 ///
-/// - [`CancelLease::arm`] marks the call as one that may reach the gateway, before its first push.
-/// - [`CancelLease::settle`] gives the unit and the place back once the call ended.
-/// - A drop before then gives them back too, unless the lease is armed: then it counts one cancel and
-///   keeps the unit, as tightbeam cancels a call whose reply body or response drops before its end.
+/// - [`CancelLease::arm`] marks the call as one that may reach the gateway.
+/// - [`CancelLease::settle`] gives the place back once the call ended.
+/// - A drop before then gives it back too, and counts one cancel if the lease is armed, as tightbeam
+///   cancels a call whose reply body or response drops before its end.
 pub(crate) struct CancelLease {
 	session: Arc<MuxSession>,
 	/// The place among the open calls, until the lease settles.
 	place: Option<OwnedSemaphorePermit>,
 	/// Whether the call may be live at the gateway.
-	owed: bool,
+	owed: AtomicBool,
 }
 
 impl CancelLease {
-	/// Mark the call as one that may reach the gateway, before its first push.
-	fn arm(&mut self) {
-		self.owed = true;
+	/// Mark the call as one that may reach the gateway.
+	fn arm(&self) {
+		self.owed.store(true, Ordering::Release);
 	}
 
-	/// Give the unit and the place back, as a call that ended owes the gateway
-	/// no cancel.
-	pub(crate) fn settle(&mut self) {
-		if self.place.take().is_some() {
-			self.session.held.fetch_sub(1, Ordering::AcqRel);
+	/// The answer of `attempt`, an open of a stream, during which the call
+	/// may reach the gateway. An attempt that finds every stream taken sent
+	/// no Open, so the call owes no cancel after it.
+	async fn during<T, E>(
+		&self,
+		attempt: impl Future<Output = Result<Result<T, TransportError>, E>>,
+	) -> Result<Result<T, TransportError>, E> {
+		self.arm();
+		let tried = attempt.await;
+		if matches!(
+			tried,
+			Ok(Err(TransportError::OperationFailed(TransportFailure::StreamsExhausted)))
+		) {
+			self.owed.store(false, Ordering::Release);
 		}
+
+		tried
+	}
+
+	/// Give the place back, as a call that ended owes the gateway no cancel.
+	pub(crate) fn settle(&mut self) {
+		self.place = None;
 	}
 }
 
 impl Drop for CancelLease {
 	fn drop(&mut self) {
-		if self.place.take().is_none() {
-			return;
-		}
-
-		if !self.owed {
-			self.session.held.fetch_sub(1, Ordering::AcqRel);
+		let open = self.place.take().is_some();
+		if !open || !*self.owed.get_mut() {
 			return;
 		}
 
@@ -246,7 +255,7 @@ impl Drop for CancelLease {
 }
 
 /// The open session that a coupler holds one work request on.
-pub(crate) enum Ready<P: HandshakeProvider + Send + Sync + 'static> {
+enum Ready<P: HandshakeProvider + Send + Sync + 'static> {
 	Mux(Arc<MuxSession>),
 	Single(Arc<Mutex<GrpcTransport<P>>>),
 }
@@ -254,29 +263,31 @@ pub(crate) enum Ready<P: HandshakeProvider + Send + Sync + 'static> {
 impl<P: HandshakeProvider + Send + Sync + 'static> Ready<P> {
 	/// Hold a live session for one send, within the deadline of the call.
 	///
-	/// - The send holds a multiplexed session once it has a free stream. That
-	///   stream is not reserved, so the send waits again when another call
-	///   takes it.
+	/// - The send holds a place on a multiplexed session once it has a free
+	///   stream. That stream is not reserved, so the send waits again when
+	///   another call takes it.
 	/// - The send holds the transport of a single session, which carries one
 	///   call at a time. A session that a call left mid-exchange lost its
 	///   stream position, so it carries no other call (CWE-672).
 	///
 	/// # Errors
 	///
-	/// - [`CallFault::Deadline`] -- the session came free at `expires` or later.
-	/// - [`CallFault::Internal`] -- the clock gave the wait for the session no timer.
+	/// - [`Refusal::Renewing`] -- the multiplexed session renews.
+	/// - [`CallFault::Deadline`] -- a place or the session came free at `expires` or later.
+	/// - [`CallFault::Internal`] -- the clock gave a wait no timer.
 	/// - [`CallFault::Unavailable`] -- the session ended, drains, or lost its position.
-	pub(crate) async fn hold(self, expires: &Deadline) -> Result<Held<P>, CallFault> {
+	async fn hold(self, expires: &Deadline) -> Result<Held<P>, Refusal> {
 		match self {
 			Self::Mux(session) => {
+				let lease = session.lease(expires).await?;
 				let slot = expires.bound(session.spawned.handle.wait_for_stream_slot()).await;
 				slot?.map_err(|_| CallFault::Unavailable)?;
-				Ok(Held::Mux(session))
+				Ok(Held::Mux(lease))
 			}
 			Self::Single(transport) => {
 				let transport = expires.bound(transport.lock_owned()).await?;
 				if !transport.is_leasable() {
-					return Err(CallFault::Unavailable);
+					return Err(CallFault::Unavailable.into());
 				}
 
 				Ok(Held::Single(transport))
@@ -285,20 +296,20 @@ impl<P: HandshakeProvider + Send + Sync + 'static> Ready<P> {
 	}
 
 	/// Open a duplex stream to the servlet type `servlet` on a multiplexed
-	/// session, under a unit of its cancel budget, on a free stream as
+	/// session, under a place among its open calls, on a free stream as
 	/// [`FreeStream::take`] takes it. Nothing leaves until the first push of
 	/// the sink.
 	///
 	/// # Errors
 	///
+	/// - [`Refusal::Renewing`] -- the session renews.
 	/// - [`CallFault::Deadline`] -- a place among the open calls, or a stream, came free at `expires` or
 	///   later.
 	/// - [`CallFault::Internal`] -- the clock gave a wait for a place or a free stream no timer.
-	/// - [`CallFault::Unavailable`] -- the session runs one call at a time, ended, drains, or spent its
-	///   cancel budget.
-	pub(crate) async fn open_stream(self, servlet: Urn<'static>, expires: &Deadline) -> Result<Duplex, CallFault> {
+	/// - [`CallFault::Unavailable`] -- the session runs one call at a time, ended, or drains.
+	async fn open_stream(self, servlet: &Urn<'static>, expires: &Deadline) -> Result<Duplex, Refusal> {
 		let Self::Mux(session) = self else {
-			return Err(CallFault::Unavailable);
+			return Err(CallFault::Unavailable.into());
 		};
 
 		let lease = session.lease(expires).await?;
@@ -311,7 +322,7 @@ impl<P: HandshakeProvider + Send + Sync + 'static> Ready<P> {
 		match opened {
 			Ok((sink, body)) => Ok(Duplex { sink, body, lease }),
 			Err(TakeFault::Tried(never)) => match never {},
-			Err(TakeFault::Failed(_) | TakeFault::Closed(_)) => Err(CallFault::Unavailable),
+			Err(TakeFault::Failed(_) | TakeFault::Closed(_)) => Err(CallFault::Unavailable.into()),
 			Err(TakeFault::Lapsed(lapse)) => Err(lapse.into()),
 		}
 	}
@@ -387,7 +398,7 @@ impl Duplex {
 	///   byte of the head may have left.
 	/// - [`SendFailure::Stalled`] -- the push waited past the read deadline of the session.
 	pub(crate) async fn push_head(self, head: &HeadPart, expires: &Deadline) -> Result<OpenedDuplex, SendFailure> {
-		let Self { mut sink, body, mut lease } = self;
+		let Self { mut sink, body, lease } = self;
 		lease.arm();
 		match expires.bound(sink.push(head.as_bytes())).await {
 			Ok(Ok(())) => Ok(OpenedDuplex { sink, body, lease }),
@@ -405,30 +416,30 @@ pub(crate) struct OpenedDuplex {
 	pub(crate) lease: CancelLease,
 }
 
-/// The session that one call holds for its send.
+/// The session that one call holds for its send: its place on a multiplexed
+/// session, or the transport of a single session.
 pub(crate) enum Held<P: HandshakeProvider + Send + Sync + 'static> {
-	Mux(Arc<MuxSession>),
+	Mux(CancelLease),
 	Single(OwnedMutexGuard<GrpcTransport<P>>),
 }
 
 impl<P: HandshakeProvider + Send + Sync + 'static> Held<P> {
 	/// Send `work` and return the reply of the gateway, within `expires`. On
-	/// a multiplexed session, the send holds a unit of its cancel budget, and
-	/// a stream that another call took first is waited for again.
+	/// a multiplexed session, the lease of the send arms while each emit
+	/// runs, and a stream that another call took first is waited for again.
 	///
 	/// # Errors
 	///
-	/// - [`SendFailure::Transport`] -- the [`TransportError`] of the send or of the reply, or a spent cancel
-	///   budget, before any byte left.
-	/// - [`SendFailure::Expired`] -- no place among the open calls, or no stream, came free before
-	///   `expires`, or the clock gave the wait no timer.
+	/// - [`SendFailure::Transport`] -- the [`TransportError`] of the send or of the reply.
+	/// - [`SendFailure::Expired`] -- no stream came free before `expires`, or the clock gave the wait no
+	///   timer.
 	/// - [`SendFailure::Unanswered`] -- the reply did not come before `expires`, or the clock gave the wait
 	///   no timer.
 	/// - [`SendFailure::Stalled`] -- a wait of the send passed a read deadline of the session, as
 	///   [`CallFault::Stalled`] states.
 	pub(crate) async fn send(self, work: &Frame, expires: &Deadline) -> Result<Option<Frame>, SendFailure> {
-		let session = match self {
-			Self::Mux(session) => session,
+		let mut lease = match self {
+			Self::Mux(lease) => lease,
 			Self::Single(mut transport) => {
 				let reply = expires.bound(transport.emit(work.clone(), None)).await;
 				let reply = reply.map_err(|_| SendFailure::Unanswered)?;
@@ -436,13 +447,10 @@ impl<P: HandshakeProvider + Send + Sync + 'static> Held<P> {
 			}
 		};
 
-		let mut lease = session.lease(expires).await?;
-		lease.arm();
-
-		let handle = &session.spawned.handle;
+		let handle = &lease.session.spawned.handle;
 		let free = FreeStream { handle, expires };
 
-		let sent = free.take(|| expires.bound(handle.emit_on_stream(work))).await;
+		let sent = free.take(|| lease.during(expires.bound(handle.emit_on_stream(work)))).await;
 		let sent = sent.map_err(|fault| SendFailure::of_take(fault, expires));
 		if !sent.as_ref().err().is_some_and(SendFailure::leaves_live) {
 			lease.settle();
@@ -549,19 +557,26 @@ impl SendFailure {
 	}
 }
 
-/// The state that the session task and the coupler share, and the health of
-/// the edge: whether a session outlived its last probe.
+/// The state that the session task and the coupler share, the wake of each
+/// call that waits for its next session, and the health of the edge: whether
+/// a session outlived its last probe.
 struct Shared<P: HandshakeProvider + Send + Sync + 'static> {
 	state: StdMutex<State<P>>,
+	changed: Notify,
 	serving: watch::Sender<bool>,
 }
 
 impl<P: HandshakeProvider + Send + Sync + 'static> Shared<P> {
+	fn new(state: State<P>, serving: watch::Sender<bool>) -> Self {
+		Self { state: StdMutex::new(state), changed: Notify::new(), serving }
+	}
+
 	/// Enter `state`. A state that carries no call ends the health of the
 	/// edge at once, and an open one serves from its first probe.
 	fn set(&self, state: State<P>) {
 		let live = state.is_live();
 		*self.state.lock().unwrap_or_else(PoisonError::into_inner) = state;
+		self.changed.notify_waiters();
 		if !live {
 			self.publish(false);
 		}
@@ -578,6 +593,7 @@ impl<P: HandshakeProvider + Send + Sync + 'static> Shared<P> {
 		*current = state;
 
 		drop(current);
+		self.changed.notify_waiters();
 		self.publish(false);
 	}
 
@@ -590,9 +606,36 @@ impl<P: HandshakeProvider + Send + Sync + 'static> Shared<P> {
 		self.state.lock().unwrap_or_else(PoisonError::into_inner).is_live()
 	}
 
-	/// What a call sends on, or `None` while the session carries no call.
-	fn ready(&self) -> Option<Ready<P>> {
-		self.state.lock().unwrap_or_else(PoisonError::into_inner).ready()
+	/// The answer of `attempt` on the session that takes a new call, within
+	/// `expires`. A call that finds the session renewing waits for the next
+	/// one, and tries again there.
+	///
+	/// # Errors
+	///
+	/// - [`CallFault::Unavailable`] -- no session is open.
+	/// - [`CallFault::Deadline`] -- the next session opened at `expires` or later.
+	/// - [`CallFault::Internal`] -- the clock gave the wait for the next session no timer.
+	/// - The fault of `attempt`.
+	async fn admit<T, F>(&self, expires: &Deadline, mut attempt: impl FnMut(Ready<P>) -> F) -> Result<T, CallFault>
+	where
+		F: Future<Output = Result<T, Refusal>>,
+	{
+		loop {
+			let changed = self.changed.notified();
+			let mut changed = pin!(changed);
+			changed.as_mut().enable();
+
+			let offer = self.state.lock().unwrap_or_else(PoisonError::into_inner).offer();
+			match offer {
+				Offer::Ready(ready) => match attempt(ready).await {
+					Err(Refusal::Renewing) => continue,
+					Err(Refusal::Fault(fault)) => return Err(fault),
+					Ok(taken) => return Ok(taken),
+				},
+				Offer::Renewing => expires.bound(changed).await?,
+				Offer::Closed => return Err(CallFault::Unavailable),
+			}
+		}
 	}
 }
 
@@ -682,7 +725,7 @@ impl<P: HandshakeProvider + Send + Sync + 'static> LoopbackSession<P> {
 		let opener = Opener::<P, C> { queue, local, pin, handshake, offer, clock, _listener: PhantomData };
 
 		let (serving, _) = watch::channel(false);
-		let shared = Arc::new(Shared { state: StdMutex::new(State::Opening), serving });
+		let shared = Arc::new(Shared::new(State::Opening, serving));
 		let driven = Arc::clone(&shared);
 		let task = tokio::spawn(async move { Self::run(driven, opener, recorder).await });
 		Self { shared, task }
@@ -696,7 +739,7 @@ impl<P: HandshakeProvider + Send + Sync + 'static> LoopbackSession<P> {
 	///   scenario that reads the change or the record reads it after the deadline that follows it.
 	/// - A multiplexed session whose cancels reach [`MuxSession::RENEWAL`] renews: the next session opens
 	///   at once, while this one carries its calls, and takes every call after it. The last call of this
-	///   one ends it.
+	///   one ends it. A next session that fails to open ends the renewal, so its waiting calls fail.
 	async fn run<C: EdgeProfile>(shared: Arc<Shared<P>>, opener: Opener<P, C>, recorder: CallRecorder) {
 		let clock = Arc::clone(&opener.clock);
 		loop {
@@ -726,14 +769,29 @@ impl<P: HandshakeProvider + Send + Sync + 'static> LoopbackSession<P> {
 			}
 
 			let retry = Deadline::after(&clock, Coupler::SESSION_BACKOFF);
-			shared.unless_live(State::Backoff);
+			shared.set(State::Backoff);
 			retry.sleep().await;
 		}
 	}
 
-	/// What a call sends on, or `None` while the session carries no call.
-	pub(crate) fn ready(&self) -> Option<Ready<P>> {
-		self.shared.ready()
+	/// Hold the session that takes a new call for one send, within
+	/// `expires`, as [`Shared::admit`] admits it.
+	///
+	/// # Errors
+	///
+	/// - The errors of [`Shared::admit`].
+	pub(crate) async fn hold(&self, expires: &Deadline) -> Result<Held<P>, CallFault> {
+		self.shared.admit(expires, |ready| ready.hold(expires)).await
+	}
+
+	/// Open a duplex stream to the servlet type `servlet` on the session that
+	/// takes a new call, within `expires`, as [`Shared::admit`] admits it.
+	///
+	/// # Errors
+	///
+	/// - The errors of [`Shared::admit`].
+	pub(crate) async fn open_stream(&self, servlet: &Urn<'static>, expires: &Deadline) -> Result<Duplex, CallFault> {
+		self.shared.admit(expires, |ready| ready.open_stream(servlet, expires)).await
 	}
 
 	/// Whether a session outlived its last probe, which the health check of
@@ -759,21 +817,24 @@ impl<P: HandshakeProvider + Send + Sync + 'static> Drop for LoopbackSession<P> {
 #[cfg(test)]
 mod tests {
 	use futures_util::FutureExt;
+	use tightbeam::builder::TypeBuilder;
 	use tightbeam::clock::SystemClock;
 	use tightbeam::crypto::profiles::DefaultCryptoProvider;
+	use tightbeam::der::asn1::OctetString;
 	use tightbeam::transport::handshake::negotiation::MuxSettings;
 	use tightbeam::transport::multiplex::MuxTransport;
 	use tightbeam::transport::tcp::r#async::TokioStream;
 	use tightbeam::transport::{EndpointConfig, TcpTransport};
+	use tightbeam::Version;
 	use tokio::net::{TcpListener, TcpStream};
 
+	use super::super::message::{CoupledPart, PartWire};
 	use super::*;
 
 	type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 	/// A multiplexed session over a cleartext loopback connection, and the
-	/// accepted end, which holds the connection open. A lease touches no byte
-	/// of the connection.
+	/// accepted end, which holds the connection open and never answers.
 	async fn session() -> Result<(Arc<MuxSession>, TcpStream), Box<dyn std::error::Error>> {
 		let listener = TcpListener::bind("127.0.0.1:0").await?;
 		let dialing = TcpStream::connect(listener.local_addr()?).await?;
@@ -787,23 +848,36 @@ mod tests {
 		Ok((Arc::new(MuxSession::new(mux.spawn())), accepted))
 	}
 
+	/// The state that `state` starts, shared, and the health watch of it.
+	fn shared(state: State<DefaultCryptoProvider>) -> (Shared<DefaultCryptoProvider>, watch::Receiver<bool>) {
+		let (serving, health) = watch::channel(true);
+		(Shared::new(state, serving), health)
+	}
+
 	/// A deadline beyond every reading, so a wait for a place never lapses.
 	fn unbounded() -> Deadline {
 		let clock: Arc<dyn Clock> = Arc::new(SystemClock);
 		Deadline::unbounded(&clock)
 	}
 
+	/// An unsigned work frame.
+	fn work() -> Result<Frame, Box<dyn std::error::Error>> {
+		let part = PartWire::Message(OctetString::new(b"order".to_vec())?);
+		let draft = Version::V1.compose().with_id(b"call").with_order(1);
+		Ok(draft.with_message(CoupledPart { part }).build()?)
+	}
+
 	/// The lease that `session` gives at once, if any, outside the budget of
 	/// polls of the task, which would otherwise make a long run of leases
 	/// wait.
-	fn now(session: &Arc<MuxSession>, expires: &Deadline) -> Option<Result<CancelLease, LeaseFault>> {
+	fn now(session: &Arc<MuxSession>, expires: &Deadline) -> Option<Result<CancelLease, Refusal>> {
 		tokio::task::unconstrained(session.lease(expires)).now_or_never()
 	}
 
 	/// The lease that `session` gives at once.
 	fn leased(session: &Arc<MuxSession>, expires: &Deadline) -> Result<CancelLease, Box<dyn std::error::Error>> {
 		match now(session, expires) {
-			Some(leased) => leased.map_err(|fault| format!("{fault:?}").into()),
+			Some(leased) => leased.map_err(|refusal| format!("{refusal:?}").into()),
 			None => Err("the lease waits".into()),
 		}
 	}
@@ -811,11 +885,15 @@ mod tests {
 	/// Leave `count` cancels on `session`, each a lease that drops armed.
 	fn cancel(session: &Arc<MuxSession>, expires: &Deadline, count: u32) -> TestResult {
 		for _ in 0..count {
-			let mut lease = leased(session, expires)?;
-			lease.arm();
+			leased(session, expires)?.arm();
 		}
 
 		Ok(())
+	}
+
+	/// Whether `held` holds a place on `session`.
+	fn holds(held: Option<Result<Held<DefaultCryptoProvider>, CallFault>>, session: &Arc<MuxSession>) -> bool {
+		matches!(held, Some(Ok(Held::Mux(lease))) if Arc::ptr_eq(&lease.session, session))
 	}
 
 	#[tokio::test]
@@ -855,26 +933,116 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn a_session_whose_cancels_hold_the_budget_carries_no_call() -> TestResult {
+	async fn a_renewing_session_takes_no_new_call_and_keeps_serving() -> TestResult {
 		let (session, _peer) = session().await?;
 		let expires = unbounded();
 
-		cancel(&session, &expires, DEFAULT_MUX_CANCEL_BUDGET)?;
+		cancel(&session, &expires, MuxSession::RENEWAL)?;
 
 		let refused = now(&session, &expires);
 		assert!(
-			matches!(refused, Some(Err(LeaseFault::Spent))),
-			"a spent session MUST refuse a lease"
+			matches!(refused, Some(Err(Refusal::Renewing))),
+			"a renewing session MUST refuse a lease"
 		);
-		assert!(!session.carries(), "a spent session MUST carry no new call");
 
-		let state = State::<DefaultCryptoProvider>::Mux(Arc::clone(&session));
-		assert!(state.ready().is_none(), "a spent session MUST NOT be ready");
-
-		let (serving, health) = watch::channel(true);
-		let shared = Shared { state: StdMutex::new(state), serving };
+		let (shared, health) = shared(State::Mux(Arc::clone(&session)));
 		shared.unless_live(State::Backoff);
-		assert!(!*health.borrow(), "a spent session MUST read NOT_SERVING");
+		assert!(*health.borrow(), "a renewing session MUST keep serving");
+		Ok(())
+	}
+
+	#[tokio::test]
+	async fn a_call_during_the_renewal_waits_for_the_next_session() -> TestResult {
+		let (renewing, _renewing_peer) = session().await?;
+		let (next, _next_peer) = session().await?;
+		let expires = unbounded();
+		cancel(&renewing, &expires, MuxSession::RENEWAL)?;
+
+		let (shared, _health) = shared(State::Mux(Arc::clone(&renewing)));
+		let mut waiting = pin!(shared.admit(&expires, |ready| ready.hold(&expires)));
+		let early = waiting.as_mut().now_or_never();
+		assert!(early.is_none(), "a call during the renewal MUST wait for the next session");
+
+		shared.set(State::Mux(Arc::clone(&next)));
+		assert!(holds(waiting.now_or_never(), &next), "the next session MUST take the call");
+		Ok(())
+	}
+
+	#[tokio::test]
+	async fn a_call_that_waits_for_a_place_moves_to_the_next_session_at_the_renewal() -> TestResult {
+		let (renewing, _renewing_peer) = session().await?;
+		let (next, _next_peer) = session().await?;
+		let expires = unbounded();
+		cancel(&renewing, &expires, MuxSession::RENEWAL - 1)?;
+		let mut open = Vec::new();
+		for _ in 0..MuxSession::PLACES {
+			open.push(leased(&renewing, &expires)?);
+		}
+
+		let (shared, _health) = shared(State::Mux(Arc::clone(&renewing)));
+		let mut waiting = pin!(shared.admit(&expires, |ready| ready.hold(&expires)));
+		assert!(waiting.as_mut().now_or_never().is_none(), "a call past the places MUST wait");
+
+		if let Some(ended) = open.pop() {
+			ended.arm();
+		}
+
+		let early = waiting.as_mut().now_or_never();
+		assert!(
+			early.is_none(),
+			"a call that waited past the renewal MUST wait for the next session"
+		);
+
+		shared.set(State::Mux(Arc::clone(&next)));
+		assert!(holds(waiting.now_or_never(), &next), "the next session MUST take the call");
+		Ok(())
+	}
+
+	#[tokio::test]
+	async fn a_send_that_drops_while_it_waits_for_a_stream_counts_no_cancel() -> TestResult {
+		let (session, _peer) = session().await?;
+		let expires = unbounded();
+		let mut taken = Vec::new();
+		let exhausted = loop {
+			match session.spawned.handle.open_duplex() {
+				Ok(duplex) => taken.push(duplex),
+				Err(error) => break error,
+			}
+		};
+
+		let streams_exhausted = TransportError::OperationFailed(TransportFailure::StreamsExhausted);
+		assert_eq!(
+			exhausted.to_string(),
+			streams_exhausted.to_string(),
+			"the duplexes MUST take every stream"
+		);
+
+		let frame = work()?;
+		let held = Held::<DefaultCryptoProvider>::Mux(leased(&session, &expires)?);
+		let sent = tokio::task::unconstrained(held.send(&frame, &expires)).now_or_never();
+		assert!(sent.is_none(), "a send with every stream taken MUST wait");
+		assert_eq!(
+			session.cancels.load(Ordering::Acquire),
+			0,
+			"a send that sent no Open MUST count no cancel"
+		);
+		Ok(())
+	}
+
+	#[tokio::test]
+	async fn a_send_that_drops_once_its_open_may_have_left_counts_a_cancel() -> TestResult {
+		let (session, _peer) = session().await?;
+		let expires = unbounded();
+
+		let frame = work()?;
+		let held = Held::<DefaultCryptoProvider>::Mux(leased(&session, &expires)?);
+		let sent = tokio::task::unconstrained(held.send(&frame, &expires)).now_or_never();
+		assert!(sent.is_none(), "a send that the peer never answers MUST wait");
+		assert_eq!(
+			session.cancels.load(Ordering::Acquire),
+			1,
+			"a send whose Open may have left MUST count a cancel"
+		);
 		Ok(())
 	}
 }

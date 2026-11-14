@@ -518,8 +518,7 @@ impl<P: HandshakeProvider + Send + Sync + 'static> LiveCoupler<P> {
 		ending: &CallEnding,
 	) -> Result<VerifiedAnswer, CallFault> {
 		let permitted = self.permit(opened, body)?;
-		let ready = self.session.ready().ok_or(CallFault::Unavailable)?;
-		let held = ready.hold(permitted.expires()).await?;
+		let held = self.session.hold(permitted.expires()).await?;
 		let vouched = permitted
 			.vouch(&self.config.voucher, self.next_request_id(), self.ceiling)
 			.await?;
@@ -557,8 +556,7 @@ impl<P: HandshakeProvider + Send + Sync + 'static> LiveCoupler<P> {
 	async fn start_stream(&self, opened: Opened<StreamShape>, ending: &CallEnding) -> Result<OpenStream, CallFault> {
 		let permitted = self.permit(opened, Vec::new())?;
 		let permit = Arc::clone(&self.relays).try_acquire_owned().map_err(|_| CallFault::Streams)?;
-		let ready = self.session.ready().ok_or(CallFault::Unavailable)?;
-		let duplex = ready.open_stream(permitted.servlet().clone(), permitted.expires()).await?;
+		let duplex = self.session.open_stream(permitted.servlet(), permitted.expires()).await?;
 		let vouched = permitted
 			.vouch_head(&self.config.voucher, self.next_request_id(), self.ceiling)
 			.await?;
