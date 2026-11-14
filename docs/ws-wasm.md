@@ -166,6 +166,7 @@ The bindings that open a stream:
 
 - `request` and `submitWork` take an optional `AbortSignal`, which `Signal::read` parses, and they poll their call once before they return, so the stream holds its slot of the cap by the time the caller reads `hasPendingStreams`.
 - A body half of a progressive stream is a `Slot` that one call leases at a time. The slot holds the abort of the call that holds the half, so a free of the handle ends the read in flight at once. A free before the peer's `last` discards the chunks still to come, and only a free of a duplex reply body cancels its stream, as the doc of `MuxStreamBody` says.
+- The request half of a client stream is a `Slot` that only its handle holds, so a free of the handle ends the push in flight at once, even one that waits on the credit of the peer, and cancels the stream. The reply half of a served duplex stream shares its slot with its push, so that push finishes after a free, because tightbeam counts the records of a reply push as owed until they send or the stream ends.
 - The handlers of `serve`, `serveStreaming`, and `serveDuplex` and the `StreamRoute` they read are declared once, in Rust, as TypeScript types of the build.
 
 `JsSigningKeyProvider` adapts a JavaScript signer to the `SigningKeyProvider` of tightbeam, so mutual authentication needs no raw key bytes. The signer is duck-typed: an object with an `algorithmOid` string, a `publicKeyDer` `Uint8Array`, and a `signPrehash` method that resolves with a `Uint8Array`. `JsSigningKeyProvider::new` refuses any other shape.

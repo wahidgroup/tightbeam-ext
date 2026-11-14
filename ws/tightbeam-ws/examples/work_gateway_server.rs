@@ -7,7 +7,9 @@ use std::sync::Arc;
 use tightbeam::colony::cluster::Cluster;
 use tightbeam::trace::TraceCollector;
 use tightbeam::urn::Urn;
-use tightbeam_ws::testing::{EnvVar, Identity, IdentityFiles, WorkClient, WorkGateway, WorkPlane, WorkStack};
+use tightbeam_ws::testing::{
+	EnvVar, Identity, IdentityFiles, WorkClient, WorkGateway, WorkPlane, WorkProbeServlet, WorkStack,
+};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -32,7 +34,7 @@ async fn main() -> Result<(), BoxError> {
 
 	let trace = TraceCollector::default();
 	let edge = format!("0.0.0.0:{port}");
-	let stack = WorkStack::<WorkGateway>::start(&trace, &plane, edge).await?;
+	let stack = WorkStack::<WorkGateway, WorkProbeServlet>::start(&trace, &plane, edge).await?;
 
 	let gateway = stack.gateway();
 	let edge = WorkClient::edge_of(gateway)?;

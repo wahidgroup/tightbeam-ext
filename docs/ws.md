@@ -132,13 +132,13 @@ assert_eq!(refused.to_string(), "the transport refused the split: Invalid state"
 | `serve`            | The accepted link of `serve`. It names no socket, so `tightbeam-pubsub` depends on `serve` alone                                                                                                                                                                                                                                                                                                                                                                               |
 | `instrument`       | The audit trail of a served link: the gate verdict of each call and each answered probe of the keepalive, on the trace of the transport that the link was accepted on, and `ServedMux::trace`                                                                                                                                                                                                                                                                                  |
 | `testing`          | `socket`, `serve`, `instrument`, and the `testing` feature of `tightbeam-rs`, with the test-support module: X.509 identity fixtures, the demo security kinds and the `PeerIdentity` that a kind decides, the shared multiplexed echo behavior, the echo suites (`EchoService`, `PoolEchoes`) that every transport of the repository runs against itself, the `ReadOutcome` that a scenario records for the read of a dial, and `specs`, the specs that grade the shared suites |
-| `colony`           | `testing`, and the upstream `colony` runtime with the gateway, hive, and servlet configs that one identity derives, and the work probe that every edge transport shares: `WorkPlane`, `WorkStack`, `WorkClient`, `WorkBody`, `WorkProbeServlet`, and `WorkProbeHive`, and `WorkGateway`, the gateway of the WebSocket edge, over an optional `der`                                                                                                                             |
+| `colony`           | `testing`, and the upstream `colony` runtime with the gateway, hive, and servlet configs that one identity derives, and the work probe that every edge transport shares: `WorkPlane`, `WorkStack`, `WorkClient`, `WorkBody`, `WorkProbe` and the `work_probe!` macro that declares a probe over one colony protocol, `WorkProbeServlet` and `WorkProbeHive` over the WebSocket colony, and `WorkGateway`, the gateway of the WebSocket edge, over an optional `der`            |
 
 The examples `gen_certs`, `echo_server_mux`, and `echo_server_mux_clear` require `testing`, and `work_gateway_server` requires `colony`.
 
 ## Cluster work plane
 
-The `colony` feature of tightbeam routes signed work frames through a cluster gateway to the servlets that hives register. The WebSocket transport is the browser edge of a colony, and the colony interior runs on `WsListener` too ([The gRPC Transport](grpc.md#limitations) gives the reason):
+The `colony` feature of tightbeam routes signed work frames through a cluster gateway to the servlets that hives register. The WebSocket transport is the browser edge of a colony, and the colony interior runs on `WsListener` too:
 
 - A gateway declares the edge with `cluster! { ..., protocol: WsListener, edge: WsListener }` and sets `ClusterConfig::edge` to `EdgePlane::new(addr)`.
 - The gateway binds a second accept plane on WebSocket that admits `Work` frames only. It refuses each control frame, such as a registration, an advertisement, or gossip, with `PermissionDenied`.
@@ -147,11 +147,12 @@ The `colony` feature of tightbeam routes signed work frames through a cluster ga
 
 An application enables `colony` on `tightbeam-rs` in its own manifest to use the edge. The `colony` feature of this crate holds the work plane that the edge transports of the repository share. Every colony process presents one `Identity`, and the gateway, the hive, and the servlet derive their configuration from it:
 
-- `WorkPlane` holds that identity and the work identity, and starts each part on its own, as a scenario does.
-- `WorkStack` starts a gateway of any edge protocol over the WebSocket colony, with a hive that serves the work probe.
+- `WorkPlane` holds that identity and the work identity, and starts each part on its own, as a scenario does. `WorkPlane::hive::<S>` starts a hive of the probe `S`.
+- `work_probe!` declares a probe servlet and its hive over one colony protocol, with `WorkProbe` on the servlet. This crate declares `WorkProbeServlet` and `WorkProbeHive` over `WsListener`, and `tightbeam-grpc` declares its probe over `TokioListener`.
+- `WorkStack<G, S>` starts the gateway `G` of any edge protocol, with a hive of the probe `S` over the colony of `G`.
 - `WorkGateway` is the gateway of the WebSocket edge.
 - `WorkClient::submit` submits one signed probe frame through the edge of any work gateway, at the address that `WorkClient::edge_of` reads.
-- `WorkProbeServlet` answers `pong:<payload-hex>:<valid>`, where `valid` says whether the end-to-end signature verified on the bytes that the servlet received.
+- Each probe that `work_probe!` declares answers `pong:<payload-hex>:<valid>`, where `valid` says whether the end-to-end signature verified on the bytes that the servlet received.
 
 `tests/work_plane.rs` runs the round trip and a typed `WorkRefused` refusal from a WebSocket edge client through a gateway, hive, and servlet on the WebSocket colony.
 

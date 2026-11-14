@@ -58,7 +58,7 @@ impl ReceiptApprover for JsReceiptApprover {
 				return Ok(None);
 			};
 
-			let bytes = JsBytes::recognize(&resolved).ok_or(REFUSED)?;
+			let bytes = JsBytes::recognize(&resolved).octets().ok_or(REFUSED)?;
 			if bytes.len() > MAX_SETTLEMENT_ANSWER {
 				return Err(REFUSED);
 			}

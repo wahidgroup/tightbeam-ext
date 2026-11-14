@@ -11,7 +11,7 @@ use http::Uri;
 use hyper_util::rt::TokioIo;
 use rustls::crypto::{ring, CryptoProvider};
 use rustls::server::danger::ClientCertVerifier;
-use rustls::server::WebPkiClientVerifier;
+use rustls::server::{NoServerSessionStorage, WebPkiClientVerifier};
 use rustls::sign::{CertifiedKey, SingleCertAndKey};
 use rustls::version::TLS13;
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
@@ -64,14 +64,21 @@ impl EdgeTlsPolicy {
 	/// The config of a bind that presents `key`, and verifies the client chain
 	/// of each connection with `verifier`.
 	///
+	/// - The bind stores no session and issues no ticket, so each connection
+	///   runs a full handshake, and `verifier` checks its chain at that
+	///   connection.
+	///
 	/// # Errors
 	///
 	/// - [`EdgeError::Tls`] -- the provider refuses TLS 1.3.
 	fn server(key: &Arc<CertifiedKey>, verifier: Arc<dyn ClientCertVerifier>) -> Result<ServerConfig, EdgeError> {
 		let builder = ServerConfig::builder_with_provider(Self::provider()).with_protocol_versions(&[&TLS13])?;
 		let resolver = Arc::new(SingleCertAndKey::from(Arc::clone(key)));
+
 		let mut config = builder.with_client_cert_verifier(verifier).with_cert_resolver(resolver);
 		config.alpn_protocols = vec![ALPN_H2.to_vec()];
+		config.session_storage = Arc::new(NoServerSessionStorage {});
+		config.send_tls13_tickets = 0;
 		Ok(config)
 	}
 

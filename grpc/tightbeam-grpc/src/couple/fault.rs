@@ -43,6 +43,11 @@ pub(crate) enum CallFault {
 	/// The deadline of the call passed before the answer, or the clock gave a
 	/// wait of its send no timer.
 	Deadline,
+	/// A wait of the send, or of a part of the stream, of the call passed the
+	/// read deadline of an end of the loopback session, after its frame may
+	/// have left, or the gateway answered the call with `DEADLINE_EXCEEDED`.
+	/// tightbeam reports both alike, so the coupler cannot tell them apart.
+	Stalled,
 	/// The gateway refused the work with this status.
 	Transit(TransitStatus),
 	/// An answer or a part does not verify under the signer of the route,
@@ -84,6 +89,7 @@ impl CallFault {
 			Self::Replayed => "replayed",
 			Self::Oversize => "oversize",
 			Self::Deadline => "deadline",
+			Self::Stalled => "stalled",
 			Self::Transit(_) => "transit",
 			Self::AnswerRefused => "answer-refused",
 			Self::Internal => "internal",
@@ -107,6 +113,7 @@ impl CallFault {
 			Self::Replayed => Status::unauthenticated("the claim of the call was spent or is stale"),
 			Self::Oversize => Status::resource_exhausted("the call passes the envelope ceiling of the edge"),
 			Self::Deadline => Status::deadline_exceeded("the call passed its deadline"),
+			Self::Stalled => Status::deadline_exceeded("the call passed a deadline on the loopback session"),
 			Self::Transit(status) => Self::transit(*status),
 			Self::AnswerRefused => Status::internal("the answer of the servlet does not verify"),
 			Self::Internal => Status::internal("the coupler failed to carry the call"),

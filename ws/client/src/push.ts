@@ -84,9 +84,10 @@ export class PushHalf<T extends PushHandle> implements Disposable {
 	}
 
 	/**
-	 * Free an open handle at once. A push in flight holds its own share of the
-	 * half in wasm, so the half drops once that push settles, and the drop of
-	 * a request half cancels its stream.
+	 * Free an open handle at once. The free of a request half ends a push in
+	 * flight with `StreamClosed`, even one that waits on the credit of the
+	 * peer, and cancels its stream. A push in flight on a served reply half
+	 * keeps its share of the half in wasm and finishes.
 	 */
 	[Symbol.dispose](): void {
 		this.#hold[Symbol.dispose]();

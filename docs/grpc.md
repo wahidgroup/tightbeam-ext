@@ -73,6 +73,7 @@ assert_eq!(bound, GrpcAddr::from(listener.local_addr()));
 - `EdgeTls::from_pem(EdgeTlsFiles { chain, key })` loads the edge certificate. `DialTls::from_pem(roots)` loads the dial roots.
 - The edge certificate names the host that a dial verifies.
 - TLS 1.3 and ALPN `h2` only, under rustls with ring.
+- The edge resumes no TLS session, so each connection runs a full handshake, and the edge verifies its client chain at that handshake.
 
 ```rust
 use tightbeam::crypto::profiles::DefaultCryptoProvider;
@@ -117,12 +118,12 @@ Tests: `tests/tls.rs` and `tests/edge.rs`. The `testing` feature adds:
 
 Each connection is bounded before any handshake proves its peer:
 
-| Bound                                        | Effect                                                                  |
-| -------------------------------------------- | ----------------------------------------------------------------------- |
-| `DEFAULT_MAX_SERVER_CONNECTIONS` slots       | A connection holds a slot until its tunnel is accepted (CWE-770)        |
-| `handshake_timeout`                          | A connection with no call, or a tunnel nobody accepts, closes (CWE-400) |
-| TLS handshake                                | Runs on its own task, under the slot and the same deadline              |
-| One stream per connection                    | `SETTINGS_MAX_CONCURRENT_STREAMS` is 1 on a tunnel edge                 |
+| Bound                                  | Effect                                                                  |
+| -------------------------------------- | ----------------------------------------------------------------------- |
+| `DEFAULT_MAX_SERVER_CONNECTIONS` slots | A connection holds a slot until its tunnel is accepted (CWE-770)        |
+| `handshake_timeout`                    | A connection with no call, or a tunnel nobody accepts, closes (CWE-400) |
+| TLS handshake                          | Runs on its own task, under the slot and the same deadline              |
+| One stream per connection              | `SETTINGS_MAX_CONCURRENT_STREAMS` is 1 on a tunnel edge                 |
 
 - A call that ends before its tunnel is accepted returns the connection to its old slot and deadline.
 - A replacing call keeps the old expiry, so no connection renews its deadline.
@@ -150,14 +151,14 @@ One bidirectional call on `TUNNEL_PATH`, `/tightbeam.v1.Transport/Connect`, unde
 
 Under `instrument`, the trace of the profile records each of these refusals, which the edge makes before any session exists, as `events::EDGE_REFUSED`, by its kind:
 
-| Label                                                                            | The edge refused                                                  |
-| -------------------------------------------------------------------------------- | ----------------------------------------------------------------- |
-| `method`, `media-type`, `path`, `unconnected`                                    | a call, as the table above names it                               |
-| `queue-full`                                                                     | a tunnel call, when the queue of tunnels for `accept` has no room |
-| `no-slot`, `other-kind`, `tunnel-held`, `closed`                                 | a tunnel call that the lane of its connection refuses             |
-| `tls`                                                                            | a connection whose TLS handshake failed                           |
-| `late`                                                                           | a connection that passed neither its PROXY header nor TLS in time |
-| `no-timer`                                                                       | a connection whose wait the clock of the edge gave no timer       |
+| Label                                            | The edge refused                                                  |
+| ------------------------------------------------ | ----------------------------------------------------------------- |
+| `method`, `media-type`, `path`, `unconnected`    | a call, as the table above names it                               |
+| `queue-full`                                     | a tunnel call, when the queue of tunnels for `accept` has no room |
+| `no-slot`, `other-kind`, `tunnel-held`, `closed` | a tunnel call that the lane of its connection refuses             |
+| `tls`                                            | a connection whose TLS handshake failed                           |
+| `late`                                           | a connection that passed neither its PROXY header nor TLS in time |
+| `no-timer`                                       | a connection whose wait the clock of the edge gave no timer       |
 
 - tonic's refusals record no `EDGE_REFUSED`.
 - A PROXY header that the edge refuses records `events::PROXY_HEADER_REFUSED` alone, as [PROXY protocol](#proxy-protocol) states.
@@ -185,8 +186,8 @@ A failed dial classifies its error the same way.
 
 ## Cluster work plane
 
-- Declare `cluster! { ..., protocol: WsListener, edge: GrpcListener }` with `tightbeam_ws::protocol::WsListener`, and set `ClusterConfig::edge` to an `EdgePlane`.
-- Enable `colony` on `tightbeam-rs`, and add `tightbeam-ws` with its `colony` feature for `WsListener`.
+- Declare `cluster! { ..., protocol: TokioListener, edge: GrpcListener }`, and set `ClusterConfig::edge` to an `EdgePlane`.
+- Enable `colony` on `tightbeam-rs`.
 - The edge admits `Work`. A control frame refuses with `PermissionDenied`.
 - `EdgePlane::with_streams` also admits stream and duplex opens to servlets. A coupler with stream routes needs it.
 - `GenericClient<GrpcListener>` and `PooledClient<GrpcListener>` submit through `submit_work_to`.
@@ -285,7 +286,7 @@ Under `couple`, `Edge::coupled(EdgeTls, Coupler)` serves stock gRPC callers besi
 - A clone of a coupler shares its ledger, and each bind of a clone starts its own replay window and loopback session.
 - Replicas of an edge that share one ledger spend a claim once between them.
 - A `ClaimSpend` carries the `ClaimKey` that names the claim, the `SignerDigest` of its signer, its expiry, and a `HolderId` of its own. The coupler builds a spend only from a verified claim, and `testing::LedgerConformance` builds its own.
-- The key of a spend is the SHA-256 of the signer and the order of the claim, because one signer issues one claim at one order.
+- The key of a spend is the SHA-256 of the canonical public key of the signer and the order of the claim, because one signer issues one claim at one order. A claim that names another certificate of that key, with its point in either SEC 1 form, spends the same key. A signer key whose point is in another form refuses the claim with 16.
 - The coupler checks the freshness of a claim on its own clock, so a key lives until its claim leaves the window.
 - `ClaimLedger::spend(spend, now)` takes that clock, so a driver judges each expiry at `now` and reads no clock of its own.
 
@@ -332,6 +333,7 @@ Under `couple`, `Edge::coupled(EdgeTls, Coupler)` serves stock gRPC callers besi
 - A send that fails before the frame leaves the session, as tightbeam proves with `TransportError::is_connection_error`, forgets the spent claim, so the caller may retry it. A gateway that refuses the work before its handler runs is such a send.
 - A send whose deadline passes while it waits again for a stream forgets its claim too, because the session refused its frame for want of a stream.
 - Every other failed send keeps the claim spent, because the frame may have reached the servlet. A status that the gateway answers after its handler ran, such as `RESOURCE_EXHAUSTED`, is one.
+- tightbeam bounds each wait of a send by the read deadline of the loopback session. A send that this bound ends, under a call limit past it, answers 4 as `stalled` and keeps its claim spent, because its frame may have left.
 - A call that its caller ends from step 8 on keeps any claim that its ledger took.
 - The loopback session runs into the coupler's own listener, so the gateway admits it like any edge client.
 - The session multiplexes when the gateway sets `pool_config.mux_offer`, and runs one call at a time otherwise.
@@ -347,17 +349,19 @@ Under `couple`, `Edge::coupled(EdgeTls, Coupler)` serves stock gRPC callers besi
 | `Routes::bidi_stream`   | many     | many    |
 
 - A stream needs a multiplexed loopback session. A single session refuses it with 14.
-- Open streams take at most half the streams of the loopback session, so a coupler with a stream route needs 2 streams or more. Past that half, a stream refuses with 8.
+- Open streams take at most half the streams of the loopback session, so a coupler with a stream route needs 2 streams or more. They also take at most 256, half the places of a session below, so the unary calls keep the other half. Past that, a stream refuses with 8.
 - Steps 1 to 4 run as for a unary call. The stream then takes a relay permit before step 5 finds the loopback session open, and at step 6 it opens a duplex stream to the servlet. Steps 7 and 8 sign and spend as for a unary call, and step 9 pushes the head: the `CoupledCall` with an empty body and its stream terms. A push of the head that passes the deadline keeps the claim spent, because the head may have reached the servlet whole.
 - The stream terms fix the shape of the method and the ceiling of each part, the envelope ceiling of the edge. Both ends keep to them.
 - Every part, the head first, is a signed frame behind a 4-byte big-endian length, within the envelope ceiling of the edge. Each later part carries the call id, in order from 1.
 - The voucher signs each request part. The coupler verifies each answer part under the pinned signer, at the next order.
-- The last answer part carries the status. Once the coupler reads it, the coupler ends the requests and reads the stream to its end within the deadline. A failure of the stream after that part, or a deadline that passes before the stream ends, leaves the status to it. A request that meets a stream that the servlet ended leaves the status to the answer.
+- The last answer part carries the status. Once the coupler reads it, the coupler closes the requests and reads the stream to its end within the deadline. A failure of the stream after that part, or a deadline that passes before the stream ends, leaves the status to it. A request that meets a stream that the servlet ended leaves the status to the answer.
 - A claim on a stream covers its method and its certificate, over an empty body.
 - A count of messages that the route does not take refuses with 12, as gRPC answers a cardinality violation, at either end. A part past the part ceiling refuses with 8, at either end.
 - An end part on the request side refuses with 3, because the requests end by a close.
+- On a multiplexed loopback session, a call or a stream that ends before its answer, at its deadline, at the drop of its response, or at a fault of its requests, cancels. The gateway serves that session under the cancel budget of tightbeam: each cancel that comes within a third of the read deadline of the start of its handler draws on it, and the gateway ends the session past it.
+- At most half the budget of calls and streams are open on one loopback session at once, and a call waits within its deadline for a place. The coupler counts every cancel, because the start of the handler lies at the gateway. The next session opens once the cancels reach half the budget, while the last one carries its open calls, and a session whose cancels hold the whole budget carries no new call.
 - The coupler counts the answers of the servlet itself, so a servlet outside the stream library that breaks the shape refuses as `answer-shape`.
-- The relay of a stream runs on a task of its own. The deadline of the call ends it, however slowly either side reads, and the drop of the response ends it at once, as `cancelled`.
+- The relay of a stream runs on a task of its own. The deadline of the call ends it, however slowly either side reads, and the drop of the response ends it at once, as `cancelled`. A request part or the close that waits past the read deadline of the loopback session ends it with 4, as `stalled`.
 - The relay frees the slot and the relay permit of its stream before it records the end.
 
 ### Health
@@ -411,8 +415,9 @@ Under `couple`, `Edge::coupled(EdgeTls, Coupler)` serves stock gRPC callers besi
 - `reply(body, signer)` answers status 0, and `fail(status, signer)` any other status, under the identity that the route pins. `fail` carries the status details to `grpc-status-details-bin`.
 - `AdmittedStream::admit(body, reply, trust, signer)` admits the head of a stream in a duplex arm, and binds the signer of every answer part. Each later request part must verify under the signer of the head.
 - `split()` gives an `AdmittedStreamParts` of the `Origin`, the `StreamRequests`, and the `StreamAnswers`, so each direction runs on its own.
-- `StreamRequests::next()` reads a request. `StreamAnswers::send(body)`, `finish(requests)`, and `end(requests, status)` answer. `end` with status 0 is `finish`.
-- `end` takes the `StreamRequests` back, and holds the stream until the caller ends its requests, dropping each request that comes, so a gateway relays the last answer part before the stream ends.
+- `StreamRequests::next()` reads a request, and `None` at the close. `StreamAnswers::send(body)`, `finish()`, and `end(status)` answer. `end` with status 0 is `finish`.
+- `next` and `send` refuse with a `StreamRefusal`. `StreamRefusal::end(answers)` ends an `Ends`, a part that does not admit or send, with a signed end part of its status, and fails the stream on a `Breaks`, a push that stopped or failed.
+- `end` with status 0 short of the count of the method ends with 12, and an end part past the part ceiling ends with 8.
 - A head or a part that does not admit ends the stream with the status that the `# Errors` of `AdmittedStream::admit` and `StreamRequests::next` give for it: 16, 3, 12, 8, or 14.
 - `AdmittedStream::admit` refuses a head with no stream terms with 3.
 
@@ -445,8 +450,8 @@ Under `couple`, `Edge::coupled(EdgeTls, Coupler)` serves stock gRPC callers besi
 - `CoupledReply` reads `code()`, `message()`, `body()`, and `details()`, the encoded `google.rpc.Status`. `into_result()` gives the body for status 0, and the status otherwise.
 - `Backend::relay_stream(body, reply)` serves a stream route in the `duplex:` arm. Each request goes on as it arrives, and each answer comes back signed.
 - A unary route reached as a stream, a stream of another shape, or a stream route reached as a unary call, refuses with a signed 12.
-- A request part that does not admit cancels the call of the server, and records `BACKEND_CALL_REFUSED` as `part`.
-- An answer of the server that the adapter cannot send ends the stream with its own status, which the caller reads: 12 past the count of the method, and 8 past the part ceiling. It records `part` too.
+- A request part that does not admit cancels the call of the server, ends the stream with a signed end part of its status, and records `BACKEND_CALL_REFUSED` as `part`.
+- An answer of the server that the adapter cannot send ends the stream with a signed end part of its own status, which the caller reads: 12 past the count of the method or short of it, and 8 past the part ceiling. It records `part` too.
 - An answer part takes its order once its push lands. A push that the timeout of the adapter cuts ends the stream with 4 and no part after it, and records `part`.
 - `Backend::with_clock(clock)` runs the timeout of each call, and the deadline that each admitted call carries, on a tightbeam `Clock`, in place of `SystemClock`. A call whose wait that clock gives no timer ends with 13.
 - Under `instrument`, `Backend::with_trace` records `BACKEND_CALL_RELAYED` and `BACKEND_CALL_REFUSED`.
@@ -500,12 +505,10 @@ A hop MUST carry a tunnel unchanged for the life of its session:
 - `EncryptedProtocol::bind_with` and `cluster!` take no value of a deployment, so a profile is a type. A profile whose material comes at run time stages it in the static cell of `staged_profile!`, one deployment per type.
 - The PROXY protocol is version 2 alone.
 - Before its handshake, a peer can send one message up to the envelope ceiling ([The Envelope Rules of Message Sockets](wire.md#limitations)).
-- A link on tightbeam's `TokioListener` that carries a stream of more than one record (16 KiB each by default) can lose part of a record. tightbeam-rs 0.19.0 drops a frame read that has taken part of a record when a stream body reports progress, so the next read starts inside the record. The link then refuses an envelope (`transport/envelope-refused`) and closes (`connection/closed`, `invalid-message`), and each stream on it ends with 13.
-- The hive plane of a colony therefore runs on `WsListener`, which holds a partial message in its socket buffer across a dropped read. Test: `tests/adapter.rs` `a_flooded_answer_reaches_a_direct_caller_whole`.
 
 ## Sources
 
-- tightbeam-rs 0.19.0, the mux reader and the frame read: `src/transport/multiplex/router/reader.rs` lines 702 to 727, and `src/transport/protocols.rs` lines 455 to 468.
+- tightbeam-rs, the cancel budget of a mux connection, 1024 cancels of live handlers within a third of the read deadline of their start: `DEFAULT_MUX_CANCEL_BUDGET` in `src/constants.rs`, `InFlight::abort` in `src/transport/multiplex/router/responder.rs`, and `Pulse::is_rapid_since` in `src/transport/multiplex/router/link.rs`.
 - gRPC over HTTP2, `grpc/grpc` `doc/PROTOCOL-HTTP2.md`: <https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md>
 - gRPC compression, `grpc/grpc` `doc/compression.md`: <https://github.com/grpc/grpc/blob/master/doc/compression.md>
 - gRPC health checking, `grpc/grpc` `doc/health-checking.md`: <https://github.com/grpc/grpc/blob/master/doc/health-checking.md>

@@ -7,7 +7,7 @@ set -euo pipefail
 # Usage: publish-release.sh [--dry-run] crates
 #        publish-release.sh [--dry-run] client <tarball>
 #
-# It reads VERSION, CRATES, and NPM_CLIENT as scripts/verify-release-tag.sh
+# It reads EXT, VERSION, CRATES, and NPM_CLIENT as scripts/verify-release-tag.sh
 # exports them. --dry-run asks the registries, then prints each publish in
 # place of running it.
 
@@ -24,6 +24,9 @@ if [ "${1:-}" = "--dry-run" ]; then
 	DRY_RUN=1
 	shift
 fi
+
+# Each attempt refuses a yanked version before it reads or writes a registry.
+"$REPO_ROOT/scripts/check-yanked.sh" "${EXT:?}"
 
 # Run the publish $@, or print it under --dry-run.
 publish() {

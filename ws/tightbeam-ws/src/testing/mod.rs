@@ -29,4 +29,4 @@ pub use paywall::{DemoPaywall, DemoSettlement};
 pub use watch::EventWatch;
 
 #[cfg(feature = "colony")]
-pub use colony::{WorkBody, WorkClient, WorkGateway, WorkPlane, WorkProbeHive, WorkProbeServlet, WorkStack};
+pub use colony::{WorkBody, WorkClient, WorkGateway, WorkPlane, WorkProbe, WorkProbeHive, WorkProbeServlet, WorkStack};

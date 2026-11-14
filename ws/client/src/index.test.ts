@@ -163,6 +163,21 @@ describe("connectMutual client key guard", () => {
 			code,
 		});
 	});
+
+	it("refuses a scalar over a detached buffer as InvalidBytes at its member", async () => {
+		const key = new Uint8Array(32).fill(1);
+		structuredClone(key.buffer, { transfer: [key.buffer] });
+
+		const dialed = engine.connectMutual(UNREACHED_URL, {
+			serverCertDer: SERVER_CERT,
+			clientCertDer: CLIENT_CERT,
+			clientKey: key,
+		});
+		await expect(dialed).rejects.toMatchObject({
+			code: "InvalidBytes",
+			path: "identity.clientKey",
+		});
+	});
 });
 
 describe("connectMutual certificate guard", () => {

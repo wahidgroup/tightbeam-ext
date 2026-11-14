@@ -203,7 +203,7 @@ impl SigningKeyProvider for JsSigningKeyProvider {
 			let returned = invoked.map_err(|_| SignerFault::JsRejected)?;
 			let settled = returned.settle().await.map_err(|_| SignerFault::JsRejected)?;
 
-			let signature = JsBytes::recognize(&settled).ok_or(SignerFault::NotBytes)?;
+			let signature = JsBytes::recognize(&settled).octets().ok_or(SignerFault::NotBytes)?;
 			if signature.is_empty() {
 				return Err(SignerFault::EmptySignature.into());
 			}

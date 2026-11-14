@@ -1,7 +1,10 @@
 //! The outbound adapter to a stock gRPC server: it admits and grants a call,
 //! calls the server, and then encodes and signs the reply.
 
+use core::convert::Infallible;
 use core::fmt;
+use core::future::{pending, Future};
+use core::pin::{pin, Pin};
 use core::time::Duration;
 use std::sync::Arc;
 
@@ -11,10 +14,10 @@ use tightbeam::der;
 use tightbeam::transport::multiplex::{ReplySink, StreamBody};
 use tightbeam::transport::TransportError;
 use tightbeam::{Frame, TightBeamError};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::client::Grpc;
-use tonic::codec::CompressionEncoding;
+use tonic::codec::{CompressionEncoding, Streaming};
 use tonic::transport::Channel;
 use tonic::{Code, Status};
 
@@ -24,8 +27,9 @@ use tightbeam::trace::TraceCollector;
 use super::admit::{AdmissionTrust, AdmittedCall, Origin};
 use super::error::CoupleError;
 use super::message::CoupledReply;
+use super::method::MethodPath;
 use super::routes::{Carriage, Grants, Policy, Routes};
-use super::stream::{AdmittedStream, AdmittedStreamParts, StreamAnswers, StreamRequests};
+use super::stream::{AdmittedStream, AdmittedStreamParts, StreamAnswers, StreamRefusal, StreamRequests};
 use crate::deadline::Deadline;
 use crate::edge::{DialTls, TlsEndpoint};
 use crate::protocol::GrpcAddr;
@@ -61,6 +65,7 @@ impl BackendChannel {
 	async fn call(&self, admitted: &AdmittedCall, timeout: Duration) -> Result<CoupledReply, der::Error> {
 		let deadline = admitted.origin().bounded(timeout);
 		let exchanged = deadline.bound(self.exchange(admitted, &deadline)).await;
+
 		let answered = exchanged.unwrap_or_else(|lapse| Err(Backend::lapsed(lapse)));
 		match answered {
 			Ok(body) => CoupledReply::ok(body),
@@ -75,6 +80,7 @@ impl BackendChannel {
 		let origin = admitted.origin();
 		let path = origin.method().path_and_query();
 		let request = origin.request(admitted.body().to_vec(), deadline);
+
 		let response = grpc.unary(request, path, TunnelCodec).await?;
 		Ok(response.into_inner())
 	}
@@ -82,82 +88,136 @@ impl BackendChannel {
 	/// The pivot of a stream: relay `requests` to the backend and each of its
 	/// answers to `answers`, within `timeout` or what remains of the deadline
 	/// of the stream when that is sooner, then end `answers` with the status
-	/// of the backend.
-	///
-	/// # Errors
-	///
-	/// - The [`TightBeamError`] of a request part that does not admit, which ends the stream.
-	/// - The [`TightBeamError`] of an answer part that does not build, sign, or send, such as one past the
-	///   count of its method or the part ceiling.
+	/// of the backend, of its deadline, or of a part that does not admit or
+	/// send.
 	async fn stream(
 		&self,
 		head: &Origin,
 		mut requests: StreamRequests,
 		mut answers: StreamAnswers,
 		timeout: Duration,
-	) -> Result<Code, TightBeamError> {
+	) -> StreamEnd {
 		let deadline = head.bounded(timeout);
 		let relayed = self.exchange_stream(head, &mut requests, &mut answers, &deadline);
 		let status = match deadline.bound(relayed).await {
 			Ok(Ok(status)) => status,
-			Ok(Err(refused)) => return Err(refused),
+			Ok(Err(refused)) => return StreamEnd::refused(refused.end(answers).await),
 			Err(lapse) => Backend::lapsed(lapse),
 		};
 
-		answers.end(requests, &status).await?;
-		Ok(status.code())
+		StreamEnd::of_answer(status.code(), answers.close(&status).await)
 	}
 
-	/// Wait for the channel, then run the stream of `head` both ways at once
-	/// within `deadline`: the status that ended it, or the refusal of a
-	/// request part or of an answer part.
+	/// Run the stream of `head` both ways at once within `deadline`: the
+	/// status that ended it, or the refusal of a request part or of an answer
+	/// part. A refused request part ends the relay between two answers, so
+	/// no push of an answer stops before it lands.
 	async fn exchange_stream(
 		&self,
 		head: &Origin,
 		requests: &mut StreamRequests,
 		answers: &mut StreamAnswers,
 		deadline: &Deadline,
-	) -> Result<Status, TightBeamError> {
+	) -> Result<Status, StreamRefusal> {
 		let (sender, outbound) = mpsc::channel(1);
+		let (refuse, refused) = oneshot::channel();
 		let forward = async move {
-			while let Some(message) = requests.next().await? {
-				if sender.send(message).await.is_err() {
-					break;
-				}
+			if let Err(refusal) = Self::forward(requests, sender).await {
+				let _ = refuse.send(refusal);
 			}
 
-			// The drop of the sender ends the requests, and the answer ends
-			// the stream.
-			drop(sender);
-			core::future::pending::<Result<Status, TightBeamError>>().await
+			pending::<Infallible>().await
 		};
 
-		let answer = async {
-			let mut grpc = match self.ready().await {
-				Ok(grpc) => grpc,
-				Err(status) => return Ok(status),
-			};
-			let path = head.method().path_and_query();
-			let request = head.request(ReceiverStream::new(outbound), deadline);
-			let response = match grpc.streaming(request, path, TunnelCodec).await {
-				Ok(response) => response,
-				Err(status) => return Ok(status),
-			};
-
-			let mut inbound = response.into_inner();
-			loop {
-				match inbound.message().await {
-					Ok(Some(message)) => answers.send(message).await?,
-					Ok(None) => return Ok(Status::new(Code::Ok, "")),
-					Err(status) => return Ok(status),
-				}
+		let refusal = async move {
+			match refused.await {
+				Ok(refusal) => refusal,
+				Err(_) => pending().await,
 			}
 		};
 
 		tokio::select! {
-			answered = answer => answered,
-			refused = forward => refused,
+			answered = self.answer(head, answers, outbound, refusal, deadline) => answered,
+			never = forward => match never {},
 		}
+	}
+
+	/// Send each request of `requests` on `sender` until they end. The drop
+	/// of `sender` ends the requests of the backend, and the answer ends the
+	/// stream.
+	///
+	/// # Errors
+	///
+	/// - The [`StreamRefusal`] of a request part.
+	async fn forward(requests: &mut StreamRequests, sender: mpsc::Sender<Vec<u8>>) -> Result<(), StreamRefusal> {
+		while let Some(message) = requests.next().await? {
+			if sender.send(message).await.is_err() {
+				break;
+			}
+		}
+
+		Ok(())
+	}
+
+	/// Wait for the channel, call the backend with the requests of
+	/// `outbound`, and send each of its answers on `answers`, until the
+	/// backend ends the call, or `refusal` gives the refusal of a request
+	/// part, before the call or between two answers.
+	///
+	/// # Errors
+	///
+	/// - The [`StreamRefusal`] of a request part, or of an answer part.
+	async fn answer(
+		&self,
+		head: &Origin,
+		answers: &mut StreamAnswers,
+		outbound: mpsc::Receiver<Vec<u8>>,
+		refusal: impl Future<Output = StreamRefusal>,
+		deadline: &Deadline,
+	) -> Result<Status, StreamRefusal> {
+		let mut refusal = pin!(refusal);
+		let called = Self::before(self.call_stream(head, outbound, deadline), refusal.as_mut());
+		let mut inbound = match called.await? {
+			Ok(inbound) => inbound,
+			Err(status) => return Ok(status),
+		};
+
+		loop {
+			match Self::before(inbound.message(), refusal.as_mut()).await? {
+				Ok(Some(message)) => answers.send(message).await?,
+				Ok(None) => return Ok(Status::new(Code::Ok, "")),
+				Err(status) => return Ok(status),
+			}
+		}
+	}
+
+	/// What `work` gives, or as `Err` the refusal that `refusal` gives first.
+	async fn before<T>(
+		work: impl Future<Output = T>,
+		refusal: Pin<&mut impl Future<Output = StreamRefusal>>,
+	) -> Result<T, StreamRefusal> {
+		tokio::select! {
+			biased;
+			refused = refusal => Err(refused),
+			done = work => Ok(done),
+		}
+	}
+
+	/// Wait for the channel, then call the method of `head` on the backend
+	/// with the requests of `outbound` within `deadline`: its answers, or the
+	/// status that refused the call.
+	async fn call_stream(
+		&self,
+		head: &Origin,
+		outbound: mpsc::Receiver<Vec<u8>>,
+		deadline: &Deadline,
+	) -> Result<Streaming<Vec<u8>>, Status> {
+		let mut grpc = self.ready().await?;
+		let path = head.method().path_and_query();
+		let request = head.request(ReceiverStream::new(outbound), deadline);
+
+		let response = grpc.streaming(request, path, TunnelCodec).await?;
+		Ok(response.into_inner())
 	}
 
 	/// The client of the channel, once the channel is ready, which accepts
@@ -297,8 +357,8 @@ impl Backend {
 	///
 	/// # Errors
 	///
-	/// - The errors of [`AdmittedStream::admit`] and [`StreamRequests::next`], which end the stream.
-	/// - The [`TightBeamError`] of an answer part that does not build, sign, or send.
+	/// - The errors of [`AdmittedStream::admit`], which end the stream.
+	/// - The [`TightBeamError`] of answers that broke, such as a push that the timeout cut.
 	pub async fn relay_stream(&self, body: StreamBody, reply: ReplySink) -> Result<(), TightBeamError> {
 		let stream = AdmittedStream::admit(body, reply, &self.admission, self.signer.clone()).await?;
 		let carriage = Carriage::Stream(stream.shape());
@@ -306,20 +366,11 @@ impl Backend {
 		let permitted = self.policy.permit(head.principal(), head.method(), carriage, head.assurance());
 		if let Err(refusal) = permitted {
 			self.audit.denied(refusal);
-			return answers.end(requests, &refusal.status()).await;
+			return answers.end(&refusal.status()).await;
 		}
 
 		let relayed = self.channel.stream(&head, requests, answers, self.timeout).await;
-		match relayed {
-			Ok(code) => {
-				self.audit.relayed(head.method(), code);
-				Ok(())
-			}
-			Err(refused) => {
-				self.audit.part_refused();
-				Err(refused)
-			}
-		}
+		relayed.record(&self.audit, head.method())
 	}
 
 	/// The status of a call whose bound on the backend lapsed: 4 once its
@@ -328,6 +379,63 @@ impl Backend {
 		match lapse {
 			Lapse::Passed => Status::deadline_exceeded("the backend passed the deadline"),
 			Lapse::NoTimer => Status::internal("the clock of the adapter gave the call no timer"),
+		}
+	}
+}
+
+/// How the relay of a stream of the backend ended.
+enum StreamEnd {
+	/// A signed end part of this code ended the stream: the status of the
+	/// backend, or of its timeout.
+	Relayed(Code),
+	/// A part that did not admit or send ended the stream with a signed end
+	/// part of its status.
+	Refused,
+	/// The answers broke, so no end part followed.
+	Broken(TightBeamError),
+}
+
+impl StreamEnd {
+	/// The end of a stream that a refused part ended as `ended` answered.
+	fn refused(ended: Result<(), TightBeamError>) -> Self {
+		match ended {
+			Ok(()) => Self::Refused,
+			Err(broken) => Self::Broken(broken),
+		}
+	}
+
+	/// The end of a stream that the adapter ended with a status of code
+	/// `asked`, as `ended` answered with the code that ended it: relayed when
+	/// the two agree, and refused when the end of `asked` did not send and
+	/// another code ended the stream in its place.
+	fn of_answer(asked: Code, ended: Result<Code, TightBeamError>) -> Self {
+		match ended {
+			Ok(code) if code == asked => Self::Relayed(code),
+			Ok(_) => Self::Refused,
+			Err(broken) => Self::Broken(broken),
+		}
+	}
+
+	/// Record the end of a stream of `method` on `audit`, and give the result
+	/// of its handler: `Ok` for a stream that a signed end part ended.
+	///
+	/// # Errors
+	///
+	/// - [`StreamEnd::Broken`] -- the error of the answers that broke.
+	fn record(self, audit: &EdgeAudit, method: &MethodPath) -> Result<(), TightBeamError> {
+		match self {
+			Self::Relayed(code) => {
+				audit.relayed(method, code);
+				Ok(())
+			}
+			Self::Refused => {
+				audit.part_refused();
+				Ok(())
+			}
+			Self::Broken(broken) => {
+				audit.part_refused();
+				Err(broken)
+			}
 		}
 	}
 }
