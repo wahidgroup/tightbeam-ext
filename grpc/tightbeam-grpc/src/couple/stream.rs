@@ -25,7 +25,7 @@ use tonic::{Code, Status};
 
 use super::admit::{AdmissionFault, AdmissionTrust, AdmittedHead, AdmittedSigner, Origin};
 use super::fault::CallFault;
-use super::loopback::{CancelLease, OpenedDuplex};
+use super::loopback::{LeasedBody, OpenedDuplex};
 use super::message::{CoupledPart, CoupledReply, PartWire, StreamTerms};
 use super::routes::{Arity, Servlet, Shape, StreamShape};
 use super::saga::{CallEnding, CallHold};
@@ -181,21 +181,13 @@ impl PartBuffer {
 
 /// The parts of a stream as they arrive, in chunks of any size.
 struct PartReader {
-	body: StreamBody,
+	body: LeasedBody,
 	buffer: PartBuffer,
-	/// The unit of the cancel budget of the loopback session that the answer
-	/// of a coupled stream holds until its stream ends.
-	lease: Option<CancelLease>,
 }
 
 impl PartReader {
-	fn new(body: StreamBody, ceiling: usize) -> Self {
-		Self { body, buffer: PartBuffer::new(ceiling), lease: None }
-	}
-
-	/// The parts of the answer of a coupled stream, which holds `lease`.
-	fn leased(body: StreamBody, ceiling: usize, lease: CancelLease) -> Self {
-		Self { lease: Some(lease), ..Self::new(body, ceiling) }
+	fn new(body: LeasedBody, ceiling: usize) -> Self {
+		Self { body, buffer: PartBuffer::new(ceiling) }
 	}
 
 	/// Read each later part under `ceiling`.
@@ -203,21 +195,13 @@ impl PartReader {
 		self.buffer.ceiling = ceiling;
 	}
 
-	/// The next chunk of the stream. The end or the failure of the stream
-	/// settles the lease, because a stream that ended owes no cancel.
+	/// The next chunk of the stream.
 	///
 	/// # Errors
 	///
 	/// - The [`TransportError`] of the stream.
 	async fn chunk(&mut self) -> TransportResult<Option<Vec<u8>>> {
-		let chunk = self.body.chunk().await;
-		if !matches!(chunk, Ok(Some(_))) {
-			if let Some(lease) = &mut self.lease {
-				lease.settle();
-			}
-		}
-
-		chunk
+		self.body.chunk().await
 	}
 
 	/// The frame of the next part, or `None` once the stream ends between
@@ -917,7 +901,7 @@ impl AdmittedStream {
 		trust: &AdmissionTrust,
 		signer: SigningIdentity,
 	) -> Result<Self, TightBeamError> {
-		let mut reader = PartReader::new(body, trust.part_ceiling());
+		let mut reader = PartReader::new(LeasedBody::bare(body), trust.part_ceiling());
 		let head = reader.next().await.map_err(PartFault::of_request)?;
 		let head = head.ok_or_else(|| PartFault::Malformed.of_request())?;
 		let refused = |fault: AdmissionFault| TightBeamError::from(TransportError::from(fault.status()));
@@ -1108,10 +1092,8 @@ pub(crate) struct OpenStream {
 	request_id: RequestId,
 	terms: StreamTerms,
 	sink: RequestSink,
-	body: StreamBody,
-	/// The unit of the cancel budget of the loopback session that the stream
-	/// holds until it ends.
-	lease: CancelLease,
+	/// The answers of the stream, with its lease on the loopback session.
+	body: LeasedBody,
 	/// The relay permit of the coupler, which the stream holds to its end.
 	permit: OwnedSemaphorePermit,
 }
@@ -1121,8 +1103,8 @@ impl OpenStream {
 	/// sink of `opened`, and whose answer arrives on its body, under the relay
 	/// `permit`.
 	pub(crate) fn new(hold: CallHold, head: &HeadPart, opened: OpenedDuplex, permit: OwnedSemaphorePermit) -> Self {
-		let OpenedDuplex { sink, body, lease } = opened;
-		Self { hold, request_id: *head.id(), terms: *head.terms(), sink, body, lease, permit }
+		let OpenedDuplex { sink, body } = opened;
+		Self { hold, request_id: *head.id(), terms: *head.terms(), sink, body, permit }
 	}
 }
 
@@ -1163,13 +1145,13 @@ impl StreamRelay {
 	/// status that ends the response.
 	async fn run(self, answers: mpsc::Sender<Vec<u8>>) -> Result<(), Status> {
 		let Self { open, requests, signer, ending } = self;
-		let OpenStream { hold, request_id, terms, sink, body, lease, permit } = open;
+		let OpenStream { hold, request_id, terms, sink, body, permit } = open;
 		let ceiling = terms.ceiling();
 		let expires = hold.expires();
 
 		let order = PartOrder::requests(request_id.as_bytes(), terms.shape());
 		let mut upstream = Requests::Open(Box::new(PartSink::new(sink, order, signer, ceiling)));
-		let reader = PartReader::leased(body, ceiling, lease);
+		let reader = PartReader::new(body, ceiling);
 		let order = PartOrder::answers(request_id.as_bytes(), terms.shape());
 		let verifier = PartVerifier::Pinned(hold.servlet().clone());
 		let mut downstream = PartStream { reader, order, verifier };

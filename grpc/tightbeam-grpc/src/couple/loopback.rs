@@ -21,7 +21,9 @@ use tightbeam::crypto::x509::{Certificate, KeyCurves};
 use tightbeam::transport::handshake::negotiation::TransportOffer;
 use tightbeam::transport::handshake::HandshakeProvider;
 use tightbeam::transport::multiplex::{MuxConnector, MuxHandle, MuxRole, RequestSink, SpawnedMux, StreamBody};
-use tightbeam::transport::{ClientBuilder, ConnectionBuilder, MessageEmitter, TransportError, TransportFailure};
+use tightbeam::transport::{
+	ClientBuilder, ConnectionBuilder, MessageEmitter, TransportError, TransportFailure, TransportResult,
+};
 use tightbeam::urn::Urn;
 use tightbeam::Frame;
 
@@ -228,7 +230,7 @@ impl CancelLease {
 	}
 
 	/// Give the place back, as a call that ended owes the gateway no cancel.
-	pub(crate) fn settle(&mut self) {
+	fn settle(&mut self) {
 		self.place = None;
 	}
 
@@ -238,6 +240,27 @@ impl CancelLease {
 		if !failure.leaves_live() {
 			self.settle();
 		}
+	}
+
+	/// Send `work` on a free stream of the session, and return the reply of
+	/// the gateway, within `expires`. The lease owes a cancel only while an
+	/// emit may have left its stream live at the gateway.
+	///
+	/// # Errors
+	///
+	/// - The [`SendFailure`] of the send, as [`SendFailure::of_take`] reads it.
+	async fn emit(mut self, work: &Frame, expires: &Deadline) -> Result<Option<Frame>, SendFailure> {
+		let handle = &self.session.spawned.handle;
+		let free = FreeStream { handle, expires };
+
+		let sent = free.take(|| self.during(expires.bound(handle.emit_on_stream(work)))).await;
+		let sent = sent.map_err(|fault| SendFailure::of_take(fault, expires));
+		match &sent {
+			Ok(_) => self.settle(),
+			Err(failure) => self.failed(failure),
+		}
+
+		sent
 	}
 }
 
@@ -403,7 +426,7 @@ impl Duplex {
 		let Self { mut sink, body, mut lease } = self;
 		lease.arm();
 		let failure = match expires.bound(sink.push(head.as_bytes())).await {
-			Ok(Ok(())) => return Ok(OpenedDuplex { sink, body, lease }),
+			Ok(Ok(())) => return Ok(OpenedDuplex { sink, body: LeasedBody { body, lease: Some(lease) } }),
 			Ok(Err(error)) => SendFailure::of_push(error),
 			Err(_) => SendFailure::Unanswered,
 		};
@@ -414,11 +437,41 @@ impl Duplex {
 }
 
 /// A duplex stream to a servlet whose head the push opened: the sink of its
-/// requests, the body of its answers, and its unit of the cancel budget.
+/// requests, and the body of its answers with the lease of the stream.
 pub(crate) struct OpenedDuplex {
 	pub(crate) sink: RequestSink,
-	pub(crate) body: StreamBody,
-	pub(crate) lease: CancelLease,
+	pub(crate) body: LeasedBody,
+}
+
+/// The body of a duplex stream, and the lease of its loopback session, if
+/// any, which settles at the end of the body, because a stream that ended
+/// owes no cancel.
+pub(crate) struct LeasedBody {
+	body: StreamBody,
+	lease: Option<CancelLease>,
+}
+
+impl LeasedBody {
+	/// A body that holds no lease, such as the requests that a servlet reads.
+	pub(crate) fn bare(body: StreamBody) -> Self {
+		Self { body, lease: None }
+	}
+
+	/// The next chunk of the body. The end or the failure of the body settles
+	/// its lease.
+	///
+	/// # Errors
+	///
+	/// - The [`TransportError`] of the stream.
+	pub(crate) async fn chunk(&mut self) -> TransportResult<Option<Vec<u8>>> {
+		let chunk = self.body.chunk().await;
+		let ended = !matches!(chunk, Ok(Some(_)));
+		if let (true, Some(lease)) = (ended, &mut self.lease) {
+			lease.settle();
+		}
+
+		chunk
+	}
 }
 
 /// The session that one call holds for its send: its place on a multiplexed
@@ -443,26 +496,14 @@ impl<P: HandshakeProvider + Send + Sync + 'static> Held<P> {
 	/// - [`SendFailure::Stalled`] -- a wait of the send passed a read deadline of the session, as
 	///   [`CallFault::Stalled`] states.
 	pub(crate) async fn send(self, work: &Frame, expires: &Deadline) -> Result<Option<Frame>, SendFailure> {
-		let mut lease = match self {
-			Self::Mux(lease) => lease,
+		match self {
+			Self::Mux(lease) => lease.emit(work, expires).await,
 			Self::Single(mut transport) => {
 				let reply = expires.bound(transport.emit(work.clone(), None)).await;
 				let reply = reply.map_err(|_| SendFailure::Unanswered)?;
-				return reply.map_err(|error| SendFailure::of_emit(error, expires));
+				reply.map_err(|error| SendFailure::of_emit(error, expires))
 			}
-		};
-
-		let handle = &lease.session.spawned.handle;
-		let free = FreeStream { handle, expires };
-
-		let sent = free.take(|| lease.during(expires.bound(handle.emit_on_stream(work)))).await;
-		let sent = sent.map_err(|fault| SendFailure::of_take(fault, expires));
-		match &sent {
-			Ok(_) => lease.settle(),
-			Err(failure) => lease.failed(failure),
 		}
-
-		sent
 	}
 }
 
@@ -612,6 +653,30 @@ impl<P: HandshakeProvider + Send + Sync + 'static> Shared<P> {
 		self.state.lock().unwrap_or_else(PoisonError::into_inner).is_live()
 	}
 
+	/// Publish whether the state carries calls, as a probe reads it, and give
+	/// that answer.
+	fn probe(&self) -> bool {
+		let live = self.is_live();
+		self.publish(live);
+		live
+	}
+
+	/// The answer of `work`, under a probe at each `Coupler::LIVENESS_PROBE`
+	/// on `clock`, so a session that renews while `work` opens the next one
+	/// reads NOT_SERVING once it ends.
+	async fn probed<T>(&self, clock: &Arc<dyn Clock>, work: impl Future<Output = T>) -> T {
+		let mut work = pin!(work);
+		loop {
+			let probe = Deadline::after(clock, Coupler::LIVENESS_PROBE);
+			tokio::select! {
+				done = &mut work => return done,
+				() = probe.sleep() => {}
+			}
+
+			self.probe();
+		}
+	}
+
 	/// The answer of `attempt` on the session that takes a new call, within
 	/// `expires`. A call that finds the session renewing waits for the next
 	/// one, and tries again there.
@@ -746,11 +811,12 @@ impl<P: HandshakeProvider + Send + Sync + 'static> LoopbackSession<P> {
 	/// - A multiplexed session whose cancels reach [`MuxSession::RENEWAL`] renews: the next session opens
 	///   at once, while this one carries its calls, and takes every call after it. The last call of this
 	///   one ends it. A next session that fails to open ends the renewal, so its waiting calls fail.
+	/// - The probe runs while each session opens, so a renewing session that ends reads NOT_SERVING.
 	async fn run<C: EdgeProfile>(shared: Arc<Shared<P>>, opener: Opener<P, C>, recorder: CallRecorder) {
 		let clock = Arc::clone(&opener.clock);
 		loop {
 			shared.unless_live(State::Opening);
-			if let Ok(opened) = opener.open().await {
+			if let Ok(opened) = shared.probed(&clock, opener.open()).await {
 				let mut probe = Deadline::after(&clock, Coupler::LIVENESS_PROBE);
 				let mut renewal = pin!(MuxSession::renews(opened.mux()));
 				shared.set(opened);
@@ -761,12 +827,10 @@ impl<P: HandshakeProvider + Send + Sync + 'static> LoopbackSession<P> {
 						() = &mut renewal => break true,
 					}
 
-					if !shared.is_live() {
+					probe = Deadline::after(&clock, Coupler::LIVENESS_PROBE);
+					if !shared.probe() {
 						break false;
 					}
-
-					probe = Deadline::after(&clock, Coupler::LIVENESS_PROBE);
-					shared.publish(true);
 				};
 
 				if renews {
@@ -835,6 +899,7 @@ mod tests {
 	use tokio::net::{TcpListener, TcpStream};
 
 	use core::time::Duration;
+	use tightbeam::clock::ManualClock;
 	use tightbeam_ws::testing::Identity;
 
 	use super::super::message::{CoupledCall, CoupledPart, PartWire, StreamTerms};
@@ -892,6 +957,31 @@ mod tests {
 		let signed = voucher.sign(CoupledCall::head(&method, terms)?, RequestId::new([1; 16])).await;
 		let signed = signed.map_err(|fault| format!("{fault:?}"))?;
 		Ok(signed.into_head(terms).map_err(|fault| format!("{fault:?}"))?)
+	}
+
+	/// The duplex stream of `session` whose head left, under a lease of it.
+	async fn opened(session: &Arc<MuxSession>) -> Result<OpenedDuplex, Box<dyn std::error::Error>> {
+		let head = head().await?;
+		let (sink, body) = session.spawned.handle.open_duplex()?;
+		let duplex = Duplex { sink, body, lease: leased(session, &unbounded())? };
+		let opened = duplex.push_head(&head, &unbounded()).await;
+		opened.map_err(|failure| format!("{failure:?}").into())
+	}
+
+	/// End the connection of `session` by dropping `peer`, and wait until its
+	/// drivers end, as a body that the end fails proves.
+	async fn end(session: &Arc<MuxSession>, peer: TcpStream) -> TestResult {
+		let (_, mut body) = session.spawned.handle.open_duplex()?;
+		drop(peer);
+
+		let ended = body.chunk().await;
+		assert!(ended.is_err(), "a body MUST fail once its connection ends");
+
+		while session.carries() {
+			tokio::task::yield_now().await;
+		}
+
+		Ok(())
 	}
 
 	/// The lease that `session` gives at once, if any, outside the budget of
@@ -1090,6 +1180,52 @@ mod tests {
 
 		let cancels = session.cancels.load(Ordering::Acquire);
 		assert_eq!(cancels, 0, "a head that opened no stream MUST count no cancel");
+		Ok(())
+	}
+
+	#[tokio::test]
+	async fn a_stream_whose_body_ends_owes_no_cancel() -> TestResult {
+		let (session, peer) = session().await?;
+		let mut opened = opened(&session).await?;
+
+		drop(peer);
+		let ended = opened.body.chunk().await;
+		assert!(ended.is_err(), "the body MUST fail once its connection ends");
+		drop(opened);
+
+		let cancels = session.cancels.load(Ordering::Acquire);
+		assert_eq!(cancels, 0, "a stream whose body ended MUST count no cancel");
+		Ok(())
+	}
+
+	#[tokio::test]
+	async fn a_stream_dropped_before_its_end_counts_a_cancel() -> TestResult {
+		let (session, _peer) = session().await?;
+		drop(opened(&session).await?);
+
+		let cancels = session.cancels.load(Ordering::Acquire);
+		assert_eq!(cancels, 1, "a stream dropped before its end MUST count a cancel");
+		Ok(())
+	}
+
+	#[tokio::test]
+	async fn a_renewing_session_that_ends_while_the_next_one_opens_reads_not_serving() -> TestResult {
+		let (session, peer) = session().await?;
+		let manual = Arc::new(ManualClock::default());
+		let clock: Arc<dyn Clock> = manual.clone();
+		let (shared, health) = shared(State::Mux(Arc::clone(&session)));
+
+		let mut opening = pin!(shared.probed(&clock, pending::<()>()));
+		assert!(opening.as_mut().now_or_never().is_none(), "the next session MUST still open");
+
+		end(&session, peer).await?;
+		manual.advance(Coupler::LIVENESS_PROBE);
+
+		assert!(opening.as_mut().now_or_never().is_none(), "the next session MUST still open");
+		assert!(
+			!*health.borrow(),
+			"a session that ended MUST read NOT_SERVING while the next one opens"
+		);
 		Ok(())
 	}
 }
