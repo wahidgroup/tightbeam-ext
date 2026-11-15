@@ -18,13 +18,12 @@ use sha2::{Digest, Sha256};
 use tightbeam::builder::TypeBuilder;
 use tightbeam::clock::{Clock, Lapse, UnixMillis};
 use tightbeam::colony::cluster::FreshnessWindow;
+use tightbeam::crypto::profiles::DefaultCryptoProvider;
 use tightbeam::crypto::sign::SigningIdentity;
 use tightbeam::crypto::x509::store::CertificateTrust;
-use tightbeam::crypto::x509::{CanonicalKey, Certificate, ErasedSigning, KeyPurposes, PeerCertificate};
+use tightbeam::crypto::x509::{CanonicalKey, Certificate, KeyPurposes, PeerCertificate, Signing};
 use tightbeam::der::asn1::OctetString;
-use tightbeam::der::oid::db::rfc5912::ID_EC_PUBLIC_KEY;
 use tightbeam::der::{Decode, Encode};
-use tightbeam::spki::SubjectPublicKeyInfoOwned;
 use tightbeam::{Frame, TightBeamError, Version};
 use tonic::metadata::{MetadataMap, MetadataValue};
 
@@ -227,13 +226,12 @@ impl CallClaim {
 
 		claims.verify_presented(&issuers, &signer).map_err(refused)?;
 
-		let signer_key = SignerKey::of(&signer.tbs_certificate.subject_public_key_info)?;
 		let named = Principal::of(&signer);
-		let peer = PeerCertificate::<ErasedSigning>::parse(signer, KeyPurposes::HOUSE.signer).map_err(refused)?;
+		let peer = SignerPeer::parse(signer, KeyPurposes::HOUSE.signer).map_err(refused)?;
+		let signer_key = SignerKey::of(&peer)?;
 
 		let frame = Frame::from_der(frame.as_bytes()).map_err(|_| CallFault::ClaimRefused)?;
-		let verified = frame.verify_under(&peer, claims.to_policy_ref());
-		verified.map_err(|_| CallFault::ClaimRefused)?;
+		frame.verify(&peer).map_err(|_| CallFault::ClaimRefused)?;
 
 		if named.as_ref() != Some(principal) {
 			return Err(CallFault::ClaimRefused);
@@ -260,6 +258,10 @@ struct Opened {
 	forwarded: Vec<u8>,
 }
 
+/// The certificate of a claim signer, admitted with its house key decoded
+/// once, in a point form that RFC 5480 section 2.2 admits.
+type SignerPeer = PeerCertificate<Signing<DefaultCryptoProvider>>;
+
 /// The public key that the frame of a claim verifies under, in its canonical
 /// form, which names the key under each certificate of it and in either SEC 1
 /// form of its point.
@@ -267,19 +269,13 @@ struct Opened {
 struct SignerKey(CanonicalKey);
 
 impl SignerKey {
-	/// The key that `spki` holds.
+	/// The key that `peer` verifies under.
 	///
 	/// # Errors
 	///
-	/// - [`CallFault::ClaimRefused`] -- `spki` holds an elliptic-curve point in a form that RFC 5480
-	///   section 2.2 refuses, such as the compact form, which `CanonicalKey` keeps as it arrived.
-	fn of(spki: &SubjectPublicKeyInfoOwned) -> Result<Self, CallFault> {
-		let form = spki.subject_public_key.raw_bytes().first();
-		let refused = spki.algorithm.oid == ID_EC_PUBLIC_KEY && !matches!(form, Some(0x02..=0x04));
-		if refused {
-			return Err(CallFault::ClaimRefused);
-		}
-
+	/// - [`CallFault::ClaimRefused`] -- the canonical form of the key does not encode.
+	fn of(peer: &SignerPeer) -> Result<Self, CallFault> {
+		let spki = &peer.certificate().tbs_certificate.subject_public_key_info;
 		let canonical = CanonicalKey::of(spki).map_err(|_| CallFault::ClaimRefused)?;
 		Ok(Self(canonical))
 	}
@@ -522,6 +518,7 @@ mod tests {
 	use tightbeam::crypto::x509::ext::pkix::{KeyUsage, KeyUsages};
 	use tightbeam::crypto::x509::store::{CertificateTrustBuilder, NoRevocation, TrustBuilder};
 	use tightbeam::crypto::x509::KeyCurves;
+	use tightbeam::der::asn1::BitString;
 	use tightbeam::testing::{TestCertificate, TestIdentity, TestKey};
 	use tightbeam::trace::TraceCollector;
 
@@ -568,8 +565,9 @@ mod tests {
 	/// A claim of the signer of [`TestKey::insecure_fixed_signing`] at `order`.
 	fn claim(order: UnixMillis) -> VerifiedClaim {
 		let certificate = TestCertificate::self_signed(&TestKey::insecure_fixed_signing());
-		let signer_key = SignerKey::of(&certificate.tbs_certificate.subject_public_key_info);
-		VerifiedClaim { signer_key: signer_key.expect("a fixed key signs"), order, forwarded: Vec::new() }
+		let peer = SignerPeer::parse(certificate, KeyPurposes::HOUSE.signer).expect("a fixed key admits as a signer");
+		let signer_key = SignerKey::of(&peer).expect("a fixed key signs");
+		VerifiedClaim { signer_key, order, forwarded: Vec::new() }
 	}
 
 	#[tokio::test]
@@ -731,6 +729,7 @@ mod tests {
 			let envelope = ClaimEnvelope { signer, ..claim.envelope.clone() };
 			Ok(CallClaim { encoded: envelope.to_der()?, envelope })
 		};
+
 		let (replayed, refused) = (Some(CallFault::Replayed), Some(CallFault::ClaimRefused));
 		let presented = [
 			(claim.clone(), None, "the first spend MUST take the key"),
@@ -752,6 +751,52 @@ mod tests {
 			};
 			assert_eq!(spent, expected, "{reason}");
 		}
+		Ok(())
+	}
+
+	/// A signer key held as its bare x-coordinate, whose first octet names a
+	/// SEC 1 form, refuses its claim before any spend.
+	#[tokio::test]
+	async fn a_bare_x_coordinate_that_starts_as_a_sec1_form_is_refused() -> Result<(), Box<dyn std::error::Error>> {
+		for form in [0x02_u8, 0x03, 0x04] {
+			let (key, bare) = loop {
+				let key = Secp256k1SigningKey::random(&mut OsRng);
+				let point = key.verifying_key().to_encoded_point(true);
+				let x = point.as_bytes()[1..].to_vec();
+				if x[0] == form {
+					break (key, x);
+				}
+			};
+
+			let authority = Secp256k1SigningKey::random(&mut OsRng);
+			let root = TestCertificate::authority(&authority, "claims root")?;
+			let signing = KeyUsage(KeyUsages::DigitalSignature.into());
+			let issued = TestCertificate::issued(&authority, "claims root", &key, "web", 1, signing)?;
+			let mut held = TestCertificate::issued(&authority, "claims root", &key, "web", 2, signing)?;
+			held.tbs_certificate.subject_public_key_info.subject_public_key = BitString::from_bytes(&bare)?;
+
+			let held = TestCertificate::signed_by(held, &authority);
+			let builder = CertificateTrustBuilder::new(Secp256k1Policy::default(), KeyCurves::HOUSE, NoRevocation);
+			let claims = builder.with_certificate(root)?.build();
+
+			let lifetime = Duration::from_secs(60);
+			let tls_leaf = TlsAuthority::mint("CN=edge root", lifetime)?.caller("CN=web", None)?;
+			let tls_leaf = tls_leaf.leaf();
+			let method: MethodPath = "/orders.v1.Orders/Place".parse()?;
+			let identity = TestIdentity::presenting(issued.clone(), &key);
+			let claim = ClaimSigner::new(identity, [], tls_leaf).sign(&method, b"order").await?;
+			let envelope = ClaimEnvelope { signer: held, ..claim.envelope.clone() };
+			let bare = CallClaim { encoded: envelope.to_der()?, envelope };
+
+			let principal = Principal::of(&issued).ok_or("the signer names a principal")?;
+			let leaf = LeafDigest::of(tls_leaf.as_ref());
+			let whole = claim.verify(&principal, &leaf, &method, b"order", &claims).err();
+			assert_eq!(whole, None, "the claim under the whole point MUST verify");
+
+			let refused = bare.verify(&principal, &leaf, &method, b"order", &claims).err();
+			assert_eq!(refused, Some(CallFault::ClaimRefused), "a bare x-coordinate MUST be refused");
+		}
+
 		Ok(())
 	}
 }

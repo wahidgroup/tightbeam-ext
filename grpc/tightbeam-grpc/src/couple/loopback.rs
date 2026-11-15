@@ -101,7 +101,7 @@ enum Offer<P: HandshakeProvider + Send + Sync + 'static> {
 pub(crate) struct MuxSession {
 	/// The drivers of the session, whose drop ends it once no call holds it.
 	spawned: SpawnedMux,
-	/// The places of the open calls.
+	/// The places of the open calls, which close at the renewal.
 	open: Arc<Semaphore>,
 	/// The cancels that the calls of the session left with the gateway.
 	cancels: AtomicU32,
@@ -136,14 +136,10 @@ impl MuxSession {
 		!self.spawned.drivers.is_finished()
 	}
 
-	/// Whether the session takes a new call: it carries, and does not renew.
+	/// Whether the session takes a new call: it carries, and its places are
+	/// open.
 	fn admits(&self) -> bool {
-		self.carries() && !self.renews_now()
-	}
-
-	/// Whether the cancels of the session reached [`MuxSession::RENEWAL`].
-	fn renews_now(&self) -> bool {
-		self.cancels.load(Ordering::Acquire) >= Self::RENEWAL
+		self.carries() && !self.open.is_closed()
 	}
 
 	/// A place for one call, once one comes free within `expires`. The lease
@@ -151,14 +147,11 @@ impl MuxSession {
 	///
 	/// # Errors
 	///
-	/// - [`Refusal::Renewing`] -- the session renews.
+	/// - [`Refusal::Renewing`] -- the session renews, so its places closed.
 	/// - [`Refusal::Fault`] -- no place came free within `expires`, or the clock gave the wait no timer.
 	async fn lease(self: &Arc<Self>, expires: &Deadline) -> Result<CancelLease, Refusal> {
 		let place = expires.bound(Arc::clone(&self.open).acquire_owned()).await;
-		let place = place?.map_err(|_| CallFault::Unavailable)?;
-		if self.renews_now() {
-			return Err(Refusal::Renewing);
-		}
+		let place = place?.map_err(|_| Refusal::Renewing)?;
 
 		Ok(CancelLease { session: Arc::clone(self), place: Some(place), owed: AtomicBool::new(false) })
 	}
@@ -238,6 +231,14 @@ impl CancelLease {
 	pub(crate) fn settle(&mut self) {
 		self.place = None;
 	}
+
+	/// Settle the lease of an attempt that failed with `failure`, unless the
+	/// failure may leave its stream live at the gateway.
+	fn failed(&mut self, failure: &SendFailure) {
+		if !failure.leaves_live() {
+			self.settle();
+		}
+	}
 }
 
 impl Drop for CancelLease {
@@ -249,6 +250,7 @@ impl Drop for CancelLease {
 
 		let cancels = self.session.cancels.fetch_add(1, Ordering::AcqRel) + 1;
 		if cancels == MuxSession::RENEWAL {
+			self.session.open.close();
 			self.session.renewal.notify_one();
 		}
 	}
@@ -398,13 +400,16 @@ impl Duplex {
 	///   byte of the head may have left.
 	/// - [`SendFailure::Stalled`] -- the push waited past the read deadline of the session.
 	pub(crate) async fn push_head(self, head: &HeadPart, expires: &Deadline) -> Result<OpenedDuplex, SendFailure> {
-		let Self { mut sink, body, lease } = self;
+		let Self { mut sink, body, mut lease } = self;
 		lease.arm();
-		match expires.bound(sink.push(head.as_bytes())).await {
-			Ok(Ok(())) => Ok(OpenedDuplex { sink, body, lease }),
-			Ok(Err(error)) => Err(SendFailure::of_push(error)),
-			Err(_) => Err(SendFailure::Unanswered),
-		}
+		let failure = match expires.bound(sink.push(head.as_bytes())).await {
+			Ok(Ok(())) => return Ok(OpenedDuplex { sink, body, lease }),
+			Ok(Err(error)) => SendFailure::of_push(error),
+			Err(_) => SendFailure::Unanswered,
+		};
+
+		lease.failed(&failure);
+		Err(failure)
 	}
 }
 
@@ -452,8 +457,9 @@ impl<P: HandshakeProvider + Send + Sync + 'static> Held<P> {
 
 		let sent = free.take(|| lease.during(expires.bound(handle.emit_on_stream(work)))).await;
 		let sent = sent.map_err(|fault| SendFailure::of_take(fault, expires));
-		if !sent.as_ref().err().is_some_and(SendFailure::leaves_live) {
-			lease.settle();
+		match &sent {
+			Ok(_) => lease.settle(),
+			Err(failure) => lease.failed(failure),
 		}
 
 		sent
@@ -828,7 +834,13 @@ mod tests {
 	use tightbeam::Version;
 	use tokio::net::{TcpListener, TcpStream};
 
-	use super::super::message::{CoupledPart, PartWire};
+	use core::time::Duration;
+	use tightbeam_ws::testing::Identity;
+
+	use super::super::message::{CoupledCall, CoupledPart, PartWire, StreamTerms};
+	use super::super::method::MethodPath;
+	use super::super::routes::StreamShape;
+	use super::super::voucher::{Identities, RequestId, Voucher};
 	use super::*;
 
 	type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -865,6 +877,21 @@ mod tests {
 		let part = PartWire::Message(OctetString::new(b"order".to_vec())?);
 		let draft = Version::V1.compose().with_id(b"call").with_order(1);
 		Ok(draft.with_message(CoupledPart { part }).build()?)
+	}
+
+	/// The head of a stream, signed by the voucher of minted identities.
+	async fn head() -> Result<HeadPart, Box<dyn std::error::Error>> {
+		let lifetime = Duration::from_secs(60);
+		let session = Identity::mint("CN=session", 2, lifetime)?;
+		let signer = Identity::mint("CN=coupler", 3, lifetime)?;
+		let identities = Identities { handshake: session.signing_identity(), signer: signer.signing_identity() };
+		let voucher = Voucher::new(identities);
+		let terms = StreamTerms::new(StreamShape::Bidi, 4096);
+		let method: MethodPath = "/orders.v1.Orders/Watch".parse()?;
+
+		let signed = voucher.sign(CoupledCall::head(&method, terms)?, RequestId::new([1; 16])).await;
+		let signed = signed.map_err(|fault| format!("{fault:?}"))?;
+		Ok(signed.into_head(terms).map_err(|fault| format!("{fault:?}"))?)
 	}
 
 	/// The lease that `session` gives at once, if any, outside the budget of
@@ -1043,6 +1070,26 @@ mod tests {
 			1,
 			"a send whose Open may have left MUST count a cancel"
 		);
+		Ok(())
+	}
+
+	#[tokio::test]
+	async fn a_head_that_a_draining_session_refuses_counts_no_cancel() -> TestResult {
+		let (session, _peer) = session().await?;
+		let head = head().await?;
+		let (sink, body) = session.spawned.handle.open_duplex()?;
+		let duplex = Duplex { sink, body, lease: leased(&session, &unbounded())? };
+
+		session.spawned.handle.shutdown().await?;
+
+		let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+		let expires = Deadline::after(&clock, Duration::from_secs(10));
+		let failure = duplex.push_head(&head, &expires).await.err();
+		let refused = matches!(failure, Some(SendFailure::Transport(_)));
+		assert!(refused, "a draining session MUST refuse the head, got {failure:?}");
+
+		let cancels = session.cancels.load(Ordering::Acquire);
+		assert_eq!(cancels, 0, "a head that opened no stream MUST count no cancel");
 		Ok(())
 	}
 }
