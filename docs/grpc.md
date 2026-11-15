@@ -63,17 +63,51 @@ assert_eq!(bound, GrpcAddr::from(listener.local_addr()));
 | `EdgeProfile::edge()` | Once per bind, before it binds | `Edge::h2c()`, `Edge::tls(..)`, `Edge::coupled(..)` |
 | `EdgeProfile::dial()` | Once per dial                  | `Dial::H2c` or `Dial::Tls`                          |
 
-- A profile reads its own files. A failure is an `edge::EdgeError`. A coupler that refuses its configuration fails with `couple::CoupleError`, which converts to `EdgeError::Couple`.
-- A bind builds its TLS acceptor, its client verifier, and the pin of its coupler before it binds its socket, so a refused profile binds no socket. A coupled edge bound in the clear fails with `MissingEncryption`, and a refused certificate with `InvalidCertificate`.
-- `staged_profile! { Orders }` declares a profile whose material its process stages at run time, through `Orders::stage(edge, dial)`, before its gateway binds. Its cell is static, so it holds one deployment per process, and each deployment of one process declares a type.
-- Under `instrument`, `Edge::with_trace(trace)` is the one trace of each bind of the edge, from its first connection on: the refusals of the edge, its PROXY headers, and the calls of its coupler. A gateway binds its edge with no trace of its own.
-- `Edge::with_clock(clock)` runs every timer of each bind on a tightbeam `Clock`, in place of `SystemClock`: the deadline of each connection and of its PROXY header and TLS handshake, the pause after a failed accept, and each deadline of each tunnel transport. On a coupled edge it also runs the deadline of each call, the call limit of each watch, and the transport, the probes, and the backoff of the loopback session.
+#### Failures
+
+- A profile reads its own files. A failure is an `edge::EdgeError`.
+- A coupler that refuses its configuration fails with `couple::CoupleError`, which converts to `EdgeError::Couple`.
+- A bind builds its TLS acceptor, its client verifier, and the pin of its coupler before it binds its socket, so a refused profile binds no socket.
+
+| The bind                          | Fails with           |
+| --------------------------------- | -------------------- |
+| A coupled edge bound in the clear | `MissingEncryption`  |
+| A refused certificate             | `InvalidCertificate` |
+
+#### Staged profiles
+
+- `staged_profile! { Orders }` declares a profile whose material its process stages at run time, through `Orders::stage(edge, dial)`, before its gateway binds.
+- Its cell is static, so it holds one deployment per process.
+- Each deployment of one process declares a type.
+
+#### Trace and clock
+
+- Under `instrument`, `Edge::with_trace(trace)` is the one trace of each bind of the edge, from its first connection on: the refusals of the edge, its PROXY headers, and the calls of its coupler.
+- A gateway binds its edge with no trace of its own.
+- `Edge::with_clock(clock)` runs every timer of each bind on a tightbeam `Clock`, in place of `SystemClock`.
+
+| On                   | The clock runs                                                                                                                                         |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Every edge           | The deadline of each connection and of its PROXY header and TLS handshake, the pause after a failed accept, and each deadline of each tunnel transport |
+| A coupled edge, also | The deadline of each call, the call limit of each watch, and the transport, the probes, and the backoff of the loopback session                        |
+
 - On a coupled edge, the same clock gives the time that the coupler judges the freshness of each claim and the expiry of each bearer token at.
-- A clock that gives a wait no timer, `Lapse::NoTimer`, refuses that wait: a connection as `no-timer`, a health watch with 13, and a coupled call with 13, or with 4 when the wait is its send or the push of the head of its stream.
+- A clock that gives a wait no timer, `Lapse::NoTimer`, refuses that wait:
+
+| The wait                                                                | Refuses with |
+| ----------------------------------------------------------------------- | ------------ |
+| Of a connection                                                         | `no-timer`   |
+| Of a health watch                                                       | 13           |
+| Of a coupled call                                                       | 13           |
+| Of the send of a coupled call, or of the push of the head of its stream | 4            |
+
+#### TLS
+
 - `EdgeTls::from_pem(EdgeTlsFiles { chain, key })` loads the edge certificate. `DialTls::from_pem(roots)` loads the dial roots.
 - The edge certificate names the host that a dial verifies.
 - TLS 1.3 and ALPN `h2` only, under rustls with ring.
-- The edge resumes no TLS session, so each connection runs a full handshake, and the edge verifies its client chain at that handshake.
+- The edge resumes no TLS session, so each connection runs a full handshake.
+- The edge verifies its client chain at that handshake.
 
 ```rust
 use tightbeam::crypto::profiles::DefaultCryptoProvider;
@@ -97,22 +131,39 @@ impl EdgeProfile for Orders {
 type OrdersEdge = GrpcListener<DefaultCryptoProvider, Orders>;
 ```
 
+#### Testing
+
 Tests: `tests/tls.rs` and `tests/edge.rs`. The `testing` feature adds:
 
-- `testing::TlsAuthority`, which creates a TLS PKI at run time.
-- `testing::CoupledStack`, the coupled edge of the e2e stack: its routes, its callers, and its files. `write(lifetime, claims)` stages the whole set beside its directory, and a rename publishes it, so the directory holds every file from the moment it exists.
-- Under `couple`, `testing::StreamParts` and `testing::PartFrames`, the parts of a coupled stream as any peer writes and reads them, under keys that the peer picks. `StreamParts::open` takes the `testing::StreamSigners` of the head and of the later parts, and gives the `testing::OpenedStream` of the framed head and those parts.
+| Item                                          | Gives                                                                                                           |
+| --------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| `testing::TlsAuthority`                       | A TLS PKI, created at run time                                                                                  |
+| `testing::CoupledStack`                       | The coupled edge of the e2e stack: its routes, its callers, and its files                                       |
+| `testing::StreamParts`, `testing::PartFrames` | Under `couple`, the parts of a coupled stream as any peer writes and reads them, under keys that the peer picks |
+
+- `CoupledStack::write(lifetime, claims)` stages the whole set beside its directory, and a rename publishes it, so the directory holds every file from the moment it exists.
+- `StreamParts::open` takes the `testing::StreamSigners` of the head and of the later parts.
+- It gives the `testing::OpenedStream` of the framed head and those parts.
 
 ### PROXY protocol
 
 - `Edge::with_proxy_protocol(ProxyHops::new(["10.0.0.0/8"])?)` reads a PROXY protocol v2 header from each connection of those hops.
-- The source address of the header becomes the peer that `accept` yields.
-- A `LOCAL` header, such as a health check of the hop, keeps the hop as the peer.
-- A connection of a hop with no header, or a malformed one, closes.
-- The edge reads a header from the addresses of its hops alone, so only a hop names another client.
 - The header is read before TLS, under the slot and the deadline of the connection.
-- Under `instrument`, `Edge::with_trace(trace)` records each header that the edge reads as `events::PROXY_HEADER_READ`, labeled `client` or `local`, with the peer it takes as its value.
-- It records each header that it refuses as `events::PROXY_HEADER_REFUSED`: `malformed` for no header or a malformed one, and `ended` for a connection that ends within its header.
+- The edge reads a header from the addresses of its hops alone, so only a hop names another client.
+
+| The header of a hop                           | The edge                                    |
+| --------------------------------------------- | ------------------------------------------- |
+| Carries a source address                      | Yields that address as the peer of `accept` |
+| Is `LOCAL`, such as a health check of the hop | Keeps the hop as the peer                   |
+| Is missing or malformed                       | Closes the connection                       |
+
+Under `instrument`, `Edge::with_trace(trace)` records:
+
+| Event                          | Label               | For                                                                  |
+| ------------------------------ | ------------------- | -------------------------------------------------------------------- |
+| `events::PROXY_HEADER_READ`    | `client` or `local` | Each header that the edge reads, with the peer it takes as its value |
+| `events::PROXY_HEADER_REFUSED` | `malformed`         | No header, or a malformed one                                        |
+| `events::PROXY_HEADER_REFUSED` | `ended`             | A connection that ends within its header                             |
 
 ## Connection slots
 
@@ -244,21 +295,64 @@ Under `couple`, `Edge::coupled(EdgeTls, Coupler)` serves stock gRPC callers besi
 | A chain in `x-forwarded-client-cert`, from `with_forwarding_proxy(principal)` | The forwarded leaf, as above              | `Vouched`                 |
 | A JWT-SVID in `authorization: Bearer`, under `with_bearer(BearerTrust)`       | Its `sub`                                 | `Bearer`                  |
 
-- A subject principal is the subject as `Principal::subject` parses its RFC 4514 string, so a PrintableString subject and a UTF8String subject of the same text are one principal.
-- A principal SPIFFE ID names a workload: `spiffe://`, a trust domain of lowercase letters, digits, `.`, `-`, and `_`, and a path of one or more segments. Each segment is letters, digits, `.`, `-`, and `_`, and is neither `.` nor `..`.
-- A certificate with two SPIFFE IDs, or with a `spiffe://` URI off that grammar, such as `spiffe://acme`, names no principal, and its call refuses with 16. The TLS path, the bearer path, and each servlet read a principal by this one rule.
-- A connection of the forwarding proxy names its caller by the last XFCC element, the one the proxy appended, or else by a bearer token. The edge verifies the forwarded chain under its own roots and CRLs.
+A call that proves no caller refuses with 16.
+
+#### Principals
+
+- A subject principal is the subject as `Principal::subject` parses its RFC 4514 string.
+- A PrintableString subject and a UTF8String subject of the same text are one principal.
+- A principal SPIFFE ID names a workload:
+
+| Part         | Holds                                                                                |
+| ------------ | ------------------------------------------------------------------------------------ |
+| Scheme       | `spiffe://`                                                                          |
+| Trust domain | Lowercase letters, digits, `.`, `-`, and `_`                                         |
+| Path         | One or more segments of letters, digits, `.`, `-`, and `_`, none of them `.` or `..` |
+
+- A certificate with two SPIFFE IDs, or with a `spiffe://` URI off that grammar, such as `spiffe://acme`, names no principal. Its call refuses with 16.
+- The TLS path, the bearer path, and each servlet read a principal by this one rule.
+
+#### The caller of a connection
+
+| The connection                       | Names its caller by                                                       |
+| ------------------------------------ | ------------------------------------------------------------------------- |
+| Of the forwarding proxy              | The last XFCC element, the one the proxy appended, or else a bearer token |
+| Any other, with a client certificate | Its own certificate, whatever its headers say                             |
+| Any other, with none                 | A bearer token                                                            |
+
+- The edge verifies a forwarded chain under its own roots and CRLs.
 - A client chain may pass through intermediate authorities to a TLS root. A caller presents them after its leaf, and a proxy forwards them in `Chain`.
-- The XFCC field follows the Envoy grammar strictly. Two fields, an unknown or repeated key, or a value that is neither a token nor one whole quoted string refuses the call with 16.
+
+#### XFCC
+
+- The XFCC field follows the Envoy grammar strictly.
+- Two fields, an unknown or repeated key, or a value that is neither a token nor one whole quoted string refuses the call with 16.
 - `Cert` holds one certificate. A `Chain` beside a `Cert` starts with it.
 - Set the proxy to replace the field, Envoy `SANITIZE_SET`, so each field that reaches the edge is one that the proxy set.
-- Any other connection with a client certificate names its own caller, whatever its headers say.
-- A connection with none names its caller by a bearer token.
-- `BearerTrust::from_jwks(trust_domain, audience, jwks)` pins the ES256 keys of the bundle of one trust domain by `kid`. A trust domain off its grammar refuses with `CoupleError::Principal`.
-- A token MUST carry `alg` `ES256`, a known `kid`, the audience in `aud`, an `exp`, and the SPIFFE ID of a workload of the trust domain in `sub`. `with_leeway` widens `exp` and `nbf`, by `BearerTrust::DEFAULT_LEEWAY` unless it is set.
-- `exp` and an `nbf` are NumericDates: JSON numbers of seconds since the epoch, which may hold a fraction. A token whose `exp` or `nbf` is any other value refuses with 16.
-- `authorization` and `x-forwarded-client-cert` name the caller to the edge alone. `with_forwarded_metadata` and `CoupledCall::with_metadata` refuse them.
-- A call that proves no caller refuses with 16.
+
+#### Bearer tokens
+
+- `BearerTrust::from_jwks(trust_domain, audience, jwks)` pins the ES256 keys of the bundle of one trust domain by `kid`.
+- A trust domain off its grammar refuses with `CoupleError::Principal`.
+
+| A token MUST carry | With                                            |
+| ------------------ | ----------------------------------------------- |
+| `alg`              | `ES256`                                         |
+| `kid`              | A known key                                     |
+| `aud`              | The audience                                    |
+| `exp`              | An expiry                                       |
+| `sub`              | The SPIFFE ID of a workload of the trust domain |
+
+- `with_leeway` widens `exp` and `nbf`, by `BearerTrust::DEFAULT_LEEWAY` unless it is set.
+- `exp` and an `nbf` are NumericDates: JSON numbers of seconds since the epoch, which may hold a fraction.
+- A token whose `exp` or `nbf` is any other value refuses with 16.
+
+#### Reserved headers
+
+- `authorization` and `x-forwarded-client-cert` name the caller to the edge alone.
+- `with_forwarded_metadata` and `CoupledCall::with_metadata` refuse them.
+
+#### Revocation
 
 `CallerTrust::with_crls(crls)` checks each client chain, direct or forwarded, against the CRL of each issuer:
 
@@ -268,6 +362,8 @@ Under `couple`, `Edge::coupled(EdgeTls, Coupler)` serves stock gRPC callers besi
 | A certificate whose issuer has no CRL in `crls`  | `unknown_ca`                             | 16                                      |
 | A certificate under a CRL past its `nextUpdate`  | `unknown_ca`                             | 16                                      |
 
+#### Assurance
+
 | Assurance | The call carries                                                     |
 | --------- | -------------------------------------------------------------------- |
 | `Bearer`  | A verified bearer token, which anyone who holds it can present       |
@@ -276,19 +372,30 @@ Under `couple`, `Edge::coupled(EdgeTls, Coupler)` serves stock gRPC callers besi
 
 - A route that requires `Vouched` refuses a `Bearer` call with 7.
 - A claim signer is a tightbeam identity for the same principal, under the claim store of `CallerTrust`.
-- A claim covers the method, the body hash, and the TLS certificate hash, so a bearer caller holds no claim. The [claim encoding](#claim-encoding) specifies it.
+- A claim covers the method, the body hash, and the TLS certificate hash, so a bearer caller holds no claim.
+- The [claim encoding](#claim-encoding) specifies a claim.
 - A bad claim refuses with 16, and the call stays refused at any lower assurance.
-- The coupler spends each claim once in its claim ledger, within the replay window: `Coupler::DEFAULT_REPLAY_WINDOW`, or `Coupler::with_replay_window`, which takes a window of at most one day.
+- The coupler spends each claim once in its claim ledger, within the replay window.
+- The window is `Coupler::DEFAULT_REPLAY_WINDOW`, or `Coupler::with_replay_window`, which takes a window of at most one day.
 
 ### Claim ledger
 
-- A `couple::ClaimLedger` driver holds the spent claims. The coupler holds `MemoryLedger`, of its process alone, unless `Coupler::with_claim_ledger(Arc<dyn ClaimLedger>)` sets another.
-- A clone of a coupler shares its ledger, and each bind of a clone starts its own replay window and loopback session.
+- A `couple::ClaimLedger` driver holds the spent claims.
+- The coupler holds `MemoryLedger`, of its process alone, unless `Coupler::with_claim_ledger(Arc<dyn ClaimLedger>)` sets another.
+- A clone of a coupler shares its ledger. Each bind of a clone starts its own replay window and loopback session.
 - Replicas of an edge that share one ledger spend a claim once between them.
-- A `ClaimSpend` carries the `ClaimKey` that names the claim, the `SignerDigest` of its signer, its expiry, and a `HolderId` of its own. The coupler builds a spend only from a verified claim, and `testing::LedgerConformance` builds its own.
-- The key of a spend is the SHA-256 of the canonical public key of the signer and the order of the claim, because one signer issues one claim at one order. A claim that names another certificate of that key, with its point in either SEC 1 form, spends the same key. A signer key whose point is in another form refuses the claim with 16.
+
+#### Spends
+
+- A `ClaimSpend` carries the `ClaimKey` that names the claim, the `SignerDigest` of its signer, its expiry, and a `HolderId` of its own.
+- The coupler builds a spend only from a verified claim, and `testing::LedgerConformance` builds its own.
+- The key of a spend is the SHA-256 of the canonical public key of the signer and the order of the claim, because one signer issues one claim at one order.
+- A claim that names another certificate of that key, with its point in either SEC 1 form, spends the same key.
+- A signer key whose point is in another form refuses the claim with 16.
 - The coupler checks the freshness of a claim on its own clock, so a key lives until its claim leaves the window.
 - `ClaimLedger::spend(spend, now)` takes that clock, so a driver judges each expiry at `now` and reads no clock of its own.
+
+#### Drivers
 
 | A driver MUST                                       | Because                                       |
 | --------------------------------------------------- | --------------------------------------------- |
@@ -300,11 +407,17 @@ Under `couple`, `Edge::coupled(EdgeTls, Coupler)` serves stock gRPC callers besi
 | Free a key on `forget` only for its `holder`        | A forget frees the spend that made it alone   |
 | Answer `LedgerError` when the store fails           | A failed spend refuses the call with 14       |
 
-- A driver MAY refuse a fresh key of a signer that holds `REPLAY_GUARD_CAPACITY` live spends or more, as `MemoryLedger` does, the bound of `tightbeam::colony::hive::gates`. The coupler reads that refusal as a replay.
+- A driver MAY refuse a fresh key of a signer that holds `REPLAY_GUARD_CAPACITY` live spends or more, as `MemoryLedger` does.
+- That bound is the bound of `tightbeam::colony::hive::gates`.
+- The coupler reads that refusal as a replay.
 - A failed forget keeps the claim spent, and the call answers its own fault.
-- `testing::LedgerConformance::new(ledger).check()` checks the first six rows of the table against a driver, on a tokio runtime of two workers or more, and refuses any other runtime with `LedgerBreach::Runtime`. A driver runs it in its own tests.
 - The crate ships no driver of a shared store.
-- A call keeps its claim when it times out before it holds a live session, or finds the session dead.
+
+#### Conformance
+
+- `testing::LedgerConformance::new(ledger).check()` checks the first six rows of the table against a driver.
+- It runs on a tokio runtime of two workers or more, and refuses any other runtime with `LedgerBreach::Runtime`.
+- A driver runs it in its own tests.
 
 ### Steps of a coupled call
 
@@ -321,20 +434,47 @@ Under `couple`, `Edge::coupled(EdgeTls, Coupler)` serves stock gRPC callers besi
 | 9    | sends the work, and waits again for a stream that another call took   | colony status |
 | 10   | checks the answer id and its pinned signer                            | 13            |
 
+#### Deadline
+
 - The deadline of the call bounds steps 2 to 10, and refuses with 4 once it passes.
 - From step 8, the spend and the send of step 9 each hold the deadline themselves, so a call answers 4 only after it forgets or keeps the claim.
-- A forget holds the call limit once more, from its own start. A forget that the ledger does not answer within it keeps the claim spent, so a call ends within its deadline and one more call limit.
-- A ledger that answers the spend at the deadline or later may have taken the claim, so the coupler forgets the spend before it answers 4. The caller may retry the claim.
-- The trail records one end of each call: its answer, its refusal, `refused` when tonic refuses its request before the coupler reads it, or `cancelled` when its caller ends it first.
+- A forget holds the call limit once more, from its own start.
+- A forget that the ledger does not answer within it keeps the claim spent, so a call ends within its deadline and one more call limit.
+- tightbeam bounds each wait of a send by the read deadline of the loopback session.
+- A send that this bound ends, under a call limit past it, answers 4 as `stalled`. It keeps its claim spent, because its frame may have left.
+
+#### The claim of a failed call
+
+| The call                                                                                            | Its claim                                                           | Because                                            |
+| --------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------- | -------------------------------------------------- |
+| Times out before it holds a live session, or finds the session dead                                 | Stays with the caller                                               | The spend comes at step 8                          |
+| Gets the answer of its ledger at the deadline or later                                              | Is forgotten before the call answers 4, and the caller may retry it | The ledger may have taken it                       |
+| Fails its send before the frame leaves the session, as `TransportError::is_connection_error` proves | Is forgotten, so the caller may retry it                            | No servlet reads the frame                         |
+| Passes its deadline while it waits again for a stream                                               | Is forgotten                                                        | The session refused its frame for want of a stream |
+| Fails its send in any other way                                                                     | Stays spent                                                         | The frame may have reached the servlet             |
+| Is ended by its caller from step 8 on                                                               | Stays spent, if its ledger took it                                  |                                                    |
+
+- A gateway that refuses the work before its handler runs fails the send before the frame leaves the session.
+- A status that the gateway answers after its handler ran, such as `RESOURCE_EXHAUSTED`, is a send that failed in another way.
+
+#### Limits and the trail
+
 - `Coupler::with_call_limits(CallLimits)` sets the deadline of each call, the coupled connections, and the calls on each one, from the defaults that `CallLimits` documents.
 - `with_call_limits` refuses limits of fewer than 2 streams on a coupler with a stream route, with `CoupleError::Streams`.
 - `CallLimits::with_timeout` takes a deadline of at most one day.
 - The coupler sends each call at most once.
-- A send that fails before the frame leaves the session, as tightbeam proves with `TransportError::is_connection_error`, forgets the spent claim, so the caller may retry it. A gateway that refuses the work before its handler runs is such a send.
-- A send whose deadline passes while it waits again for a stream forgets its claim too, because the session refused its frame for want of a stream.
-- Every other failed send keeps the claim spent, because the frame may have reached the servlet. A status that the gateway answers after its handler ran, such as `RESOURCE_EXHAUSTED`, is one.
-- tightbeam bounds each wait of a send by the read deadline of the loopback session. A send that this bound ends, under a call limit past it, answers 4 as `stalled` and keeps its claim spent, because its frame may have left.
-- A call that its caller ends from step 8 on keeps any claim that its ledger took.
+
+The trail records one end of each call:
+
+| The call                                             | Records     |
+| ---------------------------------------------------- | ----------- |
+| Answers                                              | Its answer  |
+| Refuses                                              | Its refusal |
+| Meets a refusal of tonic before the coupler reads it | `refused`   |
+| Is ended by its caller first                         | `cancelled` |
+
+#### The loopback session
+
 - The loopback session runs into the coupler's own listener, so the gateway admits it like any edge client.
 - The session multiplexes when the gateway sets `pool_config.mux_offer`, and runs one call at a time otherwise.
 - A single session that a call left mid-exchange reopens before it carries another call.
@@ -371,23 +511,43 @@ Under `couple`, `Edge::coupled(EdgeTls, Coupler)` serves stock gRPC callers besi
 | A tunnel edge  | `SERVING` while it listens                                                      |
 | A coupled edge | `SERVING` once the loopback session outlives a probe, `Coupler::LIVENESS_PROBE` |
 
+#### Watches
+
 - `Check` refuses a named service with 5. `Watch` reads `SERVICE_UNKNOWN` for one, and holds.
 - `Watch` answers the status at once, then each change.
-- A watch of a caller that the edge identifies, and that a grant names, holds its connection, and ends with 0 at the call limit of the coupler. The caller watches again.
+- A watch of a caller that the edge identifies, and that a grant names, holds its connection.
+- That watch ends with 0 at the call limit of the coupler, and the caller watches again.
 - The call limit covers the read of the request of the watch too.
 - Any other watch ends with the deadline of its connection.
+
+#### Sessions
+
 - A session that the gateway refuses after its handshake reads `NOT_SERVING`.
 - A session that fails to open, or ends, opens again after `Coupler::SESSION_BACKOFF`.
+- A renewing session that ends while the next one opens reads `NOT_SERVING` at its next probe.
 
 ### gRPC-Web
 
 - `Coupler::with_grpc_web(["https://shop.example"])` serves gRPC-Web, binary and text, to the pages of those origins.
-- The edge answers the CORS preflight of each origin with 204, and lets the page read `grpc-status`, `grpc-message`, and `grpc-status-details-bin`.
-- A preflight or a call from another origin reads 403. A gRPC-Web call with no `origin` is served.
+
+| The request                               | Reads  |
+| ----------------------------------------- | ------ |
+| The CORS preflight of a listed origin     | 204    |
+| A preflight or a call from another origin | 403    |
+| A gRPC-Web call with no `origin`          | Served |
+
+- The edge lets the page read `grpc-status`, `grpc-message`, and `grpc-status-details-bin`.
 - `with_grpc_web` serializes each origin as RFC 6454 does: the scheme and the host in lowercase, and no default port.
-- `with_grpc_web` refuses, with `CoupleError::Origin`, an origin with no scheme or a scheme other than `http` or `https`, with a path, a query, a fragment, a user, or a `*`, with no host, with a port that is no number up to 65535, or with an authority that does not parse as a URI authority, such as a host with a space, a `%`, or a byte outside ASCII.
 - A page presents no client certificate, so its calls usually prove `Bearer`.
 - A server stream answers each message in order, then its status in the trailer frame.
+
+`with_grpc_web` refuses, with `CoupleError::Origin`, an origin with:
+
+- No scheme, or a scheme other than `http` or `https`
+- A path, a query, a fragment, a user, or a `*`
+- No host
+- A port that is no number up to 65535
+- An authority that does not parse as a URI authority, such as a host with a space, a `%`, or a byte outside ASCII
 
 ### Reflection
 
@@ -399,33 +559,91 @@ Under `couple`, `Edge::coupled(EdgeTls, Coupler)` serves stock gRPC callers besi
 ### Metadata, deadline, details, compression
 
 - `Coupler::with_forwarded_metadata(keys)` forwards every value of those request headers, such as `traceparent`, to the servlet.
-- It refuses with `CoupleError::Metadata` a key outside `a-z0-9-_.`, under `grpc-`, a key that the edge stamps, `tightbeam-principal-bin` or `tightbeam-claim-bin`, a connection header such as `te` or `host`, a credential header, or a repeat. A value that does not decode refuses the call with 3.
+- A value that does not decode refuses the call with 3.
+
+`with_forwarded_metadata` refuses with `CoupleError::Metadata`:
+
+- A key outside `a-z0-9-_.`
+- A key under `grpc-`
+- A key that the edge stamps, `tightbeam-principal-bin` or `tightbeam-claim-bin`
+- A connection header, such as `te` or `host`
+- A credential header
+- A repeat
+
+#### Deadline and compression
+
 - Each `CoupledCall` carries what remains of its deadline, in milliseconds, counted after the call holds the session.
 - The coupled edge accepts and sends gzip.
-- tonic refuses a request message past the envelope ceiling with 11, and one that decompresses past it with 8. The caller of a unary call or a stream reads that code, and the trail records the call as `refused`.
+- tonic refuses a request message past the envelope ceiling with 11, and one that decompresses past it with 8.
+- The caller of a unary call or a stream reads that code, and the trail records the call as `refused`.
 
 ### `AdmittedCall` and `AdmittedStream`
 
-- `AdmittedCall::admit(frame, trust)` takes the principal and the assurance from the signer of a direct call, or from the origin that a voucher signs. A frame that does not admit refuses with `WorkRefused(Unauthenticated)`, and the head of a stream with `WorkRefused(InvalidArgument)`.
-- `AdmissionTrust::new()` trusts no sender. `with_vouchers`, `with_direct_callers`, and `with_claim_signers` each admit one kind, and a call of a kind that no setter names refuses.
+#### Admission
+
+- `AdmittedCall::admit(frame, trust)` takes the principal and the assurance from the signer of a direct call, or from the origin that a voucher signs.
+- A frame that does not admit refuses with `WorkRefused(Unauthenticated)`, and the head of a stream with `WorkRefused(InvalidArgument)`.
+- `AdmissionTrust::new()` trusts no sender.
+- `with_vouchers`, `with_direct_callers`, and `with_claim_signers` each admit one kind. A call of a kind that no setter names refuses.
 - Pass `CallerTrust::claim_store` to `with_claim_signers`, so the servlet checks claims under the same store as the edge.
 - `with_part_ceiling` bounds the parts of a stream, `DEFAULT_MAX_ENCRYPTED_ENVELOPE` by default.
-- `origin()` of an `AdmittedCall` or an `AdmittedStream` reads its `Origin`: `principal()`, `assurance()`, `method()`, `metadata()`, each `Metadata` entry by its key and its value, and `remaining()`, the time left to its deadline.
-- `Origin::stamp(metadata)` writes the identity of the call onto the metadata of a call that an adapter makes for it: each forwarded entry, the principal in `Origin::PRINCIPAL_KEY`, `tightbeam-principal-bin`, and any claim in `tightbeam-claim-bin`.
-- `reply(body, signer)` answers status 0, and `fail(status, signer)` any other status, under the identity that the route pins. `fail` carries the status details to `grpc-status-details-bin`.
-- `AdmittedStream::admit(body, reply, trust, signer)` admits the head of a stream in a duplex arm, and binds the signer of every answer part. Each later request part must verify under the signer of the head.
-- `split()` gives an `AdmittedStreamParts` of the `Origin`, the `StreamRequests`, and the `StreamAnswers`, so each direction runs on its own.
-- `StreamRequests::next()` reads a request, and `None` at the close. `StreamAnswers::send(body)`, `finish()`, and `end(status)` answer. `end` with status 0 is `finish`.
-- `next` and `send` refuse with a `StreamRefusal`. `StreamRefusal::end(answers)` ends an `Ends`, a part that does not admit or send, with a signed end part of its status, and fails the stream on a `Breaks`, a push that stopped or failed.
-- `end` with status 0 short of the count of the method ends with 12, and an end part past the part ceiling ends with 8.
-- A head or a part that does not admit ends the stream with the status that the `# Errors` of `AdmittedStream::admit` and `StreamRequests::next` give for it: 16, 3, 12, 8, or 14.
+
+#### Origin and answers
+
+- `origin()` of an `AdmittedCall` or an `AdmittedStream` reads its `Origin`.
+- An `Origin` reads `principal()`, `assurance()`, `method()`, `metadata()`, and `remaining()`, the time left to its deadline.
+- `metadata()` reads each `Metadata` entry by its key and its value.
+- `reply(body, signer)` answers status 0, and `fail(status, signer)` any other status, under the identity that the route pins.
+- `fail` carries the status details to `grpc-status-details-bin`.
+
+`Origin::stamp(metadata)` writes the identity of the call onto the metadata of a call that an adapter makes for it:
+
+- Each forwarded entry
+- The principal in `Origin::PRINCIPAL_KEY`, and in `tightbeam-principal-bin`
+- Any claim in `tightbeam-claim-bin`
+
+#### Streams
+
+- `AdmittedStream::admit(body, reply, trust, signer)` admits the head of a stream in a duplex arm, and binds the signer of every answer part.
+- Each later request part must verify under the signer of the head.
 - `AdmittedStream::admit` refuses a head with no stream terms with 3.
+- `split()` gives an `AdmittedStreamParts` of the `Origin`, the `StreamRequests`, and the `StreamAnswers`, so each direction runs on its own.
+- `StreamRequests::next()` reads a request, and `None` at the close.
+- `StreamAnswers::send(body)`, `finish()`, and `end(status)` answer. `end` with status 0 is `finish`.
+- `end` with status 0 short of the count of the method ends with 12.
+- An end part past the part ceiling ends with 8.
+
+#### Stream refusals
+
+`next` and `send` refuse with a `StreamRefusal`. `StreamRefusal::end(answers)` acts by its kind:
+
+| `StreamRefusal` | Is                                 | `end` does                                           |
+| --------------- | ---------------------------------- | ---------------------------------------------------- |
+| `Ends`          | A part that does not admit or send | Ends the stream with a signed end part of its status |
+| `Breaks`        | A push that stopped or failed      | Fails the stream                                     |
+
+A head or a part that does not admit ends the stream with the status that the `# Errors` of `AdmittedStream::admit` and `StreamRequests::next` give for it: 16, 3, 12, 8, or 14.
 
 ### Events and tests
 
-- Under `instrument`, the trace of the profile records `COUPLED_CALL_OPENED` when a head opens a call on its lane, then `COUPLED_CALL_ADMITTED`, `_REFUSED`, and `_ANSWERED`. A call that its lane refuses reads the label of the lane: `no-permit`, `calls-exhausted`, `other-kind`, or `closed`.
-- It records `COUPLED_SESSION_OPENED` when the loopback session opens, after it reads the deadline of its first probe.
-- It records each spend of a claim as `COUPLED_CLAIM_SPENT`, and each forget as `COUPLED_CLAIM_FORGOTTEN`: `unsent` after a send whose frame stayed in the session, `deadline` after a ledger that answered past the deadline, and `no-timer` after a ledger whose wait the clock gave no timer.
+Under `instrument`, the trace of the profile records:
+
+| Event                                            | When                                                                       |
+| ------------------------------------------------ | -------------------------------------------------------------------------- |
+| `COUPLED_CALL_OPENED`                            | A head opens a call on its lane                                            |
+| `COUPLED_CALL_ADMITTED`, `_REFUSED`, `_ANSWERED` | After it, as the call goes                                                 |
+| `COUPLED_SESSION_OPENED`                         | The loopback session opens, after it reads the deadline of its first probe |
+| `COUPLED_CLAIM_SPENT`                            | Each spend of a claim                                                      |
+| `COUPLED_CLAIM_FORGOTTEN`                        | Each forget, by the label below                                            |
+
+- A call that its lane refuses reads the label of the lane: `no-permit`, `calls-exhausted`, `other-kind`, or `closed`.
+
+| Forget label | After                                       |
+| ------------ | ------------------------------------------- |
+| `unsent`     | A send whose frame stayed in the session    |
+| `deadline`   | A ledger that answered past the deadline    |
+| `no-timer`   | A ledger whose wait the clock gave no timer |
+
 - A mutual edge that refuses the voucher handshake identity reads as [Health](#health) states for a refused session.
 - A gateway whose `EdgePlane` refuses streams answers a stream with 7.
 - Tests: `tests/coupler.rs`, `tests/compensation.rs`, and `tests/stock.rs` in the docker stack.
@@ -441,19 +659,40 @@ Under `couple`, `Edge::coupled(EdgeTls, Coupler)` serves stock gRPC callers besi
 | 3    | connects and calls, within `Backend::with_timeout` | a signed server status, 14, or 4 |
 | 4    | signs the reply                                    | 13                               |
 
+#### Calls
+
 - The adapter presents its client certificate, from `DialTls::with_identity`.
 - Each call carries the principal in `tightbeam-principal-bin`, any claim in `tightbeam-claim-bin`, and the metadata of the coupled call.
 - The deadline is the sooner of `Backend::with_timeout` and the deadline of the coupled call.
+- `Backend::with_clock(clock)` runs the timeout of each call, and the deadline that each admitted call carries, on a tightbeam `Clock`, in place of `SystemClock`.
+- A call whose wait that clock gives no timer ends with 13.
 - The details of a server status reach the caller.
 - The adapter accepts gzip answers.
-- A tightbeam client calls it with `CoupledCall::direct(method, body)`. `with_timeout(duration)` sets its deadline. `with_metadata(key, value)` adds an entry, and refuses as `with_forwarded_metadata` does.
-- `CoupledReply` reads `code()`, `message()`, `body()`, and `details()`, the encoded `google.rpc.Status`. `into_result()` gives the body for status 0, and the status otherwise.
-- `Backend::relay_stream(body, reply)` serves a stream route in the `duplex:` arm. Each request goes on as it arrives, and each answer comes back signed.
+
+#### Tightbeam clients
+
+- A tightbeam client calls the adapter with `CoupledCall::direct(method, body)`.
+- `with_timeout(duration)` sets its deadline.
+- `with_metadata(key, value)` adds an entry, and refuses as `with_forwarded_metadata` does.
+- `CoupledReply` reads `code()`, `message()`, `body()`, and `details()`, the encoded `google.rpc.Status`.
+- `into_result()` gives the body for status 0, and the status otherwise.
+
+#### Streams
+
+- `Backend::relay_stream(body, reply)` serves a stream route in the `duplex:` arm.
+- Each request goes on as it arrives, and each answer comes back signed.
 - A unary route reached as a stream, a stream of another shape, or a stream route reached as a unary call, refuses with a signed 12.
-- A request part that does not admit cancels the call of the server, ends the stream with a signed end part of its status, and records `BACKEND_CALL_REFUSED` as `part`.
-- An answer of the server that the adapter cannot send ends the stream with a signed end part of its own status, which the caller reads: 12 past the count of the method or short of it, and 8 past the part ceiling. It records `part` too.
-- An answer part takes its order once its push lands. A push that the timeout of the adapter cuts ends the stream with 4 and no part after it, and records `part`.
-- `Backend::with_clock(clock)` runs the timeout of each call, and the deadline that each admitted call carries, on a tightbeam `Clock`, in place of `SystemClock`. A call whose wait that clock gives no timer ends with 13.
+- An answer part takes its order once its push lands.
+
+| The stream meets                                             | It ends with                                                            | And records `BACKEND_CALL_REFUSED` as |
+| ------------------------------------------------------------ | ----------------------------------------------------------------------- | ------------------------------------- |
+| A request part that does not admit                           | A cancel of the call of the server, and a signed end part of its status | `part`                                |
+| A server answer past the count of the method, or short of it | A signed end part of 12, which the caller reads                         | `part`                                |
+| A server answer past the part ceiling                        | A signed end part of 8, which the caller reads                          | `part`                                |
+| A push that the timeout of the adapter cuts                  | 4, and no part after it                                                 | `part`                                |
+
+#### Trace and tests
+
 - Under `instrument`, `Backend::with_trace` records `BACKEND_CALL_RELAYED` and `BACKEND_CALL_REFUSED`.
 - Tests: `tests/adapter.rs`.
 
@@ -500,9 +739,11 @@ A hop MUST carry a tunnel unchanged for the life of its session:
 - A TLS edge presents one certificate chain, and admits TLS 1.3 alone.
 - The ALPN of an edge offers `h2` alone, so gRPC-Web runs on HTTP/2.
 - A claim on a stream covers no message of the stream.
+- A claim signer holds a secp256k1 key, the house curve.
 - Bearer tokens are ES256 alone, under pinned keys. The edge fetches no key set.
 - TLS roots, CRLs, and bearer keys load when the edge binds. A rolling restart of the replicas replaces them.
-- `EncryptedProtocol::bind_with` and `cluster!` take no value of a deployment, so a profile is a type. A profile whose material comes at run time stages it in the static cell of `staged_profile!`, one deployment per type.
+- `EncryptedProtocol::bind_with` and `cluster!` take no value of a deployment, so a profile is a type.
+- A profile whose material comes at run time stages it in the static cell of `staged_profile!`, one deployment per type.
 - The PROXY protocol is version 2 alone.
 - Before its handshake, a peer can send one message up to the envelope ceiling ([The Envelope Rules of Message Sockets](wire.md#limitations)).
 

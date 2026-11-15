@@ -95,6 +95,8 @@ For engineers who run a tightbeam colony and need stock gRPC clients or servers 
      -d '{"id":"order-7"}' gateway:9122 orders.v1.Orders/Get
    ```
 
+#### Add a claim for a `Signed` route
+
 For a method routed as `Assurance::Signed`, a Rust caller adds a claim under a tightbeam identity of the same principal:
 
 ```rust
@@ -144,7 +146,9 @@ claim.attach(request.metadata_mut());
 
 4. For a `Signed` route, the caller signs its claim over an empty body: `signer.sign(&method, b"")`.
 5. Set `ClusterConfig::edge` to `EdgePlane::new(addr).with_streams()`.
-6. Keep `CallLimits::with_streams` at 2 streams or more. `Coupler::with_call_limits` refuses fewer with `CoupleError::Streams`, because an open stream would hold the one stream that unary calls need.
+6. Keep `CallLimits::with_streams` at 2 streams or more.
+   - `Coupler::with_call_limits` refuses fewer with `CoupleError::Streams`.
+   - With fewer, an open stream would hold the one stream that unary calls need.
 7. `split()` gives an `AdmittedStreamParts` of the `Origin`, the `StreamRequests`, and the `StreamAnswers`, so each direction can run on a task of its own.
 
 ## Admit callers behind a proxy or with tokens
@@ -217,7 +221,10 @@ let routes = Routes::new().unary("/orders.v1.Orders/Browse", browse, Assurance::
 
 ## Run replicas of a coupled edge
 
-1. Write a driver of `ClaimLedger` over a store that the replicas share: an insert of `ClaimSpend::key` that fails when the key exists or the spend is past its expiry at the `now` of `spend`, with that expiry, and a delete that holds only for `ClaimSpend::holder`.
+1. Write a driver of `ClaimLedger` over a store that the replicas share. It holds:
+   - an insert of `ClaimSpend::key`, with the expiry of the spend
+   - which fails when the key exists, or when the spend is past its expiry at the `now` of `spend`
+   - a delete that holds only for `ClaimSpend::holder`
 2. Check it in its own tests:
 
    ```rust
@@ -269,11 +276,18 @@ let routes = Routes::new().unary("/orders.v1.Orders/Browse", browse, Assurance::
    # }
    ```
 
-2. Host it in a servlet whose input is `CoupledCall`. Answer each frame with `ctx.env_config().relay(&frame).await`, and each stream in the `duplex:` arm with `ctx.env_config().relay_stream(body, reply).await`.
+2. Host it in a servlet whose input is `CoupledCall`:
+   - Answer each frame with `ctx.env_config().relay(&frame).await`.
+   - Answer each stream in the `duplex:` arm with `ctx.env_config().relay_stream(body, reply).await`.
 3. Reach it from either side of the colony:
    - A tightbeam client sends `CoupledCall::direct(method, body)` in a frame it signs.
    - A coupled edge routes a method to the servlet type of the adapter.
-4. The server reads the principal in `tightbeam-principal-bin`, and a signed call's claim in `tightbeam-claim-bin`. A servlet of your own writes both with `Origin::stamp`.
+4. Read the identity of the call at the server:
+   - The server reads the principal in `tightbeam-principal-bin`.
+   - It reads the claim of a signed call in `tightbeam-claim-bin`.
+   - A servlet of your own writes both with `Origin::stamp`.
+
+#### Read the answer in a tightbeam client
 
 A tightbeam client reads the answer as a `CoupledReply`:
 
@@ -299,27 +313,44 @@ let answer: CoupledReply = reply.decode_message()?;
 
 ## Fix a refused call
 
-| Status                 | Cause                                                                          | Fix                                                                               |
-| ---------------------- | ------------------------------------------------------------------------------ | --------------------------------------------------------------------------------- |
-| 16 `UNAUTHENTICATED`   | No client certificate, or one outside `callers-ca.pem`                         | Issue the caller a certificate under the caller CA                                |
-| 16 `UNAUTHENTICATED`   | The SPIFFE ID of the caller names no workload, such as `spiffe://acme`         | Issue the caller a SPIFFE ID with a path, such as `spiffe://acme/billing`         |
-| 16 `UNAUTHENTICATED`   | The bearer token fails its key, its audience, or its time                      | Issue a fresh ES256 JWT-SVID for the audience of `BearerTrust`                    |
-| 16 `UNAUTHENTICATED`   | A call of the forwarding proxy with no chain, or one outside the caller CA     | Set `forward_client_cert_details` on the proxy                                    |
-| 16 `UNAUTHENTICATED`   | A CRL refuses the chain that the proxy forwards                                | Issue the caller a new certificate, or load a fresh CRL of each issuer            |
-| 14 `UNAVAILABLE`       | The handshake failed with `certificate_revoked` or `unknown_ca` under the CRLs | Issue the caller a new certificate, or load a fresh CRL of each issuer            |
-| 7 `PERMISSION_DENIED`  | A stream, and the `EdgePlane` of the gateway refuses streams                   | Set `EdgePlane::with_streams`                                                     |
-| 14 `UNAVAILABLE`       | A signed call, and the claim ledger failed                                     | Restore the store of the ledger driver                                            |
-| 403                    | A gRPC-Web call or preflight from an origin that the edge does not serve       | Add the origin to `Coupler::with_grpc_web`                                        |
-| 16 `UNAUTHENTICATED`   | The claim failed, or was spent already                                         | Sign a fresh claim over this method and body, bound to this certificate           |
-| 7 `PERMISSION_DENIED`  | No grant names the principal, or the call proves less than the route requires  | Add the grant, or sign a claim for a `Signed` route                               |
-| 12 `UNIMPLEMENTED`     | The method is not routed                                                       | Route it with `Routes::unary`, `server_stream`, `client_stream`, or `bidi_stream` |
-| 14 `UNAVAILABLE`       | Health reads `NOT_SERVING`: the gateway refuses the voucher handshake          | Trust the handshake identity of the voucher on a mutual edge                      |
-| 14 `UNAVAILABLE`       | The connection already carries a tunnel                                        | Use a separate connection for tunnel and coupled calls                            |
-| 14 `UNAVAILABLE`       | A stream, and the loopback session runs one call at a time                     | Set `pool_config.mux_offer` on the gateway                                        |
-| 12 `UNIMPLEMENTED`     | A second request to a server-streaming method, or none to it                   | Send exactly one request message                                                  |
-| 12 `UNIMPLEMENTED`     | The servlet answers a count of messages that the route does not take           | Send exactly one response message on a unary or client-streaming route            |
-| 8 `RESOURCE_EXHAUSTED` | The edge carries its most streams at once                                      | Retry later, or raise `CallLimits::with_streams`                                  |
-| 3 `INVALID_ARGUMENT`   | A forwarded metadata value does not decode                                     | Send a valid value, or drop the header                                            |
-| 4 `DEADLINE_EXCEEDED`  | The call outlived its `grpc-timeout` or `CallLimits::with_timeout`             | Raise the deadline. An unspent claim can be retried                               |
-| 13 `INTERNAL`          | The answer is signed by a key that the route does not pin                      | Pass the certificate the servlet signs under to `Servlet::new`                    |
-| 8 `RESOURCE_EXHAUSTED` | The call, or a part of its stream, passes the envelope ceiling of the edge     | Send a smaller body, or raise `TransportLimits` on the edge                       |
+#### Caller identity and claims
+
+| Status               | Cause                                                                          | Fix                                                                       |
+| -------------------- | ------------------------------------------------------------------------------ | ------------------------------------------------------------------------- |
+| 16 `UNAUTHENTICATED` | No client certificate, or one outside `callers-ca.pem`                         | Issue the caller a certificate under the caller CA                        |
+| 16 `UNAUTHENTICATED` | The SPIFFE ID of the caller names no workload, such as `spiffe://acme`         | Issue the caller a SPIFFE ID with a path, such as `spiffe://acme/billing` |
+| 16 `UNAUTHENTICATED` | The bearer token fails its key, its audience, or its time                      | Issue a fresh ES256 JWT-SVID for the audience of `BearerTrust`            |
+| 16 `UNAUTHENTICATED` | A call of the forwarding proxy with no chain, or one outside the caller CA     | Set `forward_client_cert_details` on the proxy                            |
+| 16 `UNAUTHENTICATED` | A CRL refuses the chain that the proxy forwards                                | Issue the caller a new certificate, or load a fresh CRL of each issuer    |
+| 14 `UNAVAILABLE`     | The handshake failed with `certificate_revoked` or `unknown_ca` under the CRLs | Issue the caller a new certificate, or load a fresh CRL of each issuer    |
+| 16 `UNAUTHENTICATED` | The claim failed, or was spent already                                         | Sign a fresh claim over this method and body, bound to this certificate   |
+
+#### Routes and access
+
+| Status                | Cause                                                                         | Fix                                                                               |
+| --------------------- | ----------------------------------------------------------------------------- | --------------------------------------------------------------------------------- |
+| 7 `PERMISSION_DENIED` | No grant names the principal, or the call proves less than the route requires | Add the grant, or sign a claim for a `Signed` route                               |
+| 12 `UNIMPLEMENTED`    | The method is not routed                                                      | Route it with `Routes::unary`, `server_stream`, `client_stream`, or `bidi_stream` |
+| 7 `PERMISSION_DENIED` | A stream, and the `EdgePlane` of the gateway refuses streams                  | Set `EdgePlane::with_streams`                                                     |
+| 403                   | A gRPC-Web call or preflight from an origin that the edge does not serve      | Add the origin to `Coupler::with_grpc_web`                                        |
+
+#### Sessions and connections
+
+| Status           | Cause                                                                 | Fix                                                          |
+| ---------------- | --------------------------------------------------------------------- | ------------------------------------------------------------ |
+| 14 `UNAVAILABLE` | A signed call, and the claim ledger failed                            | Restore the store of the ledger driver                       |
+| 14 `UNAVAILABLE` | Health reads `NOT_SERVING`: the gateway refuses the voucher handshake | Trust the handshake identity of the voucher on a mutual edge |
+| 14 `UNAVAILABLE` | The connection already carries a tunnel                               | Use a separate connection for tunnel and coupled calls       |
+| 14 `UNAVAILABLE` | A stream, and the loopback session runs one call at a time            | Set `pool_config.mux_offer` on the gateway                   |
+
+#### Messages and limits
+
+| Status                 | Cause                                                                      | Fix                                                                    |
+| ---------------------- | -------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
+| 12 `UNIMPLEMENTED`     | A second request to a server-streaming method, or none to it               | Send exactly one request message                                       |
+| 12 `UNIMPLEMENTED`     | The servlet answers a count of messages that the route does not take       | Send exactly one response message on a unary or client-streaming route |
+| 8 `RESOURCE_EXHAUSTED` | The edge carries its most streams at once                                  | Retry later, or raise `CallLimits::with_streams`                       |
+| 3 `INVALID_ARGUMENT`   | A forwarded metadata value does not decode                                 | Send a valid value, or drop the header                                 |
+| 4 `DEADLINE_EXCEEDED`  | The call outlived its `grpc-timeout` or `CallLimits::with_timeout`         | Raise the deadline. An unspent claim can be retried                    |
+| 13 `INTERNAL`          | The answer is signed by a key that the route does not pin                  | Pass the certificate the servlet signs under to `Servlet::new`         |
+| 8 `RESOURCE_EXHAUSTED` | The call, or a part of its stream, passes the envelope ceiling of the edge | Send a smaller body, or raise `TransportLimits` on the edge            |

@@ -14,7 +14,12 @@ This page specifies `@wahidgroup/tightbeam-ws-client`, the TypeScript client of 
 - compression, verification, and decryption
 - envelopes and detached commitments
 
-It drills down from the [tightbeam-ws-client README](../ws/client/README.md) for engineers who build on the client or review it. The README holds what each part is for and the standards it follows. The wasm engine under the client has its own page, [The Browser Engine](ws-wasm.md). Every sample on this page compiles in [`ws/client/src/docs.test.ts`](../ws/client/src/docs.test.ts), which reads it from this page.
+About this page:
+
+- It drills down from the [tightbeam-ws-client README](../ws/client/README.md) for engineers who build on the client or review it.
+- The README holds what each part is for and the standards it follows.
+- The wasm engine under the client has its own page, [The Browser Engine](ws-wasm.md).
+- Every sample on this page compiles in [`ws/client/src/docs.test.ts`](../ws/client/src/docs.test.ts), which reads it from this page.
 
 ## Contents
 
@@ -39,9 +44,28 @@ It drills down from the [tightbeam-ws-client README](../ws/client/README.md) for
 
 ## Package
 
-The frame codec, the ASN.1 DER engine, is the Rust implementation of tightbeam, compiled from `tightbeam-ws-wasm` with `wasm-pack`. The TypeScript layer adds the builder, the typed message envelope, validation, and connection handling.
+### Codec and bundles
 
-Two wasm bundles ship in the package, a `web` build and a `nodejs` build, and each has its own engine loader. The `#engine` entry of the package `imports` map selects the loader of the `nodejs` build under the `node` condition and the loader of the `web` build otherwise. The `#wasm` entry names the types of the glue alone. ESM gives a relative import no module-private visibility, so the lint of the client holds the glue to the loaders, as [The Browser Engine](ws-wasm.md#build) states. Its `no-restricted-imports` rule refuses a static value import of the glue in every module, and its `no-restricted-syntax` rule refuses a dynamic import outside `src/engine/**`. Node 24 and later supply a global `WebSocket`, so Node needs no shim.
+- The frame codec, the ASN.1 DER engine, is the Rust implementation of tightbeam, compiled from `tightbeam-ws-wasm` with `wasm-pack`.
+- The TypeScript layer adds the builder, the typed message envelope, validation, and connection handling.
+- Two wasm bundles ship in the package, a `web` build and a `nodejs` build, and each has its own engine loader.
+- Node 24 and later supply a global `WebSocket`, so Node needs no shim.
+
+| `imports` entry | Selects                                                                                                  |
+| --------------- | -------------------------------------------------------------------------------------------------------- |
+| `#engine`       | The loader of the `nodejs` build under the `node` condition, and the loader of the `web` build otherwise |
+| `#wasm`         | The types of the glue alone                                                                              |
+
+### Glue lint
+
+ESM gives a relative import no module-private visibility, so the lint of the client holds the glue to the loaders, as [The Browser Engine](ws-wasm.md#build) states:
+
+| Rule                    | Refuses                                            |
+| ----------------------- | -------------------------------------------------- |
+| `no-restricted-imports` | A static value import of the glue, in every module |
+| `no-restricted-syntax`  | A dynamic import outside `src/engine/**`           |
+
+### Surface shared with tightbeam-rs
 
 The client keeps this surface of `tightbeam-rs` under the same names:
 
@@ -51,18 +75,28 @@ The client keeps this surface of `tightbeam-rs` under the same names:
 | `Frame`   | `verify`, `frameIntegrityVerdict`, `messageCommitmentVerdict`, and the enums `Version` and `MessagePriority` with the same ordinals, which `engine.Version` and `engine.MessagePriority` hold |
 | Transport | Multiplexed bidirectional streams, HPKE sessions, GoAway reasons, and the gRPC status codes of a refusal                                                                                      |
 
-`assertVersion` belongs to the client alone. `tightbeam-rs` takes the version when the builder starts, through `FrameBuilder::from(Version)` or `compose!`, and the engine refuses another version as the structure assembles.
+- `assertVersion` belongs to the client alone.
+- `tightbeam-rs` takes the version when the builder starts, through `FrameBuilder::from(Version)` or `compose!`.
+- The engine refuses another version as the structure assembles.
 
-The package checks:
+### Package checks
 
-- `tsconfig.build.json` names no Node types, so a Node import or a Node global in the sources fails to compile, and `dist/` holds no Node code.
-- `tsconfig.build.json` sets `stripInternal`, and each static that takes the parts of an engine is `@internal`, so the declarations leave those statics out. The `PARTS` brand of `EngineParts` keeps each such static behind the `Engine`: the key of the brand is local to `engine.ts`, so only an `Engine` builds the parts.
-- `npm run smoke` loads every export that `package.json` names under a resolve hook that refuses each module of `wasm/` and `wasm-node/`, so an export that loads the glue as it imports fails the smoke. `Engine.load` is the one call that loads the glue.
-- `npm run pack:check` asserts that the pack holds what `package.json` names. Every packed path sits under a `files` entry or is `package.json`, every `files` entry appears in the pack, and every packed output under the `outDir` of the build compiles from a source that `tsconfig.build.json` includes.
+- `tsconfig.build.json` names no Node types. A Node import or a Node global in the sources therefore fails to compile, and `dist/` holds no Node code.
+- `tsconfig.build.json` sets `stripInternal`. Each static that takes the parts of an engine is `@internal`, so the declarations leave those statics out.
+- The `PARTS` brand of `EngineParts` keeps each such static behind the `Engine`. The key of the brand is local to `engine.ts`, so only an `Engine` builds the parts.
+- `npm run smoke` loads every export that `package.json` names, under a resolve hook that refuses each module of `wasm/` and `wasm-node/`.
+- An export that loads the glue as it imports therefore fails the smoke. `Engine.load` is the one call that loads the glue.
+- `npm run pack:check` asserts that the pack holds what `package.json` names:
+  - Every packed path sits under a `files` entry or is `package.json`.
+  - Every `files` entry appears in the pack.
+  - Every packed output under the `outDir` of the build compiles from a source that `tsconfig.build.json` includes.
 
 ## Engine
 
-`Engine.load(input?)` loads the wasm engine and resolves with an `Engine`, the proof that the module loaded. Every parse and constructor that calls into the module synchronously is a method of the `Engine`, and only `load` makes one, so the type checker refuses a call that needs the module before it loaded. The loader of the build imports the glue inside `load`, so the binary loads at `load` alone and an import of the package stays free of it.
+- `Engine.load(input?)` loads the wasm engine and resolves with an `Engine`, the proof that the module loaded.
+- Every parse and constructor that calls into the module synchronously is a method of the `Engine`.
+- Only `load` makes an `Engine`, so the type checker refuses a call that needs the module before it loaded.
+- The loader of the build imports the glue inside `load`. The binary therefore loads at `load` alone, and an import of the package stays free of it.
 
 ```ts
 import { Engine } from "@wahidgroup/tightbeam-ws-client";
@@ -75,15 +109,23 @@ const hosted = await Engine.load(wasmUrl);
 const inWorker = await Engine.load(compiledModule);
 ```
 
-The load rules:
+### Load rules
 
-- The `web` build starts the binary from `input`: a URL, a `Response`, the bytes, or a compiled `WebAssembly.Module`. Without `input`, it fetches the binary that sits beside its glue.
-- The `nodejs` build reads its binary beside its glue as it loads, so it ignores `input`.
-- Each loader starts its glue once per realm, and `Engine.load` builds one engine over it, both through one `Once`. Every later load therefore resolves the same `Engine` and leaves its `input` unread, and a failed load leaves the next call to load again.
-- A failed load rejects with a `TightbeamTransportError` whose `code` is `EngineUnavailable`, and the failure of the platform or the glue is its `cause`. The browser e2e runs that failure and its retry, because only the web loader reads an input that can fail.
+| Build    | Starts the binary from                                                                                                              |
+| -------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| `web`    | `input`: a URL, a `Response`, the bytes, or a compiled `WebAssembly.Module`. Without `input`, it fetches the binary beside its glue |
+| `nodejs` | The binary beside its glue, which it reads as it loads, so it ignores `input`                                                       |
+
+- Each loader starts its glue once per realm, and `Engine.load` builds one engine over it, both through one `Once`.
+- Every later load therefore resolves the same `Engine` and leaves its `input` unread.
+- A failed load leaves the next call to load again.
+- A failed load rejects with a `TightbeamTransportError` whose `code` is `EngineUnavailable`. The failure of the platform or the glue is its `cause`.
+- The browser e2e runs that failure and its retry, because only the web loader reads an input that can fail.
 - A failed load leaves no engine, so its rejection takes the test that [Transport errors](#transport-errors) names for a caller with no engine.
 
-The engine parses each value it owns once, in Rust, and hands back a handle, so the TypeScript layer keeps the proof and runs no second parser:
+### Parsed values
+
+The engine parses each value it owns once, in Rust, and hands back a handle. The TypeScript layer therefore keeps the proof and runs no second parser.
 
 | Method                                                                      | Answers                                                                     | Refusal                             |
 | --------------------------------------------------------------------------- | --------------------------------------------------------------------------- | ----------------------------------- |
@@ -98,17 +140,32 @@ The engine parses each value it owns once, in Rust, and hands back a handle, so 
 | `envelope(codec)`, `opening(salt, bodyDer)`                                 | [Envelopes](#envelopes) and [Detached commitments](#detached-commitments)   | `CommitmentSpent` for a spent salt  |
 | `connect`, `connectMutual`, `connectCleartext`                              | A `TightbeamWsClient` ([Connectors](#connectors))                           | The option and identity faults      |
 
-`engine.profile` holds the object identifiers of the tightbeam profile, read from the constants of `tightbeam-rs`, and `engine.sha3_256` is the profile hasher.
+- `engine.profile` holds the object identifiers of the tightbeam profile, read from the constants of `tightbeam-rs`.
+- `engine.sha3_256` is the profile hasher.
 
-The handle rules:
+### Borrowed handles
 
-- A method that receives an `Oid` or a `DigestInfo` borrows it for the call, and a holder that keeps one past the call keeps a copy of its own. `withContentOid`, `withPreviousHash`, `withMessageHasher`, `withWitnessHasher`, `withCompressor`, `engine.messageBuilder`, an envelope, and a pub/sub publish each copy the `Oid` or the `DigestInfo` they keep, so a free of the caller's handle leaves the holder its own. `withMessageHasher` and `engine.opening` take the salt of the `CommitmentSalt` they receive and leave the caller an empty shell ([Frame builder](#frame-builder), [Detached commitments](#detached-commitments)). A pub/sub subscription only decodes, so it holds the caller's codec and reads no handle of it. A `HeldCodec` holds the copy of its content type until its holder disposes it, and a later read of its `contentOid` refuses with `CodecReleased`.
-- The realm owns `engine.profile`, `engine.sha3_256`, and one zstd handle, and lends each one as a view (`ProfileView`, `OidView`, `ZstdView`) with no `free` and no `[Symbol.dispose]`, so no caller can release a handle that every later build of the realm reads. `engine.zstd(maxOutput)` parses the ceiling once into a handle bound to it, and the `ZstdView` holds that handle, which the glue reclaims with the view.
-- A frame keeps the wasm `DigestInfo` and `Oid` handles of the digests and the identifiers it decoded, and lends them as views too. `clone()` answers a handle the caller owns.
+- A method that receives an `Oid` or a `DigestInfo` borrows it for the call.
+- A holder that keeps one past the call keeps a copy of its own.
+- These holders copy the `Oid` or the `DigestInfo` they keep, so a free of the caller's handle leaves the holder its own: `withContentOid`, `withPreviousHash`, `withMessageHasher`, `withWitnessHasher`, `withCompressor`, `engine.messageBuilder`, an envelope, and a pub/sub publish.
+- `withMessageHasher` and `engine.opening` take the salt of the `CommitmentSalt` they receive, and leave the caller an empty shell ([Frame builder](#frame-builder), [Detached commitments](#detached-commitments)).
+- A pub/sub subscription only decodes, so it holds the caller's codec and reads no handle of it.
+- A `HeldCodec` holds the copy of its content type until its holder disposes it. A later read of its `contentOid` refuses with `CodecReleased`.
+
+### Lent views
+
+- The realm owns `engine.profile`, `engine.sha3_256`, and one zstd handle.
+- It lends each one as a view (`ProfileView`, `OidView`, `ZstdView`) with no `free` and no `[Symbol.dispose]`.
+- No caller can therefore release a handle that every later build of the realm reads.
+- `engine.zstd(maxOutput)` parses the ceiling once into a handle bound to it. The `ZstdView` holds that handle, which the glue reclaims with the view.
+- A frame keeps the wasm `DigestInfo` and `Oid` handles of the digests and the identifiers it decoded, and lends them as views too.
+- `clone()` answers a handle the caller owns.
 
 ## Connectors
 
-Every connection is a multiplexed tightbeam session, so one socket carries concurrent, bidirectional streams. Each connector is a method of the `Engine`, and it resolves once the session is ready, so a failed dial rejects the connect call and not the first emit. The rejection is `InvalidUrl` when the runtime refuses the url, `ConnectionClosed` when the socket of `connectCleartext` closes before it opens, `PeerClosedBeforeHandshake` when the socket of `connect` or `connectMutual` closes before the handshake completes, `InvalidCertificate` when the trust store refuses the pinned server certificate, such as one outside its validity on the host clock, or the code of the `tightbeam-rs` variant that refuses the handshake or the client identity, such as `Signer`.
+- Every connection is a multiplexed tightbeam session, so one socket carries concurrent, bidirectional streams.
+- Each connector is a method of the `Engine`.
+- A connector resolves once the session is ready, so a failed dial rejects the connect call and not the first emit.
 
 | Connector                                | Session                                             | Stream caps                                                                                                                      |
 | ---------------------------------------- | --------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
@@ -116,7 +173,8 @@ Every connection is a multiplexed tightbeam session, so one socket carries concu
 | `connect(url, serverCertDer, options?)`  | HPKE, with the server pinned by its DER certificate | `maxPeerStreams` (default `DEFAULT_STREAM_CAP`) caps server-initiated streams. The advertisement of the server caps client emits |
 | `connectMutual(url, identity, options?)` | HPKE with mutual authentication                     | As `connect`                                                                                                                     |
 
-The HPKE handshake also negotiates stream multiplexing (`transport-multiplex` of tightbeam, in the style of HTTP/2). A connection to a server that offers no multiplexing rejects with `InvalidState`.
+- The HPKE handshake also negotiates stream multiplexing (`transport-multiplex` of tightbeam, in the style of HTTP/2).
+- A connection to a server that offers no multiplexing rejects with `InvalidState`.
 
 ```ts
 // Server-authenticated:
@@ -130,9 +188,21 @@ const mutual = await engine.connectMutual(url, {
 });
 ```
 
+### Dial faults
+
+| The dial                                                                                                  | Rejects with                               |
+| --------------------------------------------------------------------------------------------------------- | ------------------------------------------ |
+| The runtime refuses the url                                                                               | `InvalidUrl`                               |
+| The socket of `connectCleartext` closes before it opens                                                   | `ConnectionClosed`                         |
+| The socket of `connect` or `connectMutual` closes before the handshake completes                          | `PeerClosedBeforeHandshake`                |
+| The trust store refuses the pinned server certificate, such as one outside its validity on the host clock | `InvalidCertificate`                       |
+| `tightbeam-rs` refuses the handshake or the client identity                                               | The code of that variant, such as `Signer` |
+
 ### Identity faults
 
-`connectMutual` takes the identity as named fields, so each certificate names its role at the call. It reads and parses the identity before any dial, so the caller may reuse its buffers at once. A malformed identity rejects with a `TightbeamTransportError`:
+- `connectMutual` takes the identity as named fields, so each certificate names its role at the call.
+- It reads and parses the identity before any dial, so the caller may reuse its buffers at once.
+- A malformed identity rejects with a `TightbeamTransportError`:
 
 | Code                                            | Cause                                                                                                       |
 | ----------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
@@ -142,7 +212,9 @@ const mutual = await engine.connectMutual(url, {
 | `InvalidCallback`, `InvalidOid`, `InvalidBytes` | A `TransportSigner` lacks `signPrehash`, names no OID, or holds a `publicKeyDer` that is not a `Uint8Array` |
 | `InvalidCertificate`                            | A certificate is no DER certificate, named on `path`, as `connect` refuses its `serverCertDer`              |
 
-The engine parses the options of every connector once, and its faults belong to the same family, a `TightbeamTransportError` that `engine.isTransportError` recognizes:
+#### Option faults
+
+The engine parses the options of every connector once. Their faults belong to the same family, a `TightbeamTransportError` that `engine.isTransportError` recognizes:
 
 | Code                         | Cause                                                                                                      |
 | ---------------------------- | ---------------------------------------------------------------------------------------------------------- |
@@ -158,7 +230,15 @@ The engine parses the options of every connector once, and its faults belong to 
 
 ### External signers
 
-A certificate key in an external key store, such as WebAuthn, a wallet, or a KMS bridge, signs through a `TransportSigner` in place of the raw scalar. The handshake hands the signer the transcript prehash, so the private key stays outside wasm. The contract names no algorithm: the signer signs the prehash directly, with no second hash, and returns the signature encoding that the session profile verifies. Under the default-profile build that encoding is a secp256k1 signature as a DER `ECDSA-Sig-Value` (RFC 3279 § 2.2.3). A custom-profile build expects the encoding of its own profile ([The Browser Engine](ws-wasm.md#session-profiles)).
+- A certificate key in an external key store, such as WebAuthn, a wallet, or a KMS bridge, signs through a `TransportSigner` in place of the raw scalar.
+- The handshake hands the signer the transcript prehash, so the private key stays outside wasm.
+- The contract names no algorithm. The signer signs the prehash directly, with no second hash.
+- The signer returns the signature encoding that the session profile verifies:
+
+| Build           | Signature encoding                                                                  |
+| --------------- | ----------------------------------------------------------------------------------- |
+| Default profile | A secp256k1 signature as a DER `ECDSA-Sig-Value` (RFC 3279 § 2.2.3)                 |
+| Custom profile  | The encoding of its own profile ([The Browser Engine](ws-wasm.md#session-profiles)) |
 
 ```ts
 import type { TransportSigner } from "@wahidgroup/tightbeam-ws-client";
@@ -178,11 +258,18 @@ const external = await engine.connectMutual(url, {
 
 The engine parses the dotted `algorithmOid` of the signer once, as the dial begins.
 
-The session profile is a compile-time choice, as for a native `tightbeam-rs` transport, and the default build runs HPKE over secp256k1, AES-256-GCM records, and SHA3-256 certificates. A deployment on another provider rebuilds the wasm layer against its own `CryptoProvider`. Frame-level cryptography stays caller-supplied under any profile.
+#### Session profile
+
+- The session profile is a compile-time choice, as for a native `tightbeam-rs` transport.
+- The default build runs HPKE over secp256k1, AES-256-GCM records, and SHA3-256 certificates.
+- A deployment on another provider rebuilds the wasm layer against its own `CryptoProvider`.
+- Frame-level cryptography stays caller-supplied under any profile.
 
 ### Session budgets
 
-A metered session requests credits for each direction and settles the invoices of the server through `approveReceipt`. `budgets`, `authorization`, and `approveReceipt` belong to `MutualConnectOptions`, so `connect` and `connectCleartext` refuse them, and a JavaScript caller that passes them anyway is refused.
+- A metered session requests credits for each direction, and settles the invoices of the server through `approveReceipt`.
+- `budgets`, `authorization`, and `approveReceipt` belong to `MutualConnectOptions`, so `connect` and `connectCleartext` refuse them.
+- A JavaScript caller that passes them anyway is refused.
 
 ```ts
 const metered = await engine.connectMutual(
@@ -201,21 +288,36 @@ metered.usableSendBudget; // epoch usable credits, or undefined when unmetered
 metered.sessionReceiptDer; // dual-signed receipt DER, rotates on renewal
 ```
 
-The client has no getter for a live remaining balance. A reconnect policy MUST treat the peer GoAway reasons `"budget-exhausted"` and `"settlement-failed"` as drain signals, with a backoff or a new authorization, and not as a protocol fault.
+- The client has no getter for a live remaining balance.
+- A reconnect policy MUST treat the peer GoAway reasons `"budget-exhausted"` and `"settlement-failed"` as drain signals, with a backoff or a new authorization, and not as a protocol fault.
 
 ## Frame
 
-`emit` resolves with the response `Frame`, or with `undefined` when the peer answers without a body. `engine.frame(der)` parses the bytes once, so a malformed frame throws `SerializationError` at construction. The one decode answers the fields and the preimages, so every getter reads decoded state. The engine decides the layer of the body at the parse: cleartext, compressed, or sealed. A `Frame` exposes:
+- `emit` resolves with the response `Frame`, or with `undefined` when the peer answers without a body.
+- `engine.frame(der)` parses the bytes once, so a malformed frame throws `SerializationError` at construction.
+- The one decode answers the fields and the preimages, so every getter reads decoded state.
+- The engine decides the layer of the body at the parse: cleartext, compressed, or sealed.
 
-- the typed body through `open(codec, { opener, inflator })`, the one decode of a body, which refuses a layer it holds no capability for with `OpaqueBody` and names the missing `opener` or `inflator` on `layer`. A capability that the frame needs no use of goes unused, so a cleartext frame opens under any options
-- the carried body octets through `bodyDer`, and the raw frame through `toDer()`
-- the metadata `version`, `id`, and `order`, and the V2+ and V3+ fields `priority`, `lifetime`, `previousFrame`, and `matrix` when present
-- the security markers `signed`, `messageIntegrity`, `frameIntegrity`, and `confidential`, with their carried infos `signatureInfo`, `messageIntegrityInfo`, `frameIntegrityInfo`, and `confidentialityInfo`. A carried digest is an engine `DigestInfo`, every carried algorithm is an `Oid`, and the confidentiality info names the content type that its envelope authenticates as `contentOid`
-- the methods of [Verification and decryption](#verification-and-decryption)
+A `Frame` exposes:
+
+| Part             | Surface                                                                                                                     |
+| ---------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| Typed body       | `open(codec, { opener, inflator })`, the one decode of a body                                                               |
+| Carried octets   | `bodyDer`, and the raw frame through `toDer()`                                                                              |
+| Metadata         | `version`, `id`, and `order`, and the V2+ and V3+ fields `priority`, `lifetime`, `previousFrame`, and `matrix` when present |
+| Security markers | `signed`, `messageIntegrity`, `frameIntegrity`, and `confidential`                                                          |
+| Carried infos    | `signatureInfo`, `messageIntegrityInfo`, `frameIntegrityInfo`, and `confidentialityInfo`                                    |
+| Checks           | The methods of [Verification and decryption](#verification-and-decryption)                                                  |
+
+- `open` refuses a layer it holds no capability for with `OpaqueBody`, and names the missing `opener` or `inflator` on `layer`.
+- A capability that the frame needs no use of goes unused, so a cleartext frame opens under any options.
+- A carried digest is an engine `DigestInfo`, and every carried algorithm is an `Oid`.
+- The confidentiality info names the content type that its envelope authenticates as `contentOid`.
 
 ## Streams
 
-Every `emit` opens its own stream, so concurrent emits interleave on the connection and each response correlates by stream ID. `serve` answers the streams that the server initiates.
+- Every `emit` opens its own stream, so concurrent emits interleave on the connection and each response correlates by stream ID.
+- `serve` answers the streams that the server initiates.
 
 ```ts
 const mux = await engine.connect(url, serverCertDer);
@@ -242,17 +344,41 @@ await mux.shutdown(); // GoAway, drain in-flight streams, stop
 await mux.close();
 ```
 
-The serve rules:
+### Handlers
 
-- A later `serve*` call in the same mode swaps the handler for the streams that dispatch after it, and a stream in flight finishes on the handler it started on. Handlers for distinct streams run concurrently.
-- A handler of `serve`, `serveStreaming`, or `serveDuplex` refuses a stream by throwing `StreamRefusal` with the gRPC status code of its choice, as in `throw new StreamRefusal("NotFound", "no such order")`. `StreamRefusal.settlement` decides the status of every throw, so any other throw or rejection answers `Unknown`, a rethrown `TransportError` and a bare status name among them.
-- A duplex handler resolves with a `TransitRefusal`, a status other than `Ok`, or with `undefined` for `Ok`.
-- A server-initiated stream that arrives before `serve()` waits in a bounded queue, sized to the cap granted to the server. The handler serves the queue in order once it registers, so registration has no race.
-- `serve`, `serveStreaming`, and `serveDuplex` each take `{ claim: "exclusive" }`, which claims dispatch, and `"shared"` is the default claim. Every later `serve*` call then throws a `TightbeamTransportError` whose `code` is `ServeDispatchClaimed`, so no stream reroutes in silence. An exclusive claim over a running shared handler throws `ServeDispatchShared`, and a claim that is neither label throws `InvalidServeClaim`. The pubsub `SubscriptionManager` claims its client this way, and application routes compose through its `fallback` option.
-- `serve`, `serveStreaming`, and `serveDuplex` exclude one another on one client. The first call consumes the responder, and a later call in another mode throws a `TightbeamTransportError` whose `code` is `ServeModeConflict`.
-- `maxConcurrentStreams` reports the negotiated local cap. After `shutdown`, a new emit rejects while the streams in flight drain.
-- `emit` and `submitWork` take the slot of their stream before they return, so `hasPendingStreams` reads `true` at once after the call.
+- A later `serve*` call in the same mode swaps the handler for the streams that dispatch after it.
+- A stream in flight finishes on the handler it started on.
+- Handlers for distinct streams run concurrently.
+- A server-initiated stream that arrives before `serve()` waits in a bounded queue, sized to the cap granted to the server.
+- The handler serves the queue in order once it registers, so registration has no race.
 - The engine declares the handler of each `serve*` call and the `StreamRoute` a progressive handler reads, so the client and the engine share one declaration of each.
+
+### Stream refusals
+
+- A handler of `serve`, `serveStreaming`, or `serveDuplex` refuses a stream by throwing `StreamRefusal` with the gRPC status code of its choice, as in `throw new StreamRefusal("NotFound", "no such order")`.
+- `StreamRefusal.settlement` decides the status of every throw.
+- Any other throw or rejection answers `Unknown`, a rethrown `TransportError` and a bare status name among them.
+- A duplex handler resolves with a `TransitRefusal`, a status other than `Ok`, or with `undefined` for `Ok`.
+
+### Claims and modes
+
+- `serve`, `serveStreaming`, and `serveDuplex` each take `{ claim: "exclusive" }`, which claims dispatch. `"shared"` is the default claim.
+- An exclusive claim makes every later `serve*` call throw, so no stream reroutes in silence.
+- The pubsub `SubscriptionManager` claims its client this way, and application routes compose through its `fallback` option.
+- `serve`, `serveStreaming`, and `serveDuplex` exclude one another on one client. The first call consumes the responder.
+
+| The call                                         | Throws a `TightbeamTransportError` whose `code` is |
+| ------------------------------------------------ | -------------------------------------------------- |
+| A later `serve*` call after an exclusive claim   | `ServeDispatchClaimed`                             |
+| An exclusive claim over a running shared handler | `ServeDispatchShared`                              |
+| A claim that is neither label                    | `InvalidServeClaim`                                |
+| A later call in another mode than the first      | `ServeModeConflict`                                |
+
+### Slots and drain
+
+- `maxConcurrentStreams` reports the negotiated local cap.
+- After `shutdown`, a new emit rejects while the streams in flight drain.
+- `emit` and `submitWork` take the slot of their stream before they return, so `hasPendingStreams` reads `true` at once after the call.
 
 ### Progressive bodies
 
@@ -265,13 +391,42 @@ Unary `emit` and `serve` stay the default. Progressive body I/O runs on the same
 | `serveStreaming(handler)` | Serve a progressive request body that the peer initiates                         |
 | `serveDuplex(handler)`    | Serve a progressive duplex body that the peer initiates                          |
 
-A push reaches the socket at once, so a duplex conversation that pushes and then awaits the next reply chunk makes progress. `closeWith(chunk)` flags that chunk `last` in one record, one record fewer than a push and a close.
+- A push reaches the socket at once, so a duplex conversation that pushes and then awaits the next reply chunk makes progress.
+- `closeWith(chunk)` flags that chunk `last` in one record, one record fewer than a push and a close.
 
-The calls on one push half, the request half of a stream or the reply half of a served duplex stream, run in the order they were made, so a close waits for the pushes before it, and a push that waits holds a copy of its chunk. Each stream owns its wasm handle and releases it on every exit. A close consumes the handle, and the end of an `await using` scope cancels a stream that no close reached. After a close or a disposal, a push or a second close refuses with `StreamClosed`. A disposal of a request half also ends a push in flight with `StreamClosed`, even one that waits on the credit of the peer, and a push in flight on a reply half finishes.
+#### Push halves
 
-The request half and the reply `body` of a duplex stream end apart: a close ends the request half, the body reads until the `last` chunk of the peer, and a `break` out of the body cancels the stream. A disposal of the body also cancels an opened stream, and a read that still waits ends at once with no chunk. A `serveStreaming` or `serveDuplex` handler receives a body and a reply half that the client frees once the handler settles.
+- A push half is the request half of a stream, or the reply half of a served duplex stream.
+- The calls on one push half run in the order they were made, so a close waits for the pushes before it.
+- A push that waits holds a copy of its chunk.
+- Each stream owns its wasm handle and releases it on every exit.
+- A close consumes the handle, and the end of an `await using` scope cancels a stream that no close reached.
+- After a close or a disposal, a push or a second close refuses with `StreamClosed`.
+- A disposal of a request half also ends a push in flight with `StreamClosed`, even one that waits on the credit of the peer.
+- A push in flight on a reply half finishes.
 
-A body frees its handle on the `last` chunk of the peer, on a failed read, on a `break` or a `return` of a `for await` loop, and as an `await using` scope ends, and each of these discards the chunks still to come. A body is single-use: every loop over it shares one generator, so overlapping loops queue their reads, and a `break` in any loop ends the body for every loop.
+#### Duplex bodies
+
+The request half and the reply `body` of a duplex stream end apart:
+
+| The caller             | Ends                                                                                   |
+| ---------------------- | -------------------------------------------------------------------------------------- |
+| Closes                 | The request half                                                                       |
+| Reads the body         | At the `last` chunk of the peer                                                        |
+| Breaks out of the body | The stream, which it cancels                                                           |
+| Disposes the body      | An opened stream, which it cancels. A read that still waits ends at once with no chunk |
+
+A `serveStreaming` or `serveDuplex` handler receives a body and a reply half that the client frees once the handler settles.
+
+#### Body lifetime
+
+- A body frees its handle on each of these, and each one discards the chunks still to come:
+  - the `last` chunk of the peer
+  - a failed read
+  - a `break` or a `return` of a `for await` loop
+  - the end of an `await using` scope
+- A body is single-use. Every loop over it shares one generator, so overlapping loops queue their reads.
+- A `break` in any loop ends the body for every loop.
 
 ```ts
 await using stream = client.openStream();
@@ -289,10 +444,15 @@ for await (const chunk of duplex.body) {
 
 ### Routing
 
-An application that serves more than one kind of stream demultiplexes by frame id. A `Router` binds each id prefix to a `Route`, a decoder and a handler typed by it, so the type checker holds the two to one message type. The longest matching prefix wins. For an id that no prefix matches, `dispatch` rejects with an `UnroutedTopicError`, which answers the stream with an `Unimplemented` status.
+- An application that serves more than one kind of stream demultiplexes by frame id.
+- A `Router` binds each id prefix to a `Route`, a decoder and a handler typed by it, so the type checker holds the two to one message type.
+- The longest matching prefix wins.
+- For an id that no prefix matches, `dispatch` rejects with an `UnroutedTopicError`, which answers the stream with an `Unimplemented` status.
 
-- `Route.of(codec, handler)` decodes a cleartext body.
-- `Route.sealed(envelope, handler)` unwraps the frame under an [envelope](#envelopes) first, so a route that declares a signature refuses an unsigned or forged frame before its body decodes.
+| Route                             | Decodes                                                                                                                                                             |
+| --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Route.of(codec, handler)`        | A cleartext body                                                                                                                                                    |
+| `Route.sealed(envelope, handler)` | The frame, unwrapped under an [envelope](#envelopes) first. A route that declares a signature therefore refuses an unsigned or forged frame before its body decodes |
 
 ```ts
 import { Route, Router } from "@wahidgroup/tightbeam-ws-client";
@@ -313,11 +473,14 @@ const routes = new Router({
 mux.serve((request) => routes.dispatch(request));
 ```
 
-A server matches on the frame id prefix in its own stream handler before it decodes. The router only routes, so subscription semantics, ordering, and replay stay with the application.
+- A server matches on the frame id prefix in its own stream handler before it decodes.
+- The router only routes, so subscription semantics, ordering, and replay stay with the application.
 
 ## Cluster work submission
 
-`submitWork(target, frame, options?)` routes a signed work frame through a tightbeam cluster gateway to the servlet type that the URN `target` names. It resolves with the complete response frame of the servlet. The gateway relays the request frame and the response frame with their bytes unchanged, so each side verifies the end-to-end signature of the other ([The WebSocket Transport](ws.md#cluster-work-plane)).
+- `submitWork(target, frame, options?)` routes a signed work frame through a tightbeam cluster gateway to the servlet type that the URN `target` names.
+- It resolves with the complete response frame of the servlet.
+- The gateway relays the request frame and the response frame with their bytes unchanged, so each side verifies the end-to-end signature of the other ([The WebSocket Transport](ws.md#cluster-work-plane)).
 
 ```ts
 const work = await engine
@@ -331,7 +494,9 @@ const served = await mux.submitWork("urn:tightbeam::servlet:work-probe", work);
 await served.verify(signingKey.verifyingKey());
 ```
 
-A gateway refusal rejects with `code === "WorkRefused"`, and a check of that code narrows the error to the member whose `status` carries the name of the transit status from the gRPC canonical registry, such as `"Unavailable"` for an unserved servlet type. An `AbortSignal` in the options cancels the submission as it cancels `emit`.
+- A gateway refusal rejects with `code === "WorkRefused"`.
+- A check of that code narrows the error to the member whose `status` carries the name of the transit status from the gRPC canonical registry, such as `"Unavailable"` for an unserved servlet type.
+- An `AbortSignal` in the options cancels the submission as it cancels `emit`.
 
 ```ts
 try {
@@ -345,7 +510,11 @@ try {
 
 ## Cancellation
 
-`emit` takes an `AbortSignal`. The abort cancels the stream: it frees the slot of the cap, tells the peer with a best-effort `MuxCancel`, and rejects the emit with the abort reason of the signal. A timeout is a signal.
+`emit` takes an `AbortSignal`, and a timeout is a signal. The abort cancels the stream:
+
+- It frees the slot of the cap.
+- It tells the peer with a best-effort `MuxCancel`.
+- It rejects the emit with the abort reason of the signal.
 
 ```ts
 const response = await mux.emit(built, {
@@ -363,7 +532,8 @@ const mux = await engine.connect(url, serverCertDer, {
 
 ## Connection lifecycle
 
-Every client exposes `closed`, a promise that resolves with the `{ code, reason, wasClean }` of the close frame on every close path, and a `readyState` getter with the WebSocket constants.
+- Every client exposes `closed`, a promise that resolves with the `{ code, reason, wasClean }` of the close frame on every close path.
+- Every client exposes a `readyState` getter with the WebSocket constants.
 
 ```ts
 async function watchClose(client: TightbeamWsClient): Promise<void> {
@@ -378,16 +548,26 @@ void watchClose(client);
 
 ### Close and drain
 
-- `close()` closes the socket, releases the wasm resources of the client, and resolves once the socket has closed. It is idempotent, and it is safe with emits in flight.
-- `shutdown()` drains the session gracefully with a GoAway. Call it before `close()`.
-- `shutdownWith(reason)` drains and advertises why. The reason is a label, `"shutdown"`, `"protocol-error"`, `"enhance-your-calm"`, `"budget-exhausted"`, or `"settlement-failed"`, or a numeric code that the application defines and that the peer reads back through its own GoAway surface.
-- After `close()`, an async operation rejects with `ConnectionClosed`, and a synchronous one throws it: `serve`, `serveStreaming`, `serveDuplex`, `openStream`, `openStreamTo`, `openDuplex`, and `openDuplexTo`. `closed`, `readyState`, and the GoAway getters stay readable for a reconnect policy.
+| Call                   | Does                                                                                                  |
+| ---------------------- | ----------------------------------------------------------------------------------------------------- |
+| `close()`              | Closes the socket, releases the wasm resources of the client, and resolves once the socket has closed |
+| `shutdown()`           | Drains the session gracefully with a GoAway. Call it before `close()`                                 |
+| `shutdownWith(reason)` | Drains and advertises why                                                                             |
+
+- `close()` is idempotent, and it is safe with emits in flight.
+- The reason of `shutdownWith` is a label, `"shutdown"`, `"protocol-error"`, `"enhance-your-calm"`, `"budget-exhausted"`, or `"settlement-failed"`.
+- It may instead be a numeric code that the application defines, which the peer reads back through its own GoAway surface.
+- After `close()`, an async operation rejects with `ConnectionClosed`.
+- After `close()`, a synchronous one throws it: `serve`, `serveStreaming`, `serveDuplex`, `openStream`, `openStreamTo`, `openDuplex`, and `openDuplexTo`.
+- `closed`, `readyState`, and the GoAway getters stay readable for a reconnect policy.
 
 ### Lifetime
 
-A client lives until `close()`, the close of the peer, or a GoAway. Garbage collection is a backstop for a client that the application leaked. A client declared with `await using` closes as its scope ends.
-
-A `using` or `await using` declaration needs `Symbol.dispose` and `Symbol.asyncDispose` at runtime, which Node 24 and current browsers define. The client frees each handle it borrows for one call through `using` on its own paths, so it needs `Symbol.dispose` at runtime too.
+- A client lives until `close()`, the close of the peer, or a GoAway.
+- Garbage collection is a backstop for a client that the application leaked.
+- A client declared with `await using` closes as its scope ends.
+- A `using` or `await using` declaration needs `Symbol.dispose` and `Symbol.asyncDispose` at runtime, which Node 24 and current browsers define.
+- The client frees each handle it borrows for one call through `using` on its own paths, so it needs `Symbol.dispose` at runtime too.
 
 ```ts
 await using client = await engine.connectCleartext(url);
@@ -396,11 +576,19 @@ client.serve((request) => routes.dispatch(request));
 
 ### GoAway
 
-When the peer drains the session, the client records why. `goawayReason` reads the reason from the GoAway of the peer, and it reads `undefined` while the connection is live or after a local shutdown. `goawayCode` exposes the raw numeric code of a reason that the application defines, which `goawayReason` labels `"application"`.
+When the peer drains the session, the client records why:
+
+| Getter         | Reads                                                                                                          |
+| -------------- | -------------------------------------------------------------------------------------------------------------- |
+| `goawayReason` | The reason from the GoAway of the peer, and `undefined` while the connection is live or after a local shutdown |
+| `goawayCode`   | The raw numeric code of a reason that the application defines, which `goawayReason` labels `"application"`     |
 
 ### Reconnection
 
-Reconnection belongs to the application. The client supplies the inputs of the policy, `closed`, `goawayReason`, and `wasClean`, and only the application knows what state to replay. The loop branches on the reason, backs off, and registers `serve` again on each connection.
+- Reconnection belongs to the application.
+- The client supplies the inputs of the policy: `closed`, `goawayReason`, and `wasClean`.
+- Only the application knows what state to replay.
+- The loop branches on the reason, backs off, and registers `serve` again on each connection.
 
 ```ts
 async function connectLoop(
@@ -452,7 +640,22 @@ async function connectLoop(
 
 ## Transport errors
 
-A transport failure rejects as a `TransportError`, an `Error` named `TightbeamTransportError` that carries a stable `code`. `TransportError` is a union with one member per family of its code, so a check of `code` narrows to the member that carries the detail of that code. `engine.isTransportError` narrows an unknown value once it checks the name brand, the code, and the detail, so it answers `false` for a forged error with an unknown code or a missing detail. A lost connection narrows through `engine.isTransportError`, and its `code` is `ConnectionClosed`. Before an engine exists, the one test is `error instanceof ClientTransportError && error.code === "EngineUnavailable"`, because a failed `Engine.load` is the one rejection that reaches a caller with no engine. `engine.isTransportError` tests every other case.
+- A transport failure rejects as a `TransportError`, an `Error` named `TightbeamTransportError` that carries a stable `code`.
+- `TransportError` is a union with one member per family of its code, so a check of `code` narrows to the member that carries the detail of that code.
+- `engine.isTransportError` narrows an unknown value once it checks the name brand, the code, and the detail.
+- It answers `false` for a forged error with an unknown code or a missing detail.
+- A lost connection narrows through `engine.isTransportError`, and its `code` is `ConnectionClosed`.
+
+### The test of an error
+
+| Case                 | Test                                                                          |
+| -------------------- | ----------------------------------------------------------------------------- |
+| No engine exists yet | `error instanceof ClientTransportError && error.code === "EngineUnavailable"` |
+| Every other case     | `engine.isTransportError`                                                     |
+
+A failed `Engine.load` is the one rejection that reaches a caller with no engine, so the first row is its one test.
+
+### Code families
 
 Each code has one declaration in one of four families:
 
@@ -465,10 +668,14 @@ Each code has one declaration in one of four families:
 
 Two codes carry a detail:
 
-- `WorkRefused`, a refused work submission, carries its `TransitCode` on `status`.
-- `OpaqueBody`, a body that a read cannot reverse, carries the capability it lacks on `layer`: `opener` or `inflator`.
+| Code          | Names                             | Detail                                                      |
+| ------------- | --------------------------------- | ----------------------------------------------------------- |
+| `WorkRefused` | A refused work submission         | Its `TransitCode`, on `status`                              |
+| `OpaqueBody`  | A body that a read cannot reverse | The capability it lacks, on `layer`: `opener` or `inflator` |
 
-A refusal of one field names it on `path`, such as `matrix.n`. `ClientTransportError` has a private constructor, and one named static builds each code it decides. `ClientTransportError.opaqueBody` builds the refusal of a body read under the `OpaqueBody` code of the engine, so a body refuses with one code on every read.
+- A refusal of one field names it on `path`, such as `matrix.n`.
+- `ClientTransportError` has a private constructor, and one named static builds each code it decides.
+- `ClientTransportError.opaqueBody` builds the refusal of a body read under the `OpaqueBody` code of the engine, so a body refuses with one code on every read.
 
 ```ts
 try {
@@ -479,6 +686,8 @@ try {
   }
 }
 ```
+
+### Codes and retries
 
 A local condition carries its variant name. A peer refusal carries a gRPC canonical status name, with the retry contract that the name defines:
 
@@ -494,7 +703,17 @@ A local condition carries its variant name. A peer refusal carries a gRPC canoni
 | `Unknown`                                                 | Peer   | A peer handler failed without a classification                        |
 | `DeadlineExceeded`, `Unauthenticated`, `PermissionDenied` | Peer   | A gate policy refused the stream                                      |
 
-`waitForStreamSlot()` waits for admission in place of a blind retry of `StreamsExhausted`. It resolves once a new stream would be admitted. It rejects with `Draining` or `ConnectionClosed` once no stream will ever be admitted again, and with the abort reason of its `{ signal }` option when the caller gives up first. Like `hasStreamHeadroom`, it is advisory: a concurrent emit can take the slot between the wake and the use, so the caller keeps its rejection handling.
+### Waiting for a slot
+
+`waitForStreamSlot()` waits for admission in place of a blind retry of `StreamsExhausted`:
+
+| It                                                       | When                                       |
+| -------------------------------------------------------- | ------------------------------------------ |
+| Resolves                                                 | Once a new stream would be admitted        |
+| Rejects with `Draining` or `ConnectionClosed`            | Once no stream will ever be admitted again |
+| Rejects with the abort reason of its `{ signal }` option | When the caller gives up first             |
+
+Like `hasStreamHeadroom`, it is advisory. A concurrent emit can take the slot between the wake and the use, so the caller keeps its rejection handling.
 
 ```ts
 await mux.waitForStreamSlot({ signal: AbortSignal.timeout(5_000) });
@@ -503,9 +722,17 @@ const response = await mux.emit(built);
 
 ## Keepalive
 
-A native tightbeam server runs each read under its operation timeout, 30 seconds by default (`DEFAULT_OPERATION_TIMEOUT`), and ends a session that sends nothing for that long. The client pings its peer every 10 seconds, a third of that timeout (`KEEPALIVE_PROBES_PER_DEADLINE`), so an idle session stays open with no application code.
+- A native tightbeam server runs each read under its operation timeout, 30 seconds by default (`DEFAULT_OPERATION_TIMEOUT`).
+- It ends a session that sends nothing for that long.
+- The client pings its peer every 10 seconds, a third of that timeout (`KEEPALIVE_PROBES_PER_DEADLINE`), so an idle session stays open with no application code.
 
-`ping()` is the same liveness probe at the protocol level, the analog of RFC 9113 § 6.7, for an application that measures the link itself. It resolves when the peer acknowledges. It allocates no stream, and no application handler runs on the peer. Browsers answer the pings of the WebSocket protocol on their own, and this probe covers the application level, where silence otherwise looks the same as idleness.
+### Ping
+
+- `ping()` is the same liveness probe at the protocol level, the analog of RFC 9113 § 6.7, for an application that measures the link itself.
+- It resolves when the peer acknowledges.
+- It allocates no stream, and no application handler runs on the peer.
+- Browsers answer the pings of the WebSocket protocol on their own.
+- This probe covers the application level, where silence otherwise looks the same as idleness.
 
 ```ts
 await mux.ping({ signal: AbortSignal.timeout(5_000) });
@@ -513,7 +740,17 @@ await mux.ping({ signal: AbortSignal.timeout(5_000) });
 
 ## Frame builder
 
-A builder begins with its body: `engine.frameBuilder(bytes)` for raw bytes under the profile opaque wrapper, or `engine.messageBuilder(codec, message)` for a typed message. Every `with*` call returns a new immutable builder, and `build()` exists once `withId` named the frame, as `tightbeam-rs` refuses a frame with no id. `build()` resolves with the assembled `Frame`. Capability objects select the algorithms.
+A builder begins with its body:
+
+| Call                                    | Body                                       |
+| --------------------------------------- | ------------------------------------------ |
+| `engine.frameBuilder(bytes)`            | Raw bytes under the profile opaque wrapper |
+| `engine.messageBuilder(codec, message)` | A typed message                            |
+
+- Every `with*` call returns a new immutable builder.
+- `build()` exists once `withId` named the frame, as `tightbeam-rs` refuses a frame with no id.
+- `build()` resolves with the assembled `Frame`.
+- Capability objects select the algorithms.
 
 ```ts
 const signingKey = engine.signingKey(rawScalar);
@@ -534,24 +771,73 @@ const built = await engine
   .build();
 ```
 
-The build rules:
+### Build order
 
-- The wasm engine decides the version floor from every requested field, as `GatedField::since` does in `tightbeam-rs`, or it honors a pin from `withVersion(engine.Version.V2)`. A pin below the floor rejects with an error whose `code` is `UnsupportedField`. `assertVersion` rejects another version with `VersionMismatch`. The engine decides both as the structure assembles, before any hasher, encryptor, or signatory acts.
-- A value with a rule parses once, in the engine, before it reaches the builder: `engine.oid`, `engine.salt`, and `engine.digestInfo` throw a `TightbeamTransportError` at the call. A `Hasher` and a `BodyCompressor` name their algorithm by such an `Oid`.
-- The engine parses the order, the lifetime, the version, and the priority as the build installs them. The order and the lifetime take a whole number or a `bigint` from 0 to 2^64-1. A value outside the range, or one of another type, rejects the build with `InvalidOrder`, `InvalidLifetime`, `InvalidVersion`, or `InvalidPriority`.
-- `withMessageHasher(hasher, salt?)` and `withWitnessHasher(hasher)` take any `Hasher`. The profile hasher is `engine.sha3_256`. Without a salt, the message commitment is a plain digest of the body.
-- `withContentOid(oid)` and `withPreviousHash(parent)` hold a copy of the handle they receive, and the builder copies the content type a codec declares, so a free of the caller's handle leaves the build its own. Every handle a build makes, such as the digest of each integrity step, frees within the build.
-- `withMessageHasher` takes its salt after it copies the algorithm of the hasher, so a refused hasher leaves the salt with the caller. A call that takes the salt leaves the caller an empty shell that frees as any handle does, and a disposal of that shell leaves the builder its salt. A salt commits one frame, so a committed builder, and every builder made from it, builds once. A second build, or a second take of the same shell, rejects with `CommitmentSpent`.
-- A build holds its salt from its start, so a concurrent build rejects with `CommitmentSpent` before its signer prompts. A build that a layer refuses gives the salt back to a retry.
-- `withEncryptor` takes any `BodyEncryptor`, and the frame has one body-encryption slot. The profile offers a symmetric cipher, `engine.aes256Gcm({ key, keyId })`, which every holder of the shared key opens under one `keyId`. It also offers an asymmetric encryptor to a recipient, `engine.hpkeEncryptor(recipientPublicKey)`, which the recipient secret opens. The encryptor seals the body as the content type that the builder or the codec names, and as `id-data` without one.
-- A field the engine refuses rejects with the engine code and the field on `path`, such as `InvalidMatrixDimension` at `matrix.n`. An untyped caller that builds without an id meets `BuildError`.
-- The builder runs its steps in this order: the message commitment, the compression, the encryption, the frame integrity, and the signature.
+The builder runs its steps in this order:
+
+1. the message commitment
+2. the compression
+3. the encryption
+4. the frame integrity
+5. the signature
+
+### Versions
+
+- The wasm engine decides the version floor from every requested field, as `GatedField::since` does in `tightbeam-rs`, or it honors a pin from `withVersion(engine.Version.V2)`.
+- The engine decides both checks below as the structure assembles, before any hasher, encryptor, or signatory acts.
+
+| The build                                           | Rejects with an error whose `code` is |
+| --------------------------------------------------- | ------------------------------------- |
+| Pins a version below the floor                      | `UnsupportedField`                    |
+| Lands on another version than `assertVersion` names | `VersionMismatch`                     |
+
+### Values
+
+- A value with a rule parses once, in the engine, before it reaches the builder.
+- `engine.oid`, `engine.salt`, and `engine.digestInfo` throw a `TightbeamTransportError` at the call.
+- A `Hasher` and a `BodyCompressor` name their algorithm by such an `Oid`.
+- The engine parses the order, the lifetime, the version, and the priority as the build installs them.
+- The order and the lifetime take a whole number or a `bigint` from 0 to 2^64-1.
+- A value outside the range, or one of another type, rejects the build with `InvalidOrder`, `InvalidLifetime`, `InvalidVersion`, or `InvalidPriority`.
+- A field the engine refuses rejects with the engine code and the field on `path`, such as `InvalidMatrixDimension` at `matrix.n`.
+- An untyped caller that builds without an id meets `BuildError`.
+
+### Hashers and handles
+
+- `withMessageHasher(hasher, salt?)` and `withWitnessHasher(hasher)` take any `Hasher`.
+- The profile hasher is `engine.sha3_256`.
+- Without a salt, the message commitment is a plain digest of the body.
+- `withContentOid(oid)` and `withPreviousHash(parent)` hold a copy of the handle they receive.
+- The builder copies the content type a codec declares, so a free of the caller's handle leaves the build its own.
+- Every handle a build makes, such as the digest of each integrity step, frees within the build.
+
+### Salts
+
+- `withMessageHasher` takes its salt after it copies the algorithm of the hasher, so a refused hasher leaves the salt with the caller.
+- A call that takes the salt leaves the caller an empty shell that frees as any handle does.
+- A disposal of that shell leaves the builder its salt.
+- A salt commits one frame, so a committed builder, and every builder made from it, builds once.
+- A second build, or a second take of the same shell, rejects with `CommitmentSpent`.
+- A build holds its salt from its start, so a concurrent build rejects with `CommitmentSpent` before its signer prompts.
+- A build that a layer refuses gives the salt back to a retry.
+
+### Encryption
+
+`withEncryptor` takes any `BodyEncryptor`, and the frame has one body-encryption slot. The profile offers two:
+
+| Encryptor                                  | Kind                       | Opened by                                         |
+| ------------------------------------------ | -------------------------- | ------------------------------------------------- |
+| `engine.aes256Gcm({ key, keyId })`         | Symmetric cipher           | Every holder of the shared key, under one `keyId` |
+| `engine.hpkeEncryptor(recipientPublicKey)` | Asymmetric, to a recipient | The recipient secret                              |
+
+The encryptor seals the body as the content type that the builder or the codec names, and as `id-data` without one.
 
 ## Typed messages
 
-The protocol treats the frame body as opaque DER, and what the body encodes is a contract between the peers. A `MessageCodec<T>` pairs a TypeScript type with that contract: `encode` produces the body DER, and `decode` parses and validates it at runtime. Each call site therefore reads a typed payload, and the encoded frame stays free of any schema.
-
-`engine.wrapping(inner)` lifts a byte-level serialization, such as JSON, CBOR, or protobuf, into a codec by wrapping it in the profile opaque body:
+- The protocol treats the frame body as opaque DER, and what the body encodes is a contract between the peers.
+- A `MessageCodec<T>` pairs a TypeScript type with that contract. `encode` produces the body DER, and `decode` parses and validates it at runtime.
+- Each call site therefore reads a typed payload, and the encoded frame stays free of any schema.
+- `engine.wrapping(inner)` lifts a byte-level serialization, such as JSON, CBOR, or protobuf, into a codec by wrapping it in the profile opaque body:
 
 ```ts
 import type { MessageCodec } from "@wahidgroup/tightbeam-ws-client";
@@ -585,14 +871,27 @@ const reply = await client.emit(built);
 const message = await reply?.open(Chat); // ChatMessage
 ```
 
-- A peer can expect one ASN.1 `Message` schema, such as a Rust `der::Sequence`. Its codec is a `MessageCodec` that the application implements with an ASN.1 library, or one that `tightbeam-asn-emit` generates ([The ASN.1 Codec Bridge](asn.md)). The builder installs the DER that the codec emits.
+### Codecs
+
+- A peer can expect one ASN.1 `Message` schema, such as a Rust `der::Sequence`.
+- Its codec is a `MessageCodec` that the application implements with an ASN.1 library, or one that `tightbeam-asn-emit` generates ([The ASN.1 Codec Bridge](asn.md)).
+- The builder installs the DER that the codec emits.
 - `engine.frameBuilder(bytes)` is shorthand for `engine.messageBuilder(engine.opaque, bytes)`, raw bytes in the opaque wrapper.
 - The optional `contentOid` of a codec is an `Oid`, and it goes into the confidentiality info when the body is sealed.
-- `engine.framed` is the codec of a frame in a frame: a message that is itself a full tightbeam frame, carried with its bytes unchanged inside the body of another frame. Pub/sub topics use it to relay a frame that a publisher signed or sealed through the registry, so frame-level security holds end to end through the broker.
+
+### Frame in a frame
+
+- `engine.framed` is the codec of a frame in a frame: a message that is itself a full tightbeam frame, carried with its bytes unchanged inside the body of another frame.
+- Pub/sub topics use it to relay a frame that a publisher signed or sealed through the registry.
+- Frame-level security therefore holds end to end through the broker.
 
 ## Custom cryptography
 
-Each digest and compression capability pairs the operation with the `Oid` that the frame records, so implementations from any library or language interchange. A cipher names its algorithm in the envelope it writes. A signer signs the profile signature, which the engine fixes, so a signer names no OID and only signs the prehash it receives. The profile ships wasm-backed implementations of SHA3-256, secp256k1 ECDSA, AES-256-GCM, HPKE, and zstd, and every other algorithm plugs in through the same interfaces.
+- Each digest and compression capability pairs the operation with the `Oid` that the frame records, so implementations from any library or language interchange.
+- A cipher names its algorithm in the envelope it writes.
+- A signer signs the profile signature, which the engine fixes, so a signer names no OID and only signs the prehash it receives.
+- The profile ships wasm-backed implementations of SHA3-256, secp256k1 ECDSA, AES-256-GCM, HPKE, and zstd.
+- Every other algorithm plugs in through the same interfaces.
 
 | Interface                        | Contract                                                                                                                                 |
 | -------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
@@ -603,9 +902,18 @@ Each digest and compression capability pairs the operation with the `Oid` that t
 | `BodyDecryptor`                  | `decrypt(sealed)`, which receives the carried pieces and resolves with the octets that were sealed                                       |
 | `BodyCompressor`, `BodyInflator` | [Compression](#compression)                                                                                                              |
 
-Each operation of these interfaces, of `MessageCodec` and `PayloadCodec`, and of `TransportSigner` that takes an input is a readonly function property. Under `strictFunctionTypes`, which `strict` sets, the type checker therefore refuses an implementation whose parameter admits less than the operation declares. A throw or a rejection from an operation fails the call that reached it, such as the build, `Frame.open`, or the dial.
+### Interface rules
 
-The `envelopeDer` of an encrypted body is a DER CMS `AuthEnvelopedData` (RFC 5083) with its content detached, and it names the content-encryption algorithm. A profile decryptor reads the algorithm and the key from the envelope, and the engine rejects an envelope that the key refuses, such as one that names another key or whose tag fails, with a `TightbeamTransportError`. `engine.profile` lends the profile identifiers as views.
+- Each operation that takes an input is a readonly function property: on these interfaces, on `MessageCodec` and `PayloadCodec`, and on `TransportSigner`.
+- Under `strictFunctionTypes`, which `strict` sets, the type checker therefore refuses an implementation whose parameter admits less than the operation declares.
+- A throw or a rejection from an operation fails the call that reached it, such as the build, `Frame.open`, or the dial.
+
+### Encrypted bodies
+
+- The `envelopeDer` of an encrypted body is a DER CMS `AuthEnvelopedData` (RFC 5083) with its content detached, and it names the content-encryption algorithm.
+- A profile decryptor reads the algorithm and the key from the envelope.
+- The engine rejects an envelope that the key refuses, such as one that names another key or whose tag fails, with a `TightbeamTransportError`.
+- `engine.profile` lends the profile identifiers as views.
 
 ```ts
 import type { Hasher, Signatory } from "@wahidgroup/tightbeam-ws-client";
@@ -633,22 +941,44 @@ const built = await engine
   .build();
 ```
 
-The profile key classes, `Secp256k1SigningKey`, `Secp256k1VerifyingKey`, `Aes256Gcm`, `HpkeEncryptor`, and `HpkeDecryptor`, come from `engine.signingKey`, `engine.verifyingKey`, `engine.aes256Gcm`, `engine.hpkeEncryptor`, and `engine.hpkeDecryptor`. Each one owns a wasm handle and releases it through `[Symbol.dispose]`, so a `using` declaration frees the key as its scope ends:
+### Profile keys
 
+| Class                   | Comes from             |
+| ----------------------- | ---------------------- |
+| `Secp256k1SigningKey`   | `engine.signingKey`    |
+| `Secp256k1VerifyingKey` | `engine.verifyingKey`  |
+| `Aes256Gcm`             | `engine.aes256Gcm`     |
+| `HpkeEncryptor`         | `engine.hpkeEncryptor` |
+| `HpkeDecryptor`         | `engine.hpkeDecryptor` |
+
+- Each one owns a wasm handle and releases it through `[Symbol.dispose]`, so a `using` declaration frees the key as its scope ends.
 - A release wipes the wasm copy of a secret at once, or when a decryption already in flight settles.
-- The release is idempotent, and every later call on the key refuses with `KeyReleased`. A method that answers a promise, such as `encrypt`, `decrypt`, or `signPrehash`, rejects with it, so each one fails on one channel.
-- A signing key derives its verifying key once and lends that one key from `verifyingKey()` as a `VerifyingKeyView`. The view has no release of its own, and the signing key frees it with itself.
+- The release is idempotent, and every later call on the key refuses with `KeyReleased`.
+- A method that answers a promise, such as `encrypt`, `decrypt`, or `signPrehash`, rejects with it, so each one fails on one channel.
+- A signing key derives its verifying key once, and lends that one key from `verifyingKey()` as a `VerifyingKeyView`.
+- The view has no release of its own, and the signing key frees it with itself.
 
 ## Compression
 
-A `BodyCompressor` shrinks the body DER and names its algorithm once, as its `algorithmOid`, and a `BodyInflator` reverses it in the shape of the `Inflator` of `tightbeam-rs`: its `algorithmOid`, `admitsParameters(parametersDer?)`, and `decompress(data)`. `Frame.open` checks that the inflator reverses the algorithm of the frame and admits its parameters before it decrypts anything. The builder compresses after the message commitment, which covers the uncompressed body, and before the encryption, so peers encrypt the compressed bytes. That order is the order of `tightbeam-rs`.
+| Capability       | Contract                                                                                                                                      |
+| ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `BodyCompressor` | Shrinks the body DER, and names its algorithm once, as its `algorithmOid`                                                                     |
+| `BodyInflator`   | Reverses it, in the shape of the `Inflator` of `tightbeam-rs`: its `algorithmOid`, `admitsParameters(parametersDer?)`, and `decompress(data)` |
 
-`engine.zstd(maxOutput?)` lends the profile compression of the realm at that ceiling: one zstd frame under `engine.profile.zstd`, compatible in its encoded form with the `ZstdCompression` of `tightbeam-rs`. The engine runs it in Rust, so the browser admits what a native peer admits ([The Browser Engine](ws-wasm.md#compression)):
+- `Frame.open` checks that the inflator reverses the algorithm of the frame and admits its parameters before it decrypts anything.
+- The builder compresses after the message commitment, which covers the uncompressed body.
+- The builder compresses before the encryption, so peers encrypt the compressed bytes.
+- That order is the order of `tightbeam-rs`.
 
-- no parameters, or a compression level that libzstd accepts
-- one frame and no octet after it: a zstd frame, or a skippable frame that inflates to no octets. A trailing skippable frame or a seek table rejects
-- a decompressed size within the output cap, 16 MiB by default as in `tightbeam-rs`, which `maxOutput` tunes. The output stays within the cap
-- a declared window within the same cap, rounded up to a power of two as `tightbeam-rs` rounds it
+### The profile zstd
+
+- `engine.zstd(maxOutput?)` lends the profile compression of the realm at that ceiling: one zstd frame under `engine.profile.zstd`.
+- Its encoded form is compatible with the `ZstdCompression` of `tightbeam-rs`.
+- The engine runs it in Rust, so the browser admits what a native peer admits ([The Browser Engine](ws-wasm.md#compression)):
+  - no parameters, or a compression level that libzstd accepts
+  - one frame and no octet after it: a zstd frame, or a skippable frame that inflates to no octets. A trailing skippable frame or a seek table rejects
+  - a decompressed size within the output cap, 16 MiB by default as in `tightbeam-rs`, which `maxOutput` tunes. The output stays within the cap
+  - a declared window within the same cap, rounded up to a power of two as `tightbeam-rs` rounds it
 
 ```ts
 const zstd = engine.zstd();
@@ -669,11 +999,17 @@ const opened = await sealed.open(engine.opaque, {
 });
 ```
 
+### Compression refusals
+
 A refusal carries one code on every path:
 
-- `zstd.decompress(data)`, which `Frame.open` calls, throws a `TightbeamTransportError` whose `code` names the refusal: `WindowTooLarge`, `OutputLimitExceeded`, `Truncated`, `TrailingBytes`, `Stalled`, or `Malformed`.
-- An inflator that names another algorithm than the compactness info, or refuses its parameters, rejects with `CompactnessRefused` at `compactness` before any decryption.
-- `engine.zstd(maxOutput)` throws `InvalidMaxOutput` for a cap that is no whole, non-negative number.
+| Path                                                                                          | Refuses with                                                                                                                                                        |
+| --------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `zstd.decompress(data)`, which `Frame.open` calls                                             | A thrown `TightbeamTransportError` whose `code` names the refusal: `WindowTooLarge`, `OutputLimitExceeded`, `Truncated`, `TrailingBytes`, `Stalled`, or `Malformed` |
+| An inflator that names another algorithm than the compactness info, or refuses its parameters | `CompactnessRefused` at `compactness`, before any decryption                                                                                                        |
+| `engine.zstd(maxOutput)` with a cap that is no whole, non-negative number                     | A thrown `InvalidMaxOutput`                                                                                                                                         |
+
+### Other algorithms
 
 Any other algorithm works through the same interfaces. The platform-native `CompressionStream` gives a zlib alternative with no dependency (`engine.profile.zlib`, RFC 3274):
 
@@ -709,13 +1045,23 @@ const built = await engine
   .build();
 ```
 
-A compressor names its algorithm once, as `algorithmOid`, as an inflator does. `withCompressor` copies that `Oid`, so one compressor serves every build, and the compressor keeps its own handle.
+- A compressor names its algorithm once, as `algorithmOid`, as an inflator does.
+- `withCompressor` copies that `Oid`, so one compressor serves every build, and the compressor keeps its own handle.
 
-A compressed frame reports `compressed: true` and carries `compactnessInfo`, `{ algorithmOid, parametersDer?, contentOid }`, with each algorithm an `OidView` that the frame owns. A read without an inflator rejects with `OpaqueBody`, which names `inflator` on `layer`. An inflator SHOULD cap its output size, because a body from the peer can be a decompression bomb (CWE-409).
+### Compressed frames
+
+- A compressed frame reports `compressed: true`, and carries `compactnessInfo`, `{ algorithmOid, parametersDer?, contentOid }`.
+- Each algorithm of `compactnessInfo` is an `OidView` that the frame owns.
+- A read without an inflator rejects with `OpaqueBody`, which names `inflator` on `layer`.
+- An inflator SHOULD cap its output size, because a body from the peer can be a decompression bomb (CWE-409).
 
 ## Verification and decryption
 
-The `Frame` carries its own verification. A verdict is an `IntegrityVerdict` of `tightbeam-rs` by its label, one of `"verified"`, `"absent"`, `"algorithm-mismatch"`, and `"mismatch"`, and the engine `DigestInfo` that the frame carries judges every one but `"absent"`. The verdict methods recompute under any `Hasher`, and the profile SHA3-256 is the default. An external verifier checks `signatureInfo.signature`, a DER `ECDSA-Sig-Value`, over `signaturePrehash()` with its own library.
+- The `Frame` carries its own verification.
+- A verdict is an `IntegrityVerdict` of `tightbeam-rs` by its label, one of `"verified"`, `"absent"`, `"algorithm-mismatch"`, and `"mismatch"`.
+- The engine `DigestInfo` that the frame carries judges every verdict but `"absent"`.
+- The verdict methods recompute under any `Hasher`, and the profile SHA3-256 is the default.
+- An external verifier checks `signatureInfo.signature`, a DER `ECDSA-Sig-Value`, over `signaturePrehash()` with its own library.
 
 ```ts
 await response.verify(signingKey.verifyingKey()); // the profile scheme rejects an invalid signature
@@ -743,8 +1089,12 @@ response.signatureInfo; // { algorithmOid, digestAlgorithmOid, signature }
 
 The calls above work on one frame. A conversation applies the same layers to every frame in both directions, and `engine.envelope(codec)` declares them once:
 
-- `frame(message)` begins a builder with the layers applied.
-- `unwrap(frame)` reverses the layers in protocol order, verify, open, inflate, and decode, and it enforces them. A received frame that lacks a declared signature or seal rejects with `EnvelopeUnsigned` or `EnvelopeCleartext`, so a peer cannot downgrade the conversation by omission.
+| Method           | Does                                                                                        |
+| ---------------- | ------------------------------------------------------------------------------------------- |
+| `frame(message)` | Begins a builder with the layers applied                                                    |
+| `unwrap(frame)`  | Reverses the layers in protocol order, verify, open, inflate, and decode, and enforces them |
+
+A received frame that lacks a declared signature or seal rejects with `EnvelopeUnsigned` or `EnvelopeCleartext`, so a peer cannot downgrade the conversation by omission.
 
 ```ts
 const topic = engine.aes256Gcm({ key: topicKey, keyId: topicKeyId });
@@ -761,13 +1111,28 @@ const sent = await notes.frame(note).withId("note-1").withOrder(1n).build();
 const received = await notes.unwrap(relayed);
 ```
 
+### Declarations
+
 An envelope is immutable, and every frame of the conversation reuses it. Each declaration names the halves that the party holds, each in a field of its own name:
 
-- `signed({ signer, verifier })`: `frame()` signs with `signer`, and `unwrap` requires a signature that verifies under `verifier`. A wallet, a passkey, or an HSM that cannot verify names `signer` alone, and a party without the signing key names `verifier` alone.
-- `sealed({ sealer, opener })` takes a `BodyEncryptor` and a `BodyDecryptor`, and `Aes256Gcm` is both. An HPKE pair splits: the publisher declares `sealed({ sealer: engine.hpkeEncryptor(recipientPublic) })`, and the recipient declares `sealed({ opener: engine.hpkeDecryptor(recipientSecret) })`.
-- `compressed({ compressor, inflator })` is a transport optimization and no security property, so an uncompressed received frame still unwraps.
+| Declaration                            | Halves                                                                                             |
+| -------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| `signed({ signer, verifier })`         | `frame()` signs with `signer`, and `unwrap` requires a signature that verifies under `verifier`    |
+| `sealed({ sealer, opener })`           | A `BodyEncryptor` and a `BodyDecryptor`. `Aes256Gcm` is both                                       |
+| `compressed({ compressor, inflator })` | A transport optimization and no security property, so an uncompressed received frame still unwraps |
 
-The type `Envelope<T, Sends, Receives>` records whether every declared layer holds its send half and its receive half, so `frame()` exists only on an envelope that can sign and seal what it sends, and `unwrap()` only on one that can verify and open what it receives. The type checker therefore refuses a `frame()` call on a verify-only envelope. The published declarations key that record with a symbol, so the guarantee holds for every consumer of the package. An untyped caller meets `EnvelopeSender` or `EnvelopeReceiver` instead.
+- A wallet, a passkey, or an HSM that cannot verify names `signer` alone.
+- A party without the signing key names `verifier` alone.
+- An HPKE pair splits. The publisher declares `sealed({ sealer: engine.hpkeEncryptor(recipientPublic) })`, and the recipient declares `sealed({ opener: engine.hpkeDecryptor(recipientSecret) })`.
+
+### Typed halves
+
+- The type `Envelope<T, Sends, Receives>` records whether every declared layer holds its send half and its receive half.
+- `frame()` therefore exists only on an envelope that can sign and seal what it sends.
+- `unwrap()` exists only on one that can verify and open what it receives.
+- The type checker therefore refuses a `frame()` call on a verify-only envelope.
+- The published declarations key that record with a symbol, so the guarantee holds for every consumer of the package.
+- An untyped caller meets `EnvelopeSender` or `EnvelopeReceiver` instead.
 
 A one-sided party composes only its half:
 
@@ -779,18 +1144,29 @@ const readOnly = engine
   .sealed({ opener: engine.hpkeDecryptor(recipientSecret) });
 ```
 
-The `authenticated` and `confidential` getters report the declarations. `unwrap` enforces them, so they hold for every unwrapped frame, and a UI shows them as badges with no probe of each frame. The pubsub manager accepts an envelope wherever it accepts a codec, and it publishes frame in frame so the layers hold end to end through the broker ([The Subscription Client](pubsub-client.md#payload-shapes)).
+### Reported declarations
+
+- The `authenticated` and `confidential` getters report the declarations.
+- `unwrap` enforces them, so they hold for every unwrapped frame.
+- A UI therefore shows them as badges with no probe of each frame.
+- The pubsub manager accepts an envelope wherever it accepts a codec.
+- It publishes frame in frame, so the layers hold end to end through the broker ([The Subscription Client](pubsub-client.md#payload-shapes)).
 
 ## Detached commitments
 
-A commitment can also live outside a frame, as `tightbeam::crypto::commitment::Opening` does in Rust. A prover publishes a hiding digest now and discloses the opening `(salt, body)` later, and any holder of the digest verifies the disclosure. The preimage is the one that the message commitment of a frame uses, so a detached commitment and one that a frame carries interchange:
+- A commitment can also live outside a frame, as `tightbeam::crypto::commitment::Opening` does in Rust.
+- A prover publishes a hiding digest now and discloses the opening `(salt, body)` later, and any holder of the digest verifies the disclosure.
+- The preimage is the one that the message commitment of a frame uses, so a detached commitment and one that a frame carries interchange.
+
+### Preimages
 
 - An empty salt binds the body, under the preimage `mode || body`.
 - A salt of at least 16 octets binds and hides the body, under the preimage `mode || len(salt) || salt || body`.
-
-A plain digest of the body binds it alone, because a brute force over candidate bodies recovers a low-entropy body from its published digest. A secret salt hides the body until the opening `(salt, body)` is disclosed.
-
-The mode octet is `0x00` for an empty salt and `0x01` for a hiding salt, and `len(salt)` is an 8-octet big-endian length. The mode octet keeps a commitment under an empty salt apart from the plain digest of the body, so neither verifies as the other.
+- The mode octet is `0x00` for an empty salt, and `0x01` for a hiding salt.
+- `len(salt)` is an 8-octet big-endian length.
+- The mode octet keeps a commitment under an empty salt apart from the plain digest of the body, so neither verifies as the other.
+- A plain digest of the body binds it alone, because a brute force over candidate bodies recovers a low-entropy body from its published digest.
+- A secret salt hides the body until the opening `(salt, body)` is disclosed.
 
 ```ts
 // Prover: publish `commitment`, keep the salt and the body secret until disclosure.
@@ -803,7 +1179,14 @@ using disclosed = engine.opening(engine.salt(secret), bodyDer);
 const verified = await disclosed.verify(engine.sha3_256, commitment);
 ```
 
-`verify` resolves with `false` on an algorithm mismatch or a digest mismatch. `commitment` is an engine `DigestInfo`, the one owner that judges a recomputed digest against a carried one. An opening copies the body before it takes its salt, so a refused copy leaves the salt with the caller. An opening that takes the salt leaves the caller an empty shell, and it frees the salt as its `using` scope ends. The salt is a `CommitmentSalt` handle and the body is DER octets, so the type checker refuses a call that swaps them. Any `Hasher` works on both sides.
+### Opening rules
+
+- `verify` resolves with `false` on an algorithm mismatch or a digest mismatch.
+- `commitment` is an engine `DigestInfo`, the one owner that judges a recomputed digest against a carried one.
+- An opening copies the body before it takes its salt, so a refused copy leaves the salt with the caller.
+- An opening that takes the salt leaves the caller an empty shell, and it frees the salt as its `using` scope ends.
+- The salt is a `CommitmentSalt` handle and the body is DER octets, so the type checker refuses a call that swaps them.
+- Any `Hasher` works on both sides.
 
 ## Sources
 

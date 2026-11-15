@@ -8,7 +8,11 @@ This project is under active development. Public APIs MAY change without notice.
 
 ## Abstract
 
-tightbeam streams DER-encoded envelopes over raw TCP. This crate carries the same envelopes as the messages of one bidirectional gRPC call over HTTP/2, the tunnel, so native tightbeam clients reach a server through gRPC hops: sidecar meshes, L4 load balancers, and HTTP/2 proxies that route by `:authority`, in h2c or over TLS 1.3. It plugs into the transport traits of tightbeam, so the handshake, the policies, multiplexing, and pooling of tightbeam run over it unchanged, and a cluster gateway takes it as its edge.
+- tightbeam streams DER-encoded envelopes over raw TCP.
+- This crate carries the same envelopes as the messages of one bidirectional gRPC call over HTTP/2, the tunnel.
+- Native tightbeam clients reach a server through gRPC hops: sidecar meshes, L4 load balancers, and HTTP/2 proxies that route by `:authority`, in h2c or over TLS 1.3.
+- It plugs into the transport traits of tightbeam, so the handshake, the policies, multiplexing, and pooling of tightbeam run over it unchanged.
+- A cluster gateway takes it as its edge.
 
 ## Install
 
@@ -33,25 +37,47 @@ let server_handle = server! {
 # }
 ```
 
-The listener serves in the clear here, and `bind_cleartext` says so: its tunnels are plaintext, unprotected, and unauthenticated (CWE-319). An encrypted listener binds with its certificate, and each tunnel runs the tightbeam handshake.
+- The listener serves in the clear here, and `bind_cleartext` says so: its tunnels are plaintext, unprotected, and unauthenticated (CWE-319).
+- An encrypted listener binds with its certificate, and each tunnel runs the tightbeam handshake.
 
 ## Transport
 
-`GrpcListener` is a tightbeam protocol: it binds, accepts, and dials tunnels, and its stream holds every read and write to the envelope rules of [tightbeam-wire](https://github.com/wahidgroup/tightbeam-ext/tree/master/wire/tightbeam-wire). Each connection holds a slot and a deadline while no caller holds its tunnel. Implementation: [docs/grpc.md](https://github.com/wahidgroup/tightbeam-ext/blob/master/docs/grpc.md#listener).
+- `GrpcListener` is a tightbeam protocol: it binds, accepts, and dials tunnels.
+- Its stream holds every read and write to the envelope rules of [tightbeam-wire](https://github.com/wahidgroup/tightbeam-ext/tree/master/wire/tightbeam-wire).
+- Each connection holds a slot and a deadline while no caller holds its tunnel.
 
-The edge profile of a listener is a type that provisions each bind and each dial of a deployment: h2c by default, or TLS 1.3 from the certificates of the deployment. A deployment whose material comes at run time stages it through `staged_profile!`. Implementation: [docs/grpc.md](https://github.com/wahidgroup/tightbeam-ext/blob/master/docs/grpc.md#edge-profile).
+Implementation: [docs/grpc.md](https://github.com/wahidgroup/tightbeam-ext/blob/master/docs/grpc.md#listener).
+
+- The edge profile of a listener is a type that provisions each bind and each dial of a deployment.
+- It is h2c by default, or TLS 1.3 from the certificates of the deployment.
+- A deployment whose material comes at run time stages it through `staged_profile!`.
+
+Implementation: [docs/grpc.md](https://github.com/wahidgroup/tightbeam-ext/blob/master/docs/grpc.md#edge-profile).
 
 ## Audit trail
 
-The `instrument` feature records each call and each connection that an edge refuses before any session exists, each PROXY header that it reads or refuses, and each call of its coupler, on the one trace that the profile's `Edge::with_trace` attaches. Implementation: [docs/grpc.md](https://github.com/wahidgroup/tightbeam-ext/blob/master/docs/grpc.md#tunnel-call).
+The `instrument` feature records these on the one trace that the profile's `Edge::with_trace` attaches:
+
+- each call and each connection that an edge refuses before any session exists
+- each PROXY header that it reads or refuses
+- each call of its coupler
+
+Implementation: [docs/grpc.md](https://github.com/wahidgroup/tightbeam-ext/blob/master/docs/grpc.md#tunnel-call).
 
 ## Security
 
-Authentication and confidentiality come from the tightbeam handshake inside the tunnel. TLS under the edge profile protects the hop to the listener, and replaces nothing inside the tunnel. Implementation: [docs/grpc.md](https://github.com/wahidgroup/tightbeam-ext/blob/master/docs/grpc.md#limitations).
+- Authentication and confidentiality come from the tightbeam handshake inside the tunnel.
+- TLS under the edge profile protects the hop to the listener, and replaces nothing inside the tunnel.
+
+Implementation: [docs/grpc.md](https://github.com/wahidgroup/tightbeam-ext/blob/master/docs/grpc.md#limitations).
 
 ## Cluster edge
 
-A tightbeam cluster gateway binds a gRPC edge that admits signed work frames from native clients, and stream opens once its `EdgePlane` admits them, while the colony keeps the protocol that its cluster declares. Implementation: [docs/grpc.md](https://github.com/wahidgroup/tightbeam-ext/blob/master/docs/grpc.md#cluster-work-plane).
+- A tightbeam cluster gateway binds a gRPC edge that admits signed work frames from native clients.
+- The edge admits stream opens once its `EdgePlane` admits them.
+- The colony keeps the protocol that its cluster declares.
+
+Implementation: [docs/grpc.md](https://github.com/wahidgroup/tightbeam-ext/blob/master/docs/grpc.md#cluster-work-plane).
 
 ## Coupled edge
 
@@ -65,7 +91,14 @@ How to: [docs/grpc-interop.md](https://github.com/wahidgroup/tightbeam-ext/blob/
 
 ## Proxy hops
 
-A hop between client and server speaks HTTP/2 under the profile of the server, routes by `:authority`, sets no route timeout, and retires idle upstream connections before the server closes them, because a tunnel lives as long as its session. Implementation: [docs/grpc.md](https://github.com/wahidgroup/tightbeam-ext/blob/master/docs/grpc.md#hop-requirements).
+A hop between client and server:
+
+- speaks HTTP/2 under the profile of the server
+- routes by `:authority`
+- sets no route timeout
+- retires idle upstream connections before the server closes them
+
+Each rule holds because a tunnel lives as long as its session. Implementation: [docs/grpc.md](https://github.com/wahidgroup/tightbeam-ext/blob/master/docs/grpc.md#hop-requirements).
 
 ## Related
 
