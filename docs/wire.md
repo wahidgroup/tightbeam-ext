@@ -87,5 +87,5 @@ The crate names no socket and depends on tightbeam alone. A `wasm32` build of it
 ## Sources
 
 - The Rust Reference, Implementations, Orphan rules: <https://doc.rust-lang.org/reference/items/implementations.html#orphan-rules>
-- tightbeam-rs 0.19.0, `transport::AsyncProtocolStream` and `transport::AsyncByteStream`: <https://docs.rs/tightbeam-rs/0.19.0/tightbeam/transport/index.html>
-- tightbeam-rs 0.19.0, `TransportError::peer_refusal`, which names the refusal of each error: `src/transport/error.rs` lines 641 to 683
+- tightbeam-rs, `transport::AsyncProtocolStream` and `transport::AsyncByteStream`: <https://docs.rs/tightbeam-rs/latest/tightbeam/transport/index.html>
+- tightbeam-rs, `TransportError::peer_refusal`, which names the refusal of each error

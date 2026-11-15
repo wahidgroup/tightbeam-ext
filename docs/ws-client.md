@@ -110,11 +110,11 @@ The handle rules:
 
 Every connection is a multiplexed tightbeam session, so one socket carries concurrent, bidirectional streams. Each connector is a method of the `Engine`, and it resolves once the session is ready, so a failed dial rejects the connect call and not the first emit. The rejection is `InvalidUrl` when the runtime refuses the url, `ConnectionClosed` when the socket of `connectCleartext` closes before it opens, `PeerClosedBeforeHandshake` when the socket of `connect` or `connectMutual` closes before the handshake completes, `InvalidCertificate` when the trust store refuses the pinned server certificate, such as one outside its validity on the host clock, or the code of the `tightbeam-rs` variant that refuses the handshake or the client identity, such as `Signer`.
 
-| Connector                                | Session                                             | Stream caps                                                                                                                         |
-| ---------------------------------------- | --------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
-| `connectCleartext(url, options?)`        | No handshake, no confidentiality, no integrity      | `streams` (default `DEFAULT_STREAM_CAP`) caps both directions. Both endpoints MUST configure the same value                         |
-| `connect(url, serverCertDer, options?)`  | HPKE, with the server pinned by its DER certificate | `maxPeerStreams` (default `DEFAULT_STREAM_CAP`) caps server-initiated streams. The advertisement of the server caps client emits    |
-| `connectMutual(url, identity, options?)` | HPKE with mutual authentication                     | As `connect`                                                                                                                        |
+| Connector                                | Session                                             | Stream caps                                                                                                                      |
+| ---------------------------------------- | --------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| `connectCleartext(url, options?)`        | No handshake, no confidentiality, no integrity      | `streams` (default `DEFAULT_STREAM_CAP`) caps both directions. Both endpoints MUST configure the same value                      |
+| `connect(url, serverCertDer, options?)`  | HPKE, with the server pinned by its DER certificate | `maxPeerStreams` (default `DEFAULT_STREAM_CAP`) caps server-initiated streams. The advertisement of the server caps client emits |
+| `connectMutual(url, identity, options?)` | HPKE with mutual authentication                     | As `connect`                                                                                                                     |
 
 The HPKE handshake also negotiates stream multiplexing (`transport-multiplex` of tightbeam, in the style of HTTP/2). A connection to a server that offers no multiplexing rejects with `InvalidState`.
 
@@ -124,9 +124,9 @@ const secure = await engine.connect(url, serverCertDer);
 
 // Mutually authenticated (32-byte secp256k1 signing key):
 const mutual = await engine.connectMutual(url, {
-	serverCertDer,
-	clientCertDer,
-	clientKey: clientSigningKey,
+  serverCertDer,
+  clientCertDer,
+  clientKey: clientSigningKey,
 });
 ```
 
@@ -136,7 +136,7 @@ const mutual = await engine.connectMutual(url, {
 
 | Code                                            | Cause                                                                                                       |
 | ----------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
-| `InvalidBytes`                                  | A certificate is not a `Uint8Array`                                                                         |
+| `InvalidBytes`                                  | A certificate is not a `Uint8Array`, or the raw scalar is a `Uint8Array` over a detached buffer             |
 | `InvalidClientKey`                              | The key is neither a `Uint8Array` nor an object                                                             |
 | `InvalidSigningKey`                             | The raw scalar is not 32 octets, or names no key                                                            |
 | `InvalidCallback`, `InvalidOid`, `InvalidBytes` | A `TransportSigner` lacks `signPrehash`, names no OID, or holds a `publicKeyDer` that is not a `Uint8Array` |
@@ -164,15 +164,15 @@ A certificate key in an external key store, such as WebAuthn, a wallet, or a KMS
 import type { TransportSigner } from "@wahidgroup/tightbeam-ws-client";
 
 const signer: TransportSigner = {
-	algorithmOid: "2.16.840.1.101.3.4.3.10", // ecdsa-with-SHA3-256
-	publicKeyDer: spkiFromKeyStore,
-	signPrehash: (prehash) => keyStore.signDigest(prehash),
+  algorithmOid: "2.16.840.1.101.3.4.3.10", // ecdsa-with-SHA3-256
+  publicKeyDer: spkiFromKeyStore,
+  signPrehash: (prehash) => keyStore.signDigest(prehash),
 };
 
 const external = await engine.connectMutual(url, {
-	serverCertDer,
-	clientCertDer,
-	clientKey: signer,
+  serverCertDer,
+  clientCertDer,
+  clientKey: signer,
 });
 ```
 
@@ -186,15 +186,15 @@ A metered session requests credits for each direction and settles the invoices o
 
 ```ts
 const metered = await engine.connectMutual(
-	url,
-	{ serverCertDer, clientCertDer, clientKey: clientSigningKey },
-	{
-		budgets: { clientToServer: 4096, serverToClient: 4096 },
-		approveReceipt: ({ receiptDer, challenge }) => {
-			// Pay the invoice in `challenge`, or return undefined to refuse.
-			return paymentFor(challenge);
-		},
-	},
+  url,
+  { serverCertDer, clientCertDer, clientKey: clientSigningKey },
+  {
+    budgets: { clientToServer: 4096, serverToClient: 4096 },
+    approveReceipt: ({ receiptDer, challenge }) => {
+      // Pay the invoice in `challenge`, or return undefined to refuse.
+      return paymentFor(challenge);
+    },
+  },
 );
 
 metered.usableSendBudget; // epoch usable credits, or undefined when unmetered
@@ -224,16 +224,19 @@ const mux = await engine.connect(url, serverCertDer);
 // handler serves streams dispatched after the call), and handlers for
 // distinct streams run concurrently.
 mux.serve(async (request) => {
-	const reply = await engine
-		.frameBuilder(handle(await request.open(engine.opaque)))
-		.withId("reply")
-		.withOrder(1)
-		.build();
-	return reply; // or undefined/null for a bodiless acceptance
+  const reply = await engine
+    .frameBuilder(handle(await request.open(engine.opaque)))
+    .withId("reply")
+    .withOrder(1)
+    .build();
+  return reply; // or undefined/null for a bodiless acceptance
 });
 
 // Concurrent client-initiated streams over the one connection.
-const [first, second] = await Promise.all([mux.emit(builtFirst), mux.emit(builtSecond)]);
+const [first, second] = await Promise.all([
+  mux.emit(builtFirst),
+  mux.emit(builtSecond),
+]);
 
 await mux.shutdown(); // GoAway, drain in-flight streams, stop
 await mux.close();
@@ -264,7 +267,7 @@ Unary `emit` and `serve` stay the default. Progressive body I/O runs on the same
 
 A push reaches the socket at once, so a duplex conversation that pushes and then awaits the next reply chunk makes progress. `closeWith(chunk)` flags that chunk `last` in one record, one record fewer than a push and a close.
 
-The calls on one push half, the request half of a stream or the reply half of a served duplex stream, run in the order they were made, so a close waits for the pushes before it, and a push that waits holds a copy of its chunk. Each stream owns its wasm handle and releases it on every exit. A close consumes the handle, and the end of an `await using` scope cancels a stream that no close reached. After a close or a disposal, a push or a second close refuses with `StreamClosed`.
+The calls on one push half, the request half of a stream or the reply half of a served duplex stream, run in the order they were made, so a close waits for the pushes before it, and a push that waits holds a copy of its chunk. Each stream owns its wasm handle and releases it on every exit. A close consumes the handle, and the end of an `await using` scope cancels a stream that no close reached. After a close or a disposal, a push or a second close refuses with `StreamClosed`. A disposal of a request half also ends a push in flight with `StreamClosed`, even one that waits on the credit of the peer, and a push in flight on a reply half finishes.
 
 The request half and the reply `body` of a duplex stream end apart: a close ends the request half, the body reads until the `last` chunk of the peer, and a `break` out of the body cancels the stream. A disposal of the body also cancels an opened stream, and a read that still waits ends at once with no chunk. A `serveStreaming` or `serveDuplex` handler receives a body and a reply half that the client frees once the handler settles.
 
@@ -280,7 +283,7 @@ await duplex.push(chunkA);
 const first = await duplex.body[Symbol.asyncIterator]().next();
 await duplex.closeWith(chunkB);
 for await (const chunk of duplex.body) {
-	handle(chunk);
+  handle(chunk);
 }
 ```
 
@@ -297,14 +300,14 @@ import { Route, Router } from "@wahidgroup/tightbeam-ws-client";
 const chat = engine.envelope(ChatCodec).signed({ verifier: publisherKey });
 
 const routes = new Router({
-	"tick/": Route.of(TickCodec, (tick) => {
-		store.applyTick(tick); // tick: Tick, inferred from the codec
-		return undefined; // bodiless ack
-	}),
-	"chat/": Route.sealed(chat, async (message, request) => {
-		store.appendChat(message); // the signature verified before decode
-		return buildReceipt(request); // response frame
-	}),
+  "tick/": Route.of(TickCodec, (tick) => {
+    store.applyTick(tick); // tick: Tick, inferred from the codec
+    return undefined; // bodiless ack
+  }),
+  "chat/": Route.sealed(chat, async (message, request) => {
+    store.appendChat(message); // the signature verified before decode
+    return buildReceipt(request); // response frame
+  }),
 });
 
 mux.serve((request) => routes.dispatch(request));
@@ -317,7 +320,12 @@ A server matches on the frame id prefix in its own stream handler before it deco
 `submitWork(target, frame, options?)` routes a signed work frame through a tightbeam cluster gateway to the servlet type that the URN `target` names. It resolves with the complete response frame of the servlet. The gateway relays the request frame and the response frame with their bytes unchanged, so each side verifies the end-to-end signature of the other ([The WebSocket Transport](ws.md#cluster-work-plane)).
 
 ```ts
-const work = await engine.frameBuilder(payload).withId("job-42").withOrder(1).withSigner(signingKey).build();
+const work = await engine
+  .frameBuilder(payload)
+  .withId("job-42")
+  .withOrder(1)
+  .withSigner(signingKey)
+  .build();
 
 const served = await mux.submitWork("urn:tightbeam::servlet:work-probe", work);
 await served.verify(signingKey.verifyingKey());
@@ -327,11 +335,11 @@ A gateway refusal rejects with `code === "WorkRefused"`, and a check of that cod
 
 ```ts
 try {
-	await mux.submitWork(target, work, { signal });
+  await mux.submitWork(target, work, { signal });
 } catch (error) {
-	if (engine.isTransportError(error) && error.code === "WorkRefused") {
-		handleRefusal(error);
-	}
+  if (engine.isTransportError(error) && error.code === "WorkRefused") {
+    handleRefusal(error);
+  }
 }
 ```
 
@@ -341,7 +349,7 @@ try {
 
 ```ts
 const response = await mux.emit(built, {
-	signal: AbortSignal.timeout(5_000),
+  signal: AbortSignal.timeout(5_000),
 });
 ```
 
@@ -349,7 +357,7 @@ The connectors take a signal the same way. The abort cancels the dial and the ha
 
 ```ts
 const mux = await engine.connect(url, serverCertDer, {
-	signal: AbortSignal.timeout(5_000),
+  signal: AbortSignal.timeout(5_000),
 });
 ```
 
@@ -359,10 +367,10 @@ Every client exposes `closed`, a promise that resolves with the `{ code, reason,
 
 ```ts
 async function watchClose(client: TightbeamWsClient): Promise<void> {
-	const info = await client.closed;
-	if (!info.wasClean) {
-		scheduleReconnect(info.code);
-	}
+  const info = await client.closed;
+  if (!info.wasClean) {
+    scheduleReconnect(info.code);
+  }
 }
 
 void watchClose(client);
@@ -395,48 +403,50 @@ When the peer drains the session, the client records why. `goawayReason` reads t
 Reconnection belongs to the application. The client supplies the inputs of the policy, `closed`, `goawayReason`, and `wasClean`, and only the application knows what state to replay. The loop branches on the reason, backs off, and registers `serve` again on each connection.
 
 ```ts
-async function connectLoop(handle: (client: TightbeamWsClient) => void): Promise<void> {
-	let delay = 500;
+async function connectLoop(
+  handle: (client: TightbeamWsClient) => void,
+): Promise<void> {
+  let delay = 500;
 
-	for (;;) {
-		let client: TightbeamWsClient;
-		try {
-			client = await engine.connect(url, serverCertDer, {
-				signal: AbortSignal.timeout(5_000),
-			});
-		} catch {
-			await sleep((delay = Math.min(delay * 2, 30_000)));
-			continue;
-		}
+  for (;;) {
+    let client: TightbeamWsClient;
+    try {
+      client = await engine.connect(url, serverCertDer, {
+        signal: AbortSignal.timeout(5_000),
+      });
+    } catch {
+      await sleep((delay = Math.min(delay * 2, 30_000)));
+      continue;
+    }
 
-		delay = 500;
+    delay = 500;
 
-		/*
-		 * serve is per connection: re-register handlers here.
-		 */
-		handle(client);
+    /*
+     * serve is per connection: re-register handlers here.
+     */
+    handle(client);
 
-		const info = await client.closed;
+    const info = await client.closed;
 
-		/*
-		 * Free the dead connection's wasm resources. The GoAway getters
-		 * stay readable from the close snapshot.
-		 */
-		await client.close();
+    /*
+     * Free the dead connection's wasm resources. The GoAway getters
+     * stay readable from the close snapshot.
+     */
+    await client.close();
 
-		switch (client.goawayReason) {
-			case "shutdown":
-				break; // orderly drain (rotation, redeploy): go right back
-			case "enhance-your-calm":
-				await sleep((delay = Math.min(delay * 2, 30_000)));
-				break; // the server asked for calm
-			case "protocol-error":
-				report(info);
-				return; // a bug, not a transient fault
-			default:
-				await sleep(delay); // no GoAway: connection loss
-		}
-	}
+    switch (client.goawayReason) {
+      case "shutdown":
+        break; // orderly drain (rotation, redeploy): go right back
+      case "enhance-your-calm":
+        await sleep((delay = Math.min(delay * 2, 30_000)));
+        break; // the server asked for calm
+      case "protocol-error":
+        report(info);
+        return; // a bug, not a transient fault
+      default:
+        await sleep(delay); // no GoAway: connection loss
+    }
+  }
 }
 ```
 
@@ -462,11 +472,11 @@ A refusal of one field names it on `path`, such as `matrix.n`. `ClientTransportE
 
 ```ts
 try {
-	await mux.emit(built);
+  await mux.emit(built);
 } catch (error) {
-	if (engine.isTransportError(error) && error.code === "Draining") {
-		// GoAway received on a live connection: reconnect before emitting again.
-	}
+  if (engine.isTransportError(error) && error.code === "Draining") {
+    // GoAway received on a live connection: reconnect before emitting again.
+  }
 }
 ```
 
@@ -509,19 +519,19 @@ A builder begins with its body: `engine.frameBuilder(bytes)` for raw bytes under
 const signingKey = engine.signingKey(rawScalar);
 
 const built = await engine
-	.frameBuilder(body)
-	.withId("doc-42")
-	.withOrder(1n)
-	.withPriority(engine.MessagePriority.LowLatency) // V2+
-	.withLifetime(60) // V2+
-	.withPreviousHash(engine.digestInfo(engine.oid(digestOid), digest)) // V2+
-	.withMatrix(2, new Uint8Array([0, 1, 1, 0])) // V3+
-	.withMessageHasher(engine.sha3_256, engine.salt(salt)) // V1+: body commitment, hidden by a salt of 16+ octets
-	.withWitnessHasher(engine.sha3_256) // V1+: frame integrity
-	.withEncryptor(engine.aes256Gcm({ key, keyId })) // V1+: body encryption
-	.withSigner(signingKey) // V1+: secp256k1 signature
-	.assertVersion(engine.Version.V3) // fail the build unless it lands on V3
-	.build();
+  .frameBuilder(body)
+  .withId("doc-42")
+  .withOrder(1n)
+  .withPriority(engine.MessagePriority.LowLatency) // V2+
+  .withLifetime(60) // V2+
+  .withPreviousHash(engine.digestInfo(engine.oid(digestOid), digest)) // V2+
+  .withMatrix(2, new Uint8Array([0, 1, 1, 0])) // V3+
+  .withMessageHasher(engine.sha3_256, engine.salt(salt)) // V1+: body commitment, hidden by a salt of 16+ octets
+  .withWitnessHasher(engine.sha3_256) // V1+: frame integrity
+  .withEncryptor(engine.aes256Gcm({ key, keyId })) // V1+: body encryption
+  .withSigner(signingKey) // V1+: secp256k1 signature
+  .assertVersion(engine.Version.V3) // fail the build unless it lands on V3
+  .build();
 ```
 
 The build rules:
@@ -547,23 +557,29 @@ The protocol treats the frame body as opaque DER, and what the body encodes is a
 import type { MessageCodec } from "@wahidgroup/tightbeam-ws-client";
 
 interface ChatMessage {
-	author: string;
-	text: string;
+  author: string;
+  text: string;
 }
 
 const Chat: MessageCodec<ChatMessage> = engine.wrapping({
-	encode: (message) => new TextEncoder().encode(JSON.stringify(message)),
-	decode: (payload) => {
-		const parsed = JSON.parse(new TextDecoder().decode(payload));
-		// Runtime validation is the codec's responsibility.
-		if (typeof parsed?.author !== "string" || typeof parsed?.text !== "string") {
-			throw new Error("not a ChatMessage");
-		}
-		return parsed;
-	},
+  encode: (message) => new TextEncoder().encode(JSON.stringify(message)),
+  decode: (payload) => {
+    const parsed = JSON.parse(new TextDecoder().decode(payload));
+    // Runtime validation is the codec's responsibility.
+    if (
+      typeof parsed?.author !== "string" ||
+      typeof parsed?.text !== "string"
+    ) {
+      throw new Error("not a ChatMessage");
+    }
+    return parsed;
+  },
 });
 
-const built = await engine.messageBuilder(Chat, { author: "ada", text: "hello" }).withId("chat-1").build();
+const built = await engine
+  .messageBuilder(Chat, { author: "ada", text: "hello" })
+  .withId("chat-1")
+  .build();
 
 const reply = await client.emit(built);
 const message = await reply?.open(Chat); // ChatMessage
@@ -597,24 +613,24 @@ import { sha3_512 } from "@noble/hashes/sha3.js";
 
 // Any digest: implement Hasher with the OID peers should recompute under.
 const sha3_512Hasher: Hasher = {
-	algorithmOid: engine.oid("2.16.840.1.101.3.4.2.10"),
-	digest: async (data) => sha3_512(data),
+  algorithmOid: engine.oid("2.16.840.1.101.3.4.2.10"),
+  digest: async (data) => sha3_512(data),
 };
 
 // Any signer of the profile signature: the builder hands the implementation the digest of the frame's CMS signed
 // attributes and attaches the returned DER signature, so an external signer's private key stays outside wasm memory
 // (wallets, passkeys, HSMs, remote KMS).
 const walletSigner: Signatory = {
-	signerId: () => walletKeyId, // subject key identifier of its certificate
-	signPrehash: async (prehash) => wallet.signDigest(prehash),
+  signerId: () => walletKeyId, // subject key identifier of its certificate
+  signPrehash: async (prehash) => wallet.signDigest(prehash),
 };
 
 const built = await engine
-	.frameBuilder(body)
-	.withId("wallet-1")
-	.withWitnessHasher(sha3_512Hasher)
-	.withSigner(walletSigner)
-	.build();
+  .frameBuilder(body)
+  .withId("wallet-1")
+  .withWitnessHasher(sha3_512Hasher)
+  .withSigner(walletSigner)
+  .build();
 ```
 
 The profile key classes, `Secp256k1SigningKey`, `Secp256k1VerifyingKey`, `Aes256Gcm`, `HpkeEncryptor`, and `HpkeDecryptor`, come from `engine.signingKey`, `engine.verifyingKey`, `engine.aes256Gcm`, `engine.hpkeEncryptor`, and `engine.hpkeDecryptor`. Each one owns a wasm handle and releases it through `[Symbol.dispose]`, so a `using` declaration frees the key as its scope ends:
@@ -637,15 +653,19 @@ A `BodyCompressor` shrinks the body DER and names its algorithm once, as its `al
 ```ts
 const zstd = engine.zstd();
 
-const built = await engine.frameBuilder(body).withId("packed-1").withCompressor(zstd).build();
+const built = await engine
+  .frameBuilder(body)
+  .withId("packed-1")
+  .withCompressor(zstd)
+  .build();
 
 // Cleartext + compressed: name the inflator.
 const message = await received.open(engine.opaque, { inflator: zstd });
 
 // Compressed then sealed: name both capabilities.
 const opened = await sealed.open(engine.opaque, {
-	opener: cipher,
-	inflator: zstd,
+  opener: cipher,
+  inflator: zstd,
 });
 ```
 
@@ -658,24 +678,35 @@ A refusal carries one code on every path:
 Any other algorithm works through the same interfaces. The platform-native `CompressionStream` gives a zlib alternative with no dependency (`engine.profile.zlib`, RFC 3274):
 
 ```ts
-import type { BodyCompressor, BodyInflator, CompressedBody } from "@wahidgroup/tightbeam-ws-client";
+import type {
+  BodyCompressor,
+  BodyInflator,
+  CompressedBody,
+} from "@wahidgroup/tightbeam-ws-client";
 
-async function pump(transform: ReadableWritablePair<Uint8Array, BufferSource>, bytes: Uint8Array): Promise<Uint8Array> {
-	const source = new Blob([bytes.slice()]).stream().pipeThrough(transform);
-	return new Uint8Array(await new Response(source).arrayBuffer());
+async function pump(
+  transform: ReadableWritablePair<Uint8Array, BufferSource>,
+  bytes: Uint8Array,
+): Promise<Uint8Array> {
+  const source = new Blob([bytes.slice()]).stream().pipeThrough(transform);
+  return new Uint8Array(await new Response(source).arrayBuffer());
 }
 
 const zlibOid = engine.profile.zlib;
 const zlib: BodyCompressor & BodyInflator = {
-	algorithmOid: zlibOid,
-	compress: async (bodyDer) => ({
-		data: await pump(new CompressionStream("deflate"), bodyDer),
-	}),
-	admitsParameters: (parametersDer) => parametersDer === undefined,
-	decompress: (data) => pump(new DecompressionStream("deflate"), data),
+  algorithmOid: zlibOid,
+  compress: async (bodyDer) => ({
+    data: await pump(new CompressionStream("deflate"), bodyDer),
+  }),
+  admitsParameters: (parametersDer) => parametersDer === undefined,
+  decompress: (data) => pump(new DecompressionStream("deflate"), data),
 };
 
-const built = await engine.frameBuilder(body).withId("zlib-1").withCompressor(zlib).build();
+const built = await engine
+  .frameBuilder(body)
+  .withId("zlib-1")
+  .withCompressor(zlib)
+  .build();
 ```
 
 A compressor names its algorithm once, as `algorithmOid`, as an inflator does. `withCompressor` copies that `Oid`, so one compressor serves every build, and the compressor keeps its own handle.
@@ -695,10 +726,10 @@ await response.messageCommitmentVerdict(engine.salt(salt)); // checks the body c
 // Open an encrypted body with the matching cipher or recipient secret,
 // decoding the plaintext under any codec (engine.opaque for raw bytes):
 await response.open(engine.opaque, {
-	opener: engine.aes256Gcm({ key, keyId }),
+  opener: engine.aes256Gcm({ key, keyId }),
 });
 await response.open(Chat, {
-	opener: engine.hpkeDecryptor(recipientSecretKey),
+  opener: engine.hpkeDecryptor(recipientSecretKey),
 });
 
 // Raw surfaces for external verification:
@@ -718,10 +749,10 @@ The calls above work on one frame. A conversation applies the same layers to eve
 ```ts
 const topic = engine.aes256Gcm({ key: topicKey, keyId: topicKeyId });
 const notes = engine
-	.envelope(Notes) // any MessageCodec<T>
-	.signed({ signer: signingKey, verifier: signingKey.verifyingKey() })
-	.sealed({ sealer: topic, opener: topic })
-	.compressed({ compressor: engine.zstd(), inflator: engine.zstd() });
+  .envelope(Notes) // any MessageCodec<T>
+  .signed({ signer: signingKey, verifier: signingKey.verifyingKey() })
+  .sealed({ sealer: topic, opener: topic })
+  .compressed({ compressor: engine.zstd(), inflator: engine.zstd() });
 
 // Sender: the layers are already applied, the metadata stays yours.
 const sent = await notes.frame(note).withId("note-1").withOrder(1n).build();
@@ -743,9 +774,9 @@ A one-sided party composes only its half:
 ```ts
 // A subscriber that verifies and opens, and holds no half that signs or sends.
 const readOnly = engine
-	.envelope(Notes)
-	.signed({ verifier: publisherKey })
-	.sealed({ opener: engine.hpkeDecryptor(recipientSecret) });
+  .envelope(Notes)
+  .signed({ verifier: publisherKey })
+  .sealed({ opener: engine.hpkeDecryptor(recipientSecret) });
 ```
 
 The `authenticated` and `confidential` getters report the declarations. `unwrap` enforces them, so they hold for every unwrapped frame, and a UI shows them as badges with no probe of each frame. The pubsub manager accepts an envelope wherever it accepts a codec, and it publishes frame in frame so the layers hold end to end through the broker ([The Subscription Client](pubsub-client.md#payload-shapes)).

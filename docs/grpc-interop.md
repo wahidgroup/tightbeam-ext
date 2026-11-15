@@ -16,85 +16,84 @@ For engineers who run a tightbeam colony and need stock gRPC clients or servers 
 
 ## Serve stock gRPC callers
 
-1. Enable the `couple` feature of `tightbeam-grpc`, and add `tightbeam-ws` with its `colony` feature for the `WsListener` of the colony.
+1. Enable the `couple` feature of `tightbeam-grpc`.
 2. Write the edge profile, and declare the gateway with it:
 
-    ```rust
-    # mod profile {
-    # #![allow(unexpected_cfgs)]
-    use tightbeam::crypto::profiles::DefaultCryptoProvider;
-    use tightbeam::{cluster, urn};
-    use tightbeam_grpc::couple::{Assurance, CallerTrust, CallerTrustFiles, Coupler, Grants, Principal, Routes, Servlet};
-    use tightbeam_grpc::edge::{Dial, DialTls, Edge, EdgeError, EdgeProfile, EdgeTls, EdgeTlsFiles};
-    use tightbeam_grpc::protocol::GrpcListener;
-    use tightbeam_ws::protocol::WsListener;
-    # use tightbeam::crypto::x509::Certificate;
-    # use tightbeam_grpc::couple::Voucher;
-    # fn voucher() -> Result<Voucher, EdgeError> { unimplemented!() }
-    # fn orders_signer() -> Certificate { unimplemented!() }
+   ```rust
+   # mod profile {
+   use tightbeam::crypto::profiles::DefaultCryptoProvider;
+   use tightbeam::transport::tcp::r#async::TokioListener;
+   use tightbeam::{cluster, urn};
+   use tightbeam_grpc::couple::{Assurance, CallerTrust, CallerTrustFiles, Coupler, Grants, Principal, Routes, Servlet};
+   use tightbeam_grpc::edge::{Dial, DialTls, Edge, EdgeError, EdgeProfile, EdgeTls, EdgeTlsFiles};
+   use tightbeam_grpc::protocol::GrpcListener;
+   # use tightbeam::crypto::x509::Certificate;
+   # use tightbeam_grpc::couple::Voucher;
+   # fn voucher() -> Result<Voucher, EdgeError> { unimplemented!() }
+   # fn orders_signer() -> Certificate { unimplemented!() }
 
-    struct Orders;
+   struct Orders;
 
-    impl EdgeProfile for Orders {
-    	fn edge() -> Result<Edge, EdgeError> {
-    		let tls = EdgeTls::from_pem(EdgeTlsFiles { chain: "/run/edge/tls.crt", key: "/run/edge/tls.key" })?;
-    		let tls_roots = "/run/edge/callers-ca.pem";
-    		let callers = CallerTrust::from_pem(CallerTrustFiles { tls_roots, claim_roots: "/run/edge/claims-ca.pem" })?;
+   impl EdgeProfile for Orders {
+   	fn edge() -> Result<Edge, EdgeError> {
+   		let tls = EdgeTls::from_pem(EdgeTlsFiles { chain: "/run/edge/tls.crt", key: "/run/edge/tls.key" })?;
+   		let tls_roots = "/run/edge/callers-ca.pem";
+   		let callers = CallerTrust::from_pem(CallerTrustFiles { tls_roots, claim_roots: "/run/edge/claims-ca.pem" })?;
 
-    		let orders = Servlet::new(urn!("orders", "servlet:orders"), orders_signer())?;
-    		let routes = Routes::new().unary("/orders.v1.Orders/Get", orders, Assurance::Vouched)?;
-    		let billing = Principal::spiffe("spiffe://acme/billing")?;
-    		let grants = Grants::deny_all().grant(billing, "/orders.v1.Orders/Get")?;
+   		let orders = Servlet::new(urn!("orders", "servlet:orders"), orders_signer())?;
+   		let routes = Routes::new().unary("/orders.v1.Orders/Get", orders, Assurance::Vouched)?;
+   		let billing = Principal::spiffe("spiffe://acme/billing")?;
+   		let grants = Grants::deny_all().grant(billing, "/orders.v1.Orders/Get")?;
 
-    		let coupler = Coupler::new(callers, voucher()?, routes, grants)?;
-    		let coupler = coupler.with_forwarded_metadata(["traceparent"])?;
-    		Ok(Edge::coupled(tls, coupler))
-    	}
+   		let coupler = Coupler::new(callers, voucher()?, routes, grants)?;
+   		let coupler = coupler.with_forwarded_metadata(["traceparent"])?;
+   		Ok(Edge::coupled(tls, coupler))
+   	}
 
-    	fn dial() -> Result<Dial, EdgeError> {
-    		Ok(Dial::Tls(DialTls::from_pem("/run/edge/ca.crt")?))
-    	}
-    }
+   	fn dial() -> Result<Dial, EdgeError> {
+   		Ok(Dial::Tls(DialTls::from_pem("/run/edge/ca.crt")?))
+   	}
+   }
 
-    type OrdersEdge = GrpcListener<DefaultCryptoProvider, Orders>;
+   type OrdersEdge = GrpcListener<DefaultCryptoProvider, Orders>;
 
-    cluster! {
-    	pub OrdersGateway,
-    	protocol: WsListener,
-    	edge: OrdersEdge
-    }
-    # }
-    ```
+   cluster! {
+   	pub OrdersGateway,
+   	protocol: TokioListener,
+   	edge: OrdersEdge
+   }
+   # }
+   ```
 
-    - `Voucher::new(Identities { handshake, signer })` takes the two tightbeam identities of the coupler.
-    - `orders_signer()` is the certificate of the identity that the servlet answers under.
-    - Set `ClusterConfig::edge` to `EdgePlane::new` on the edge port, with `with_streams` for stream routes.
-    - `with_forwarded_metadata` names the request headers that `Origin::metadata` reads.
-    - A refused configuration is a `CoupleError`, which `?` turns into the `EdgeError` of the profile.
+   - `Voucher::new(Identities { handshake, signer })` takes the two tightbeam identities of the coupler.
+   - `orders_signer()` is the certificate of the identity that the servlet answers under.
+   - Set `ClusterConfig::edge` to `EdgePlane::new` on the edge port, with `with_streams` for stream routes.
+   - `with_forwarded_metadata` names the request headers that `Origin::metadata` reads.
+   - A refused configuration is a `CoupleError`, which `?` turns into the `EdgeError` of the profile.
 
 3. Serve the call in a servlet whose input is `CoupledCall`:
 
-    ```rust
-    # mod serve {
-    # use tightbeam::crypto::sign::SigningIdentity;
-    # use tightbeam::{Frame, TightBeamError};
-    # use tightbeam_grpc::couple::{AdmissionTrust, AdmittedCall};
-    # async fn serve(frame: &Frame, trust: &AdmissionTrust, signer: &SigningIdentity) -> Result<Option<Frame>, TightBeamError> {
-    let admitted = AdmittedCall::admit(frame, trust)?;
-    let order = admitted.body().to_vec();
-    admitted.reply(order, signer).await
-    # }
-    # }
-    ```
+   ```rust
+   # mod serve {
+   # use tightbeam::crypto::sign::SigningIdentity;
+   # use tightbeam::{Frame, TightBeamError};
+   # use tightbeam_grpc::couple::{AdmissionTrust, AdmittedCall};
+   # async fn serve(frame: &Frame, trust: &AdmissionTrust, signer: &SigningIdentity) -> Result<Option<Frame>, TightBeamError> {
+   let admitted = AdmittedCall::admit(frame, trust)?;
+   let order = admitted.body().to_vec();
+   admitted.reply(order, signer).await
+   # }
+   # }
+   ```
 
-    Build its trust as `AdmissionTrust::new().with_vouchers(couplers).with_claim_signers(callers.claim_store())`, so the servlet checks claims under the same store as the edge.
+   Build its trust as `AdmissionTrust::new().with_vouchers(couplers).with_claim_signers(callers.claim_store())`, so the servlet checks claims under the same store as the edge.
 
 4. Call the method from any gRPC client that has a certificate under `callers-ca.pem`:
 
-    ```sh
-    grpcurl -cacert ca.crt -cert billing.crt -key billing.key -proto orders.proto \
-      -d '{"id":"order-7"}' gateway:9122 orders.v1.Orders/Get
-    ```
+   ```sh
+   grpcurl -cacert ca.crt -cert billing.crt -key billing.key -proto orders.proto \
+     -d '{"id":"order-7"}' gateway:9122 orders.v1.Orders/Get
+   ```
 
 For a method routed as `Assurance::Signed`, a Rust caller adds a claim under a tightbeam identity of the same principal:
 
@@ -119,27 +118,34 @@ claim.attach(request.metadata_mut());
 2. Offer mux on the gateway, `pool_config.mux_offer`, and on the servlet, `ServletConfigBuilder::with_mux_offer`.
 3. Serve it in the `duplex:` arm of `servlet!`:
 
-    ```rust
-    # mod stream {
-    # use tightbeam::crypto::sign::SigningIdentity;
-    # use tightbeam::transport::multiplex::{ReplySink, StreamBody};
-    # use tightbeam::TightBeamError;
-    # use tightbeam_grpc::couple::{AdmissionTrust, AdmittedStream, AdmittedStreamParts};
-    # async fn chat(body: StreamBody, reply: ReplySink, trust: &AdmissionTrust, signer: SigningIdentity) -> Result<(), TightBeamError> {
-    let stream = AdmittedStream::admit(body, reply, trust, signer).await?;
-    let AdmittedStreamParts { mut requests, mut answers, .. } = stream.split();
-    while let Some(message) = requests.next().await? {
-    	answers.send(message).await?;
-    }
-    answers.finish(requests).await
-    # }
-    # }
-    ```
+   ```rust
+   # mod stream {
+   # use tightbeam::crypto::sign::SigningIdentity;
+   # use tightbeam::transport::multiplex::{ReplySink, StreamBody};
+   # use tightbeam::TightBeamError;
+   # use tightbeam_grpc::couple::{AdmissionTrust, AdmittedStream, AdmittedStreamParts, StreamRefusal};
+   # async fn chat(body: StreamBody, reply: ReplySink, trust: &AdmissionTrust, signer: SigningIdentity) -> Result<(), TightBeamError> {
+   let stream = AdmittedStream::admit(body, reply, trust, signer).await?;
+   let AdmittedStreamParts { mut requests, mut answers, .. } = stream.split();
+   let echoed = async {
+   	while let Some(message) = requests.next().await? {
+   		answers.send(message).await?;
+   	}
+   	Ok::<_, StreamRefusal>(())
+   }
+   .await;
+   match echoed {
+   	Ok(()) => answers.finish().await,
+   	Err(refused) => refused.end(answers).await,
+   }
+   # }
+   # }
+   ```
 
 4. For a `Signed` route, the caller signs its claim over an empty body: `signer.sign(&method, b"")`.
 5. Set `ClusterConfig::edge` to `EdgePlane::new(addr).with_streams()`.
 6. Keep `CallLimits::with_streams` at 2 streams or more. `Coupler::with_call_limits` refuses fewer with `CoupleError::Streams`, because an open stream would hold the one stream that unary calls need.
-7. `split()` gives an `AdmittedStreamParts` of the `Origin`, the `StreamRequests`, and the `StreamAnswers`, so each direction can run on a task of its own. `StreamAnswers::finish` and `end` take the `StreamRequests` back.
+7. `split()` gives an `AdmittedStreamParts` of the `Origin`, the `StreamRequests`, and the `StreamAnswers`, so each direction can run on a task of its own.
 
 ## Admit callers behind a proxy or with tokens
 
@@ -168,20 +174,20 @@ let routes = Routes::new().unary("/orders.v1.Orders/Browse", browse, Assurance::
 1. Revoke the certificate in a CRL of its issuer.
 2. Load a fresh CRL of each authority that issues caller chains, the root and each intermediate:
 
-    ```rust
-    # mod revoked {
-    use rustls_pki_types::pem::PemObject;
-    use rustls_pki_types::CertificateRevocationListDer;
-    use tightbeam_grpc::couple::{CallerTrust, CallerTrustFiles};
-    # fn callers() -> Result<CallerTrust, tightbeam_grpc::edge::EdgeError> {
-    let crls = CertificateRevocationListDer::pem_file_iter("/run/edge/callers-crls.pem")?;
-    let roots = CallerTrustFiles { tls_roots: "/run/edge/callers-ca.pem", claim_roots: "/run/edge/claims-ca.pem" };
-    let callers = CallerTrust::from_pem(roots)?
-    	.with_crls(crls.collect::<Result<Vec<_>, _>>()?);
-    # Ok(callers)
-    # }
-    # }
-    ```
+   ```rust
+   # mod revoked {
+   use rustls_pki_types::pem::PemObject;
+   use rustls_pki_types::CertificateRevocationListDer;
+   use tightbeam_grpc::couple::{CallerTrust, CallerTrustFiles};
+   # fn callers() -> Result<CallerTrust, tightbeam_grpc::edge::EdgeError> {
+   let crls = CertificateRevocationListDer::pem_file_iter("/run/edge/callers-crls.pem")?;
+   let roots = CallerTrustFiles { tls_roots: "/run/edge/callers-ca.pem", claim_roots: "/run/edge/claims-ca.pem" };
+   let callers = CallerTrust::from_pem(roots)?
+   	.with_crls(crls.collect::<Result<Vec<_>, _>>()?);
+   # Ok(callers)
+   # }
+   # }
+   ```
 
 3. Restart the replicas one at a time, before the `nextUpdate` of any CRL. A stale CRL refuses every chain that it covers.
 
@@ -196,16 +202,16 @@ let routes = Routes::new().unary("/orders.v1.Orders/Browse", browse, Assurance::
 1. Turn on PROXY protocol v2 at the load balancer.
 2. Read it at the edge:
 
-    ```rust
-    # mod proxied {
-    use tightbeam_grpc::edge::{Edge, EdgeError, EdgeTls, EdgeTlsFiles, ProxyHops};
-    # fn edge() -> Result<Edge, EdgeError> {
-    let tls = EdgeTls::from_pem(EdgeTlsFiles { chain: "/run/edge/tls.crt", key: "/run/edge/tls.key" })?;
-    let edge = Edge::tls(tls).with_proxy_protocol(ProxyHops::new(["10.0.0.0/8"])?);
-    # Ok(edge)
-    # }
-    # }
-    ```
+   ```rust
+   # mod proxied {
+   use tightbeam_grpc::edge::{Edge, EdgeError, EdgeTls, EdgeTlsFiles, ProxyHops};
+   # fn edge() -> Result<Edge, EdgeError> {
+   let tls = EdgeTls::from_pem(EdgeTlsFiles { chain: "/run/edge/tls.crt", key: "/run/edge/tls.key" })?;
+   let edge = Edge::tls(tls).with_proxy_protocol(ProxyHops::new(["10.0.0.0/8"])?);
+   # Ok(edge)
+   # }
+   # }
+   ```
 
 3. `accept` yields the client address of each tunnel.
 
@@ -214,59 +220,59 @@ let routes = Routes::new().unary("/orders.v1.Orders/Browse", browse, Assurance::
 1. Write a driver of `ClaimLedger` over a store that the replicas share: an insert of `ClaimSpend::key` that fails when the key exists or the spend is past its expiry at the `now` of `spend`, with that expiry, and a delete that holds only for `ClaimSpend::holder`.
 2. Check it in its own tests:
 
-    ```rust
-    # mod conformance {
-    # use std::sync::Arc;
-    # use tightbeam_grpc::couple::ClaimLedger;
-    use tightbeam_grpc::testing::{LedgerBreach, LedgerConformance};
-    # async fn check(driver: Arc<dyn ClaimLedger>) -> Result<(), LedgerBreach> {
-    LedgerConformance::new(driver).check().await
-    # }
-    # }
-    ```
+   ```rust
+   # mod conformance {
+   # use std::sync::Arc;
+   # use tightbeam_grpc::couple::ClaimLedger;
+   use tightbeam_grpc::testing::{LedgerBreach, LedgerConformance};
+   # async fn check(driver: Arc<dyn ClaimLedger>) -> Result<(), LedgerBreach> {
+   LedgerConformance::new(driver).check().await
+   # }
+   # }
+   ```
 
 3. Give every replica the same ledger:
 
-    ```rust
-    # mod replicas {
-    use std::sync::Arc;
-    use tightbeam_grpc::couple::{ClaimLedger, Coupler};
-    # fn replica(coupler: Coupler, driver: Arc<dyn ClaimLedger>) -> Coupler {
-    let coupler = coupler.with_claim_ledger(driver);
-    # coupler
-    # }
-    # }
-    ```
+   ```rust
+   # mod replicas {
+   use std::sync::Arc;
+   use tightbeam_grpc::couple::{ClaimLedger, Coupler};
+   # fn replica(coupler: Coupler, driver: Arc<dyn ClaimLedger>) -> Coupler {
+   let coupler = coupler.with_claim_ledger(driver);
+   # coupler
+   # }
+   # }
+   ```
 
 ## Call a stock gRPC server
 
 1. Build a `Backend` for the server:
 
-    ```rust
-    # mod backend {
-    use tightbeam_grpc::couple::{AdmissionTrust, Assurance, Backend, BackendChannel, Grants, Principal, Routes};
-    use tightbeam_grpc::edge::DialTls;
-    use tightbeam_grpc::protocol::GrpcAddr;
-    # use rustls_pki_types::{CertificateDer, PrivateKeyDer};
-    # use tightbeam::crypto::sign::SigningIdentity;
-    # fn ledger(admission: AdmissionTrust, signer: SigningIdentity, chain: Vec<CertificateDer<'static>>, key: PrivateKeyDer<'static>) -> Result<Backend, Box<dyn std::error::Error>> {
-    let tls = DialTls::from_pem("/run/adapter/ledger-ca.pem")?.with_identity(chain, key)?;
-    let addr: GrpcAddr = "ledger.internal:443".parse()?;
-    let channel = BackendChannel::new(&addr, &tls)?;
+   ```rust
+   # mod backend {
+   use tightbeam_grpc::couple::{AdmissionTrust, Assurance, Backend, BackendChannel, Grants, Principal, Routes};
+   use tightbeam_grpc::edge::DialTls;
+   use tightbeam_grpc::protocol::GrpcAddr;
+   # use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+   # use tightbeam::crypto::sign::SigningIdentity;
+   # fn ledger(admission: AdmissionTrust, signer: SigningIdentity, chain: Vec<CertificateDer<'static>>, key: PrivateKeyDer<'static>) -> Result<Backend, Box<dyn std::error::Error>> {
+   let tls = DialTls::from_pem("/run/adapter/ledger-ca.pem")?.with_identity(chain, key)?;
+   let addr: GrpcAddr = "ledger.internal:443".parse()?;
+   let channel = BackendChannel::new(&addr, &tls)?;
 
-    let routes = Routes::new().unary("/ledger.v1.Ledger/Post", (), Assurance::Signed)?;
-    let web = Principal::subject("CN=web,O=acme")?;
-    let grants = Grants::deny_all().grant(web, "/ledger.v1.Ledger/Post")?;
-    let backend = Backend::new(channel, routes, grants, admission, signer)?;
-    # Ok(backend)
-    # }
-    # }
-    ```
+   let routes = Routes::new().unary("/ledger.v1.Ledger/Post", (), Assurance::Signed)?;
+   let web = Principal::subject("CN=web,O=acme")?;
+   let grants = Grants::deny_all().grant(web, "/ledger.v1.Ledger/Post")?;
+   let backend = Backend::new(channel, routes, grants, admission, signer)?;
+   # Ok(backend)
+   # }
+   # }
+   ```
 
 2. Host it in a servlet whose input is `CoupledCall`. Answer each frame with `ctx.env_config().relay(&frame).await`, and each stream in the `duplex:` arm with `ctx.env_config().relay_stream(body, reply).await`.
 3. Reach it from either side of the colony:
-    - A tightbeam client sends `CoupledCall::direct(method, body)` in a frame it signs.
-    - A coupled edge routes a method to the servlet type of the adapter.
+   - A tightbeam client sends `CoupledCall::direct(method, body)` in a frame it signs.
+   - A coupled edge routes a method to the servlet type of the adapter.
 4. The server reads the principal in `tightbeam-principal-bin`, and a signed call's claim in `tightbeam-claim-bin`. A servlet of your own writes both with `Origin::stamp`.
 
 A tightbeam client reads the answer as a `CoupledReply`:

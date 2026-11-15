@@ -1,5 +1,5 @@
-//! The PKI, the stock caller, the coupler, the echo, and the raw peers that
-//! the scenarios share.
+//! The PKI, the stock caller, the coupler, the echo, the work probe of the
+//! TCP colony, and the raw peers that the scenarios share.
 #![allow(dead_code)]
 
 use core::future::Future;
@@ -7,7 +7,7 @@ use core::num::NonZeroUsize;
 use std::error::Error;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,7 +22,7 @@ use rustls::{AlertDescription, ClientConfig};
 use rustls_pki_types::ServerName;
 use tightbeam::clock::{Clock, ManualClock, SystemClock, UnixMillis};
 use tightbeam::colony::cluster::{Cluster, ClusterGateway, EdgePlane};
-use tightbeam::constants::DEFAULT_OPERATION_TIMEOUT;
+use tightbeam::constants::{DEFAULT_OPERATION_TIMEOUT, MAX_MUX_STREAM_CAP, MIN_MUX_CHUNK_SIZE};
 use tightbeam::crypto::policy::Secp256k1Policy;
 use tightbeam::crypto::profiles::DefaultCryptoProvider;
 use tightbeam::crypto::x509::policy::CertificateValidation;
@@ -35,6 +35,7 @@ use tightbeam::trace::TraceCollector;
 use tightbeam::transport::handshake::negotiation::TransportOffer;
 use tightbeam::transport::handshake::PeerAuthentication;
 use tightbeam::transport::multiplex::StreamBody;
+use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::transport::{
 	ConnectionBuilder, ConnectionPool, EncryptedProtocol, PoolConfig, PooledClient, Protocol,
 	TransportEncryptionConfig, TransportError,
@@ -42,13 +43,12 @@ use tightbeam::transport::{
 use tightbeam::urn::Urn;
 use tightbeam::TightBeamError;
 use tightbeam_grpc::couple::{
-	CallClaim, CallerTrust, ClaimSigner, Coupler, Grants, Identities, Routes, Servlet, Voucher,
+	CallClaim, CallerTrust, ClaimSigner, CoupledReply, Coupler, Grants, Identities, Routes, Servlet, Voucher,
 };
 use tightbeam_grpc::edge::{Dial, Edge, EdgeProfile};
 use tightbeam_grpc::events::COUPLED_SESSION_OPENED;
 use tightbeam_grpc::protocol::{GrpcAddr, GrpcListener, HEALTH_WATCH_PATH, TUNNEL_PATH};
 use tightbeam_grpc::testing::{OpenedStream, PartFrames, StreamParts, StreamSigners, TlsAuthority, TlsLeaf};
-use tightbeam_ws::protocol::WsListener;
 use tightbeam_ws::testing::{EchoService, EventWatch, Identity, WorkClient};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, ToSocketAddrs};
@@ -102,10 +102,18 @@ macro_rules! coupled {
 		tightbeam::cluster! {
 			/// The gateway of one scenario, with its coupled edge.
 			pub $gateway,
-			protocol: tightbeam_ws::protocol::WsListener,
+			protocol: tightbeam::transport::tcp::r#async::TokioListener,
 			edge: tightbeam_grpc::protocol::GrpcListener<tightbeam::crypto::profiles::DefaultCryptoProvider, $edge>
 		}
 	};
+}
+
+tightbeam_ws::work_probe! {
+	/// The work probe of the work-plane gateways, over the TCP colony.
+	pub TcpWorkProbe,
+	/// The hive that hosts the work probe over the TCP colony.
+	pub TcpWorkHive,
+	protocol: TokioListener
 }
 
 /// The codec of a stock call whose messages the scenario encodes itself.
@@ -216,6 +224,23 @@ impl ScenarioClock {
 		}
 	}
 
+	/// Count each later advance from now, because traffic of the scenario
+	/// reached each connection of its edge now, which starts the read
+	/// deadline of each again.
+	///
+	/// # Errors
+	///
+	/// - The [`TightBeamError`] of the operating system's clocks, which no scenario moves.
+	pub fn kept_alive(&self) -> Result<(), TightBeamError> {
+		match self {
+			Self::System => Err(unexpected("the scenario moves no clock")),
+			Self::Manual(manual) => {
+				manual.kept_alive();
+				Ok(())
+			}
+		}
+	}
+
 	/// Move the clock past the first probe of the next loopback session that
 	/// opens, once the events of the scenario record that open. The operating
 	/// system's clocks pass the probe themselves.
@@ -240,12 +265,26 @@ pub struct ManualScenario {
 	clock: Arc<ManualClock>,
 	events: &'static EventWatch,
 	probed: Arc<AtomicUsize>,
+	/// The time on the clock, in nanoseconds from its start, at which traffic
+	/// of the scenario last reached each connection of its edge.
+	alive_since: Arc<AtomicU64>,
 }
 
 impl ManualScenario {
 	/// A clock at its start, whose opens `events` record.
 	fn new(events: &'static EventWatch) -> Self {
-		Self { clock: Arc::default(), events, probed: Arc::default() }
+		Self {
+			clock: Arc::default(),
+			events,
+			probed: Arc::default(),
+			alive_since: Arc::default(),
+		}
+	}
+
+	/// Count each later advance from now.
+	fn kept_alive(&self) {
+		let now = u64::try_from(self.clock.elapsed().as_nanos()).unwrap_or(u64::MAX);
+		self.alive_since.store(now, Ordering::Release);
 	}
 
 	/// The clock as the edge and the adapter take it.
@@ -276,15 +315,17 @@ impl ManualScenario {
 		self.moved(Coupler::LIVENESS_PROBE)
 	}
 
-	/// Move the clock by `span`, while every advance of the scenario sums to
-	/// less than the operation timeout of the edge transports on it.
-	/// A cluster gateway binds its edge at the default limits.
+	/// Move the clock by `span`, while every advance since traffic of the
+	/// scenario last reached each connection of its edge sums to less than
+	/// the operation timeout of the edge transports on it. A cluster gateway
+	/// binds its edge at the default limits.
 	///
 	/// # Errors
 	///
 	/// - The [`TightBeamError`] of an advance that takes the sum to [`DEFAULT_OPERATION_TIMEOUT`].
 	fn moved(&self, span: Duration) -> Result<(), TightBeamError> {
-		let sum = self.clock.elapsed().saturating_add(span);
+		let alive_since = Duration::from_nanos(self.alive_since.load(Ordering::Acquire));
+		let sum = self.clock.elapsed().saturating_sub(alive_since).saturating_add(span);
 		if sum >= DEFAULT_OPERATION_TIMEOUT {
 			return Err(unexpected(
 				"the advances of the scenario reach the operation timeout of its edge",
@@ -441,6 +482,30 @@ impl Coupled {
 		G::start(Arc::new(trace.share()), config).await
 	}
 
+	/// Start the gateway `G`, which admits as many streams from each peer as
+	/// tightbeam allows, so the loopback session of its coupler carries as
+	/// many calls at once.
+	///
+	/// # Errors
+	///
+	/// - The [`TightBeamError`] of a gateway that does not start.
+	pub async fn wide_gateway<G: Cluster>(&self, trace: &TraceCollector) -> Result<G, TightBeamError> {
+		let mut config = self.transport.cluster_config(Self::edge_plane())?;
+		config.pool_config.mux_offer = Some(Arc::new(TransportOffer::mux(MAX_MUX_STREAM_CAP)));
+		G::start(Arc::new(trace.share()), config).await
+	}
+
+	/// Start the gateway `G`, whose links take [`trickle`] terms.
+	///
+	/// # Errors
+	///
+	/// - The [`TightBeamError`] of a gateway that does not start.
+	pub async fn trickle_gateway<G: Cluster>(&self, trace: &TraceCollector) -> Result<G, TightBeamError> {
+		let mut config = self.transport.cluster_config(Self::edge_plane())?;
+		config.pool_config.mux_offer = Some(Arc::new(trickle()));
+		G::start(Arc::new(trace.share()), config).await
+	}
+
 	/// Start the gateway `G`, whose accept planes authenticate each client
 	/// under the certificates of `trusted` alone.
 	///
@@ -471,7 +536,7 @@ impl Coupled {
 	///
 	/// - The [`TightBeamError`] of a gateway with no edge.
 	/// - The errors of [`Coupled::channel`] and [`StockChannel::serving`].
-	pub async fn billing<E>(&self, gateway: &ClusterGateway<WsListener, E>) -> Result<StockChannel, TightBeamError>
+	pub async fn billing<E>(&self, gateway: &ClusterGateway<TokioListener, E>) -> Result<StockChannel, TightBeamError>
 	where
 		E: Protocol<Address = GrpcAddr>,
 	{
@@ -488,7 +553,7 @@ impl Coupled {
 	///
 	/// - The [`TightBeamError`] of a gateway with no edge.
 	/// - The errors of [`Coupled::channel`] and [`StockChannel::serving`].
-	pub async fn web<E>(&self, gateway: &ClusterGateway<WsListener, E>) -> Result<WebCaller, TightBeamError>
+	pub async fn web<E>(&self, gateway: &ClusterGateway<TokioListener, E>) -> Result<WebCaller, TightBeamError>
 	where
 		E: Protocol<Address = GrpcAddr>,
 	{
@@ -578,18 +643,18 @@ impl Coupled {
 
 	/// A bidirectional stream on `route` straight over the colony plane at
 	/// `colony`, with no coupler: its head and one message, signed under
-	/// `signers`. The first message of the answer, or the failure that ended
-	/// it.
+	/// `signers`. What the first part of the answer carries, or the failure
+	/// that ended the answer before it, as [`DirectAnswer::first`] gives it.
 	///
 	/// # Errors
 	///
 	/// - The errors of [`Coupled::direct_answer`] and [`DirectAnswer::first`].
 	pub async fn direct_stream(
 		&self,
-		colony: &<WsListener as Protocol>::Address,
+		colony: &<TokioListener as Protocol>::Address,
 		route: DirectRoute<'_>,
 		signers: StreamSigners<'_>,
-	) -> Result<Result<Option<Vec<u8>>, TransportError>, TightBeamError> {
+	) -> Result<Result<Result<Vec<u8>, Status>, TransportError>, TightBeamError> {
 		let answer = self.direct_answer(colony, route, signers, TransportOffer::mux(4)).await?;
 		answer.first().await
 	}
@@ -603,7 +668,7 @@ impl Coupled {
 	///   or a part that does not open, sign, or push within [`OPENING`].
 	pub async fn direct_answer(
 		&self,
-		colony: &<WsListener as Protocol>::Address,
+		colony: &<TokioListener as Protocol>::Address,
 		DirectRoute { servlet, method }: DirectRoute<'_>,
 		signers: StreamSigners<'_>,
 		offer: TransportOffer,
@@ -614,18 +679,19 @@ impl Coupled {
 			mux_offer: Some(Arc::new(offer)),
 		};
 
-		let pool = ConnectionPool::<WsListener>::builder().with_config(config);
+		let pool = ConnectionPool::<TokioListener>::builder().with_config(config);
 		let pool = Arc::new(pool.with_trust_store(self.transport.trust_anchor()?).build());
 		let ceiling = usize::try_from(DIRECT_CEILING).map_err(unexpected)?;
 		let opened = async {
 			let client = pool.connect(*colony).await?;
 			let (mut sink, body) = client.open_duplex_to(servlet)?;
-
 			let opened = StreamParts::open(method, DIRECT_STREAM, DIRECT_CEILING, signers).await?;
 			let OpenedStream { head, mut parts } = opened;
+
 			sink.push(&head).await?;
 			sink.push(&parts.message(b"hello").await?).await?;
 			sink.close().await?;
+
 			Ok::<_, TightBeamError>(DirectAnswer { _client: client, body, read: PartFrames::new(ceiling) })
 		};
 
@@ -652,31 +718,33 @@ pub struct AnswerRead {
 pub struct DirectAnswer {
 	/// The lease of the connection, which carries the stream until the answer
 	/// drops.
-	_client: PooledClient<WsListener>,
+	_client: PooledClient<TokioListener>,
 	body: StreamBody,
 	/// The bytes of the answer that a read took, split into whole parts.
 	read: PartFrames,
 }
 
 impl DirectAnswer {
-	/// The first message of the answer, or the failure that ended it, within
-	/// [`OPENING`].
+	/// What the first part of the answer carries, within [`OPENING`]: its
+	/// message, or as `Err` the status of an end part. A stream that fails,
+	/// or ends, before any part gives its failure as the outer `Err`, which
+	/// [`TransportError::ConnectionClosed`] stands for at an end.
 	///
 	/// # Errors
 	///
 	/// - The [`TightBeamError`] of a part that does not decode, or of an answer that hangs.
-	pub async fn first(mut self) -> Result<Result<Option<Vec<u8>>, TransportError>, TightBeamError> {
+	pub async fn first(mut self) -> Result<Result<Result<Vec<u8>, Status>, TransportError>, TightBeamError> {
 		let Self { body, read, .. } = &mut self;
 		let reading = async {
 			loop {
 				match body.chunk().await {
 					Ok(Some(chunk)) => read.extend(&chunk),
-					Ok(None) => return Ok(Ok(None)),
+					Ok(None) => return Ok(Err(TransportError::ConnectionClosed)),
 					Err(error) => return Ok(Err(error)),
 				}
 
 				if let Some(answer) = read.next_frame()? {
-					return Ok(Ok(StreamParts::message_of(&answer)?));
+					return Ok(Ok(StreamParts::message_of(&answer)?.or_else(CoupledReply::into_result)));
 				}
 			}
 		};
@@ -717,7 +785,7 @@ impl DirectAnswer {
 				};
 
 				while let Some(part) = read.next_frame()? {
-					messages.extend(StreamParts::message_of(&part)?);
+					messages.extend(StreamParts::message_of(&part)?.ok());
 				}
 
 				if let Some(failure) = ended {
@@ -887,6 +955,38 @@ impl StockChannel {
 		bounded(answered).await
 	}
 
+	/// A bidi stream of `method` under `claim` when it is `Some`, which sends
+	/// `requests` and holds its requests open: its first answer, read before
+	/// the stream drops.
+	///
+	/// # Errors
+	///
+	/// - The errors of [`StockChannel::client`] and of [`bounded`].
+	/// - The [`TightBeamError`] of a stream that tonic refuses.
+	pub async fn dropped_after_an_answer(
+		&self,
+		method: &'static str,
+		requests: &[&[u8]],
+		claim: Option<&CallClaim>,
+	) -> Result<Option<Vec<u8>>, TightBeamError> {
+		let mut grpc = self.client().await?;
+		let (sender, queued) = tokio::sync::mpsc::channel::<Vec<u8>>(requests.len().max(1));
+		for request in requests {
+			sender.send(request.to_vec()).await.map_err(unexpected)?;
+		}
+
+		let mut request = Request::new(tokio_stream::wrappers::ReceiverStream::new(queued));
+		if let Some(claim) = claim {
+			claim.attach(request.metadata_mut());
+		}
+
+		let response = bounded(grpc.streaming(request, PathAndQuery::from_static(method), RawCodec)).await?;
+		let mut answers = response.map_err(unexpected)?.into_inner();
+		let first = bounded(answers.message()).await?.map_err(unexpected)?;
+		drop((answers, sender));
+		Ok(first)
+	}
+
 	/// Wait until a health watch of the edge answers `SERVING`, by
 	/// [`Watch::serving`].
 	///
@@ -908,6 +1008,7 @@ impl StockChannel {
 	pub async fn watch(&self, service: &[u8]) -> Result<Result<Watch, Status>, TightBeamError> {
 		let mut grpc = self.client().await?;
 		let path = PathAndQuery::from_static(HEALTH_WATCH_PATH);
+
 		let watched = grpc.server_streaming(Request::new(service.to_vec()), path, RawCodec);
 		let watched = bounded(watched).await?;
 		Ok(watched.map(|response| Watch(response.into_inner())))
@@ -975,6 +1076,14 @@ impl Watch {
 
 		Err(unexpected("the watch ended before the coupler served"))
 	}
+}
+
+/// The terms of a link that carries one chunk of [`MIN_MUX_CHUNK_SIZE`] bytes
+/// of each stream at a time, until its reader takes the chunk.
+pub fn trickle() -> TransportOffer {
+	TransportOffer::mux(4)
+		.with_initial_stream_credit(1)
+		.with_chunk_payload_size(MIN_MUX_CHUNK_SIZE)
 }
 
 /// `future`, a wait on a peer, within [`OPENING`].
@@ -1144,9 +1253,14 @@ impl H2Tunnel {
 	/// The TLS 1.3 client of a peer of an edge, under ring and with ALPN
 	/// `h2`, which trusts the root of `authority` and presents the chain of
 	/// `caller` when it is `Some`.
-	fn tls(authority: &TlsAuthority, caller: Option<&TlsLeaf>) -> Result<ClientConfig, TightBeamError> {
+	///
+	/// # Errors
+	///
+	/// - The [`TightBeamError`] of a root that the store refuses, or of a client chain that rustls refuses.
+	pub fn tls(authority: &TlsAuthority, caller: Option<&TlsLeaf>) -> Result<ClientConfig, TightBeamError> {
 		let mut roots = rustls::RootCertStore::empty();
 		roots.add(authority.root()).map_err(unexpected)?;
+
 		let provider = Arc::new(rustls::crypto::ring::default_provider());
 		let config = ClientConfig::builder_with_provider(provider).with_protocol_versions(&[&rustls::version::TLS13]);
 		let config = config.map_err(unexpected)?.with_root_certificates(roots);
@@ -1252,6 +1366,7 @@ impl H2Tunnel {
 			}
 			body.trailers().await
 		});
+
 		let trailers = drained.await?.map_err(unexpected)?;
 		Ok(trailers.as_ref().and_then(Self::status_of))
 	}
@@ -1316,6 +1431,7 @@ impl H2Tunnel {
 		let request = request
 			.header("content-type", "application/grpc-web+proto")
 			.header("x-grpc-web", "1");
+
 		let request = request.header("authorization", format!("Bearer {token}"));
 		let length = u32::try_from(message.len()).map_err(unexpected)?;
 		let framed = [&[0][..], &length.to_be_bytes(), message].concat();
@@ -1410,6 +1526,7 @@ impl H2Tunnel {
 			.headers()
 			.get("access-control-allow-origin")
 			.and_then(|value| value.to_str().ok());
+
 		let allowed = allowed.map(str::to_owned);
 		let exposed = response.headers().get("access-control-expose-headers");
 		let exposed = exposed.and_then(|value| value.to_str().ok()).map(str::to_owned);
@@ -1440,6 +1557,7 @@ impl H2Tunnel {
 		while !padded.len().is_multiple_of(4) {
 			padded.push(b'=');
 		}
+
 		padded
 	}
 }

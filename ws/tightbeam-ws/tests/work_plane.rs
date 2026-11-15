@@ -6,7 +6,7 @@
 use tightbeam::testing::{ClusterEnv, SetupEnv};
 use tightbeam::{tb_scenario, TightBeamError};
 use tightbeam_ws::testing::specs::{EdgeWorkSpec, UnservedWorkSpec};
-use tightbeam_ws::testing::{WorkClient, WorkGateway, WorkPlane};
+use tightbeam_ws::testing::{WorkClient, WorkGateway, WorkPlane, WorkProbeServlet};
 
 /// The identities of the work plane of every scenario.
 fn work_plane() -> WorkPlane {
@@ -23,7 +23,7 @@ tb_scenario! {
 	environment Cluster {
 		context: work_plane(),
 		start: |SetupEnv { trace, context }| async move { context.gateway::<WorkGateway>(&trace, "127.0.0.1:0").await },
-		hives: |SetupEnv { trace, context }| vec![async move { context.hive(&trace).await }],
+		hives: |SetupEnv { trace, context }| vec![async move { context.hive::<WorkProbeServlet>(&trace).await }],
 		client: |ClusterEnv { context, cluster, .. }| async move {
 			let probe = context.client();
 			let served = probe.submit(&cluster, WorkClient::probe()?, b"ws-work-1").await??;
@@ -45,7 +45,7 @@ tb_scenario! {
 	environment Cluster {
 		context: work_plane(),
 		start: |SetupEnv { trace, context }| async move { context.gateway::<WorkGateway>(&trace, "127.0.0.1:0").await },
-		hives: |SetupEnv { trace, context }| vec![async move { context.hive(&trace).await }],
+		hives: |SetupEnv { trace, context }| vec![async move { context.hive::<WorkProbeServlet>(&trace).await }],
 		client: |ClusterEnv { context, cluster, .. }| async move {
 			let probe = context.client();
 			let refused = probe.submit(&cluster, WorkClient::servlet("unserved")?, b"ws-work-refused").await?;

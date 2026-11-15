@@ -7,12 +7,16 @@ use core::pin::{pin, Pin};
 use core::task::{Context, Poll};
 use core::time::Duration;
 use std::sync::Arc;
+
 #[cfg(feature = "couple")]
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[cfg(feature = "couple")]
-use tightbeam::clock::UnixMillis;
 use tightbeam::clock::{Clock, Lapse, MonotonicInstant};
+
+#[cfg(feature = "couple")]
+use tightbeam::clock::{Timing, UnixMillis};
+#[cfg(feature = "couple")]
+use tightbeam::transport::{TransportError, TransportFailure};
 
 /// An instant on a clock, which bounds each wait up to it by the time left.
 /// An instant past the range of the clock lies beyond every reading.
@@ -50,6 +54,13 @@ impl Deadline {
 	pub(crate) fn left(&self) -> Option<Duration> {
 		let now = self.clock.monotonic();
 		self.at.map(|at| at.saturating_duration_since(now))
+	}
+
+	/// Whether the clock of the deadline gives the polling thread no timer,
+	/// so a bound on it refuses work that waits.
+	#[cfg(feature = "couple")]
+	pub(crate) fn gives_no_timer(&self) -> bool {
+		self.clock.timing() == Timing::Absent
 	}
 
 	/// Whether the deadline passed.
@@ -105,6 +116,30 @@ impl Future for DeadlineSleep {
 		}
 
 		this.sleep.as_mut().poll(cx)
+	}
+}
+
+/// The lapse of a bound that tightbeam puts on the wait of a push of a sink
+/// of a multiplexed stream, for a writer slot, the renewal floor, or credit,
+/// which the error of the push reports
+/// (tightbeam-rs `transport/error.rs`, `From<Lapse> for TransportError`). A
+/// push carries no status of the peer, so these errors are lapses alone.
+#[cfg(feature = "couple")]
+pub(crate) trait StreamLapse {
+	/// [`Lapse::Passed`] for `DeadlineExceeded`, a wait past the read deadline
+	/// of the link, [`Lapse::NoTimer`] for `FailedPrecondition`, a clock with
+	/// no timer on the polling thread, and `None` for any other error.
+	fn lapse(&self) -> Option<Lapse>;
+}
+
+#[cfg(feature = "couple")]
+impl StreamLapse for TransportError {
+	fn lapse(&self) -> Option<Lapse> {
+		match self {
+			Self::OperationFailed(TransportFailure::DeadlineExceeded) => Some(Lapse::Passed),
+			Self::OperationFailed(TransportFailure::FailedPrecondition) => Some(Lapse::NoTimer),
+			_ => None,
+		}
 	}
 }
 

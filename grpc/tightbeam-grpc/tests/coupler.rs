@@ -3,11 +3,6 @@
 //! `Get` and `List` require `Vouched`, and `Place` requires `Signed`. The
 //! billing caller holds `Get`, and the web caller holds all three.
 
-// The colony runtime macros expand `cfg(feature = ...)` probes against the
-// invoking crate's feature namespace, which holds the features of this crate
-// alone, so the leaked cfg warnings carry no signal here.
-#![allow(unexpected_cfgs)]
-
 mod support;
 
 use std::sync::Arc;
@@ -33,6 +28,7 @@ use tightbeam::policy::TransitStatus;
 use tightbeam::testing::macros::BuiltAssertSpec;
 use tightbeam::testing::{ClusterEnv, ScenarioConfig, ScenarioConfigError, SetupEnv};
 use tightbeam::trace::TraceCollector;
+use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::transport::TransportLimits;
 use tightbeam::urn::Urn;
 use tightbeam::{
@@ -41,7 +37,7 @@ use tightbeam::{
 use tightbeam_grpc::couple::{
 	AdmissionTrust, AdmittedCall, AdmittedStream, AdmittedStreamParts, Assurance, BearerTrust, CallClaim, CallLimits,
 	CallerTrust, ClaimLedger, ClaimSpend, Code, CoupleError, CoupledCall, Coupler, Grants, LedgerError, LedgerFuture,
-	MemoryLedger, Metadata, Origin, Principal, Routes, Servlet,
+	MemoryLedger, Metadata, Origin, Principal, Routes, Servlet, StreamAnswers, StreamRefusal, StreamRequests,
 };
 use tightbeam_grpc::edge::{Dial, Edge};
 use tightbeam_grpc::events::{
@@ -50,7 +46,6 @@ use tightbeam_grpc::events::{
 };
 use tightbeam_grpc::protocol::{GrpcAddr, HEALTH_CHECK_PATH};
 use tightbeam_grpc::testing::{PartFrames, StreamParts, StreamSigners, TlsAuthority, TlsLeaf};
-use tightbeam_ws::protocol::WsListener;
 use tightbeam_ws::testing::{EventWatch, Identity, WorkClient};
 use tokio::sync::Semaphore;
 use tokio_stream::wrappers::ReceiverStream;
@@ -263,7 +258,7 @@ servlet! {
 	/// the call, signed under the answer identity of the scenario, and each
 	/// coupled stream by its method.
 	pub OrdersServlet<CoupledCall, EnvConfig = OrdersEnv>,
-	protocol: WsListener,
+	protocol: TokioListener,
 	handle: |_call, frame, ctx| async move {
 		let env = ctx.env_config();
 		let admitted = AdmittedCall::admit(&frame, &env.admission)?;
@@ -291,7 +286,7 @@ servlet! {
 		if method == SEVERED {
 			while answers.send(vec![0x5a; 1024]).await.is_ok() {}
 			let late = match answers.send(b"late".to_vec()).await {
-				Err(TightBeamError::TransportError(refused)) => refused.transit_status(),
+				Err(StreamRefusal::Breaks(TightBeamError::TransportError(refused))) => refused.transit_status(),
 				_ => None,
 			};
 
@@ -300,23 +295,43 @@ servlet! {
 			return Ok(());
 		}
 
+		match env.answer(&method, &mut requests, &mut answers).await {
+			Ok(status) => answers.end(&status).await,
+			Err(refused) => refused.end(answers).await,
+		}
+	}
+}
+
+impl OrdersEnv {
+	/// Answer the stream of `method` on `answers` by its method, and give the
+	/// status to end it with, or the refusal that ends it.
+	///
+	/// # Errors
+	///
+	/// - The [`StreamRefusal`] of a request or an answer that the stream library refuses.
+	/// - [`StreamRefusal::Breaks`] -- a hold whose event does not come.
+	async fn answer(
+		&self,
+		method: &str,
+		requests: &mut StreamRequests,
+		answers: &mut StreamAnswers,
+	) -> Result<Status, StreamRefusal> {
 		if method == HOLD {
 			let request = requests.next().await?.unwrap_or_default();
 			answers.send(b"held".to_vec()).await?;
 			if let Some(hold) = Hold::of(&request) {
-				hold.release(env.events).await?;
+				hold.release(self.events).await.map_err(StreamRefusal::Breaks)?;
 			}
 
-			return answers.finish(requests).await;
+			return Ok(Status::new(Code::Ok, ""));
 		}
 
 		let mut batch = Vec::new();
 		while let Some(message) = requests.next().await? {
-			match method.as_str() {
+			match method {
 				FEED if message == FAILING => {
 					answers.send(b"partial".to_vec()).await?;
-					let status = Status::with_details(Code::FailedPrecondition, "held", DETAILS.into());
-					return answers.end(requests, &status).await;
+					return Ok(Status::with_details(Code::FailedPrecondition, "held", DETAILS.into()));
 				}
 				WATCH | FEED => {
 					for index in [b"0", b"1", b"2"] {
@@ -326,14 +341,13 @@ servlet! {
 				}
 				BATCH | BROKEN => batch.extend_from_slice(&message),
 				_ if message == FAILING => {
-					let status = Status::with_details(Code::FailedPrecondition, "held", DETAILS.into());
-					return answers.end(requests, &status).await;
+					return Ok(Status::with_details(Code::FailedPrecondition, "held", DETAILS.into()));
 				}
 				_ => answers.send([b"chat:".as_slice(), &message].concat()).await?,
 			}
 		}
 
-		match method.as_str() {
+		match method {
 			BATCH => answers.send([b"batch:".as_slice(), &batch].concat()).await?,
 			BROKEN if batch == b"twice" => {
 				answers.send(b"first".to_vec()).await?;
@@ -342,7 +356,7 @@ servlet! {
 			_ => {}
 		}
 
-		answers.finish(requests).await
+		Ok(Status::new(Code::Ok, ""))
 	}
 }
 
@@ -351,7 +365,7 @@ servlet! {
 	/// that breaks the shape of its method does: a request of `twice` answers
 	/// two messages, and any other none, before an end with status 0.
 	pub OutOfShapeServlet<CoupledCall, EnvConfig = OrdersEnv>,
-	protocol: WsListener,
+	protocol: TokioListener,
 	handle: |_call, _frame, _ctx| async move { Ok(None) },
 	duplex: |body, reply, ctx| async move {
 		out_of_shape(body, reply, ctx.env_config().signer.clone()).await
@@ -379,7 +393,7 @@ async fn out_of_shape(
 	let (head, requests) = parts.split_first().ok_or_else(|| unexpected("the stream carried no head"))?;
 	let mut twice = false;
 	for request in requests {
-		twice |= StreamParts::message_of(request)?.as_deref() == Some(b"twice".as_slice());
+		twice |= StreamParts::message_of(request)?.ok().as_deref() == Some(b"twice".as_slice());
 	}
 
 	let mut answers = StreamParts::after(head, signer, OUT_OF_SHAPE_CEILING);
@@ -393,9 +407,9 @@ async fn out_of_shape(
 }
 
 hive! {
-	/// The hive that hosts the orders servlet over the WebSocket colony.
+	/// The hive that hosts the orders servlet over the TCP colony.
 	pub OrdersHive,
-	protocol: WsListener
+	protocol: TokioListener
 }
 
 /// What a hive of the orders servlet trusts: the identity of its vouchers,
@@ -1388,6 +1402,10 @@ impl StockChannel {
 /// a call within either wait.
 const CLOCKED_LIMIT: Duration = EventWatch::PATIENCE.saturating_add(Duration::from_secs(2));
 
+/// The advance between a call and a stream that opens after it, so the
+/// deadline of the call passes on an advance that leaves the stream open.
+const STAGGER: Duration = Duration::from_secs(1);
+
 coupled!(HealthWatchEdge, HealthWatchGateway);
 
 /// A health answer that a watcher read, by its `ServingStatus`.
@@ -2020,11 +2038,23 @@ tb_scenario! {
 }
 
 coupled!(AnswerShapeEdge, AnswerShapeGateway);
-refused_streams!(AnswerShapeSpec, "transit", 2);
+
+tb_assert_spec! {
+	/// Client streams whose servlet answers twice or never: the stream
+	/// library ends each with a signed 12, which the coupler answers.
+	pub AnswerShapeSpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(COUPLED_CALL_ANSWERED, exactly!(2), equals!(12u32)),
+			(COUPLED_CALL_REFUSED, exactly!(0))
+		]
+	}
+}
 
 // A client stream answers exactly one message. The head tells the stream
 // library of the servlet so, and it refuses a second answer, or an end with
-// none, which ends the stream with 12.
+// none, which ends the stream with a signed 12.
 tb_scenario! {
 	name: a_servlet_cannot_answer_a_client_stream_twice_or_never,
 	spec: AnswerShapeSpec,
@@ -2504,15 +2534,16 @@ tb_scenario! {
 			let caller = context.claims.signing_identity();
 			let chat = DirectRoute { servlet: Coupled::servlet()?, method: CHAT };
 			let signers = StreamSigners { head: &caller, parts: &caller };
-			let answered = context.direct_stream(cluster.addr(), chat.clone(), signers).await?;
-			let answered = answered.map_err(|error| error.transit_status());
-			assert_eq!(answered, Ok(Some(b"chat:hello".to_vec())), "a part under the key of its head MUST be answered");
+			let answered = context.direct_stream(cluster.addr(), chat.clone(), signers).await?.map_err(unexpected)?;
+			let answered = answered.map_err(|status| status.code());
+			assert_eq!(answered, Ok(b"chat:hello".to_vec()), "a part under the key of its head MUST be answered");
 
 			let other = context.session.signing_identity();
 			let forging = StreamSigners { head: &caller, parts: &other };
-			let forged = context.direct_stream(cluster.addr(), chat, forging).await?;
-			let refused = forged.err().and_then(|error| error.transit_status());
-			assert_eq!(refused, Some(TransitStatus::Unauthenticated), "a part under another key MUST be refused");
+			// The servlet ends the stream with a signed end part, so the stream
+			// itself does not fail.
+			let forged = context.direct_stream(cluster.addr(), chat, forging).await?.map_err(unexpected)?;
+			assert_eq!(code_of(forged), Some(tonic::Code::Unauthenticated), "a part under another key MUST end with 16");
 
 			cluster.stop();
 			Ok(())
@@ -2569,14 +2600,16 @@ coupled!(DroppedStreamEdge, DroppedStreamGateway);
 
 tb_assert_spec! {
 	/// Coupled streams whose caller drops each response while the relay holds
-	/// an answer for it, each before a stream that the servlet serves: the
-	/// trail records the end of each dropped one as cancelled.
+	/// an answer for it, then a stream that the servlet serves: the trail
+	/// records the end of each dropped one as cancelled, and no drop fails
+	/// the route of the servlet on the gateway.
 	pub DroppedStreamSpec,
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
 			(COUPLED_CALL_REFUSED, exactly!(16), equals!("cancelled")),
-			(COUPLED_CALL_ANSWERED, exactly!(16), equals!(0u32))
+			(COUPLED_CALL_ANSWERED, exactly!(1), equals!(0u32)),
+			(events::CLUSTER_WORK_FAILED, exactly!(0))
 		]
 	}
 }
@@ -2589,9 +2622,9 @@ const H2_WINDOW: usize = 65_535;
 static DROPPED_STREAM_EVENTS: EventWatch = EventWatch::new();
 
 // Each of 16 callers reads its answer until it fills the window of its
-// connection, then drops the response. A served stream after each one keeps
-// the route of the servlet live, because the gateway abandons a route after
-// five failed streams in a row.
+// connection, then drops the response. The gateway abandons a route after
+// five failed streams in a row, so a stream after them all reads the servlet
+// only if no drop failed its route.
 tb_scenario! {
 	name: a_stream_whose_caller_drops_its_response_ends_as_cancelled,
 	config: DroppedStreamSpec::latest().watched(&DROPPED_STREAM_EVENTS),
@@ -2621,12 +2654,12 @@ tb_scenario! {
 
 				bounded(filled).await??;
 				drop((answer, caller));
-
-				let served = read(channel.stream(WATCH, &[b"order-1"], None).await?);
-				assert_eq!(served.map(|watched| watched.len()), Ok(3), "the servlet MUST serve the next stream");
 			}
 
 			DROPPED_STREAM_EVENTS.recorded(COUPLED_CALL_REFUSED, 16).await?;
+			let served = read(channel.stream(WATCH, &[b"order-1"], None).await?);
+			assert_eq!(served.map(|watched| watched.len()), Ok(3), "the servlet MUST serve the stream after the drops");
+
 			cluster.stop();
 			Ok(())
 		}
@@ -4150,6 +4183,7 @@ tb_scenario! {
 			let (signed, signed_claim) = (channel.clone(), claim.clone());
 			let placed = tokio::spawn(async move { signed.call(PLACE, b"order-80", Some(&signed_claim)).await });
 			EXPIRED_SEND_EVENTS.recorded(STORE_HELD, 1).await?;
+			context.clock.advance(STAGGER)?;
 
 			let streamed = channel.clone();
 			let stream = tokio::spawn(async move {
@@ -4164,15 +4198,16 @@ tb_scenario! {
 
 			// The send of the signed call waits for the stream past its spend
 			// and its deadline, and the store holds the forget that undoes the
-			// spend.
+			// spend. The stream keeps the one stream until its own deadline.
 			EXPIRED_SEND_EVENTS.recorded(COUPLED_CLAIM_SPENT, 1).await?;
-			context.clock.advance(CLOCKED_LIMIT)?;
+			context.clock.advance(CLOCKED_LIMIT.saturating_sub(STAGGER))?;
 			EXPIRED_SEND_EVENTS.recorded(STORE_HELD, 2).await?;
 			store.answer();
 
 			let placed = placed.await.map_err(unexpected)??;
 			assert_eq!(code_of(placed), Some(tonic::Code::DeadlineExceeded), "the signed call MUST pass its deadline");
 
+			context.clock.advance(STAGGER)?;
 			let stream = stream.await.map_err(unexpected)??;
 			assert_eq!(code_of(stream), Some(tonic::Code::DeadlineExceeded), "the held stream MUST pass its deadline");
 
@@ -4232,6 +4267,7 @@ tb_scenario! {
 			let signed = channel.clone();
 			let placed = tokio::spawn(async move { signed.call(PLACE, b"order-85", Some(&claim)).await });
 			STALLED_RELEASE_EVENTS.recorded(STORE_HELD, 1).await?;
+			context.clock.advance(STAGGER)?;
 
 			let stream = tokio::spawn(async move {
 				let held = Hold::Refused(2).body();
@@ -4245,8 +4281,9 @@ tb_scenario! {
 
 			// The send waits for the stream past its deadline, and the call
 			// limit passes while the store holds the forget of its release.
+			// The stream keeps the one stream until its own deadline.
 			STALLED_RELEASE_EVENTS.recorded(COUPLED_CLAIM_SPENT, 1).await?;
-			context.clock.advance(CLOCKED_LIMIT)?;
+			context.clock.advance(CLOCKED_LIMIT.saturating_sub(STAGGER))?;
 			STALLED_RELEASE_EVENTS.recorded(STORE_HELD, 2).await?;
 			context.clock.advance(CLOCKED_LIMIT)?;
 
@@ -4390,6 +4427,78 @@ tb_scenario! {
 	}
 }
 
+/// The call limit of the coupler of
+/// [`a_reply_past_the_read_deadline_of_the_loopback_session_answers_with_its_deadline`]:
+/// past the read deadline of its loopback session.
+const PAST_READ_DEADLINE: Duration = Duration::from_secs(60);
+
+/// The advance of
+/// [`a_reply_past_the_read_deadline_of_the_loopback_session_answers_with_its_deadline`]
+/// before the call that keeps each connection of its edge busy: half the read
+/// deadline of the loopback session.
+const HALF_READ_DEADLINE: Duration = Duration::from_secs(15);
+
+coupled!(ReadDeadlineEdge, ReadDeadlineGateway);
+
+tb_assert_spec! {
+	/// A call whose servlet holds its answer past the read deadline of the
+	/// loopback session, and within the deadline of the call: the coupler
+	/// refuses it with 4 at that read deadline, as stalled, and a call
+	/// between them serves.
+	pub ReadDeadlineSpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(COUPLED_CALL_REFUSED, exactly!(1), equals!("stalled")),
+			(COUPLED_CALL_ANSWERED, exactly!(1), equals!(0u32))
+		]
+	}
+}
+
+/// The events of the scenario of a reply past the read deadline of the
+/// loopback session.
+static READ_DEADLINE_EVENTS: EventWatch = EventWatch::new();
+
+// The coupler gives each call a minute, past the read deadline of its
+// loopback session. The servlet holds the first call until the coupler
+// refuses it. A second call halfway keeps each connection of the edge busy,
+// so the wait of the first call for its reply alone passes the read deadline,
+// and tightbeam ends that wait after its frame left.
+tb_scenario! {
+	name: a_reply_past_the_read_deadline_of_the_loopback_session_answers_with_its_deadline,
+	config: ReadDeadlineSpec::latest().watched(&READ_DEADLINE_EVENTS),
+	environment Cluster {
+		context: Coupled::clocked(&READ_DEADLINE_EVENTS),
+		start: |SetupEnv { trace, context }| async move {
+			let limits = CallLimits::default().with_timeout(PAST_READ_DEADLINE);
+			let coupler = context.orders(&context.answers, context.callers()?)?;
+			let coupler = coupler.with_call_limits(limits).map_err(edge_error)?;
+			context.stage_coupler(&trace, ReadDeadlineEdge::stage, coupler)?;
+			context.gateway::<ReadDeadlineGateway>(&trace).await
+		},
+		hives: |SetupEnv { trace, context }| vec![async move { context.hive(&trace).await }],
+		client: |ClusterEnv { context, cluster, .. }| async move {
+			let channel = context.billing(&cluster).await?;
+			let held = Hold::Refused(1).body();
+			let holding = channel.clone();
+			let held_call = tokio::spawn(async move { holding.call(GET, &held, None).await });
+			READ_DEADLINE_EVENTS.recorded(SERVED_ASSURANCE, 1).await?;
+
+			context.clock.advance(HALF_READ_DEADLINE)?;
+			let between = channel.call(GET, b"order", None).await?.map_err(|status| status.code());
+			assert_eq!(between, Ok(b"served:order".to_vec()), "the call between MUST serve");
+			context.clock.kept_alive()?;
+
+			context.clock.advance(HALF_READ_DEADLINE.saturating_add(Duration::from_secs(1)))?;
+			let held = held_call.await.map_err(unexpected)??;
+			assert_eq!(code_of(held), Some(tonic::Code::DeadlineExceeded), "the held call MUST end at the read deadline");
+
+			cluster.stop();
+			Ok(())
+		}
+	}
+}
+
 coupled!(NamelessChainEdge, NamelessChainGateway);
 
 tb_assert_spec! {
@@ -4468,7 +4577,7 @@ servlet! {
 	/// outside the stream library, then fails its handler with 10, so the
 	/// stream fails after its last answer part.
 	pub AbruptServlet<CoupledCall, EnvConfig = OrdersEnv>,
-	protocol: WsListener,
+	protocol: TokioListener,
 	handle: |_call, _frame, _ctx| async move { Ok(None) },
 	duplex: |body, reply, ctx| async move {
 		let (mut body, mut reply) = (body, reply);
@@ -4483,7 +4592,7 @@ servlet! {
 	/// keeps its handler until its caller read the status, so the stream
 	/// ends after the deadline of the coupler.
 	pub LingerServlet<CoupledCall, EnvConfig = OrdersEnv>,
-	protocol: WsListener,
+	protocol: TokioListener,
 	handle: |_call, _frame, _ctx| async move { Ok(None) },
 	duplex: |body, reply, ctx| async move {
 		let env = ctx.env_config();
@@ -4602,9 +4711,9 @@ tb_assert_spec! {
 }
 
 // The servlet fails each bidi stream at its first request while the caller
-// holds its requests open. The servlet holds the stream until the coupler
-// ends the requests, so the caller reads the status of the servlet each time,
-// and the gateway keeps routing the servlet.
+// holds its requests open. The gateway ends each splice at the end of the
+// answer of the servlet, so the caller reads the status of the servlet each
+// time, and the gateway keeps routing the servlet.
 tb_scenario! {
 	name: a_stream_that_its_caller_holds_open_answers_the_status_of_its_servlet,
 	spec: HeldOpenSpec,
@@ -4633,10 +4742,10 @@ tb_scenario! {
 coupled!(FloodedEdge, FloodedGateway);
 
 // The servlet fails each bidi stream at its first request while the caller
-// still streams. The servlet holds the stream until the coupler ends the
-// requests, so no request lands on a stream that the servlet ended: the
-// caller reads the status of the servlet each time, and the gateway keeps
-// routing the servlet.
+// still streams, so the requests that follow meet a stream that the servlet
+// ended. The gateway leaves the end of each splice to the answer of the
+// servlet: the caller reads the status of the servlet each time, and the
+// gateway keeps routing the servlet.
 tb_scenario! {
 	name: a_stream_that_its_caller_floods_answers_the_status_of_its_servlet,
 	spec: HeldOpenSpec,
@@ -4724,8 +4833,9 @@ tb_assert_spec! {
 
 // The servlet fails each stream once its head arrives, then fails its
 // handler, while the caller still streams, so the requests that follow meet a
-// stream that the servlet ended. The status of each call is the one that its stream carried:
-// the last answer part, or the status that the gateway ended the stream with.
+// stream that the servlet ended. The status of each call is the one that its
+// stream carried: the last answer part, or the status that the gateway ended
+// the stream with.
 tb_scenario! {
 	name: requests_that_meet_a_stream_its_servlet_ended_leave_the_status_to_the_stream,
 	spec: AbruptFloodSpec,
@@ -4790,6 +4900,7 @@ tb_scenario! {
 		client: |ClusterEnv { trace, context, cluster }| async move {
 			let WebCaller { channel, .. } = context.web(&cluster).await?;
 			let reading = tokio::spawn(async move { held_open(&channel, LINGER, &[], None).await });
+
 			LINGER_EVENTS.recorded(SERVLET_RELEASED, 1).await?;
 			context.clock.advance(CLOCKED_LIMIT)?;
 
@@ -4797,6 +4908,522 @@ tb_scenario! {
 			trace.event(CALLER_READ)?;
 			assert_eq!(status.code(), tonic::Code::FailedPrecondition, "the caller MUST read the status of the last part");
 			assert_eq!(status.details(), DETAILS, "the details MUST reach the caller");
+
+			cluster.stop();
+			Ok(())
+		}
+	}
+}
+
+coupled!(ReconnectEdge, ReconnectGateway);
+
+tb_assert_spec! {
+	/// Two connections of the billing caller under one TLS client: the
+	/// servlet admits the call of each.
+	pub ReconnectSpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(COUPLED_CALL_ADMITTED, exactly!(2)),
+			(SERVED_ASSURANCE, exactly!(2), equals!("vouched")),
+			(COUPLED_CALL_REFUSED, exactly!(0))
+		]
+	}
+}
+
+/// A dial of the edge under one rustls client, which keeps the session of
+/// each connection to resume the next, as a rustls client does by default,
+/// and holds the kind of the handshake of its last connection.
+#[derive(Clone)]
+struct ResumingDial {
+	edge: String,
+	config: Arc<rustls::ClientConfig>,
+	handshake: Arc<std::sync::Mutex<Option<rustls::HandshakeKind>>>,
+}
+
+impl ResumingDial {
+	/// A channel over a new connection of the dial, and the kind of its
+	/// handshake.
+	///
+	/// # Errors
+	///
+	/// - The [`TightBeamError`] of a connection that does not secure within `support::OPENING`.
+	async fn connect(&self) -> Result<(StockChannel, Option<rustls::HandshakeKind>), TightBeamError> {
+		let origin = http::Uri::from_static("https://localhost");
+		let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{}", self.edge));
+		let endpoint = endpoint.map_err(unexpected)?.origin(origin);
+		let channel = bounded(endpoint.connect_with_connector(self.clone())).await?;
+
+		let mut handshake = self.handshake.lock().map_err(|_| unexpected("a poisoned lock"))?;
+		Ok((StockChannel::from(channel.map_err(unexpected)?), handshake.take()))
+	}
+}
+
+impl tower_service::Service<http::Uri> for ResumingDial {
+	type Response = hyper_util::rt::TokioIo<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>;
+	type Error = std::io::Error;
+	type Future = core::pin::Pin<Box<dyn core::future::Future<Output = std::io::Result<Self::Response>> + Send>>;
+
+	fn poll_ready(&mut self, _context: &mut core::task::Context<'_>) -> core::task::Poll<std::io::Result<()>> {
+		core::task::Poll::Ready(Ok(()))
+	}
+
+	/// The dial connects to its own edge, the authority of the URI that
+	/// tonic passes.
+	fn call(&mut self, _uri: http::Uri) -> Self::Future {
+		let dial = self.clone();
+		Box::pin(async move {
+			let tcp = tokio::net::TcpStream::connect(&dial.edge).await?;
+			let name = rustls_pki_types::ServerName::try_from("localhost").map_err(std::io::Error::other)?;
+			let secured = tokio_rustls::TlsConnector::from(dial.config).connect(name, tcp).await?;
+			let handshake = secured.get_ref().1.handshake_kind();
+			*dial.handshake.lock().map_err(|_| std::io::Error::other("a poisoned lock"))? = handshake;
+			Ok(hyper_util::rt::TokioIo::new(secured))
+		})
+	}
+}
+
+// The billing caller dials the edge twice under one TLS client, which keeps
+// the session of its first connection. The edge resumes no session, so the
+// second connection runs a full handshake, and the edge verifies the client
+// chain again at that connection.
+tb_scenario! {
+	name: each_connection_of_a_caller_runs_a_full_handshake,
+	spec: ReconnectSpec,
+	environment Cluster {
+		context: Coupled::mint(),
+		start: |SetupEnv { trace, context }| async move {
+			context.stage(&trace, ReconnectEdge::stage)?;
+			context.gateway::<ReconnectGateway>(&trace).await
+		},
+		hives: |SetupEnv { trace, context }| vec![async move { context.hive(&trace).await }],
+		client: |ClusterEnv { context, cluster, .. }| async move {
+			let edge = WorkClient::edge_of(&cluster)?.to_string();
+			let config = Arc::new(H2Tunnel::tls(&context.tls, Some(&context.billing_caller()))?);
+			let dial = ResumingDial { edge, config, handshake: Arc::default() };
+			for order in ["order-70", "order-71"] {
+				let (channel, handshake) = dial.connect().await?;
+				assert_eq!(handshake, Some(rustls::HandshakeKind::Full), "each connection MUST run a full handshake");
+
+				channel.serving(&context.clock).await?;
+
+				let got = channel.call(GET, order.as_bytes(), None).await?;
+				let served = format!("served:{order}").into_bytes();
+				assert_eq!(got.map_err(|status| status.code()), Ok(served), "each connection MUST be admitted");
+			}
+
+			cluster.stop();
+			Ok(())
+		}
+	}
+}
+
+/// The most requests that a stream of
+/// [`a_stream_whose_requests_end_as_its_servlet_ends_answers_cleanly`] sends
+/// after the one that its servlet fails, from none up.
+const TRAILING_REQUESTS: u32 = 8;
+
+/// The rounds of
+/// [`a_stream_whose_requests_end_as_its_servlet_ends_answers_cleanly`], each
+/// of which sends every count of trailing requests once.
+const TRAILING_ROUNDS: u32 = 4;
+
+/// The streams of each count of trailing requests that
+/// [`a_stream_whose_requests_end_as_its_servlet_ends_answers_cleanly`] opens at
+/// once, as many as each link of [`Coupled::trickle_gateway`] carries.
+const TRAILING_AT_ONCE: u32 = 4;
+
+/// The streams that
+/// [`a_stream_whose_requests_end_as_its_servlet_ends_answers_cleanly`] opens.
+const TRAILING_STREAMS: u32 = (TRAILING_REQUESTS + 1) * TRAILING_ROUNDS * TRAILING_AT_ONCE;
+
+impl Coupled {
+	/// The coupler that routes [`CHAT`] to the orders servlet as `Vouched`,
+	/// and grants it to the web caller, so its streams carry no claim.
+	fn vouched_chat(&self) -> Result<Coupler, TightBeamError> {
+		let orders = Servlet::new(Self::servlet()?, self.answers.certificate().clone()).map_err(edge_error)?;
+		let routes = Routes::new()
+			.bidi_stream(CHAT, orders, Assurance::Vouched)
+			.map_err(edge_error)?;
+
+		let web = Principal::subject(WEB).map_err(edge_error)?;
+		let grants = Grants::deny_all().grant(web, CHAT).map_err(edge_error)?;
+		self.coupler(routes, grants)
+	}
+}
+
+coupled!(EndedRequestsEdge, EndedRequestsGateway);
+
+tb_assert_spec! {
+	/// Bidi streams that the servlet fails at their first request, whose
+	/// callers send more requests and end them, on links of one chunk of
+	/// credit: the coupler answers each with the status of the servlet, and
+	/// no stream fails or cancels on the gateway.
+	pub EndedRequestsSpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(COUPLED_CALL_ANSWERED, exactly!(TRAILING_STREAMS), equals!(9u32)),
+			(COUPLED_CALL_REFUSED, exactly!(0)),
+			(events::CLUSTER_WORK_FAILED, exactly!(0)),
+			(events::MUX_STREAM_CANCELLED, exactly!(0))
+		]
+	}
+}
+
+// The servlet fails each bidi stream at its first request, while the caller
+// sends a few more requests and ends them. Each part of the requests waits
+// for credit, so the servlet ends each stream while its requests still
+// arrive. The gateway frees each stream whose handler ended before its
+// requests did, so the loopback session carries every stream of the
+// scenario.
+tb_scenario! {
+	name: a_stream_whose_requests_end_as_its_servlet_ends_answers_cleanly,
+	spec: EndedRequestsSpec,
+	environment Cluster {
+		context: Coupled::mint(),
+		start: |SetupEnv { trace, context }| async move {
+			context.stage_coupler(&trace, EndedRequestsEdge::stage, context.vouched_chat()?)?;
+			context.trickle_gateway::<EndedRequestsGateway>(&trace).await
+		},
+		hives: |SetupEnv { trace, context }| vec![async move { context.hive(&trace).await }],
+		client: |ClusterEnv { context, cluster, .. }| async move {
+			let WebCaller { channel, .. } = context.web(&cluster).await?;
+			for _ in 0..TRAILING_ROUNDS {
+				for trailing in 0..=TRAILING_REQUESTS {
+					let late = vec![b"late".as_slice(); trailing as usize];
+					let requests = [&[FAILING][..], &late].concat();
+
+					let streams = (0..TRAILING_AT_ONCE).map(|_| channel.stream(CHAT, &requests, None));
+					for ended in futures_util::future::join_all(streams).await {
+						let status = ended?.err().ok_or_else(|| unexpected("the servlet answered a stream it failed"))?;
+						assert_eq!(status.code(), tonic::Code::FailedPrecondition, "the caller MUST read the status of the servlet");
+					}
+				}
+			}
+
+			cluster.stop();
+			Ok(())
+		}
+	}
+}
+
+/// The streams that
+/// [`streams_that_their_callers_end_early_keep_the_route_of_their_servlet`]
+/// ends early: one half by a drop, and one half by a second request.
+const EARLY_STREAMS: u32 = 2 * EARLY_ENDS;
+
+coupled!(EarlyEndEdge, EarlyEndGateway);
+
+tb_assert_spec! {
+	/// Streams whose callers end them before their servlet does, by a drop of
+	/// the response or a second request to a server stream, then a stream
+	/// that the servlet serves: no early end fails the route of the servlet
+	/// on the gateway, so the gateway keeps routing it.
+	pub EarlyEndSpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(COUPLED_CALL_REFUSED, exactly!(EARLY_STREAMS)),
+			(COUPLED_CALL_ANSWERED, exactly!(1), equals!(0u32)),
+			(events::CLUSTER_WORK_FAILED, exactly!(0))
+		]
+	}
+}
+
+/// The events of the scenario of streams that their callers end early.
+static EARLY_END_EVENTS: EventWatch = EventWatch::new();
+
+// Each caller ends its stream before the servlet does: it drops a bidi stream
+// after its first answer, or sends a second request to a server stream, and
+// the coupler cancels the stream. The gateway abandons a route after five
+// failed streams in a row, so a stream after them all reads the servlet only
+// if no early end failed its route.
+tb_scenario! {
+	name: streams_that_their_callers_end_early_keep_the_route_of_their_servlet,
+	config: EarlyEndSpec::latest().watched(&EARLY_END_EVENTS),
+	environment Cluster {
+		context: Coupled::watched(&EARLY_END_EVENTS),
+		start: |SetupEnv { trace, context }| async move {
+			context.stage(&trace, EarlyEndEdge::stage)?;
+			context.gateway::<EarlyEndGateway>(&trace).await
+		},
+		hives: |SetupEnv { trace, context }| vec![async move { context.hive(&trace).await }],
+		client: |ClusterEnv { context, cluster, .. }| async move {
+			let WebCaller { leaf: web, channel } = context.web(&cluster).await?;
+			for _ in 0..EARLY_ENDS {
+				let claim = context.claim(&web, CHAT, b"").await?;
+				let first = channel.dropped_after_an_answer(CHAT, &[b"a"], Some(&claim)).await?;
+				assert_eq!(first.as_deref(), Some(b"chat:a".as_slice()), "the servlet MUST answer the request");
+
+				let twice = read(channel.stream(WATCH, &[b"a", b"b"], None).await?);
+				assert_eq!(twice.map(|_| ()), Err(tonic::Code::Unimplemented), "a second request MUST end the stream");
+			}
+
+			EARLY_END_EVENTS.recorded(COUPLED_CALL_REFUSED, EARLY_STREAMS as usize).await?;
+			let served = read(channel.stream(WATCH, &[b"order-1"], None).await?);
+			assert_eq!(served.map(|watched| watched.len()), Ok(3), "the servlet MUST serve the next stream");
+
+			cluster.stop();
+			Ok(())
+		}
+	}
+}
+
+coupled!(RefusedAnswerEdge, RefusedAnswerGateway);
+
+tb_assert_spec! {
+	/// Client streams whose servlet answers twice or never, then a stream
+	/// that the servlet serves: the stream library ends each refused answer
+	/// with a signed 12, so none fails on the gateway, and the gateway keeps
+	/// routing the servlet.
+	pub RefusedAnswerSpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(COUPLED_CALL_ANSWERED, exactly!(EARLY_STREAMS + 1)),
+			(COUPLED_CALL_REFUSED, exactly!(0)),
+			(events::CLUSTER_WORK_FAILED, exactly!(0))
+		]
+	}
+}
+
+// The servlet answers each client stream twice or never, which its stream
+// library refuses. The gateway abandons a route after five failed streams in
+// a row, so a stream after them all reads the servlet only if each refusal
+// ended its stream cleanly.
+tb_scenario! {
+	name: answers_that_the_stream_library_refuses_keep_the_route_of_their_servlet,
+	spec: RefusedAnswerSpec,
+	environment Cluster {
+		context: Coupled::mint(),
+		start: |SetupEnv { trace, context }| async move {
+			context.stage(&trace, RefusedAnswerEdge::stage)?;
+			context.gateway::<RefusedAnswerGateway>(&trace).await
+		},
+		hives: |SetupEnv { trace, context }| vec![async move { context.hive(&trace).await }],
+		client: |ClusterEnv { context, cluster, .. }| async move {
+			let WebCaller { channel, .. } = context.web(&cluster).await?;
+			for _ in 0..EARLY_ENDS {
+				for request in [b"twice".as_slice(), b"never"] {
+					let refused = read(channel.stream(BROKEN, &[request], None).await?);
+					assert_eq!(refused.map(|_| ()), Err(tonic::Code::Unimplemented), "a refused answer MUST read 12");
+				}
+			}
+
+			let served = read(channel.stream(WATCH, &[b"order-1"], None).await?);
+			assert_eq!(served.map(|watched| watched.len()), Ok(3), "the servlet MUST serve the next stream");
+
+			cluster.stop();
+			Ok(())
+		}
+	}
+}
+
+/// The calls that
+/// [`a_loopback_session_whose_cancels_reach_half_its_budget_renews`] serves
+/// first: more than the cancel budget of tightbeam, so a session that kept
+/// the unit of each call that ended would refuse one.
+const SETTLED_CALLS: u32 = 1056;
+
+/// The calls of
+/// [`a_loopback_session_whose_cancels_reach_half_its_budget_renews`] whose
+/// caller ends each one while the servlet holds it: more than the cancels
+/// after which a loopback session renews, and fewer than twice them.
+const ENDED_CALLS: u32 = 528;
+
+/// The ended calls of
+/// [`a_loopback_session_whose_cancels_reach_half_its_budget_renews`] that
+/// follow the call that the servlet holds across the renewal, which starts
+/// short of the cancels that renew the session.
+const ENDED_AFTER_HELD: u32 = 32;
+
+/// The calls of each batch of
+/// [`a_loopback_session_whose_cancels_reach_half_its_budget_renews`], which
+/// run at once within the streams of the session and of its servlet.
+const CALL_BATCH: u32 = 4;
+
+/// The body of a call that the servlet holds until its caller ends it.
+const HELD_FOR_GOOD: &[u8] = b"refused:1000000";
+
+/// The admissions and the refusals that the trace of a scenario counted.
+#[derive(Clone, Copy)]
+struct CallCounts {
+	admitted: usize,
+	refused: usize,
+}
+
+impl CallCounts {
+	/// Run `count` calls of `Get` on `channel` in batches of [`CALL_BATCH`],
+	/// each of which the servlet holds until its caller ends it, once the
+	/// servlet admitted it, as `events` count: the counts after them.
+	///
+	/// # Errors
+	///
+	/// - The errors of [`EventWatch::recorded`].
+	async fn ended(self, channel: &StockChannel, count: u32, events: &EventWatch) -> Result<Self, TightBeamError> {
+		let Self { mut admitted, mut refused } = self;
+		for _ in 0..count / CALL_BATCH {
+			let calls: Vec<_> = (0..CALL_BATCH)
+				.map(|_| {
+					let calling = channel.clone();
+					tokio::spawn(async move { calling.call(GET, HELD_FOR_GOOD, None).await })
+				})
+				.collect();
+
+			admitted += CALL_BATCH as usize;
+			events.recorded(SERVED_ASSURANCE, admitted).await?;
+
+			for call in &calls {
+				call.abort();
+			}
+
+			refused += CALL_BATCH as usize;
+			events.recorded(COUPLED_CALL_REFUSED, refused).await?;
+		}
+
+		Ok(Self { admitted, refused })
+	}
+}
+
+coupled!(RenewedSessionEdge, RenewedSessionGateway);
+
+tb_assert_spec! {
+	/// Calls that the coupler serves, past the cancel budget of tightbeam,
+	/// then calls whose callers end them while the servlet holds them, past
+	/// half of it, while one call stays held: the loopback session opens the
+	/// next one, the held call answers, and a call after them serves.
+	pub RenewedSessionSpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(COUPLED_SESSION_OPENED, exactly!(2)),
+			(COUPLED_CALL_ANSWERED, exactly!(SETTLED_CALLS + 2), equals!(0u32)),
+			(COUPLED_CALL_REFUSED, exactly!(ENDED_CALLS), equals!("cancelled"))
+		]
+	}
+}
+
+/// The events of the scenario of a loopback session that renews.
+static RENEWED_SESSION_EVENTS: EventWatch = EventWatch::new();
+
+// Each settled call gives its unit of the cancel budget back. Each ended call
+// cancels on the loopback session, which counts it, and the session opens the
+// next one once its cancels reach half the budget. The call that the servlet
+// holds across the renewal answers on the session that it started on.
+tb_scenario! {
+	name: a_loopback_session_whose_cancels_reach_half_its_budget_renews,
+	config: RenewedSessionSpec::latest().watched(&RENEWED_SESSION_EVENTS),
+	environment Cluster {
+		context: Coupled::watched(&RENEWED_SESSION_EVENTS),
+		start: |SetupEnv { trace, context }| async move {
+			context.stage(&trace, RenewedSessionEdge::stage)?;
+			context.gateway::<RenewedSessionGateway>(&trace).await
+		},
+		hives: |SetupEnv { trace, context }| vec![async move { context.hive(&trace).await }],
+		client: |ClusterEnv { context, cluster, .. }| async move {
+			let channel = context.billing(&cluster).await?;
+			for _ in 0..SETTLED_CALLS / CALL_BATCH {
+				let calls = (0..CALL_BATCH).map(|_| channel.call(GET, b"order", None));
+				for answered in futures_util::future::join_all(calls).await {
+					assert_eq!(answered?.map_err(|status| status.code()), Ok(b"served:order".to_vec()));
+				}
+			}
+
+			let counts = CallCounts { admitted: SETTLED_CALLS as usize, refused: 0 };
+			let counts = counts.ended(&channel, ENDED_CALLS - ENDED_AFTER_HELD, &RENEWED_SESSION_EVENTS).await?;
+
+			let held = Hold::Refused(ENDED_CALLS as usize).body();
+			let holding = channel.clone();
+			let held_call = tokio::spawn(async move { holding.call(GET, &held, None).await });
+			let counts = CallCounts { admitted: counts.admitted + 1, ..counts };
+
+			RENEWED_SESSION_EVENTS.recorded(SERVED_ASSURANCE, counts.admitted).await?;
+			counts.ended(&channel, ENDED_AFTER_HELD, &RENEWED_SESSION_EVENTS).await?;
+			RENEWED_SESSION_EVENTS.recorded(COUPLED_SESSION_OPENED, 2).await?;
+
+			let held = held_call.await.map_err(unexpected)??.map_err(|status| status.code());
+			assert!(held.is_ok(), "the call held across the renewal MUST answer, got {held:?}");
+
+			let after = channel.call(GET, b"order", None).await?.map_err(|status| status.code());
+			assert_eq!(after, Ok(b"served:order".to_vec()), "the renewed session MUST serve");
+
+			cluster.stop();
+			Ok(())
+		}
+	}
+}
+
+/// The streams of the coupler of
+/// [`the_stream_share_of_a_coupler_leaves_its_unary_calls_their_places`]: as
+/// many as tightbeam allows, so half of them pass the places of the loopback
+/// session that its streams may hold.
+const WIDE_STREAMS: u32 = 1024;
+
+/// The open streams of a coupler at most: half the places of its loopback
+/// session.
+const STREAM_SHARE: u32 = 256;
+
+coupled!(StreamShareEdge, StreamShareGateway);
+
+tb_assert_spec! {
+	/// Signed streams whose ledger holds each spend, up to the stream share
+	/// of a coupler of 1024 streams, then one more stream and a unary call:
+	/// the stream past the share refuses with 8, and the unary call serves.
+	pub StreamShareSpec,
+	V(1,0,0): {
+		mode: Accept,
+		assertions: [
+			(COUPLED_CALL_ANSWERED, exactly!(1), equals!(0u32))
+		]
+	}
+}
+
+/// The events of the scenario of the stream share of a coupler.
+static STREAM_SHARE_EVENTS: EventWatch = EventWatch::new();
+
+// A coupler of 1024 streams would take 512 relay permits, every place of its
+// loopback session. Its open streams take half the places at most, so with
+// that half held in the spend of their claims, a stream past it refuses with
+// 8, and a unary call still finds a place and serves.
+tb_scenario! {
+	name: the_stream_share_of_a_coupler_leaves_its_unary_calls_their_places,
+	config: StreamShareSpec::latest().watched(&STREAM_SHARE_EVENTS),
+	environment Cluster {
+		context: (Coupled::watched(&STREAM_SHARE_EVENTS), HeldStoreLedger::on(&STREAM_SHARE_EVENTS)),
+		start: |SetupEnv { trace, context }| async move {
+			let streams = core::num::NonZeroU32::new(WIDE_STREAMS).ok_or_else(|| unexpected("no stream"))?;
+			let limits = CallLimits::default().with_streams(streams);
+			let coupler = context.0.orders(&context.0.answers, context.0.callers()?)?;
+			let coupler = coupler.with_claim_ledger(context.1.clone()).with_call_limits(limits).map_err(edge_error)?;
+
+			context.0.stage_coupler(&trace, StreamShareEdge::stage, coupler)?;
+			context.0.wide_gateway::<StreamShareGateway>(&trace).await
+		},
+		hives: |SetupEnv { trace, context }| vec![async move { context.0.hive(&trace).await }],
+		client: |ClusterEnv { context, cluster, .. }| async move {
+			let context = &context.0;
+			let WebCaller { leaf: web, channel } = context.web(&cluster).await?;
+			let mut held = Vec::new();
+			for _ in 0..STREAM_SHARE {
+				let claim = context.claim(&web, CHAT, b"").await?;
+				let streaming = channel.clone();
+				held.push(tokio::spawn(async move { streaming.stream(CHAT, &[], Some(&claim)).await }));
+			}
+
+			STREAM_SHARE_EVENTS.recorded(STORE_HELD, STREAM_SHARE as usize).await?;
+
+			let claim = context.claim(&web, CHAT, b"").await?;
+			let past = read(channel.stream(CHAT, &[], Some(&claim)).await?);
+			assert_eq!(past.map(|_| ()), Err(tonic::Code::ResourceExhausted), "a stream past the share MUST refuse with 8");
+
+			let billing = context.billing(&cluster).await?;
+			let served = billing.call(GET, b"order", None).await?.map_err(|status| status.code());
+			assert_eq!(served, Ok(b"served:order".to_vec()), "a unary call MUST find a place past the stream share");
+
+			for stream in &held {
+				stream.abort();
+			}
 
 			cluster.stop();
 			Ok(())

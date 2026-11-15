@@ -51,7 +51,7 @@ Authentication and confidentiality come from the tightbeam handshake inside the 
 
 ## Cluster edge
 
-A tightbeam cluster gateway binds a gRPC edge that admits signed work frames from native clients, and stream opens once its `EdgePlane` admits them, while the colony runs on the WebSocket protocol of `tightbeam-ws`. Implementation: [docs/grpc.md](https://github.com/wahidgroup/tightbeam-ext/blob/master/docs/grpc.md#cluster-work-plane).
+A tightbeam cluster gateway binds a gRPC edge that admits signed work frames from native clients, and stream opens once its `EdgePlane` admits them, while the colony keeps the protocol that its cluster declares. Implementation: [docs/grpc.md](https://github.com/wahidgroup/tightbeam-ext/blob/master/docs/grpc.md#cluster-work-plane).
 
 ## Coupled edge
 

@@ -3,14 +3,12 @@
 //! [`tightbeam-asn`]: https://docs.rs/tightbeam-asn
 //! [derive]: https://github.com/wahidgroup/tightbeam-ext/blob/master/docs/asn.md#derive
 
+mod field_key;
 mod js_name;
-
-use core::fmt;
 
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::{format_ident, quote, quote_spanned, ToTokens};
-use syn::ext::IdentExt;
 use syn::meta::ParseNestedMeta;
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
@@ -22,6 +20,7 @@ use syn::{
 
 use tightbeam_asn_names::Export;
 
+use crate::field_key::FieldKey;
 use crate::js_name::JsName;
 
 /// Marks a `der` type as a codec for TypeScript.
@@ -122,7 +121,7 @@ impl Codec {
 		let mut ts_section = TsText::from(format!("export type {} =", js_name.as_str()));
 
 		for (variant_ident, ty) in alternatives {
-			let variant_name = FieldKey::from(variant_ident);
+			let variant_name = FieldKey::try_from(variant_ident)?;
 			let kind = FieldKind::try_from(ty)?;
 			let present = format_ident!("present");
 			let from_present = kind.quote_from_value(&present);
@@ -373,7 +372,7 @@ impl FieldEmit {
 				.as_ref()
 				.ok_or_else(|| Error::new(field.span(), "expected named field"))?;
 
-			let field_key = FieldKey::from(field_name);
+			let field_key = FieldKey::try_from(field_name)?;
 			let slot = Slot::try_from(&field.ty)?;
 			let doc = DocLines::from(field.attrs.as_slice()).or(slot.contract());
 
@@ -385,29 +384,6 @@ impl FieldEmit {
 		}
 
 		Ok(emit)
-	}
-}
-
-/// The JS key of a Sequence field or a Choice variant: the name of its Rust
-/// identifier, without the `r#` of a raw identifier. It quotes as a string
-/// literal.
-struct FieldKey(String);
-
-impl From<&Ident> for FieldKey {
-	fn from(ident: &Ident) -> Self {
-		Self(ident.unraw().to_string())
-	}
-}
-
-impl fmt::Display for FieldKey {
-	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		f.write_str(&self.0)
-	}
-}
-
-impl ToTokens for FieldKey {
-	fn to_tokens(&self, tokens: &mut TokenStream2) {
-		self.0.to_tokens(tokens);
 	}
 }
 
@@ -1013,6 +989,7 @@ mod tests {
 	use syn::parse_quote;
 
 	use super::*;
+	use crate::field_key::PROTO_KEY_HELP;
 
 	/// The expansion of `input`, as the derive entry builds it.
 	fn expand(input: DeriveInput) -> Result<TokenStream2> {
@@ -1263,5 +1240,15 @@ mod tests {
 			union_field,
 		];
 		assert_eq!(refusals.each_ref().map(Option::as_deref), [Some(MEMBER_OPTIONS_HELP); 7]);
+	}
+
+	#[test]
+	fn a_member_named_proto_is_refused() {
+		let field = refusal(parse_quote! { struct Doc { __proto__: String } });
+		let raw_field = refusal(parse_quote! { struct Doc { r#__proto__: String } });
+		let variant = refusal(parse_quote! { enum Request { __proto__(Body) } });
+
+		let refusals = [field, raw_field, variant];
+		assert_eq!(refusals.each_ref().map(Option::as_deref), [Some(PROTO_KEY_HELP); 3]);
 	}
 }

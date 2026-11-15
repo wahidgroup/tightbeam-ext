@@ -1,10 +1,5 @@
 //! Colony work through the gRPC edge plane of a gateway, whose colony runs
-//! over WebSocket.
-
-// The colony runtime macros expand `cfg(feature = ...)` probes against the
-// invoking crate's feature namespace, which holds the features of this crate
-// alone, so the leaked cfg warnings carry no signal here.
-#![allow(unexpected_cfgs)]
+//! over TCP.
 
 mod support;
 
@@ -16,16 +11,18 @@ use tightbeam::colony::SubmitWork;
 use tightbeam::instrumentation::events;
 use tightbeam::policy::TransitStatus;
 use tightbeam::testing::{ClusterEnv, SetupEnv};
+use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::{cluster, exactly, tb_assert_spec, tb_scenario, Frame, TightBeamError, Version};
 use tightbeam_grpc::protocol::GrpcListener;
-use tightbeam_ws::protocol::WsListener;
 use tightbeam_ws::testing::specs::{EdgeWorkSpec, UnservedWorkSpec};
 use tightbeam_ws::testing::{WorkClient, WorkPlane};
 
+use support::TcpWorkProbe;
+
 cluster! {
-	/// WebSocket colony gateway with a gRPC edge accept plane.
+	/// TCP colony gateway with a gRPC edge accept plane.
 	pub WorkPlaneGateway,
-	protocol: WsListener,
+	protocol: TokioListener,
 	edge: GrpcListener
 }
 
@@ -53,7 +50,7 @@ async fn registration(plane: &WorkPlane) -> Result<Frame, TightBeamError> {
 	Ok(frame)
 }
 
-// A signed work frame travels from the gRPC edge through the WebSocket colony
+// A signed work frame travels from the gRPC edge through the TCP colony
 // to the work probe, and the signed answer of the probe verifies end to end.
 tb_scenario! {
 	name: submit_work_round_trips_through_grpc_gateway,
@@ -61,7 +58,7 @@ tb_scenario! {
 	environment Cluster {
 		context: work_plane(),
 		start: |SetupEnv { trace, context }| async move { context.gateway::<WorkPlaneGateway>(&trace, "127.0.0.1:0").await },
-		hives: |SetupEnv { trace, context }| vec![async move { context.hive(&trace).await }],
+		hives: |SetupEnv { trace, context }| vec![async move { context.hive::<TcpWorkProbe>(&trace).await }],
 		client: |ClusterEnv { context, cluster, .. }| async move {
 			let probe = context.client();
 			let mut client = probe.connect::<GrpcListener>(WorkClient::edge_of(&cluster)?).await?;
@@ -86,7 +83,7 @@ tb_scenario! {
 	environment Cluster {
 		context: work_plane(),
 		start: |SetupEnv { trace, context }| async move { context.gateway::<WorkPlaneGateway>(&trace, "127.0.0.1:0").await },
-		hives: |SetupEnv { trace, context }| vec![async move { context.hive(&trace).await }],
+		hives: |SetupEnv { trace, context }| vec![async move { context.hive::<TcpWorkProbe>(&trace).await }],
 		client: |ClusterEnv { context, cluster, .. }| async move {
 			let probe = context.client();
 			let mut client = probe.connect::<GrpcListener>(WorkClient::edge_of(&cluster)?).await?;
@@ -123,7 +120,7 @@ tb_scenario! {
 	environment Cluster {
 		context: work_plane(),
 		start: |SetupEnv { trace, context }| async move { context.gateway::<WorkPlaneGateway>(&trace, "127.0.0.1:0").await },
-		hives: |SetupEnv { trace, context }| vec![async move { context.hive(&trace).await }],
+		hives: |SetupEnv { trace, context }| vec![async move { context.hive::<TcpWorkProbe>(&trace).await }],
 		client: |ClusterEnv { context, cluster, .. }| async move {
 			let mut client = context.client().connect::<GrpcListener>(WorkClient::edge_of(&cluster)?).await?;
 
@@ -158,7 +155,7 @@ tb_scenario! {
 	environment Cluster {
 		context: work_plane(),
 		start: |SetupEnv { trace, context }| async move { context.gateway::<WorkPlaneGateway>(&trace, "127.0.0.1:0").await },
-		hives: |SetupEnv { trace, context }| vec![async move { context.hive(&trace).await }],
+		hives: |SetupEnv { trace, context }| vec![async move { context.hive::<TcpWorkProbe>(&trace).await }],
 		client: |ClusterEnv { trace, context, cluster }| async move {
 			let probe = context.client();
 			let pool = probe.pool::<GrpcListener>(&trace);

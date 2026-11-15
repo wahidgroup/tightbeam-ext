@@ -2,11 +2,6 @@
 //!
 //! Environment: `TBWS_SERVER_CERT`, `CERT_DIR`, and `GRPC_COUPLED_PORT`.
 
-// The colony runtime macros expand `cfg(feature = ...)` probes against the
-// invoking crate's feature namespace, which holds the features of this crate
-// alone, so the leaked cfg warnings carry no signal here.
-#![allow(unexpected_cfgs)]
-
 use core::future::pending;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -18,6 +13,7 @@ use tightbeam::crypto::profiles::DefaultCryptoProvider;
 use tightbeam::crypto::sign::SigningIdentity;
 use tightbeam::policy::TransitStatus;
 use tightbeam::trace::TraceCollector;
+use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::{cluster, hive, servlet, TightBeamError};
 use tightbeam_grpc::couple::{
 	AdmissionTrust, AdmittedCall, Assurance, CallerTrust, CallerTrustFiles, CoupledCall, Coupler, Grants, Identities,
@@ -27,7 +23,6 @@ use tightbeam_grpc::edge::{Dial, DialTls, Edge, EdgeTls, EdgeTlsFiles};
 use tightbeam_grpc::protocol::GrpcListener;
 use tightbeam_grpc::staged_profile;
 use tightbeam_grpc::testing::CoupledStack;
-use tightbeam_ws::protocol::WsListener;
 use tightbeam_ws::testing::{EnvVar, Identity, WorkClient};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -49,9 +44,9 @@ staged_profile! {
 }
 
 cluster! {
-	/// WebSocket colony gateway with a coupled gRPC edge.
+	/// TCP colony gateway with a coupled gRPC edge.
 	pub CoupledGateway,
-	protocol: WsListener,
+	protocol: TokioListener,
 	edge: GrpcListener<DefaultCryptoProvider, CoupledStackEdge>
 }
 
@@ -65,7 +60,7 @@ servlet! {
 	/// Answers each coupled call that it admits with its own request body, so
 	/// a stock caller reads back the message it sent.
 	pub OrdersServlet<CoupledCall, EnvConfig = OrdersEnv>,
-	protocol: WsListener,
+	protocol: TokioListener,
 	handle: |_call, frame, ctx| async move {
 		let env = ctx.env_config();
 		let admitted = AdmittedCall::admit(&frame, &env.admission)?;
@@ -75,9 +70,9 @@ servlet! {
 }
 
 hive! {
-	/// The hive that hosts the orders servlet over the WebSocket colony.
+	/// The hive that hosts the orders servlet over the TCP colony.
 	pub OrdersHive,
-	protocol: WsListener
+	protocol: TokioListener
 }
 
 #[tokio::main]

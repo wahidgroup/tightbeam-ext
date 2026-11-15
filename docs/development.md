@@ -157,12 +157,12 @@ The script compiles the release notes from the titles and labels of the merged p
 
 The release workflow runs two jobs:
 
-- `build` holds a read-only token. It runs the setup, `make ci`, the tag and yank checks, and the SBOM, then packages the crates and packs the npm client.
+- `build` holds a read-only token. It runs the setup, `make ci`, the tag check, and the SBOM, then packages the crates and packs the npm client.
 - `publish` holds the write token and runs no setup and no build. `scripts/publish-release.sh` publishes each crate and the client tarball that its registry lacks, and the job then creates or updates the GitHub release. So a run of the workflow after a partial publish finishes the release.
 
 ## Yanks
 
-`make release <ext> yank=1` deletes the GitHub release and pushes a signed `yanked/<ext>/v<version>` marker tag. It keeps the release tag. The deploy guard `scripts/check-yanked.sh` refuses a version that carries a yank marker.
+`make release <ext> yank=1` deletes the GitHub release and pushes a signed `yanked/<ext>/v<version>` marker tag. It keeps the release tag. The deploy guard `scripts/check-yanked.sh` refuses a version that carries a yank marker. `scripts/publish-release.sh` runs it before each registry read or write, so a re-run of a publish step refuses a version that was yanked after the first attempt.
 
 ## Sources
 

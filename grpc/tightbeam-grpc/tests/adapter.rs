@@ -1,10 +1,5 @@
 //! Colony work relayed to a stock gRPC server by a `Backend` servlet.
 
-// The colony runtime macros expand `cfg(feature = ...)` probes against the
-// invoking crate's feature namespace, which holds the features of this crate
-// alone, so the leaked cfg warnings carry no signal here.
-#![allow(unexpected_cfgs)]
-
 mod support;
 
 use core::convert::Infallible;
@@ -16,10 +11,8 @@ use std::time::Duration;
 
 use tightbeam::builder::TypeBuilder;
 use tightbeam::clock::UnixMillis;
-use tightbeam::colony::cluster::{Cluster, EdgePlane};
 use tightbeam::colony::hive::Hive;
 use tightbeam::colony::SubmitWork;
-use tightbeam::constants::MIN_MUX_CHUNK_SIZE;
 use tightbeam::instrumentation::events;
 use tightbeam::policy::TransitStatus;
 use tightbeam::runtime::rt;
@@ -27,6 +20,7 @@ use tightbeam::testing::macros::BuiltAssertSpec;
 use tightbeam::testing::{ClusterEnv, ScenarioConfig, ScenarioConfigError, SetupEnv};
 use tightbeam::trace::TraceCollector;
 use tightbeam::transport::handshake::negotiation::TransportOffer;
+use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::transport::{ClientBuilder, ConnectionBuilder};
 use tightbeam::urn::Urn;
 use tightbeam::{
@@ -42,7 +36,6 @@ use tightbeam_grpc::events::{
 };
 use tightbeam_grpc::protocol::{GrpcAddr, GrpcListener};
 use tightbeam_grpc::testing::StreamSigners;
-use tightbeam_ws::protocol::WsListener;
 use tightbeam_ws::testing::{EventWatch, Identity, WorkClient};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
@@ -58,7 +51,7 @@ use tonic::{Request, Response, Status};
 use tower_service::Service;
 
 use support::{
-	bounded, code_of, edge_error, mint_error, unexpected, AnswerRead, Coupled, DirectRoute, Graded, RawCodec,
+	bounded, code_of, edge_error, mint_error, trickle, unexpected, AnswerRead, Coupled, DirectRoute, Graded, RawCodec,
 	WebCaller, WEB,
 };
 
@@ -404,21 +397,21 @@ servlet! {
 	/// The adapter servlet, which relays each coupled call and stream it
 	/// admits to the orders backend.
 	pub LedgerAdapter<CoupledCall, EnvConfig = Backend>,
-	protocol: WsListener,
+	protocol: TokioListener,
 	handle: |_call, frame, ctx| async move { ctx.env_config().relay(&frame).await },
 	duplex: |body, reply, ctx| async move { ctx.env_config().relay_stream(body, reply).await }
 }
 
 hive! {
-	/// The hive that hosts the adapter over the WebSocket colony.
+	/// The hive that hosts the adapter over the TCP colony.
 	pub LedgerHive,
-	protocol: WsListener
+	protocol: TokioListener
 }
 
 cluster! {
 	/// A gateway with an h2c edge, which a native client submits to.
 	pub DirectGateway,
-	protocol: WsListener,
+	protocol: TokioListener,
 	edge: GrpcListener
 }
 
@@ -1073,24 +1066,29 @@ tb_scenario! {
 }
 
 tb_assert_spec! {
-	/// Two backend answers that the adapter cannot relay: one past the count
-	/// of its method, and one past the part ceiling. The adapter ends each
-	/// stream with the status of its own refusal, which the coupler relays.
+	/// Three backend answers that the adapter cannot relay: one past the
+	/// count of its method, one past the part ceiling, and an end with none.
+	/// The adapter ends each stream with a signed end part of the status of
+	/// its own refusal, which the coupler relays, so no stream fails on the
+	/// gateway.
 	pub UnsentAnswerSpec,
 	V(1,0,0): {
 		mode: Accept,
 		assertions: [
-			(BACKEND_CALL_REFUSED, exactly!(2), equals!("part")),
-			(COUPLED_CALL_REFUSED, exactly!(2), equals!("transit"))
+			(BACKEND_CALL_REFUSED, exactly!(3), equals!("part")),
+			(BACKEND_CALL_RELAYED, exactly!(0)),
+			(COUPLED_CALL_ANSWERED, exactly!(3)),
+			(COUPLED_CALL_REFUSED, exactly!(0)),
+			(events::CLUSTER_WORK_FAILED, exactly!(0))
 		]
 	}
 }
 
 coupled!(UnsentAnswerEdge, UnsentAnswerGateway);
 
-// A backend that answers a client stream twice reads 12 at the caller, and one
-// that answers past the part ceiling reads 8: the status of the part that did
-// not send, at either end.
+// A backend that answers a client stream twice, or ends it with no answer,
+// reads 12 at the caller, and one that answers past the part ceiling reads 8:
+// the status of the part that did not send, at either end.
 tb_scenario! {
 	name: a_backend_answer_that_does_not_send_ends_with_its_own_status,
 	spec: UnsentAnswerSpec,
@@ -1105,6 +1103,9 @@ tb_scenario! {
 			let WebCaller { channel, .. } = context.web(&cluster).await?;
 			let counted = channel.stream(COUNT, &[b"a", b"b"], None).await?;
 			assert_eq!(code_of(counted), Some(tonic::Code::Unimplemented), "a second answer MUST read 12");
+
+			let unanswered = channel.stream(COUNT, &[], None).await?;
+			assert_eq!(code_of(unanswered), Some(tonic::Code::Unimplemented), "an end with no answer MUST read 12");
 
 			let bulk = channel.stream(BULK, &[b"a"], None).await?;
 			assert_eq!(code_of(bulk), Some(tonic::Code::ResourceExhausted), "an answer past the ceiling MUST read 8");
@@ -1144,30 +1145,12 @@ tb_scenario! {
 			let other = context.session.signing_identity();
 			let forging = StreamSigners { head: &caller, parts: &other };
 			let route = DirectRoute { servlet: ledger()?, method: TAIL };
-			let forged = context.direct_stream(cluster.addr(), route, forging).await?;
-			let refused = forged.err().and_then(|error| error.transit_status());
-			assert_eq!(refused, Some(TransitStatus::Unauthenticated));
+			let forged = context.direct_stream(cluster.addr(), route, forging).await?.map_err(unexpected)?;
+			assert_eq!(code_of(forged), Some(tonic::Code::Unauthenticated), "the adapter MUST end the stream with 16");
 
 			cluster.stop();
 			Ok(())
 		}
-	}
-}
-
-/// The terms of a link that carries one chunk of [`MIN_MUX_CHUNK_SIZE`] bytes
-/// of each stream at a time, until its reader takes the chunk.
-fn trickle() -> TransportOffer {
-	TransportOffer::mux(4)
-		.with_initial_stream_credit(1)
-		.with_chunk_payload_size(MIN_MUX_CHUNK_SIZE)
-}
-
-impl Coupled {
-	/// Start the gateway `G`, whose links take [`trickle`] terms.
-	async fn trickle_gateway<G: Cluster>(&self, trace: &TraceCollector) -> Result<G, TightBeamError> {
-		let mut config = self.transport.cluster_config(EdgePlane::new("127.0.0.1:0"))?;
-		config.pool_config.mux_offer = Some(Arc::new(trickle()));
-		G::start(Arc::new(trace.share()), config).await
 	}
 }
 
@@ -1203,6 +1186,7 @@ tb_scenario! {
 			let signers = StreamSigners { head: &caller, parts: &caller };
 			let mut answer = context.direct_answer(cluster.addr(), route, signers, trickle()).await?;
 			answer.arrived().await?;
+
 			context.clock.advance(RELAY_TIMEOUT)?;
 			CUT_ANSWER_EVENTS.recorded(BACKEND_CALL_REFUSED, 1).await?;
 

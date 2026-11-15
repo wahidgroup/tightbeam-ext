@@ -1,11 +1,6 @@
 //! What an edge does for every kind of call: the trace of a gateway edge, the
 //! PROXY protocol of a hop in front of it, its health, and its bind.
 
-// The colony runtime macros expand `cfg(feature = ...)` probes against the
-// invoking crate's feature namespace, which holds the features of this crate
-// alone, so the leaked cfg warnings carry no signal here.
-#![allow(unexpected_cfgs)]
-
 mod support;
 
 use std::net::SocketAddr;
@@ -21,6 +16,7 @@ use tightbeam::clock::{Clock, ManualClock};
 use tightbeam::crypto::profiles::DefaultCryptoProvider;
 use tightbeam::prelude::TightBeamSocketAddr;
 use tightbeam::testing::{ClientEnv, ClusterEnv, SetupEnv};
+use tightbeam::transport::tcp::r#async::TokioListener;
 use tightbeam::transport::{TransportError, TransportLimits};
 use tightbeam::urn::Urn;
 use tightbeam::{cluster, exactly, tb_assert_spec, tb_scenario, urn, TightBeamError};
@@ -29,7 +25,6 @@ use tightbeam_grpc::edge::{Dial, Edge, ProxyHops};
 use tightbeam_grpc::events::{EDGE_REFUSED, PROXY_HEADER_READ, PROXY_HEADER_REFUSED};
 use tightbeam_grpc::protocol::{GrpcListener, HEALTH_WATCH_PATH};
 use tightbeam_grpc::testing::TlsAuthority;
-use tightbeam_ws::protocol::WsListener;
 use tightbeam_ws::testing::{EventWatch, WorkClient, WorkPlane};
 
 use support::{bounded, unexpected, EchoServer, Graded, H2Tunnel, RawCodec};
@@ -49,9 +44,9 @@ tightbeam_grpc::staged_profile! {
 }
 
 cluster! {
-	/// A WebSocket colony gateway whose h2c edge records on the trace.
+	/// A TCP colony gateway whose h2c edge records on the trace.
 	pub TracedEdgeGateway,
-	protocol: WsListener,
+	protocol: TokioListener,
 	edge: GrpcListener<DefaultCryptoProvider, TracedEdge>
 }
 
@@ -265,6 +260,7 @@ tb_scenario! {
 		server: |SetupEnv { trace, context }| async move {
 			let clock = Arc::clone(&context.1) as Arc<dyn Clock>;
 			WatchedEdge::stage(Edge::h2c().with_trace(trace.share()).with_clock(clock), Dial::H2c);
+
 			let limits = TransportLimits { handshake_timeout: WATCH_DEADLINE, ..TransportLimits::default() };
 			let config = context.0.server_config().with_limits(limits)?;
 			EchoServer::encrypted::<WatchedEdge>(config, None, &trace).await
@@ -337,6 +333,7 @@ tb_scenario! {
 		server: |SetupEnv { trace, .. }| async move {
 			let hops = ProxyHops::new(["10.0.0.0/8"]).map_err(support::edge_error)?;
 			FarHopEdge::stage(Edge::h2c().with_proxy_protocol(hops).with_trace(trace.share()), Dial::H2c);
+
 			let listener = GrpcListener::<DefaultCryptoProvider, FarHopEdge>::bind_cleartext("127.0.0.1:0").await?;
 			let addr = TightBeamSocketAddr(listener.local_addr());
 
@@ -448,6 +445,7 @@ tb_scenario! {
 			let orders = Servlet::new(servlet, context.answers.certificate().clone()).map_err(support::edge_error)?;
 			let routes = Routes::new().unary("/orders.v1.Orders/Get", orders, Assurance::Vouched);
 			let coupler = context.coupler(routes.map_err(support::edge_error)?, Grants::deny_all())?;
+
 			context.stage_coupler(&trace, ClearCoupledEdge::stage, coupler)?;
 
 			let held = std::net::TcpListener::bind("127.0.0.1:0")?;
@@ -461,6 +459,7 @@ tb_scenario! {
 			};
 
 			trace.event_with(BIND_REFUSED, &[], refused)?;
+
 			assert_eq!(refused, "missing-encryption", "the profile MUST be refused before the bind");
 			Ok(())
 		}

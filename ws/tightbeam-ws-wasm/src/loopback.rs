@@ -1,13 +1,15 @@
 //! The live `ws` peer of the wasm unit tests, as the module table of
 //! `docs/ws-wasm.md` lists.
 
+use core::future::pending;
+
 use gloo_net::websocket::futures::WebSocket;
 use js_sys::{Function, Promise};
 use wasm_bindgen::prelude::wasm_bindgen;
 use wasm_bindgen::{JsCast, JsValue};
-use wasm_bindgen_futures::JsFuture;
+use wasm_bindgen_futures::{spawn_local, JsFuture};
 
-use tightbeam::transport::multiplex::MuxRole;
+use tightbeam::transport::multiplex::{MuxDispatch, MuxRole};
 
 use crate::clock::BrowserClock;
 use crate::mux::SessionParts;
@@ -17,6 +19,10 @@ use crate::protocol::BrowserSocket;
 mod patience;
 
 pub(crate) use patience::settled;
+
+/// The length of a push larger than the initial stream credit of a peer,
+/// 64 chunks of 16 KiB.
+pub(crate) const PAST_INITIAL_CREDIT: usize = 2 * 1024 * 1024;
 
 #[wasm_bindgen(inline_js = r#"
 const { createRequire } = process.getBuiltinModule('node:module');
@@ -123,6 +129,18 @@ impl Served {
 		self.0.url()
 	}
 
+	/// The server session over the socket this server accepted, under the
+	/// symmetric cap `streams`.
+	pub(crate) async fn session(&self, streams: u32) -> SessionParts {
+		let accepted = settled(JsFuture::from(self.0.accepted())).await;
+		let accepted = accepted.expect("the server should accept the socket");
+		let served = WebSocket::try_from(accepted.unchecked_into::<web_sys::WebSocket>());
+		let served = served.expect("the server end should adapt");
+
+		let server = BrowserSocket::cleartext_session(served, MuxRole::Server, streams);
+		server.expect("the server session should split")
+	}
+
 	/// Pause the server end of the socket this server accepted, so it reads no
 	/// frame and answers no close until the hold drops.
 	pub(crate) async fn hold(&self) -> Hold {
@@ -146,17 +164,20 @@ impl Loopback {
 	/// `streams`.
 	pub(crate) async fn open(streams: u32) -> Self {
 		let listener = Served::listening().await;
-
 		let socket = WebSocket::open(&listener.url()).expect("the host should open the socket");
-		let accepted = settled(JsFuture::from(listener.0.accepted())).await;
-		let accepted = accepted.expect("the server should accept the socket");
-		let served = WebSocket::try_from(accepted.unchecked_into::<web_sys::WebSocket>());
-		let served = served.expect("the server end should adapt");
+		let server = listener.session(streams).await;
 
 		let client = BrowserSocket::cleartext_session(socket, MuxRole::Client, streams);
 		let client = client.expect("the client session should split");
-		let server = BrowserSocket::cleartext_session(served, MuxRole::Server, streams);
-		let server = server.expect("the server session should split");
 		Self { client, server, _listener: listener }
 	}
+}
+
+/// Serve the streams of `server` through `dispatch` until the test ends.
+pub(crate) fn serve(server: SessionParts, dispatch: impl MuxDispatch + 'static) {
+	spawn_local(async move {
+		let served = server;
+		let _ = served.responder.serve_with(dispatch).await;
+		pending::<()>().await;
+	});
 }

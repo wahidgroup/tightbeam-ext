@@ -14,8 +14,6 @@ mod loopback;
 mod message;
 mod metadata;
 mod method;
-#[cfg(feature = "testing")]
-pub(crate) mod parts;
 mod principal;
 mod proof;
 mod reflection;
@@ -26,6 +24,9 @@ mod stream;
 mod trust;
 mod voucher;
 mod web;
+
+#[cfg(feature = "testing")]
+pub(crate) mod parts;
 
 pub use admit::{AdmissionTrust, AdmittedCall, Origin};
 pub use backend::{Backend, BackendChannel};
@@ -40,7 +41,7 @@ pub use method::MethodPath;
 pub use principal::Principal;
 pub use routes::{Assurance, Grants, Routes, Servlet};
 pub use saga::Coupler;
-pub use stream::{AdmittedStream, AdmittedStreamParts, StreamAnswers, StreamRequests};
+pub use stream::{AdmittedStream, AdmittedStreamParts, StreamAnswers, StreamRefusal, StreamRequests};
 pub use tonic::Code;
 pub use trust::{CallerTrust, CallerTrustFiles};
 pub use voucher::{Identities, Voucher};

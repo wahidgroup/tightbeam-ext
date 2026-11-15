@@ -25,7 +25,7 @@ use crate::approver::{JsReceiptApprover, OfferedAuthorization, OfferedBudgets};
 use crate::fault::{JsFault, RefusalCode, TransportCode};
 use crate::mux::{BrowserMux, SessionParts};
 use crate::profile::Secp256k1SigningKey;
-use crate::promise::{AbortRace, JsBytes, Record, Signal, WholeNumber};
+use crate::promise::{AbortRace, JsBytes, Recognized, Record, Signal, WholeNumber};
 use crate::protocol::{BrowserSocket, Pinned};
 use crate::signer::JsSigningKeyProvider;
 use crate::socket::{Opened, OpeningSocket, SocketMonitor, SocketParts};
@@ -169,6 +169,9 @@ fn certificate(value: &JsValue, path: &str) -> Result<Certificate, JsFault> {
 	parsed.map_err(|error| TransportCode::InvalidCertificate.because(error).at(path))
 }
 
+/// The member of a mutual identity that holds its client key.
+const CLIENT_KEY: &str = "identity.clientKey";
+
 /// The key that proves possession of a client certificate.
 enum ClientKey {
 	/// The raw secp256k1 scalar, read once into the profile key.
@@ -187,19 +190,28 @@ impl TryFrom<JsValue> for ClientKey {
 	/// # Errors
 	///
 	/// - `InvalidClientKey` -- the value is neither a `Uint8Array` nor an object.
+	/// - `InvalidBytes` at `identity.clientKey` -- the scalar is a `Uint8Array` that admits no copy, as
+	///   [`JsBytes::recognize`] states.
 	/// - `InvalidSigningKey` -- the scalar is not 32 octets, or names no key.
 	/// - The errors of [`JsSigningKeyProvider::new`].
 	fn try_from(value: JsValue) -> Result<Self, Self::Error> {
-		if let Some(scalar) = JsBytes::recognize(&value) {
-			let scalar = ZeroizingBytes::new(scalar);
-			return Secp256k1SigningKey::from_scalar(scalar).map(Self::Scalar);
+		match JsBytes::recognize(&value) {
+			Recognized::Bytes(scalar) => {
+				let scalar = ZeroizingBytes::new(scalar);
+				Secp256k1SigningKey::from_scalar(scalar).map(Self::Scalar)
+			}
+			Recognized::Unreadable => {
+				let message = "clientKey must be a Uint8Array over a readable buffer";
+				Err(RefusalCode::InvalidBytes.because(message).at(CLIENT_KEY))
+			}
+			Recognized::NotBytes if value.is_object() => {
+				JsSigningKeyProvider::new(value.unchecked_into()).map(Self::Signer)
+			}
+			Recognized::NotBytes => {
+				let message = "clientKey must be the raw signing scalar as a Uint8Array or a TransportSigner";
+				Err(RefusalCode::InvalidClientKey.because(message))
+			}
 		}
-		if !value.is_object() {
-			let message = "clientKey must be the raw signing scalar as a Uint8Array or a TransportSigner";
-			return Err(RefusalCode::InvalidClientKey.because(message));
-		}
-
-		JsSigningKeyProvider::new(value.unchecked_into()).map(Self::Signer)
 	}
 }
 
@@ -248,7 +260,7 @@ impl TryFrom<&JsValue> for MutualIdentity {
 		let server = certificate(&server_member, "identity.serverCertDer")?;
 		let client = certificate(&client_member, "identity.clientCertDer")?;
 
-		let client_key = ClientKey::try_from(Record::member(value, "identity.clientKey"))?;
+		let client_key = ClientKey::try_from(Record::member(value, CLIENT_KEY))?;
 		Ok(Self { server, client, client_key })
 	}
 }

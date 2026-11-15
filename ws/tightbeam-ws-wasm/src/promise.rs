@@ -68,7 +68,7 @@ impl JsBytes {
 	/// - `InvalidBytes` -- the value is not a `Uint8Array`, or it admits no copy as
 	///   [`Self::recognize`] states.
 	pub(crate) fn read(&self) -> Result<Vec<u8>, JsFault> {
-		let bytes = Self::recognize(self);
+		let bytes = Self::recognize(self).octets();
 		bytes.ok_or_else(|| RefusalCode::InvalidBytes.because("the value must be a Uint8Array"))
 	}
 
@@ -81,7 +81,7 @@ impl JsBytes {
 	///
 	/// - `InvalidBytes` -- `value` is not a `Uint8Array`, or it admits no copy as [`Self::recognize`] states.
 	pub(crate) fn read_value(value: &JsValue, path: &str) -> Result<Vec<u8>, JsFault> {
-		let bytes = Self::recognize(value);
+		let bytes = Self::recognize(value).octets();
 		bytes.ok_or_else(|| RefusalCode::InvalidBytes.because("must be a Uint8Array").at(path))
 	}
 
@@ -96,25 +96,47 @@ impl JsBytes {
 		Self::read_value(&member, path)
 	}
 
-	/// The octets of `value` when it is a `Uint8Array`, and `None` for any
-	/// other value.
+	/// What `value` holds: the octets of a `Uint8Array`, a `Uint8Array` that
+	/// admits no copy, or no `Uint8Array` at all.
 	///
 	/// - The copy goes through a fresh `Uint8Array` over the same octets, whose length the engine reads from
 	///   the internal slot of `value`.
 	/// - The internal slot therefore sizes the copy, whatever `length` property the caller defines.
 	/// - A `Uint8Array` over a detached buffer, or past the end of a shrunk one, admits no copy, so it is
-	///   `None` too.
-	pub(crate) fn recognize(value: &JsValue) -> Option<Vec<u8>> {
+	///   [`Recognized::Unreadable`].
+	pub(crate) fn recognize(value: &JsValue) -> Recognized {
 		let name = TYPED_ARRAY_NAME.with(|getter| getter.call0(value).ok());
 		let named = name.and_then(|name| name.as_string());
 		if named.as_deref() != Some(UINT8_ARRAY) {
-			return None;
+			return Recognized::NotBytes;
 		}
 
 		let source = Array::of1(value);
 		let copied = UINT8_ARRAY_CONSTRUCTOR.with(|constructor| Reflect::construct(constructor, &source));
-		let bytes: Uint8Array = copied.ok()?.dyn_into().ok()?;
-		Some(bytes.to_vec())
+
+		let bytes = copied.ok().and_then(|copy| copy.dyn_into::<Uint8Array>().ok());
+		bytes.map_or(Recognized::Unreadable, |bytes| Recognized::Bytes(bytes.to_vec()))
+	}
+}
+
+/// What [`JsBytes::recognize`] finds in a JavaScript value.
+pub(crate) enum Recognized {
+	/// The value is no `Uint8Array`.
+	NotBytes,
+	/// The value is a `Uint8Array` that admits no copy, over a detached
+	/// buffer or past the end of a shrunk one.
+	Unreadable,
+	/// The octets of a `Uint8Array`.
+	Bytes(Vec<u8>),
+}
+
+impl Recognized {
+	/// The octets, or `None` for a value that holds none to read.
+	pub(crate) fn octets(self) -> Option<Vec<u8>> {
+		match self {
+			Self::Bytes(octets) => Some(octets),
+			Self::NotBytes | Self::Unreadable => None,
+		}
 	}
 }
 
@@ -487,7 +509,7 @@ mod tests {
 	use wasm_bindgen_test::wasm_bindgen_test;
 	use web_sys::AbortController;
 
-	use super::{AbortRace, JsBytes, Raced, Returned};
+	use super::{AbortRace, JsBytes, Raced, Recognized, Returned};
 	use crate::loopback::settled;
 
 	/// The races that the leak case runs, each of which the call wins.
@@ -506,34 +528,33 @@ mod tests {
 	#[wasm_bindgen_test]
 	fn a_number_is_no_bytes() {
 		let number = JsValue::from_f64(7.0);
-		assert!(JsBytes::recognize(&number).is_none());
+		assert!(matches!(JsBytes::recognize(&number), Recognized::NotBytes));
 	}
 
 	#[wasm_bindgen_test]
 	fn an_array_is_no_bytes() {
 		let numbers = Array::of2(&JsValue::from_f64(1.0), &JsValue::from_f64(2.0));
-		assert!(JsBytes::recognize(&numbers).is_none());
+		assert!(matches!(JsBytes::recognize(&numbers), Recognized::NotBytes));
 	}
 
 	#[wasm_bindgen_test]
 	fn a_wider_view_is_no_bytes() {
 		let wide = Uint16Array::new_with_length(2);
-		assert!(JsBytes::recognize(&wide).is_none());
+		assert!(matches!(JsBytes::recognize(&wide), Recognized::NotBytes));
 	}
 
 	#[wasm_bindgen_test]
 	fn a_uint8array_reads_as_its_bytes() {
 		let bytes = Uint8Array::from([1u8, 2, 3].as_slice());
-		assert_eq!(JsBytes::recognize(&bytes), Some(vec![1, 2, 3]));
+		assert_eq!(JsBytes::recognize(&bytes).octets(), Some(vec![1, 2, 3]));
 	}
 
 	#[wasm_bindgen_test]
-	fn a_detached_uint8array_is_no_bytes() {
+	fn a_detached_uint8array_is_unreadable() {
 		let bytes = Uint8Array::from([1u8, 2, 3].as_slice());
 		let transferred = bytes.buffer().transfer();
 		transferred.expect("the host should detach the buffer");
-
-		assert!(JsBytes::recognize(&bytes).is_none());
+		assert!(matches!(JsBytes::recognize(&bytes), Recognized::Unreadable));
 	}
 
 	#[wasm_bindgen_test]

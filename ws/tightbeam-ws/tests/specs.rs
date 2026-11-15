@@ -165,7 +165,7 @@ mod colony {
 	use tightbeam::tb_scenario;
 	use tightbeam::testing::{ClusterEnv, SetupEnv};
 	use tightbeam_ws::testing::specs::{EdgeWorkSpec, UnservedWorkSpec};
-	use tightbeam_ws::testing::{WorkClient, WorkGateway, WorkPlane};
+	use tightbeam_ws::testing::{WorkClient, WorkGateway, WorkPlane, WorkProbeServlet};
 
 	use super::rejected_by;
 
@@ -183,7 +183,7 @@ mod colony {
 		environment Cluster {
 			context: work_plane(),
 			start: |SetupEnv { trace, context }| async move { context.gateway::<WorkGateway>(&trace, "127.0.0.1:0").await },
-			hives: |SetupEnv { trace, context }| vec![async move { context.hive(&trace).await }],
+			hives: |SetupEnv { trace, context }| vec![async move { context.hive::<WorkProbeServlet>(&trace).await }],
 			client: |ClusterEnv { context, cluster, .. }| async move {
 				let refused = context.client().submit(&cluster, WorkClient::servlet("unserved")?, b"spec-probe").await?;
 				assert!(refused.is_err(), "unserved work MUST be refused, got {refused:?}");
@@ -201,7 +201,7 @@ mod colony {
 		environment Cluster {
 			context: work_plane(),
 			start: |SetupEnv { trace, context }| async move { context.gateway::<WorkGateway>(&trace, "127.0.0.1:0").await },
-			hives: |SetupEnv { trace, context }| vec![async move { context.hive(&trace).await }],
+			hives: |SetupEnv { trace, context }| vec![async move { context.hive::<WorkProbeServlet>(&trace).await }],
 			client: |ClusterEnv { context, cluster, .. }| async move {
 				let served = context.client().submit(&cluster, WorkClient::probe()?, b"spec-probe").await?;
 				assert!(served.is_ok(), "served work MUST reach the probe, got {served:?}");

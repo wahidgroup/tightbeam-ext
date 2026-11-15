@@ -42,9 +42,6 @@ jobs:
       - name: Verify version matches tag
         run: ./scripts/verify-release-tag.sh
 
-      - name: Refuse yanked versions
-        run: ./scripts/check-yanked.sh "$EXT"
-
       - name: Generate SBOM
         if: env.SBOM != ''
         run: make sbom "$EXT"

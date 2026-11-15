@@ -64,9 +64,9 @@ pub trait ClaimLedger: Send + Sync + 'static {
 	fn forget<'a>(&'a self, spend: &'a ClaimSpend) -> LedgerFuture<'a, ()>;
 }
 
-/// The key of a spend: the SHA-256 of the signer and the order of its claim,
-/// which names the claim on every replica. One signer issues one claim at one
-/// order.
+/// The key of a spend: the SHA-256 of the canonical public key of the signer
+/// and the order of its claim, which names the claim on every replica. One
+/// signer issues one claim at one order, under any certificate of its key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ClaimKey([u8; 32]);
 
@@ -82,7 +82,7 @@ impl ClaimKey {
 	}
 }
 
-/// The SHA-256 of the certificate of the signer of a claim.
+/// The SHA-256 of the canonical public key of the signer of a claim.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct SignerDigest([u8; 32]);
 
@@ -137,7 +137,7 @@ impl ClaimSpend {
 		&self.key
 	}
 
-	/// The digest of the certificate that signed the claim.
+	/// The digest of the public key that signed the claim.
 	pub fn signer(&self) -> &SignerDigest {
 		&self.signer
 	}
