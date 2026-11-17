@@ -36,9 +36,6 @@ jobs:
 
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
-      - name: CI
-        run: make ci
-
       - name: Verify version matches tag
         run: ./scripts/verify-release-tag.sh
 
@@ -53,6 +50,11 @@ jobs:
             set -- "$@" -p "$crate"
           done
           cargo package "$@"
+
+      # The tarball holds the built client, whose contents pack checks.
+      - name: Build client
+        if: env.NPM_CLIENT != ''
+        run: make client pack "$EXT"
 
       # npm/ holds the client tarball, and $SBOM keeps its path in the repo.
       - name: Pack client
