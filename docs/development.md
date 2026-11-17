@@ -245,7 +245,7 @@ With no `version=`, a release takes its version from the check:
 
 | Job       | Token     | Runs                                                                                                                                                                        |
 | --------- | --------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `build`   | Read-only | The setup, `make ci`, the tag check, and the SBOM, then packages the crates and packs the npm client                                                                        |
+| `build`   | Read-only | The tag check, the setup of the extension, and the SBOM, then packages the crates and packs the npm client. It runs no `make ci` and no audit                               |
 | `publish` | Write     | No setup and no build. `scripts/publish-release.sh` publishes each crate and the client tarball that its registry lacks, then the job creates or updates the GitHub release |
 
 So a run of the workflow after a partial publish finishes the release.
