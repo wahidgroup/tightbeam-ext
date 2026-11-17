@@ -1,4 +1,4 @@
-# Pubsub services, layered on ws/docker-compose.yml by scripts/stack.sh.
+# Pubsub services, layered on ws/docker-compose.yaml by scripts/stack.sh.
 # Every service runs the echo image under the shared certificates in /certs.
 
 # The stream cap and paywall of ws/scripts/stack-env.sh, which the relay dial

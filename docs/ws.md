@@ -308,7 +308,7 @@ let served = client.submit_work_to(servlet_urn, &signed_work_frame).await?;
 
 ## Demo servers
 
-The e2e stack runs the examples of this crate in one image (`ws/docker/echo-server/Dockerfile`), and `ws/docker-compose.yml` names one service per server. Each server reads its demo facts from the environment that `ws/scripts/stack-env.sh` writes.
+The e2e stack runs the examples of this crate in one image (`ws/docker/echo-server/Dockerfile`), and `ws/docker-compose.yaml` names one service per server. Each server reads its demo facts from the environment that `ws/scripts/stack-env.sh` writes.
 
 | Example                 | Serves                                                                                   | Environment                                                                             |
 | ----------------------- | ---------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------- |

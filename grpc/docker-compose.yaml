@@ -1,4 +1,4 @@
-# grpc extension services, composed on top of ws/docker-compose.yml by
+# grpc extension services, composed on top of ws/docker-compose.yaml by
 # scripts/stack.sh. The work gateway shares the echo image, and a pinned Envoy
 # in front of its gRPC edge is the h2c hop that the grpc e2e lane crosses.
 
