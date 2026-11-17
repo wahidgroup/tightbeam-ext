@@ -114,7 +114,7 @@ http-body = { version = "1.1.0", optional = true }
 # flag.
 tightbeam-grpc = { path = ".", features = ["instrument", "testing", "couple"] }
 tightbeam-rs = { workspace = true, features = ["testing", "testing-csp", "colony", "instrument"] }
-tightbeam-ws = { version = "0.5.0", path = "../../ws/tightbeam-ws", features = ["colony"] }
+tightbeam-ws = { version = "0.6.0", path = "../../ws/tightbeam-ws", features = ["colony"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
 tonic = { version = "0.14.9", default-features = false, features = ["channel", "tls-ring", "gzip"] }
 futures-util = { workspace = true }
