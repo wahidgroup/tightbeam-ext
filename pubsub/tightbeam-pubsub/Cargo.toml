@@ -40,7 +40,7 @@ tightbeam-rs = { workspace = true, features = [
 der = { workspace = true, features = ["alloc", "derive", "oid"] }
 tokio = { workspace = true, features = ["rt", "sync", "macros", "time"] }
 # The owner of one served connection, with no socket crate.
-tightbeam-ws = { version = "0.5.0", path = "../../ws/tightbeam-ws", default-features = false, features = ["serve"] }
+tightbeam-ws = { version = "0.6.0", path = "../../ws/tightbeam-ws", default-features = false, features = ["serve"] }
 
 [dev-dependencies]
 # Self dev-dependency: turns the `testing` feature on for every test and
@@ -49,7 +49,7 @@ tightbeam-pubsub = { path = ".", features = ["testing"] }
 # The manual clock of the deadline tests, and the cipher of a sealed body.
 tightbeam-rs = { workspace = true, features = ["aead", "testing", "testing-csp"] }
 husky-rs = { workspace = true }
-tightbeam-ws = { version = "0.5.0", path = "../../ws/tightbeam-ws", features = ["testing"] }
+tightbeam-ws = { version = "0.6.0", path = "../../ws/tightbeam-ws", features = ["testing"] }
 tokio-tungstenite = { workspace = true, features = ["connect", "handshake"] }
 serde_json = { workspace = true, features = ["std"] }
 tokio = { workspace = true, features = [
