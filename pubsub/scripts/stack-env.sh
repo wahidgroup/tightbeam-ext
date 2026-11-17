@@ -40,4 +40,4 @@ STACK_ENV_VARS+=(
 	"PUBSUB_TOPIC_KEY_ID"
 )
 
-STACK_COMPOSE_FILES+=("$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/docker-compose.yml")
+STACK_COMPOSE_FILES+=("$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/docker-compose.yaml")

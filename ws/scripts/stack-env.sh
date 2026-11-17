@@ -66,4 +66,4 @@ STACK_CERT_STEPS+=(
 	'[ -f "$CERT_DIR/server.cert.der" ] && [ -f "$CERT_DIR/client.cert.der" ] || cargo run -p tightbeam-ws --features testing --example gen_certs'
 )
 
-STACK_COMPOSE_FILES+=("$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/docker-compose.yml")
+STACK_COMPOSE_FILES+=("$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/docker-compose.yaml")

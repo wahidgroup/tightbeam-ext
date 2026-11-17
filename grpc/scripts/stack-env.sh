@@ -36,4 +36,4 @@ STACK_ENV_VARS+=(
 	"GRPC_ENVOY_CONFIG"
 )
 
-STACK_COMPOSE_FILES+=("$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/docker-compose.yml")
+STACK_COMPOSE_FILES+=("$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/docker-compose.yaml")
