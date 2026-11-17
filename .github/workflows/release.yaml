@@ -53,6 +53,11 @@ jobs:
           done
           cargo package "$@"
 
+      # The tarball holds the built client, whose contents pack checks.
+      - name: Build client
+        if: env.NPM_CLIENT != ''
+        run: make client pack "$EXT"
+
       # npm/ holds the client tarball, and $SBOM keeps its path in the repo.
       - name: Pack client
         if: env.NPM_CLIENT != ''
