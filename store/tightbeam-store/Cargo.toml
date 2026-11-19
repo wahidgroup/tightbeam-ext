@@ -1,0 +1,28 @@
+[package]
+name = "tightbeam-store"
+description = "A driver-agnostic store of tightbeam frames, typed by message and queried by frame metadata"
+authors.workspace = true
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/tightbeam-store"
+readme = "README.md"
+keywords = ["storage", "repository", "database", "tightbeam", "der"]
+categories = ["database", "data-structures"]
+
+[lib]
+name = "tightbeam_store"
+
+[dependencies]
+tightbeam-store-derive = { version = "0.1.0", path = "../tightbeam-store-derive" }
+tightbeam-rs = { workspace = true, features = ["std"] }
+
+[dev-dependencies]
+der = { workspace = true, features = ["alloc", "derive"] }
+tightbeam-rs = { workspace = true, features = ["std", "testing"] }
+
+[lints]
+workspace = true
