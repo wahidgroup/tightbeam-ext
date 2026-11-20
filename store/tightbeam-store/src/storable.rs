@@ -62,6 +62,62 @@ use crate::row_id::RowId;
 /// 	pub id: RowId,
 /// }
 /// ```
+///
+/// The derive checks the owner too. A type name of 64 bytes compiles:
+///
+/// ```
+/// # use der::Sequence;
+/// # use tightbeam::Beamable;
+/// # use tightbeam_store::{RowId, Storable};
+/// #[derive(Beamable, Sequence, Storable, Clone, Debug, PartialEq)]
+/// #[storable(frame_type = "colony-leaf")]
+/// pub struct L234567890234567890234567890234567890234567890234567890234567890 {
+/// 	#[storable(id)]
+/// 	pub id: RowId,
+/// }
+/// ```
+///
+/// A type name of 65 bytes does not:
+///
+/// ```compile_fail
+/// # use der::Sequence;
+/// # use tightbeam::Beamable;
+/// # use tightbeam_store::{RowId, Storable};
+/// #[derive(Beamable, Sequence, Storable, Clone, Debug, PartialEq)]
+/// #[storable(frame_type = "colony-leaf")]
+/// pub struct L2345678902345678902345678902345678902345678902345678902345678905 {
+/// 	#[storable(id)]
+/// 	pub id: RowId,
+/// }
+/// ```
+///
+/// The id field is a `RowId`:
+///
+/// ```
+/// # use der::Sequence;
+/// # use tightbeam::Beamable;
+/// # use tightbeam_store::{RowId, Storable};
+/// #[derive(Beamable, Sequence, Storable, Clone, Debug, PartialEq)]
+/// #[storable(frame_type = "colony-leaf")]
+/// pub struct HiveLeaf {
+/// 	#[storable(id)]
+/// 	pub id: RowId,
+/// }
+/// ```
+///
+/// A field of another type does not compile as the id:
+///
+/// ```compile_fail
+/// # use der::Sequence;
+/// # use tightbeam::Beamable;
+/// # use tightbeam_store::{RowId, Storable};
+/// #[derive(Beamable, Sequence, Storable, Clone, Debug, PartialEq)]
+/// #[storable(frame_type = "colony-leaf")]
+/// pub struct HiveLeaf {
+/// 	#[storable(id)]
+/// 	pub id: u64,
+/// }
+/// ```
 pub trait Storable: Message {
 	/// The table of this type.
 	const FRAME_TYPE: FrameType;

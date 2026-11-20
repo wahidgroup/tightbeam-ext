@@ -105,8 +105,7 @@ impl StoreUrn {
 	/// part is [`StoreError::UrnRowId`], and any other is [`StoreError::Urn`].
 	fn refusal(error: UrnValidationError) -> StoreError {
 		match error {
-			UrnValidationError::InvalidFormat { field: ROW_ID, .. }
-			| UrnValidationError::RequiredFieldMissing(ROW_ID) => StoreError::UrnRowId,
+			UrnValidationError::InvalidFormat { field: ROW_ID, .. } => StoreError::UrnRowId,
 			other => StoreError::Urn(other),
 		}
 	}
