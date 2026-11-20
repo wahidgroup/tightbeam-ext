@@ -14,6 +14,18 @@ const MAX_LEN: usize = 63;
 /// The prefix that names the tables of this crate.
 const RESERVED: &[u8] = b"tightbeam-";
 
+/// The refusal of a name of no byte, or of more than 63.
+const LENGTH_REFUSAL: &str = "a frame type holds 1 to 63 bytes";
+
+/// The refusal of a name that starts with no lowercase letter.
+const FIRST_REFUSAL: &str = "a frame type starts with a lowercase ASCII letter";
+
+/// The refusal of a name with a byte outside the grammar.
+const BYTE_REFUSAL: &str = "a frame type holds lowercase ASCII letters, digits, and hyphens alone";
+
+/// The refusal of a name with the reserved prefix.
+const PREFIX_REFUSAL: &str = "the tightbeam- prefix of a frame type is reserved";
+
 /// The name of the table that one [`Storable`](crate::Storable) type fills.
 ///
 /// A frame type holds 1 to 63 lowercase ASCII letters, digits, and hyphens,
@@ -40,10 +52,10 @@ impl FrameType {
 	pub const fn from_static(name: &'static str) -> Self {
 		let bytes = name.as_bytes();
 		if bytes.is_empty() || bytes.len() > MAX_LEN {
-			panic!("a frame type holds 1 to 63 bytes");
+			panic!("{}", LENGTH_REFUSAL);
 		}
 		if !bytes[0].is_ascii_lowercase() {
-			panic!("a frame type starts with a lowercase ASCII letter");
+			panic!("{}", FIRST_REFUSAL);
 		}
 
 		let mut index = 0;
@@ -51,14 +63,14 @@ impl FrameType {
 			let byte = bytes[index];
 			let admitted = byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-';
 			if !admitted {
-				panic!("a frame type holds lowercase ASCII letters, digits, and hyphens alone");
+				panic!("{}", BYTE_REFUSAL);
 			}
 
 			index += 1;
 		}
 
 		if Self::starts_with(bytes, RESERVED) {
-			panic!("the tightbeam- prefix of a frame type is reserved");
+			panic!("{}", PREFIX_REFUSAL);
 		}
 
 		Self(name)
@@ -142,9 +154,8 @@ impl fmt::Display for FrameType {
 
 #[cfg(test)]
 mod tests {
-	use std::panic;
-
 	use super::*;
+	use crate::test_support::panic_message;
 
 	tightbeam::tb_cases! {
 		fn a_valid_name_is_a_frame_type(name: &'static str) {
@@ -161,20 +172,23 @@ mod tests {
 	}
 
 	tightbeam::tb_cases! {
-		fn a_name_outside_the_grammar_panics(name: &'static str) {
-			assert!(panic::catch_unwind(|| FrameType::from_static(name)).is_err());
+		fn a_name_outside_the_grammar_panics((name, message): (&'static str, &'static str)) {
+			assert_eq!(panic_message(|| FrameType::from_static(name)).as_deref(), Some(message));
 		}
 		cases {
-			empty => "",
-			too_long => "a234567890123456789012345678901234567890123456789012345678901234",
-			uppercase => "Colony-leaf",
-			uppercase_inside => "colony-Leaf",
-			leading_digit => "9leaf",
-			leading_hyphen => "-leaf",
-			dot => "colony.leaf",
-			underscore => "colony_leaf",
-			non_ascii => "leaf\u{e9}",
-			reserved_prefix => "tightbeam-claims",
+			empty => ("", LENGTH_REFUSAL),
+			too_long => ("a234567890123456789012345678901234567890123456789012345678901234", LENGTH_REFUSAL),
+			uppercase => ("Colony-leaf", FIRST_REFUSAL),
+			leading_digit => ("9leaf", FIRST_REFUSAL),
+			leading_hyphen => ("-leaf", FIRST_REFUSAL),
+			uppercase_inside => ("colony-Leaf", BYTE_REFUSAL),
+			dot => ("colony.leaf", BYTE_REFUSAL),
+			underscore => ("colony_leaf", BYTE_REFUSAL),
+			non_ascii => ("leaf\u{e9}", BYTE_REFUSAL),
+			/// The loop reads the last byte too.
+			bad_last_byte => ("leaf.", BYTE_REFUSAL),
+			reserved_prefix => ("tightbeam-claims", PREFIX_REFUSAL),
+			reserved_prefix_alone => ("tightbeam-", PREFIX_REFUSAL),
 		}
 	}
 

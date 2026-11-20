@@ -63,23 +63,29 @@ impl RowKey {
 mod tests {
 	use std::str::FromStr;
 
+	use tightbeam::urn::builders::spec::Pattern;
+	use tightbeam::urn::UrnValidationError;
+
 	use super::*;
 
 	const LEAF: FrameType = FrameType::from_static("colony-leaf");
 	const SEED: FrameType = FrameType::from_static("colony-seed");
 
-	#[test]
-	fn a_key_names_its_canonical_urn() -> Result<(), StoreError> {
-		let key = RowKey::new(LEAF, RowId::from([0x00, 0xab]))?;
-		assert_eq!(key.urn().to_string(), "urn:tightbeam:store:colony-leaf:00ab");
-		Ok(())
-	}
-
-	#[test]
-	fn a_urn_resolves_to_its_row_id() -> Result<(), StoreError> {
-		let key = RowKey::new(LEAF, RowId::from(*b"leaf-42"))?;
-		assert_eq!(LEAF.row_id_of(key.urn())?, *key.row_id());
-		Ok(())
+	tightbeam::tb_cases! {
+		fn a_key_round_trips_through_its_urn_text((bytes, text): (Vec<u8>, String)) -> Result<(), StoreError> {
+			let id = RowId::try_from(bytes)?;
+			let key = RowKey::new(LEAF, id.clone())?;
+			let parsed = Urn::from_str(&text)?;
+			assert_eq!(key.urn().to_string(), text);
+			assert_eq!(LEAF.row_id_of(&parsed)?, id);
+			Ok(())
+		}
+		cases {
+			one_byte => (vec![0x00], String::from("urn:tightbeam:store:colony-leaf:00")),
+			leading_zero => (vec![0x00, 0xab], String::from("urn:tightbeam:store:colony-leaf:00ab")),
+			ascii => (b"leaf-42".to_vec(), String::from("urn:tightbeam:store:colony-leaf:6c6561662d3432")),
+			longest => (vec![0xab; 512], format!("urn:tightbeam:store:colony-leaf:{}", "ab".repeat(512))),
+		}
 	}
 
 	#[test]
@@ -91,27 +97,28 @@ mod tests {
 		Ok(())
 	}
 
-	#[test]
-	fn a_urn_of_another_table_is_refused() -> Result<(), StoreError> {
-		let key = RowKey::new(SEED, RowId::from(*b"42"))?;
-		let refused = LEAF.row_id_of(key.urn());
-		assert!(
-			matches!(refused, Err(StoreError::ForeignTable { expected, found }) if expected == LEAF && found == "colony-seed")
-		);
-		Ok(())
-	}
-
 	tightbeam::tb_cases! {
-		fn a_urn_outside_the_store_spec_is_refused(text: &'static str) -> Result<(), StoreError> {
+		fn a_urn_outside_the_store_spec_is_refused((text, expected): (&'static str, UrnValidationError)) -> Result<(), StoreError> {
 			let urn = Urn::from_str(text)?;
-			assert!(matches!(LEAF.row_id_of(&urn), Err(StoreError::Urn(_))));
+			assert!(matches!(LEAF.row_id_of(&urn), Err(StoreError::Urn(refusal)) if refusal == expected));
 			Ok(())
 		}
 		cases {
-			other_nid => "urn:other:store:colony-leaf:00ab",
-			other_category => "urn:tightbeam:instrumentation:colony-leaf:00ab",
-			table_outside_the_pattern => "urn:tightbeam:store:colony.leaf:00ab",
-			no_row_id_part => "urn:tightbeam:store:colony-leaf",
+			other_nid => ("urn:other:store:colony-leaf:00ab", UrnValidationError::NidMismatch),
+			other_category => (
+				"urn:tightbeam:instrumentation:colony-leaf:00ab",
+				UrnValidationError::InvalidFormat { field: "category", pattern: None },
+			),
+			table_outside_the_pattern => (
+				"urn:tightbeam:store:colony.leaf:00ab",
+				UrnValidationError::InvalidFormat { field: "frame_type", pattern: Some(Pattern::AlphaNumericHyphen) },
+			),
+			no_row_id_part => ("urn:tightbeam:store:colony-leaf", UrnValidationError::NssMismatch),
+			/// The spec answers before the row id part is read.
+			other_category_with_a_bad_row_id => (
+				"urn:tightbeam:instrumentation:colony-leaf:0g",
+				UrnValidationError::InvalidFormat { field: "category", pattern: None },
+			),
 		}
 	}
 
@@ -128,6 +135,8 @@ mod tests {
 			r_component => "urn:tightbeam:store:colony-leaf:00ab?+r",
 			f_component => "urn:tightbeam:store:colony-leaf:00ab#frag",
 			empty_f_component => "urn:tightbeam:store:colony-leaf:00ab#",
+			/// A spelling fault answers before the table compare.
+			uppercase_nid_on_another_table => "urn:TIGHTBEAM:store:colony-seed:00ab",
 		}
 	}
 
@@ -150,27 +159,23 @@ mod tests {
 			empty_with_an_uppercase_nid => "urn:TIGHTBEAM:store:colony-leaf:",
 			non_hex_with_a_q_component => "urn:tightbeam:store:colony-leaf:0g?=q",
 			dot_with_a_q_component => "urn:tightbeam:store:colony-leaf:00.b?=q",
+			/// A bad row id answers before the table compare.
+			non_hex_on_another_table => "urn:tightbeam:store:colony-seed:0g",
+			one_past_the_longest => format!("urn:tightbeam:store:colony-leaf:{}", "00".repeat(513)).leak(),
 		}
 	}
 
-	#[test]
-	fn a_bad_row_id_answers_before_the_table_compare() -> Result<(), StoreError> {
-		let urn = Urn::from_str("urn:tightbeam:store:colony-seed:0g")?;
-		assert!(matches!(LEAF.row_id_of(&urn), Err(StoreError::UrnRowId)));
-		Ok(())
-	}
-
-	#[test]
-	fn a_spelling_fault_answers_before_the_table_compare() -> Result<(), StoreError> {
-		let urn = Urn::from_str("urn:TIGHTBEAM:store:colony-seed:00ab")?;
-		assert!(matches!(LEAF.row_id_of(&urn), Err(StoreError::NonCanonicalUrn)));
-		Ok(())
-	}
-
-	#[test]
-	fn a_table_spelled_another_way_names_another_table() -> Result<(), StoreError> {
-		let urn = Urn::from_str("urn:tightbeam:store:Colony-leaf:00ab")?;
-		assert!(matches!(LEAF.row_id_of(&urn), Err(StoreError::ForeignTable { .. })));
-		Ok(())
+	tightbeam::tb_cases! {
+		fn a_urn_of_another_table_is_refused((text, other): (&'static str, &'static str)) -> Result<(), StoreError> {
+			let urn = Urn::from_str(text)?;
+			let refused = LEAF.row_id_of(&urn);
+			assert!(matches!(refused, Err(StoreError::ForeignTable { expected, found }) if expected == LEAF && found == other));
+			Ok(())
+		}
+		cases {
+			other_table => ("urn:tightbeam:store:colony-seed:00ab", "colony-seed"),
+			/// The table compare is exact, so another case names another table.
+			uppercase_table => ("urn:tightbeam:store:Colony-leaf:00ab", "Colony-leaf"),
+		}
 	}
 }

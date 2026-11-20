@@ -81,6 +81,11 @@ impl RowId {
 		text
 	}
 
+	/// Whether a row id holds `len` bytes: 1 to 512.
+	const fn fits(len: usize) -> bool {
+		0 < len && len <= MAX_LEN
+	}
+
 	/// The value of the lowercase hex digit `digit`.
 	fn nibble(digit: u8) -> Option<u8> {
 		match digit {
@@ -100,7 +105,7 @@ impl TryFrom<Vec<u8>> for RowId {
 	///
 	/// - [`StoreError::RowIdLength`] -- `bytes` holds 0 bytes, or more than 512.
 	fn try_from(bytes: Vec<u8>) -> Result<Self, Self::Error> {
-		if bytes.is_empty() || bytes.len() > MAX_LEN {
+		if !Self::fits(bytes.len()) {
 			return Err(StoreError::RowIdLength(bytes.len()));
 		}
 
@@ -125,7 +130,7 @@ impl<const N: usize> From<[u8; N]> for RowId {
 	/// The row id `bytes`, whose length the compiler checks: a length outside
 	/// 1 to 512 fails the build.
 	fn from(bytes: [u8; N]) -> Self {
-		const { assert!(0 < N && N <= MAX_LEN, "a row id holds 1 to 512 bytes") };
+		const { assert!(Self::fits(N), "a row id holds 1 to 512 bytes") };
 		Self(bytes.to_vec())
 	}
 }
@@ -157,9 +162,16 @@ impl EncodeValue for RowId {
 }
 
 impl<'a> DecodeValue<'a> for RowId {
+	/// The row id of the content of one OCTET STRING. The length of the
+	/// header is checked before the read, since the read allocates it.
 	fn decode_value<R: Reader<'a>>(reader: &mut R, header: Header) -> tightbeam::der::Result<Self> {
+		let len = usize::try_from(header.length)?;
+		if !Self::fits(len) {
+			return Err(Self::TAG.value_error());
+		}
+
 		let bytes = reader.read_vec(header.length)?;
-		Self::try_from(bytes).map_err(|_| Self::TAG.value_error())
+		Ok(Self(bytes))
 	}
 }
 
@@ -171,8 +183,10 @@ mod tests {
 
 	tightbeam::tb_cases! {
 		fn a_length_in_bounds_is_a_row_id(len: usize) {
-			let id = RowId::try_from(vec![7u8; len]);
-			assert_eq!(id.map(|id| id.0.len()).ok(), Some(len));
+			let bytes = vec![7u8; len];
+			let from_slice = RowId::try_from(bytes.as_slice()).map(|id| id.0);
+			let from_vec = RowId::try_from(bytes.clone()).map(|id| id.0);
+			assert_eq!((from_slice.ok(), from_vec.ok()), (Some(bytes.clone()), Some(bytes)));
 		}
 		cases {
 			one_byte => 1,
@@ -182,8 +196,11 @@ mod tests {
 
 	tightbeam::tb_cases! {
 		fn a_length_out_of_bounds_is_refused(len: usize) {
-			let refused = RowId::try_from(vec![7u8; len]);
-			assert!(matches!(refused, Err(StoreError::RowIdLength(found)) if found == len));
+			let bytes = vec![7u8; len];
+			let from_slice = RowId::try_from(bytes.as_slice());
+			let from_vec = RowId::try_from(bytes);
+			assert!(matches!(from_slice, Err(StoreError::RowIdLength(found)) if found == len));
+			assert!(matches!(from_vec, Err(StoreError::RowIdLength(found)) if found == len));
 		}
 		cases {
 			empty => 0,
@@ -231,23 +248,31 @@ mod tests {
 		}
 	}
 
-	#[test]
-	fn der_round_trips() -> Result<(), tightbeam::der::Error> {
-		let id = RowId::from(*b"leaf-42");
-		let encoded = id.to_der()?;
-		assert_eq!(RowId::from_der(&encoded)?, id);
-		Ok(())
-	}
-
 	tightbeam::tb_cases! {
-		fn der_refuses_an_octet_string_out_of_bounds(len: usize) -> Result<(), tightbeam::der::Error> {
-			let encoded = tightbeam::der::asn1::OctetString::new(vec![1u8; len])?.to_der()?;
-			assert!(RowId::from_der(&encoded).is_err());
+		fn der_is_an_octet_string((bytes, encoded): (Vec<u8>, Vec<u8>)) -> Result<(), tightbeam::der::Error> {
+			let id = RowId::try_from(bytes).map_err(|_| Tag::OctetString.value_error())?;
+			assert_eq!(id.to_der()?, encoded);
+			assert_eq!(RowId::from_der(&encoded)?, id);
 			Ok(())
 		}
 		cases {
-			empty => 0,
-			one_past_the_longest => 513,
+			one_byte => (vec![0x61], vec![0x04, 0x01, 0x61]),
+			two_bytes => (b"ab".to_vec(), vec![0x04, 0x02, 0x61, 0x62]),
+			longest => (vec![0xab; 512], [&[0x04, 0x82, 0x02, 0x00][..], &[0xab; 512]].concat()),
+		}
+	}
+
+	tightbeam::tb_cases! {
+		fn der_refuses_an_octet_string_out_of_bounds(encoded: Vec<u8>) {
+			let refused = RowId::from_der(&encoded).err().map(|error| error.kind());
+			assert_eq!(refused, Some(Tag::OctetString.value_error().kind()));
+		}
+		cases {
+			empty => vec![0x04, 0x00],
+			one_past_the_longest => [&[0x04, 0x82, 0x02, 0x01][..], &[1u8; 513]].concat(),
+			/// A header of 0x0fff_ffff bytes and no content: the bound refuses
+			/// it before the read allocates the length.
+			longest_header_without_content => vec![0x04, 0x84, 0x0f, 0xff, 0xff, 0xff],
 		}
 	}
 }

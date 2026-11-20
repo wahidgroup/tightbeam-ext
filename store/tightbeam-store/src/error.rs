@@ -13,6 +13,10 @@ pub enum StoreError {
 	#[error("a row id holds {0} bytes, outside 1 to 512")]
 	RowIdLength(usize),
 
+	/// A sort key of the KV port holds 0 bytes, or more than 621.
+	#[error("a sort key holds {0} bytes, outside 1 to 621")]
+	SortKeyLength(usize),
+
 	/// A URN is no store URN, such as one of another NID or with no row id part.
 	#[error("the URN names no store row: {0}")]
 	#[from]

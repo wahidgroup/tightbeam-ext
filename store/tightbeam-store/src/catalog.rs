@@ -4,6 +4,9 @@ use crate::frame_type::FrameType;
 use crate::owner::Owner;
 use crate::storable::Storable;
 
+/// The refusal of two entries that name one table.
+const CLASH_REFUSAL: &str = "two types of one catalog claim one table";
+
 /// The types one store holds.
 ///
 /// `#[derive(Catalog)]` with `#[catalog(TypeA, TypeB)]` writes this impl and
@@ -83,6 +86,45 @@ use crate::storable::Storable;
 /// #[derive(Catalog)]
 /// #[catalog(HiveLeaf, OtherLeaf)]
 /// pub struct Colony;
+/// ```
+///
+/// A hand-written catalog runs the same check once code reads its tables.
+/// Two tables build:
+///
+/// ```
+/// use tightbeam_store::{Catalog, FrameType, Owner, Tables};
+///
+/// const OWNER: Owner = Owner::from_static("colony::Leaf");
+///
+/// pub struct Colony;
+///
+/// impl Catalog for Colony {
+/// 	const TABLES: Tables = Tables::new(&[
+/// 		(FrameType::from_static("colony-leaf"), OWNER),
+/// 		(FrameType::from_static("colony-seed"), OWNER),
+/// 	]);
+/// }
+///
+/// assert!(Colony::TABLES.holds(FrameType::from_static("colony-leaf")));
+/// ```
+///
+/// One table twice does not:
+///
+/// ```compile_fail
+/// use tightbeam_store::{Catalog, FrameType, Owner, Tables};
+///
+/// const OWNER: Owner = Owner::from_static("colony::Leaf");
+///
+/// pub struct Colony;
+///
+/// impl Catalog for Colony {
+/// 	const TABLES: Tables = Tables::new(&[
+/// 		(FrameType::from_static("colony-leaf"), OWNER),
+/// 		(FrameType::from_static("colony-leaf"), OWNER),
+/// 	]);
+/// }
+///
+/// assert!(Colony::TABLES.holds(FrameType::from_static("colony-leaf")));
 /// ```
 pub trait Catalog {
 	/// The tables of the types this catalog lists.
@@ -164,7 +206,7 @@ impl Tables {
 			let mut inner = outer + 1;
 			while inner < entries.len() {
 				if entries[outer].0.same_as(&entries[inner].0) {
-					panic!("two types of one catalog claim one table");
+					panic!("{}", CLASH_REFUSAL);
 				}
 
 				inner += 1;
@@ -193,27 +235,33 @@ impl Tables {
 
 #[cfg(test)]
 mod tests {
-	use std::panic;
-
 	use super::*;
+	use crate::test_support::panic_message;
 
 	const LEAF: FrameType = FrameType::from_static("colony-leaf");
 	const SEED: FrameType = FrameType::from_static("colony-seed");
 	const OWNER: Owner = Owner::from_static("colony::Leaf");
 
-	#[test]
-	fn tables_hold_what_they_list() {
-		const TABLES: Tables = Tables::new(&[(LEAF, OWNER), (SEED, OWNER)]);
-		assert!(TABLES.holds(LEAF));
-		assert!(TABLES.holds(SEED));
-		assert!(!TABLES.holds(FrameType::from_static("colony-bark")));
-	}
-
 	const BARK: FrameType = FrameType::from_static("colony-bark");
 
 	tightbeam::tb_cases! {
+		fn tables_hold_what_they_list((entries, frame_type, held): (&'static [(FrameType, Owner)], FrameType, bool)) {
+			assert_eq!(Tables::new(entries).holds(frame_type), held);
+		}
+		cases {
+			first => (&[(LEAF, OWNER), (SEED, OWNER)], LEAF, true),
+			last => (&[(LEAF, OWNER), (SEED, OWNER)], SEED, true),
+			absent => (&[(LEAF, OWNER), (SEED, OWNER)], BARK, false),
+			/// A listed table is no prefix match.
+			prefix_of_a_listed_table => (&[(LEAF, OWNER)], FrameType::from_static("colony"), false),
+			empty => (&[], LEAF, false),
+		}
+	}
+
+	tightbeam::tb_cases! {
 		fn two_entries_on_one_table_panic(entries: &'static [(FrameType, Owner)]) {
-			assert!(panic::catch_unwind(|| Tables::new(entries)).is_err());
+			let message = panic_message(|| Tables::new(entries));
+			assert_eq!(message.as_deref(), Some(CLASH_REFUSAL));
 		}
 		cases {
 			first_and_second => &[(LEAF, OWNER), (LEAF, OWNER), (BARK, OWNER)],
