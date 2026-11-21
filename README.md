@@ -8,7 +8,7 @@ This project is under active development. Public APIs MAY change without notice.
 
 ## Abstract
 
-This repository holds the parts of tightbeam that sit beyond the core crate: the envelope rules that its message socket transports share, a gRPC transport, a WebSocket transport, a browser client, topic pub/sub, and an ASN.1 bridge to TypeScript. Each extension lives in its own directory with its crates, its npm packages, and its end-to-end tests. The [documentation index](docs/README.md) lists the page that specifies each part.
+This repository holds the parts of tightbeam that sit beyond the core crate: the envelope rules that its message socket transports share, a gRPC transport, a WebSocket transport, a browser client, topic pub/sub, an ASN.1 bridge to TypeScript, and a frame store. Each extension lives in its own directory with its crates, its npm packages, and its end-to-end tests. The [documentation index](docs/README.md) lists the page that specifies each part.
 
 ## Extensions
 
@@ -34,6 +34,10 @@ This repository holds the parts of tightbeam that sit beyond the core crate: the
 ### [asn/](asn): ASN.1 bridge to TypeScript
 
 - [tightbeam-asn](asn/tightbeam-asn): `#[derive(AsnCodec)]` on `der` types, and the `tightbeam-asn-emit` binary that writes TypeScript `MessageCodec` modules.
+
+### [store/](store): Frame store
+
+- [tightbeam-store](store/tightbeam-store): tightbeam messages kept as rows, one table per message type, with `#[derive(Storable)]` and `#[derive(Catalog)]`.
 
 ## Development
 

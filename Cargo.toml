@@ -9,6 +9,8 @@ members = [
 	"asn/tightbeam-asn",
 	"asn/tightbeam-asn-derive",
 	"asn/tightbeam-asn-names",
+	"store/tightbeam-store",
+	"store/tightbeam-store-derive",
 ]
 
 [workspace.package]

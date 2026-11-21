@@ -1577,6 +1577,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "tightbeam-store"
+version = "0.1.0"
+dependencies = [
+ "der",
+ "tightbeam-rs",
+ "tightbeam-store",
+ "tightbeam-store-derive",
+ "tokio",
+]
+
+[[package]]
+name = "tightbeam-store-derive"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.3",
+ "tightbeam-rs",
+]
+
+[[package]]
 name = "tightbeam-wire"
 version = "0.1.0"
 dependencies = [

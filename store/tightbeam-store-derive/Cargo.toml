@@ -1,0 +1,29 @@
+[package]
+name = "tightbeam-store-derive"
+description = "Proc-macro derives of the Storable and Catalog traits of tightbeam-store"
+authors.workspace = true
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/tightbeam-store-derive"
+readme = "README.md"
+keywords = ["storage", "derive", "tightbeam"]
+categories = ["database", "development-tools::procedural-macro-helpers"]
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "3.0.3", features = ["full"] }
+
+# `testing` holds the `tb_cases!` tables of the unit tests.
+[dev-dependencies]
+tightbeam-rs = { workspace = true, features = ["std", "testing"] }
+
+[lints]
+workspace = true
