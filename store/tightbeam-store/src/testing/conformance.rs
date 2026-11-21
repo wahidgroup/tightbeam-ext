@@ -2790,7 +2790,7 @@ mod tests {
 				.filter_map(|(key, stored)| Some((key, stored?)))
 				.collect();
 			present.sort_by(|left, right| left.0.cmp(&right.0));
-			
+
 			let absent = shown.iter().filter(|stored| stored.is_none()).count();
 			let sorted = present.into_iter().map(|(_, stored)| Some(stored));
 			Ok(sorted.chain(core::iter::repeat_n(None, absent)).collect())
