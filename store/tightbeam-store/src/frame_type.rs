@@ -9,7 +9,7 @@ use crate::row_id::RowId;
 use crate::urn_spec::StoreUrn;
 
 /// The longest frame type, in bytes.
-const MAX_LEN: usize = 63;
+pub(crate) const MAX_LEN: usize = 63;
 
 /// The prefix that names the tables of this crate.
 const RESERVED: &[u8] = b"tightbeam-";
@@ -60,9 +60,7 @@ impl FrameType {
 
 		let mut index = 0;
 		while index < bytes.len() {
-			let byte = bytes[index];
-			let admitted = byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-';
-			if !admitted {
+			if !Self::admits(bytes[index]) {
 				panic!("{}", BYTE_REFUSAL);
 			}
 
@@ -74,6 +72,12 @@ impl FrameType {
 		}
 
 		Self(name)
+	}
+
+	/// Whether a frame type takes `byte`: a lowercase ASCII letter, a digit,
+	/// or a hyphen.
+	pub(crate) const fn admits(byte: u8) -> bool {
+		byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'
 	}
 
 	/// The name of the table.

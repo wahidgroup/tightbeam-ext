@@ -17,17 +17,17 @@ categories = ["database", "data-structures"]
 name = "tightbeam_store"
 
 [features]
-testing = ["dep:tokio"]
+testing = ["dep:tokio", "tightbeam-rs/builder"]
 
 [dependencies]
 tightbeam-store-derive = { version = "0.1.0", path = "../tightbeam-store-derive" }
-tightbeam-rs = { workspace = true, features = ["std"] }
+tightbeam-rs = { workspace = true, features = ["std", "digest"] }
 tokio = { workspace = true, optional = true, features = ["macros", "rt", "sync", "time"] }
 
 [dev-dependencies]
 tightbeam-store = { path = ".", features = ["testing"] }
 der = { workspace = true, features = ["alloc", "derive"] }
-tightbeam-rs = { workspace = true, features = ["std", "testing", "tokio", "transport-hpke"] }
+tightbeam-rs = { workspace = true, features = ["compress", "std", "testing", "tokio", "transport-hpke", "zstd"] }
 tokio = { workspace = true, features = ["macros", "rt", "sync", "test-util", "time"] }
 
 [lints]

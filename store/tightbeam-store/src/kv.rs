@@ -1,6 +1,8 @@
 //! The ordered key-value port: [docs/store.md](https://github.com/wahidgroup/tightbeam-ext/blob/master/docs/store.md#the-kv-port).
 
+use core::cmp::Ordering;
 use core::fmt;
+use core::hash::{Hash, Hasher};
 use core::num::NonZeroU32;
 use core::ops::{Bound, RangeBounds};
 use std::borrow::Cow;
@@ -10,6 +12,10 @@ use tightbeam::marker::{MaybeSend, MaybeSync};
 use crate::driver::{CommitOutcome, ConfirmOutcome, DriverFuture, InsertOutcome, RemoveOutcome, Revision, SwapOutcome};
 #[cfg(test)]
 use crate::error::StoreError;
+use crate::frame_type::{self, FrameType};
+use crate::row_id::{self, RowId};
+use crate::row_key::RowKey;
+use crate::schema::MAX_BYTES;
 use crate::scope::Scope;
 use crate::selection::Direction;
 
@@ -40,7 +46,7 @@ pub trait OrderedKv: MaybeSend + MaybeSync + 'static {
 ///   revision of that write guards the next calls of this transaction.
 /// - The commit MUST NOT answer `Committed` when a competing commit moved a key
 ///   that a call relied on: the absence an insert found, the revision a swap
-///   or a guarded remove matched, or the state a check held. A call on a key
+///   or a guarded remove matched, or the state a confirm held. A call on a key
 ///   this transaction wrote relies on nothing in committed state.
 /// - A commit that loses answers `Conflicted`, or [`DriverError::Aborted`](crate::DriverError::Aborted)
 ///   when the backend ends the transaction itself.
@@ -77,7 +83,7 @@ pub trait OrderedKvTxn: MaybeSend {
 
 	/// Confirm that `key` holds the revision `expected`, or is absent when
 	/// `expected` is `None`. A `Held` answer holds until the commit.
-	fn check<'a>(self: Box<Self>, key: &'a Key, expected: Option<&'a Revision>) -> TxnFuture<'a, ConfirmOutcome>;
+	fn confirm<'a>(self: Box<Self>, key: &'a Key, expected: Option<&'a Revision>) -> TxnFuture<'a, ConfirmOutcome>;
 
 	/// Make every write of this transaction visible together, or none.
 	fn commit(self: Box<Self>) -> DriverFuture<'static, CommitOutcome<Key>>;
@@ -88,19 +94,26 @@ pub trait OrderedKvTxn: MaybeSend {
 
 /// One partition of the key space: 1 to 80 bytes of lowercase ASCII letters,
 /// digits, hyphens, and slashes, starting with a letter.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Partition(&'static str);
+///
+/// Two partitions are equal when their names are, whatever table they name.
+#[derive(Clone, Copy, Debug)]
+pub struct Partition {
+	name: &'static str,
+	/// The table whose rows this partition holds, or `None` for a partition
+	/// of no table.
+	table: Option<FrameType>,
+}
+
+// A frame type is a partition: it starts with a lowercase letter, takes a
+// subset of the bytes of a partition, and is no longer.
+const _: () = assert!(frame_type::MAX_LEN <= Partition::MAX_LEN);
 
 impl Partition {
 	/// The bytes of this partition.
 	pub const fn as_bytes(&self) -> &[u8] {
-		self.0.as_bytes()
+		self.name.as_bytes()
 	}
-}
 
-// The contract suite builds the keys, values, and ranges of this release.
-#[cfg(any(test, feature = "testing"))]
-impl Partition {
 	/// The longest partition, in bytes.
 	pub(crate) const MAX_LEN: usize = 80;
 
@@ -131,21 +144,51 @@ impl Partition {
 		let mut index = 0;
 		while index < bytes.len() {
 			let byte = bytes[index];
-			let admitted = byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'/';
-			if !admitted {
+			if !FrameType::admits(byte) && byte != b'/' {
 				panic!("{}", Self::BYTE_REFUSAL);
 			}
 
 			index += 1;
 		}
 
-		Self(name)
+		Self { name, table: None }
+	}
+
+	/// The partition of the rows of `table`.
+	pub(crate) const fn of(table: FrameType) -> Self {
+		Self { name: table.as_str(), table: Some(table) }
+	}
+}
+
+impl PartialEq for Partition {
+	fn eq(&self, other: &Self) -> bool {
+		self.name == other.name
+	}
+}
+
+impl Eq for Partition {}
+
+impl PartialOrd for Partition {
+	fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+		Some(self.cmp(other))
+	}
+}
+
+impl Ord for Partition {
+	fn cmp(&self, other: &Self) -> Ordering {
+		self.name.cmp(other.name)
+	}
+}
+
+impl Hash for Partition {
+	fn hash<H: Hasher>(&self, state: &mut H) {
+		self.name.hash(state);
 	}
 }
 
 impl fmt::Display for Partition {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		f.write_str(self.0)
+		f.write_str(self.name)
 	}
 }
 
@@ -167,12 +210,10 @@ impl Key {
 	pub fn sort(&self) -> &[u8] {
 		&self.sort
 	}
-}
 
-#[cfg(any(test, feature = "testing"))]
-impl Key {
-	/// The longest sort key, in bytes.
-	pub(crate) const MAX_SORT: usize = 621;
+	/// The longest sort key, in bytes: the longest index entry, of a length
+	/// byte, a field value, an 8-byte order, and a row id.
+	pub(crate) const MAX_SORT: usize = 1 + MAX_BYTES + 8 + row_id::MAX_LEN;
 
 	/// The refusal of a sort key of no byte, or of more than 621.
 	const SORT_LENGTH_REFUSAL: &str = "a sort key holds 1 to 621 bytes";
@@ -189,6 +230,22 @@ impl Key {
 		}
 
 		Self { partition, sort: Cow::Borrowed(sort) }
+	}
+
+	/// The key of the row `key`, in the partition of its table. A row id is
+	/// no longer than a sort key.
+	pub(crate) fn row(key: &RowKey) -> Self {
+		let sort: &[u8] = key.row_id().as_ref();
+		let sort = Cow::Owned(sort.to_vec());
+		Self { partition: Partition::of(key.frame_type()), sort }
+	}
+
+	/// The row key that [`Key::row`] built this key from, or `None` for a key
+	/// of no table.
+	pub(crate) fn row_key(&self) -> Option<RowKey> {
+		let table = self.partition.table?;
+		let row_id = RowId::try_from(self.sort()).ok()?;
+		RowKey::new(table, row_id).ok()
 	}
 
 	/// The key `sort` within `partition`.
@@ -222,10 +279,7 @@ impl KvValue {
 	pub fn as_bytes(&self) -> &[u8] {
 		&self.0
 	}
-}
 
-#[cfg(any(test, feature = "testing"))]
-impl KvValue {
 	/// The value `bytes`.
 	pub(crate) fn new(bytes: impl Into<Vec<u8>>) -> Self {
 		Self(bytes.into())
@@ -395,6 +449,38 @@ mod tests {
 		}
 	}
 
+	/// The hash of `partition`.
+	fn hashed(partition: Partition) -> u64 {
+		let mut hasher = std::hash::DefaultHasher::new();
+		partition.hash(&mut hasher);
+		hasher.finish()
+	}
+
+	// A partition equals, orders, and hashes by its name alone, whether it
+	// names a table or not.
+	#[test]
+	fn a_partition_is_its_name() {
+		const TABLE: FrameType = FrameType::from_static("north");
+
+		let named = Partition::of(TABLE);
+		assert_eq!(
+			(named, named.cmp(&NORTH), hashed(named)),
+			(NORTH, Ordering::Equal, hashed(NORTH))
+		);
+		assert_ne!(hashed(NORTH), hashed(SOUTH));
+		assert!(NORTH < SOUTH);
+	}
+
+	// A key of a table turns back into the row key it was built from, and a
+	// key of no table turns into none.
+	#[test]
+	fn a_row_key_round_trips_through_its_key() -> Result<(), StoreError> {
+		let row = RowKey::new(FrameType::from_static("north"), RowId::from(*b"leaf"))?;
+		assert_eq!(Key::row(&row).row_key(), Some(row));
+		assert_eq!(Key::from_static(NORTH, b"leaf").row_key(), None);
+		Ok(())
+	}
+
 	tightbeam::tb_cases! {
 		fn a_sort_key_in_bounds_is_a_key(len: usize) -> Result<(), StoreError> {
 			let key = Key::new(NORTH, vec![7u8; len])?;
@@ -403,7 +489,7 @@ mod tests {
 		}
 		cases {
 			one_byte => 1,
-			longest => Key::MAX_SORT,
+			longest => 621,
 		}
 	}
 
@@ -414,7 +500,7 @@ mod tests {
 		}
 		cases {
 			empty => 0,
-			one_past_the_longest => Key::MAX_SORT + 1,
+			one_past_the_longest => 622,
 		}
 	}
 
@@ -424,7 +510,7 @@ mod tests {
 		}
 		cases {
 			empty => b"",
-			one_past_the_longest => &[7u8; Key::MAX_SORT + 1],
+			one_past_the_longest => &[7u8; 622],
 		}
 	}
 

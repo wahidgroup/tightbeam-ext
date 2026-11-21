@@ -9,11 +9,13 @@ mod catalog;
 mod driver;
 mod error;
 mod frame_type;
+mod indexed;
 mod kv;
 mod memory;
 mod owner;
 mod row_id;
 mod row_key;
+mod schema;
 mod scope;
 mod selection;
 mod storable;
@@ -26,15 +28,18 @@ pub mod testing;
 
 pub use catalog::{Catalog, Holds, Tables};
 pub use driver::{
-	CommitOutcome, ConfirmOutcome, DriverError, DriverFuture, InsertOutcome, RemoveOutcome, Revision, SwapOutcome,
+	CommitOutcome, ConfirmOutcome, Driver, DriverError, DriverFuture, DriverTxn, InsertOutcome, Prepared,
+	RemoveOutcome, Revision, Row, RowTxnFuture, SwapOutcome,
 };
 pub use error::StoreError;
 pub use frame_type::FrameType;
+pub use indexed::Indexed;
 pub use kv::{Entry, Key, KeyRange, KvValue, OrderedKv, OrderedKvTxn, Partition, Stored, TxnFuture};
-pub use memory::MemoryKv;
+pub use memory::{MemoryDriver, MemoryKv};
 pub use owner::Owner;
 pub use row_id::RowId;
 pub use row_key::RowKey;
+pub use schema::{Cardinality, Field, FieldKind, FieldValue, Projection, Protection, RecipientKey, Role, Schema};
 pub use scope::Scope;
 pub use selection::Direction;
 pub use storable::Storable;

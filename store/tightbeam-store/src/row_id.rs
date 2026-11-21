@@ -5,7 +5,7 @@ use tightbeam::der::{DecodeValue, EncodeValue, FixedTag, Header, Length, Reader,
 use crate::error::StoreError;
 
 /// The longest row id, in bytes.
-const MAX_LEN: usize = 512;
+pub(crate) const MAX_LEN: usize = 512;
 
 /// The lowercase hex digits of a row id in a URN.
 const HEX: &[u8; 16] = b"0123456789abcdef";

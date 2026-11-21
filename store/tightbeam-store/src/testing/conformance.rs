@@ -15,12 +15,16 @@ use tokio::sync::watch;
 use tokio::time::timeout;
 use tokio::{join, select};
 
+use super::native::{DriverClause, Rows};
+use crate::driver::Driver;
 use crate::driver::{CommitOutcome, ConfirmOutcome, DriverError, InsertOutcome, RemoveOutcome, Revision, SwapOutcome};
+use crate::frame_type::{self, FrameType};
 use crate::kv::{Entry, Key, KeyRange, KvValue, OrderedKv, OrderedKvTxn, Partition, Stored, TxnFuture};
+use crate::row_id;
 use crate::selection::Direction;
 
 /// How long one step of a clause waits before the check reads it as hung.
-const PATIENCE: Duration = Duration::from_secs(5);
+pub(super) const PATIENCE: Duration = Duration::from_secs(5);
 
 /// The share of the patience that a racer waits for its rival: a tenth.
 const RIVAL_SHARE: u32 = 10;
@@ -31,17 +35,53 @@ const ALL: NonZeroU32 = NonZeroU32::new(100).unwrap();
 /// The limit of a scan that stops short.
 const TWO: NonZeroU32 = NonZeroU32::new(2).unwrap();
 
+/// The table of most keys of the check, and of the rows of the native port.
+const NORTH_TABLE: FrameType = FrameType::from_static("conformance-north");
+
+/// The table beside [`NORTH_TABLE`].
+const SOUTH_TABLE: FrameType = FrameType::from_static("conformance-south");
+
+/// A table whose name starts the names of [`NORTH_TABLE`] and [`SOUTH_TABLE`].
+const PREFIX_TABLE: FrameType = FrameType::from_static("conformance");
+
+/// A table whose name and a sort key join to the text of [`JOINED_TABLE`]
+/// and another sort key.
+const JOINS_TABLE: FrameType = FrameType::from_static("a");
+
+/// The table beside [`JOINS_TABLE`].
+const JOINED_TABLE: FrameType = FrameType::from_static("ab");
+
+/// The shortest table.
+const SHORTEST_TABLE: FrameType = FrameType::from_static("c");
+
+/// The longest table.
+const LONGEST_TABLE: FrameType =
+	FrameType::from_static("conformance-longest-table-of-sixty-three-bytes-0123456789012345");
+
+const _: () = assert!(LONGEST_TABLE.as_str().len() == frame_type::MAX_LEN);
+
+/// The tables of the keys of every clause that the native port runs.
+pub(super) const TABLES: [FrameType; 7] = [
+	NORTH_TABLE,
+	SOUTH_TABLE,
+	PREFIX_TABLE,
+	JOINS_TABLE,
+	JOINED_TABLE,
+	SHORTEST_TABLE,
+	LONGEST_TABLE,
+];
+
 /// The partition of most keys of the check.
-const NORTH: Partition = Partition::from_static("conformance-north");
+const NORTH: Partition = Partition::of(NORTH_TABLE);
 
 /// The partition beside [`NORTH`].
-const SOUTH: Partition = Partition::from_static("conformance-south");
+const SOUTH: Partition = Partition::of(SOUTH_TABLE);
 
 /// A partition whose name starts the names of [`NORTH`] and [`SOUTH`].
-const PREFIX: Partition = Partition::from_static("conformance");
+const PREFIX: Partition = Partition::of(PREFIX_TABLE);
 
 /// The shortest partition.
-const SHORTEST: Partition = Partition::from_static("c");
+const SHORTEST: Partition = Partition::of(SHORTEST_TABLE);
 
 /// The longest partition, with a slash.
 const LONGEST: Partition =
@@ -51,6 +91,27 @@ const _: () = assert!(LONGEST.as_bytes().len() == Partition::MAX_LEN);
 
 /// The longest sort key.
 static LONGEST_SORT: [u8; Key::MAX_SORT] = [0xab; Key::MAX_SORT];
+
+/// The longest row id.
+static LONGEST_ROW_ID: [u8; row_id::MAX_LEN] = [0xab; row_id::MAX_LEN];
+
+/// The keys at the bounds of the KV port: binary sort keys of the shortest
+/// partition, and the longest sort key of the longest partition.
+static KV_BOUNDS: [(Partition, &[u8]); 4] = [
+	(SHORTEST, &[0x00]),
+	(SHORTEST, &[0xff, 0x00]),
+	(SHORTEST, b"nul\0inside"),
+	(LONGEST, &LONGEST_SORT),
+];
+
+/// The keys at the bounds of the native port: binary row ids of the shortest
+/// table, and the longest row id of the longest table.
+static ROW_BOUNDS: [(Partition, &[u8]); 4] = [
+	(SHORTEST, &[0x00]),
+	(SHORTEST, &[0xff, 0x00]),
+	(SHORTEST, b"nul\0inside"),
+	(Partition::of(LONGEST_TABLE), &LONGEST_ROW_ID),
+];
 
 /// The largest value of the clause of exact bytes, in bytes.
 const LARGE_VALUE: usize = 65_536;
@@ -74,8 +135,8 @@ pub enum KvClause {
 	GuardsRevision,
 	/// Of concurrent guarded writes from one revision, at most one commits.
 	RacesSwap,
-	/// A checked key that changes, appears, or vanishes fails the commit.
-	ChecksReads,
+	/// A confirmed key that changes, appears, or vanishes fails the commit.
+	ConfirmsReads,
 	/// An unguarded remove of an absent key answers `Removed`.
 	RemovesAbsent,
 	/// Two values of one key with other bytes carry other revisions.
@@ -110,7 +171,7 @@ impl KvClause {
 		Self::RacesInsert,
 		Self::GuardsRevision,
 		Self::RacesSwap,
-		Self::ChecksReads,
+		Self::ConfirmsReads,
 		Self::RemovesAbsent,
 		Self::Revises,
 		Self::Preserves,
@@ -133,7 +194,7 @@ impl KvClause {
 			Self::RacesInsert => "races_insert",
 			Self::GuardsRevision => "guards_revision",
 			Self::RacesSwap => "races_swap",
-			Self::ChecksReads => "checks_reads",
+			Self::ConfirmsReads => "confirms_reads",
 			Self::RemovesAbsent => "removes_absent",
 			Self::Revises => "revises",
 			Self::Preserves => "preserves",
@@ -154,12 +215,15 @@ impl fmt::Display for KvClause {
 }
 
 /// The clause of the KV contract that a driver breaks, and how.
-pub enum KvBreach {
+pub type KvBreach = Breach<KvClause>;
+
+/// The clause `C` of a store contract that a driver breaks, and how.
+pub enum Breach<C> {
 	/// At `step` of `clause`, the driver answered `answered` where the clause
 	/// places `expected`.
 	Answered {
 		/// The clause that the answer breaks.
-		clause: KvClause,
+		clause: C,
 		/// The step of the clause, with its inputs.
 		step: String,
 		/// The answer of the driver.
@@ -170,7 +234,7 @@ pub enum KvBreach {
 	/// At `step` of `clause`, the driver failed with `error`.
 	Failed {
 		/// The clause that the failure breaks.
-		clause: KvClause,
+		clause: C,
 		/// The step that failed, with its inputs.
 		step: String,
 		/// The failure of the driver.
@@ -179,7 +243,7 @@ pub enum KvBreach {
 	/// `step` of `clause` did not settle within the patience of the check.
 	Lapsed {
 		/// The clause that waited.
-		clause: KvClause,
+		clause: C,
 		/// The step that the clause waited for, with its inputs.
 		step: String,
 		/// How long the step waited.
@@ -187,16 +251,25 @@ pub enum KvBreach {
 	},
 }
 
-impl KvBreach {
+impl<C: Copy> Breach<C> {
 	/// The clause that the driver breaks.
-	pub fn clause(&self) -> KvClause {
+	pub fn clause(&self) -> C {
 		match self {
 			Self::Answered { clause, .. } | Self::Failed { clause, .. } | Self::Lapsed { clause, .. } => *clause,
 		}
 	}
+
+	/// This breach, charged to `clause`.
+	pub(super) fn charged<D>(self, clause: D) -> Breach<D> {
+		match self {
+			Self::Answered { step, answered, expected, .. } => Breach::Answered { clause, step, answered, expected },
+			Self::Failed { step, error, .. } => Breach::Failed { clause, step, error },
+			Self::Lapsed { step, patience, .. } => Breach::Lapsed { clause, step, patience },
+		}
+	}
 }
 
-impl fmt::Display for KvBreach {
+impl<C: fmt::Display> fmt::Display for Breach<C> {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::Answered { clause, step, answered, expected } => {
@@ -215,13 +288,13 @@ impl fmt::Display for KvBreach {
 
 /// The text of a breach, which a test that returns `Result<(), KvBreach>`
 /// prints.
-impl fmt::Debug for KvBreach {
+impl<C: fmt::Display> fmt::Debug for Breach<C> {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		fmt::Display::fmt(self, f)
 	}
 }
 
-impl Error for KvBreach {
+impl<C: fmt::Display> Error for Breach<C> {
 	fn source(&self) -> Option<&(dyn Error + 'static)> {
 		match self {
 			Self::Failed { error, .. } => Some(error),
@@ -320,38 +393,48 @@ impl<F: FreshKv> KvConformance<F> {
 	/// - The [`KvBreach`] of the run. A `DriverError::Failed` inside a race
 	///   breaks [`KvClause::AbortsTyped`], whichever clause raced.
 	pub async fn clause(&self, clause: KvClause) -> Result<(), KvBreach> {
-		let probe = self.probe(clause).await?;
-		match clause {
-			KvClause::Isolates => probe.isolates().await,
-			KvClause::ReadsOwn => probe.reads_own().await,
-			KvClause::CommitsAtomic => probe.commits_atomic().await,
-			KvClause::Discards => probe.discards().await,
-			KvClause::InsertsOnce => probe.inserts_once().await,
-			KvClause::RacesInsert => probe.races_insert().await,
-			KvClause::GuardsRevision => probe.guards_revision().await,
-			KvClause::RacesSwap => probe.races_swap().await,
-			KvClause::ChecksReads => probe.checks_reads().await,
-			KvClause::RemovesAbsent => probe.removes_absent().await,
-			KvClause::Revises => probe.revises().await,
-			KvClause::Preserves => probe.preserves().await,
-			KvClause::SeparatesPartitions => probe.separates_partitions().await,
-			KvClause::ScansOrdered => probe.scans_ordered().await,
-			KvClause::GetsBatch => probe.gets_batch().await,
-			KvClause::AcceptsKeys => probe.accepts_keys().await,
-			KvClause::ConflictsEarly => probe.conflicts_early().await,
-			KvClause::AbortsTyped => probe.aborts_typed().await,
-		}
+		self.probe(clause).await?.clause(clause).await
 	}
 
 	/// The probe of `clause` on a fresh backend.
 	///
 	/// # Errors
 	///
-	/// - [`KvBreach::Lapsed`] or [`KvBreach::Failed`] -- the factory built no backend.
+	/// - [`Breach::Lapsed`] or [`Breach::Failed`] -- the factory built no backend.
 	async fn probe(&self, clause: KvClause) -> Result<Probe<F::Kv>, KvBreach> {
-		let building = Probe { clause, patience: self.patience, kv: () };
+		let building = Probe::new(clause, self.patience, ());
 		let kv = building.call("the build of a fresh backend", self.fresh.fresh()).await?;
-		Ok(Probe { clause, patience: self.patience, kv })
+		Ok(Probe::new(clause, self.patience, kv))
+	}
+}
+
+impl<K: OrderedKv> Probe<K> {
+	/// Run `clause` on this backend.
+	///
+	/// # Errors
+	///
+	/// - The [`KvBreach`] of the run.
+	pub(super) async fn clause(&self, clause: KvClause) -> Result<(), KvBreach> {
+		match clause {
+			KvClause::Isolates => self.isolates().await,
+			KvClause::ReadsOwn => self.reads_own().await,
+			KvClause::CommitsAtomic => self.commits_atomic().await,
+			KvClause::Discards => self.discards().await,
+			KvClause::InsertsOnce => self.inserts_once().await,
+			KvClause::RacesInsert => self.races_insert().await,
+			KvClause::GuardsRevision => self.guards_revision().await,
+			KvClause::RacesSwap => self.races_swap().await,
+			KvClause::ConfirmsReads => self.confirms_reads().await,
+			KvClause::RemovesAbsent => self.removes_absent().await,
+			KvClause::Revises => self.revises().await,
+			KvClause::Preserves => self.preserves().await,
+			KvClause::SeparatesPartitions => self.separates_partitions().await,
+			KvClause::ScansOrdered => self.scans_ordered().await,
+			KvClause::GetsBatch => self.gets_batch().await,
+			KvClause::AcceptsKeys => self.accepts_keys().await,
+			KvClause::ConflictsEarly => self.conflicts_early().await,
+			KvClause::AbortsTyped => self.aborts_typed().await,
+		}
 	}
 }
 
@@ -470,8 +553,8 @@ enum Write<'a> {
 	Swap(&'a Key, &'a Revision, KvValue),
 	/// A remove of the key, guarded by the revision or unguarded.
 	Remove(&'a Key, Option<&'a Revision>),
-	/// A check that the key holds the revision, or is absent.
-	Check(&'a Key, Option<&'a Revision>),
+	/// A confirm that the key holds the revision, or is absent.
+	Confirm(&'a Key, Option<&'a Revision>),
 }
 
 impl fmt::Display for Write<'_> {
@@ -481,8 +564,8 @@ impl fmt::Display for Write<'_> {
 			Self::Swap(key, _, value) => write!(f, "a swap to {:?} at {key}", Shown(value.as_bytes())),
 			Self::Remove(key, Some(_)) => write!(f, "a guarded remove at {key}"),
 			Self::Remove(key, None) => write!(f, "an unguarded remove at {key}"),
-			Self::Check(key, Some(_)) => write!(f, "a check of a revision at {key}"),
-			Self::Check(key, None) => write!(f, "a check of absence at {key}"),
+			Self::Confirm(key, Some(_)) => write!(f, "a confirm of a revision at {key}"),
+			Self::Confirm(key, None) => write!(f, "a confirm of absence at {key}"),
 		}
 	}
 }
@@ -513,8 +596,8 @@ impl Write<'_> {
 					Ok((txn, (removed != RemoveOutcome::Removed).then(|| format!("{removed:?}"))))
 				})
 			}
-			Self::Check(key, expected) => {
-				let answered = txn.check(key, *expected);
+			Self::Confirm(key, expected) => {
+				let answered = txn.confirm(key, *expected);
 				Box::pin(async move {
 					let (txn, checked) = answered.await?;
 					Ok((txn, (checked != ConfirmOutcome::Held).then(|| format!("{checked:?}"))))
@@ -555,58 +638,120 @@ enum Step<'a> {
 	Rollback,
 }
 
-/// One clause of a check, on its fresh backend. It owns each step of the
+/// The port that a probe drives the KV clauses through.
+#[derive(Clone, Copy, Debug)]
+enum Port {
+	/// The KV port itself.
+	Kv,
+	/// The native port, as [`Rows`] maps it, under the native clause it
+	/// reports.
+	Rows(DriverClause),
+}
+
+impl Port {
+	/// Whether the port reads ranges. A port with none skips each scan.
+	fn ranges(self) -> bool {
+		matches!(self, Self::Kv)
+	}
+
+	/// The keys at the bounds that the port takes.
+	fn bounds(self) -> &'static [(Partition, &'static [u8])] {
+		match self {
+			Self::Kv => &KV_BOUNDS,
+			Self::Rows(_) => &ROW_BOUNDS,
+		}
+	}
+
+	/// The name of `clause` in the contract of the port.
+	fn name(self, clause: KvClause) -> &'static str {
+		match self {
+			Self::Kv => clause.name(),
+			Self::Rows(native) => native.name(),
+		}
+	}
+}
+
+/// One clause `C` of a check, on its fresh backend. It owns each step of the
 /// clause and the patience of each wait.
-struct Probe<K> {
-	clause: KvClause,
+pub(super) struct Probe<K, C = KvClause> {
+	clause: C,
 	patience: Duration,
 	kv: K,
+	port: Port,
 }
 
 impl<K> Probe<K> {
+	/// The probe of `clause` on the KV backend `kv`.
+	fn new(clause: KvClause, patience: Duration, kv: K) -> Self {
+		Self { clause, patience, kv, port: Port::Kv }
+	}
+}
+
+impl<D: Driver> Probe<Rows<D>> {
+	/// The probe of `clause` through the native port of `rows`, which reports
+	/// the native clause `native`.
+	pub(super) fn rows(clause: KvClause, native: DriverClause, patience: Duration, rows: Rows<D>) -> Self {
+		Self { clause, patience, kv: rows, port: Port::Rows(native) }
+	}
+}
+
+impl<C: Copy> Probe<(), C> {
+	/// The probe of `clause` with no backend, for the steps before one exists.
+	pub(super) fn bare(clause: C, patience: Duration) -> Self {
+		Self { clause, patience, kv: (), port: Port::Kv }
+	}
+}
+
+impl<K, C: Copy> Probe<K, C> {
 	/// The output of `future`, once it settles within the patience.
 	///
 	/// # Errors
 	///
-	/// - [`KvBreach::Lapsed`] -- `future` did not settle in time, at `step`.
-	async fn within<T>(&self, step: &str, future: impl Future<Output = T>) -> Result<T, KvBreach> {
+	/// - [`Breach::Lapsed`] -- `future` did not settle in time, at `step`.
+	async fn within<T>(&self, step: &str, future: impl Future<Output = T>) -> Result<T, Breach<C>> {
 		let Self { clause, patience, .. } = *self;
 		let bounded = timeout(patience, future).await;
-		bounded.map_err(|_| KvBreach::Lapsed { clause, step: step.to_owned(), patience })
+		bounded.map_err(|_| Breach::Lapsed { clause, step: step.to_owned(), patience })
 	}
 
 	/// The answer of the port call `future` at `step`.
 	///
 	/// # Errors
 	///
-	/// - [`KvBreach::Lapsed`] -- the call did not settle in time.
-	/// - [`KvBreach::Failed`] -- the call failed.
-	async fn call<T>(&self, step: &str, future: impl Future<Output = Result<T, DriverError>>) -> Result<T, KvBreach> {
+	/// - [`Breach::Lapsed`] -- the call did not settle in time.
+	/// - [`Breach::Failed`] -- the call failed.
+	pub(super) async fn call<T>(
+		&self,
+		step: &str,
+		future: impl Future<Output = Result<T, DriverError>>,
+	) -> Result<T, Breach<C>> {
 		let answered = self.within(step, future).await?;
-		answered.map_err(|error| KvBreach::Failed { clause: self.clause, step: step.to_owned(), error })
+		answered.map_err(|error| Breach::Failed { clause: self.clause, step: step.to_owned(), error })
 	}
 
 	/// The breach of the answer `answered` at `step`, where the clause places
 	/// `expected`.
-	fn refuse(&self, step: &str, answered: &impl fmt::Debug, expected: &impl fmt::Debug) -> KvBreach {
+	pub(super) fn refuse(&self, step: &str, answered: &impl fmt::Debug, expected: &impl fmt::Debug) -> Breach<C> {
 		let answered = format!("{answered:?}");
 		let expected = format!("{expected:?}");
-		KvBreach::Answered { clause: self.clause, step: step.to_owned(), answered, expected }
+		Breach::Answered { clause: self.clause, step: step.to_owned(), answered, expected }
 	}
 
 	/// Expect `answered` at `step` to be `expected`.
 	///
 	/// # Errors
 	///
-	/// - [`KvBreach::Answered`] -- the driver answered anything else.
-	fn expect<T: PartialEq + fmt::Debug>(&self, step: &str, answered: T, expected: T) -> Result<(), KvBreach> {
+	/// - [`Breach::Answered`] -- the driver answered anything else.
+	fn expect<T: PartialEq + fmt::Debug>(&self, step: &str, answered: T, expected: T) -> Result<(), Breach<C>> {
 		if answered != expected {
 			return Err(self.refuse(step, &answered, &expected));
 		}
 
 		Ok(())
 	}
+}
 
+impl<K> Probe<K> {
 	/// How long a rival may go silent before a racer reads it as blocked.
 	fn rival_wait(&self) -> Duration {
 		self.patience / RIVAL_SHARE
@@ -640,7 +785,7 @@ impl<K> Probe<K> {
 			Ok(answered) => Ok(Some(answered)),
 			Err(DriverError::Aborted(_)) => Ok(None),
 			Err(error) => {
-				let step = format!("{step}, in a race of {}", self.clause);
+				let step = format!("{step}, in a race of {}", self.port.name(self.clause));
 				Err(KvBreach::Failed { clause: KvClause::AbortsTyped, step, error })
 			}
 		}
@@ -810,7 +955,7 @@ impl<K: OrderedKv> Probe<K> {
 	}
 
 	/// The transaction of a scan of `range` in `txn`, once it answers the
-	/// sort keys and bytes `expected`.
+	/// sort keys and bytes `expected`. A port with no range read skips it.
 	///
 	/// # Errors
 	///
@@ -822,6 +967,10 @@ impl<K: OrderedKv> Probe<K> {
 		(direction, limit): (Direction, NonZeroU32),
 		expected: &[(&[u8], &[u8])],
 	) -> Result<Box<dyn OrderedKvTxn>, KvBreach> {
+		if !self.port.ranges() {
+			return Ok(txn);
+		}
+
 		let step = format!("a scan of {range}, {direction:?}, at most {limit}");
 		let (txn, entries) = self.call(&step, txn.scan(range, direction, limit)).await?;
 		let answered: Vec<(Shown<'_>, Shown<'_>)> = entries.iter().map(Into::into).collect();
@@ -958,7 +1107,7 @@ impl<K: OrderedKv> Probe<K> {
 	///
 	/// # Errors
 	///
-	/// - The breach of a step, or [`KvBreach::Answered`] for a check that held past a competing
+	/// - The breach of a step, or [`KvBreach::Answered`] for a confirm that held past a competing
 	///   commit, or a rival that did not take.
 	async fn checked_against(
 		&self,
@@ -969,12 +1118,12 @@ impl<K: OrderedKv> Probe<K> {
 	) -> Result<(), KvBreach> {
 		let CheckLanes { checked, checker, rival: rival_lane } = lanes;
 		let checking = async {
-			let check = Write::Check(key, expected);
+			let confirm = Write::Confirm(key, expected);
 			let txn = self.begin().await?;
 
 			checker.beat();
 
-			let txn = self.takes(txn, slice::from_ref(&check)).await?;
+			let txn = self.takes(txn, slice::from_ref(&confirm)).await?;
 
 			checker.beat();
 			checked.open(());
@@ -991,12 +1140,12 @@ impl<K: OrderedKv> Probe<K> {
 				txn
 			};
 
-			let committed = self.racing("the commit of a check", txn.commit()).await?;
+			let committed = self.racing("the commit of a confirm", txn.commit()).await?;
 
 			checker.beat();
 
 			if rival == Some(Raced::Committed) && committed == Some(CommitOutcome::Committed) {
-				let step = format!("the commit of {check} after a competing commit");
+				let step = format!("the commit of {confirm} after a competing commit");
 				return Err(self.refuse(&step, &committed, &"Conflicted, or an abort"));
 			}
 
@@ -1009,7 +1158,7 @@ impl<K: OrderedKv> Probe<K> {
 
 		let raced = raced?;
 		if !rewrites && matches!(raced, Raced::Refused(_) | Raced::Conflicted | Raced::RolledBack) {
-			return Err(self.refuse("the write that competes with a check", &raced, &"Committed, or an abort"));
+			return Err(self.refuse("the write that competes with a confirm", &raced, &"Committed, or an abort"));
 		}
 
 		Ok(())
@@ -1068,21 +1217,27 @@ impl<K: OrderedKv> Probe<K> {
 				txn = back;
 			}
 
-			let north = KeyRange::whole(NORTH);
-			let step = format!("a scan of {north} beside an open write");
-			let (txn, entries) = self.call(&step, txn.scan(&north, Direction::Ascending, ALL)).await?;
+			let txn = if self.port.ranges() {
+				let north = KeyRange::whole(NORTH);
+				let step = format!("a scan of {north} beside an open write");
+				let (txn, entries) = self.call(&step, txn.scan(&north, Direction::Ascending, ALL)).await?;
 
-			reader_lane.beat();
+				reader_lane.beat();
 
-			let shown: Vec<(Shown<'_>, Shown<'_>)> = entries.iter().map(Into::into).collect();
-			let present = before[1..]
-				.iter()
-				.filter_map(|(key, bytes)| Some((Shown(key.sort()), Shown((*bytes)?))));
+				let shown: Vec<(Shown<'_>, Shown<'_>)> = entries.iter().map(Into::into).collect();
+				let present = before[1..]
+					.iter()
+					.filter_map(|(key, bytes)| Some((Shown(key.sort()), Shown((*bytes)?))));
 
-			let held: Vec<(Shown<'_>, Shown<'_>)> = present.collect();
-			if shown != held && !committing.is_open() {
-				return Err(self.refuse(&step, &shown, &held));
-			}
+				let held: Vec<(Shown<'_>, Shown<'_>)> = present.collect();
+				if shown != held && !committing.is_open() {
+					return Err(self.refuse(&step, &shown, &held));
+				}
+
+				txn
+			} else {
+				txn
+			};
 
 			self.rollback(txn).await?;
 			read.open(());
@@ -1144,6 +1299,7 @@ impl<K: OrderedKv> Probe<K> {
 		let txn = self.reads(txn, &guarded, None).await?;
 		let txn = self.reads(txn, &swapped, Some(b"d-own")).await?;
 		let txn = self.reads(txn, &inserted, Some(b"f-own")).await?;
+		let txn = self.reads(txn, &south_inserted, Some(b"x-own")).await?;
 
 		// The first entry left after the own removes is committed alone, so a
 		// scan of one reads past both removes to it.
@@ -1453,7 +1609,7 @@ impl<K: OrderedKv> Probe<K> {
 	/// Checks that answer `Changed` for a key that moved before them, two
 	/// checks of absence that cross, of which one fails, and checks whose
 	/// commit fails once the key changes, vanishes, appears, or comes back.
-	async fn checks_reads(&self) -> Result<(), KvBreach> {
+	async fn confirms_reads(&self) -> Result<(), KvBreach> {
 		let moved = Key::from_static(NORTH, b"moved");
 		let absent = Key::from_static(NORTH, b"never-written");
 
@@ -1469,20 +1625,25 @@ impl<K: OrderedKv> Probe<K> {
 
 		let current = self.revision(&moved).await?;
 		let checks = [
-			("a check of a stale revision", &moved, Some(&stale), ConfirmOutcome::Changed),
-			("a check of a present key as absent", &moved, None, ConfirmOutcome::Changed),
+			("a confirm of a stale revision", &moved, Some(&stale), ConfirmOutcome::Changed),
+			("a confirm of a present key as absent", &moved, None, ConfirmOutcome::Changed),
 			(
-				"a check of an absent key as present",
+				"a confirm of an absent key as present",
 				&absent,
 				Some(&current),
 				ConfirmOutcome::Changed,
 			),
-			("a check of an absent key", &absent, None, ConfirmOutcome::Held),
-			("a check of the current revision", &moved, Some(&current), ConfirmOutcome::Held),
+			("a confirm of an absent key", &absent, None, ConfirmOutcome::Held),
+			(
+				"a confirm of the current revision",
+				&moved,
+				Some(&current),
+				ConfirmOutcome::Held,
+			),
 		];
 		let mut txn = self.begin().await?;
 		for (step, key, expected, outcome) in checks {
-			txn = self.answers(step, txn.check(key, expected), outcome).await?;
+			txn = self.answers(step, txn.confirm(key, expected), outcome).await?;
 		}
 
 		self.rollback(txn).await?;
@@ -1558,14 +1719,14 @@ impl<K: OrderedKv> Probe<K> {
 		let (left_ready, right_ready) = (Gate::new(), Gate::new());
 		let (left_lane, right_lane) = (Lane::new(), Lane::new());
 		let lefty = [
-			Step::Write(Write::Check(&right, None)),
+			Step::Write(Write::Confirm(&right, None)),
 			Step::Write(Write::Insert(&left, KvValue::new(b"left".as_slice()))),
 			Step::Open(&left_ready),
 			Step::Wait(&right_ready, &right_lane),
 			Step::Commit,
 		];
 		let righty = [
-			Step::Write(Write::Check(&left, None)),
+			Step::Write(Write::Confirm(&left, None)),
 			Step::Write(Write::Insert(&right, KvValue::new(b"right".as_slice()))),
 			Step::Open(&right_ready),
 			Step::Wait(&left_ready, &left_lane),
@@ -1575,7 +1736,7 @@ impl<K: OrderedKv> Probe<K> {
 		let (lefty, righty) = join!(self.race(&lefty, &left_lane), self.race(&righty, &right_lane));
 		let raced = [lefty?, righty?];
 		if raced.iter().all(|raced| *raced == Raced::Committed) {
-			return Err(self.refuse("two crossed checks of absence", &raced, &"at most one commit"));
+			return Err(self.refuse("two crossed confirms of absence", &raced, &"at most one commit"));
 		}
 
 		Ok(())
@@ -1597,6 +1758,7 @@ impl<K: OrderedKv> Probe<K> {
 		let key = Key::from_static(NORTH, b"revised");
 		let own_key = Key::from_static(NORTH, b"revised-own");
 		let returned = Key::from_static(NORTH, b"returned");
+
 		self.seed(&[(&key, b"left"), (&returned, b"left")]).await?;
 
 		let before = self.revision(&key).await?;
@@ -1604,7 +1766,9 @@ impl<K: OrderedKv> Probe<K> {
 		let txn = self
 			.takes(txn, &[Write::Swap(&key, &before, KvValue::new(b"rite".as_slice()))])
 			.await?;
+
 		self.commit("the commit of a swap", txn).await?;
+
 		let after = self.revision(&key).await?;
 		if before == after {
 			return Err(self.refuse("the revision of a committed swap", &after, &"another revision"));
@@ -1628,12 +1792,16 @@ impl<K: OrderedKv> Probe<K> {
 		let gone = self.revision(&returned).await?;
 		let txn = self.begin().await?;
 		let txn = self.takes(txn, &[Write::Remove(&returned, Some(&gone))]).await?;
+
 		self.commit("the commit of a remove", txn).await?;
+
 		let txn = self.begin().await?;
 		let txn = self
 			.takes(txn, &[Write::Insert(&returned, KvValue::new(b"rite".as_slice()))])
 			.await?;
+
 		self.commit("the commit of a reinsert", txn).await?;
+
 		let back = self.revision(&returned).await?;
 		if back == gone {
 			return Err(self.refuse("the revision of a key that came back", &back, &"another revision"));
@@ -1645,6 +1813,7 @@ impl<K: OrderedKv> Probe<K> {
 		let txn = self
 			.answers(step, txn.swap(&returned, &gone, &lost), SwapOutcome::Stale)
 			.await?;
+
 		self.rollback(txn).await
 	}
 
@@ -1657,6 +1826,7 @@ impl<K: OrderedKv> Probe<K> {
 		let sorts: [&'static [u8]; 6] = [b"p0", b"p1", b"p2", b"p3", b"p4", b"p5"];
 		let keys = sorts.map(|sort| Key::from_static(NORTH, sort));
 		let seeds: Vec<(&Key, &[u8])> = keys.iter().zip(values).collect();
+
 		self.seed(&seeds).await?;
 
 		let expected: Vec<(&Key, Option<&[u8]>)> = keys.iter().zip(values.map(Some)).collect();
@@ -1667,18 +1837,20 @@ impl<K: OrderedKv> Probe<K> {
 		let txn = self
 			.scans(txn, &KeyRange::whole(NORTH), (Direction::Ascending, ALL), &entries)
 			.await?;
+
 		self.rollback(txn).await
 	}
 
 	/// One sort key in two partitions, a partition whose name starts another,
 	/// and two keys whose partition and sort key join to one text, each of
-	/// which holds and scans as its own entry.
+	/// which holds and scans as its own entry, and which a remove, a swap, and
+	/// a confirm of the others leave as they were.
 	async fn separates_partitions(&self) -> Result<(), KvBreach> {
 		let in_north = Key::from_static(NORTH, b"shared");
 		let in_south = Key::from_static(SOUTH, b"shared");
 		let in_prefix = Key::from_static(PREFIX, b"short");
-		let joined_after = Key::from_static(Partition::from_static("a"), b"bc");
-		let joined_before = Key::from_static(Partition::from_static("ab"), b"c");
+		let joined_after = Key::from_static(Partition::of(JOINS_TABLE), b"bc");
+		let joined_before = Key::from_static(Partition::of(JOINED_TABLE), b"c");
 		let seeds: [(&Key, &[u8]); 5] = [
 			(&in_north, b"north"),
 			(&in_south, b"south"),
@@ -1686,7 +1858,9 @@ impl<K: OrderedKv> Probe<K> {
 			(&joined_after, b"a/bc"),
 			(&joined_before, b"ab/c"),
 		];
+
 		self.seed(&seeds).await?;
+
 		let held: Vec<(&Key, Option<&[u8]>)> = seeds.iter().map(|(key, bytes)| (*key, Some(*bytes))).collect();
 		self.holds("a read of each partition", &held).await?;
 
@@ -1698,7 +1872,29 @@ impl<K: OrderedKv> Probe<K> {
 				.await?;
 		}
 
-		self.rollback(txn).await
+		self.rollback(txn).await?;
+
+		let joined_at = self.revision(&joined_before).await?;
+		let prefix_at = self.revision(&in_prefix).await?;
+		let writes = [
+			Write::Remove(&in_south, None),
+			Write::Swap(&joined_before, &joined_at, KvValue::new(b"ab/c-1".as_slice())),
+			Write::Confirm(&in_prefix, Some(&prefix_at)),
+		];
+		let txn = self.begin().await?;
+		let txn = self.takes(txn, &writes).await?;
+
+		self.commit("the commit of writes beside keys of other partitions", txn).await?;
+
+		let after: [(&Key, Option<&[u8]>); 5] = [
+			(&in_north, Some(b"north")),
+			(&in_south, None),
+			(&in_prefix, Some(b"prefix")),
+			(&joined_after, Some(b"a/bc")),
+			(&joined_before, Some(b"ab/c-1")),
+		];
+
+		self.holds("a read after writes beside keys of other partitions", &after).await
 	}
 
 	/// Scans over sort keys at the edges of unsigned byte order, each way,
@@ -1709,6 +1905,7 @@ impl<K: OrderedKv> Probe<K> {
 		let beside = Key::from_static(SOUTH, &[0x50]);
 		let mut seeds: Vec<(&Key, &[u8])> = keys.iter().zip(sorts).collect();
 		seeds.push((&beside, b"beside"));
+
 		self.seed(&seeds).await?;
 
 		let one = NonZeroU32::MIN;
@@ -1792,31 +1989,42 @@ impl<K: OrderedKv> Probe<K> {
 		let (txn, read) = self.call(step, txn.get(&keys)).await?;
 		let answered: Vec<Option<Shown<'_>>> = read.iter().map(|stored| stored.as_ref().map(Shown::from)).collect();
 		let expected = vec![Some(Shown(b"second")), None, Some(Shown(b"first"))];
+
 		self.expect(step, answered, expected)?;
 		self.rollback(txn).await
 	}
 
-	/// Keys at the bounds the core emits: partitions of 1 and 80 bytes, with
-	/// a slash, and sort keys of 1 and 621 bytes.
+	/// Keys at the bounds of the port: binary and NUL sort keys in the
+	/// shortest partition, and the longest key in the longest partition, each
+	/// of which holds and scans as written.
 	async fn accepts_keys(&self) -> Result<(), KvBreach> {
-		let shortest = Key::from_static(SHORTEST, &[0x01]);
-		let longest = Key::from_static(LONGEST, &LONGEST_SORT);
-		self.seed(&[(&shortest, b"shortest"), (&longest, b"longest")]).await?;
-		self.holds(
-			"a get of the bounds",
-			&[(&shortest, Some(b"shortest")), (&longest, Some(b"longest"))],
-		)
-		.await?;
+		let keys: Vec<Key> = self
+			.port
+			.bounds()
+			.iter()
+			.map(|(partition, sort)| Key::from_static(*partition, sort))
+			.collect();
 
-		let shortest_entries: [(&[u8], &[u8]); 1] = [(&[0x01], b"shortest")];
-		let longest_entries: [(&[u8], &[u8]); 1] = [(&LONGEST_SORT, b"longest")];
-		let txn = self.begin().await?;
-		let txn = self
-			.scans(txn, &KeyRange::whole(SHORTEST), (Direction::Ascending, ALL), &shortest_entries)
-			.await?;
-		let txn = self
-			.scans(txn, &KeyRange::whole(LONGEST), (Direction::Ascending, ALL), &longest_entries)
-			.await?;
+		let seeds: Vec<(&Key, &[u8])> = keys.iter().map(|key| (key, key.sort())).collect();
+		self.seed(&seeds).await?;
+
+		let held: Vec<(&Key, Option<&[u8]>)> = keys.iter().map(|key| (key, Some(key.sort()))).collect();
+		self.holds("a get of the bounds", &held).await?;
+
+		let mut txn = self.begin().await?;
+		for partition in [SHORTEST, keys[keys.len() - 1].partition()] {
+			let mut entries: Vec<(&[u8], &[u8])> = keys
+				.iter()
+				.filter(|key| key.partition() == partition)
+				.map(|key| (key.sort(), key.sort()))
+				.collect();
+
+			entries.sort();
+			txn = self
+				.scans(txn, &KeyRange::whole(partition), (Direction::Ascending, ALL), &entries)
+				.await?;
+		}
+
 		self.rollback(txn).await
 	}
 
@@ -1826,7 +2034,9 @@ impl<K: OrderedKv> Probe<K> {
 		let swapped = Key::from_static(NORTH, b"swapped");
 		let inserted = Key::from_static(NORTH, b"inserted");
 		let checked = Key::from_static(NORTH, b"checked");
+
 		self.seed(&[(&swapped, b"seeded"), (&checked, b"seeded")]).await?;
+
 		let swapped_at = self.revision(&swapped).await?;
 		let checked_at = self.revision(&checked).await?;
 
@@ -1840,7 +2050,7 @@ impl<K: OrderedKv> Probe<K> {
 			(Write::Insert(&inserted, open()), Write::Insert(&inserted, beside())),
 			(
 				Write::Swap(&checked, &checked_at, open()),
-				Write::Check(&checked, Some(&checked_at)),
+				Write::Confirm(&checked, Some(&checked_at)),
 			),
 		];
 		for (opening, besides) in competitions {
@@ -1853,9 +2063,11 @@ impl<K: OrderedKv> Probe<K> {
 				Step::Rival(&beside_lane),
 				Step::Rollback,
 			];
+
 			let besides = [Step::Wait(&open_wrote, &open_lane), Step::Write(besides), Step::Commit];
 			let (open_raced, beside_raced) = join!(self.race(&opening, &open_lane), self.race(&besides, &beside_lane));
 			self.expect("an open write that rolls back", open_raced?, Raced::RolledBack)?;
+
 			let beside_raced = beside_raced?;
 			if !matches!(beside_raced, Raced::Committed | Raced::Aborted) {
 				return Err(self.refuse(&step, &beside_raced, &"Committed, or an abort"));
@@ -1901,6 +2113,7 @@ impl<K: OrderedKv> Probe<K> {
 		let raced = [forward?, backward?];
 		let left_read = self.read(&left).await?;
 		let right_read = self.read(&right).await?;
+
 		let committed = raced.iter().filter(|raced| **raced == Raced::Committed).count();
 		let together = left_read.as_ref().map(Stored::bytes) == right_read.as_ref().map(Stored::bytes);
 		if committed > 1 || !together {
@@ -1917,7 +2130,7 @@ mod tests {
 	use core::future::pending;
 	use std::collections::BTreeMap;
 	use std::io;
-	use std::sync::atomic::{AtomicU64, Ordering};
+	use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 	use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
 
 	use tightbeam::testing::SetupEnv;
@@ -1927,12 +2140,18 @@ mod tests {
 	use tokio::time::{pause, sleep};
 
 	use super::*;
-	use crate::driver::DriverFuture;
-	use crate::memory::MemoryKv;
+	use crate::driver::{Driver, DriverFuture, DriverTxn, Prepared};
+	use crate::indexed::{Indexed, IndexedError};
+	use crate::memory::{MemoryDriver, MemoryKv};
+	use crate::schema::Schema;
 	use crate::scope::Scope;
+	use crate::testing::{DriverBreach, DriverClause, DriverConformance};
 
 	/// The longest sort key that a [`Fault::ShortKeys`] driver takes.
 	const SHORT_SORT: usize = 512;
+
+	/// The longest value that a [`Fault::FlipsLarge`] driver returns intact.
+	const FLIPPED_PAST: usize = 4_096;
 
 	/// No wait before a call.
 	const NONE: Lag = Lag::Yields(0);
@@ -1997,13 +2216,13 @@ mod tests {
 		/// A swap relies on no revision, so racing swaps both commit.
 		BlindSwaps,
 		/// A check compares at the call and relies on nothing at the commit.
-		ForgetsChecks,
+		ForgetsConfirms,
 		/// A check of a revision compares at the call and relies on nothing
 		/// at the commit. A check of absence holds as it should.
-		ForgetsRevisionChecks,
+		ForgetsRevisionConfirms,
 		/// A write of a key that another open transaction checked answers as
 		/// refused.
-		StaleBesideCheck,
+		StaleBesideConfirm,
 		/// An unguarded remove of an absent key answers `Stale`.
 		StaleOnAbsent,
 		/// A revision is the length of the bytes.
@@ -2017,8 +2236,15 @@ mod tests {
 		SignedOrder,
 		/// A batch get answers the present keys in key order, then the absent.
 		SortsBatch,
+		/// A get of more than one key answers one value fewer than it took
+		/// keys.
+		ShortBatch,
 		/// A sort key past 512 bytes fails.
 		ShortKeys,
+		/// A sort key that is no UTF-8 text fails, as a text column refuses it.
+		TextKeys,
+		/// A value past 4 KiB comes back with its last byte flipped.
+		FlipsLarge,
 		/// A write beside the open write of another transaction answers as
 		/// refused.
 		EarlyStale,
@@ -2156,7 +2382,7 @@ mod tests {
 		fn refuses_beside(&self, key: &Key) -> bool {
 			let written = self.is(Fault::EarlyStale) && self.written_by_other(key).is_some();
 			let checked = self.open().checks.get(key).is_some_and(|holder| *holder != self.id);
-			written || (self.is(Fault::StaleBesideCheck) && checked)
+			written || (self.is(Fault::StaleBesideConfirm) && checked)
 		}
 
 		/// The other open transaction whose write of one of `keys` a read
@@ -2240,6 +2466,9 @@ mod tests {
 			if self.is(Fault::ShortKeys) && key.sort().len() > SHORT_SORT {
 				return Err(DriverError::failed("the sort key is past 512 bytes"));
 			}
+			if self.is(Fault::TextKeys) && str::from_utf8(key.sort()).is_err() {
+				return Err(DriverError::failed("the sort key is no UTF-8 text"));
+			}
 
 			Ok(())
 		}
@@ -2296,6 +2525,14 @@ mod tests {
 
 		/// The value as the fault shows it.
 		fn shown(&self, stored: Stored) -> Stored {
+			if self.is(Fault::FlipsLarge) && stored.bytes().len() > FLIPPED_PAST {
+				let mut bytes = stored.bytes().to_vec();
+				if let Some(last) = bytes.last_mut() {
+					*last ^= 0xff;
+				}
+
+				return Stored::new(bytes, stored.revision().clone());
+			}
 			if !self.is(Fault::RevisesByLength) {
 				return stored;
 			}
@@ -2388,7 +2625,7 @@ mod tests {
 		/// A check of `key` in the inner transaction.
 		async fn check_inner(&mut self, key: &Key, expected: Option<&Revision>) -> Result<ConfirmOutcome, DriverError> {
 			let (key, expected) = (key.clone(), expected.cloned());
-			self.inner(move |inner| Box::pin(async move { inner.check(&key, expected.as_ref()).await }))
+			self.inner(move |inner| Box::pin(async move { inner.confirm(&key, expected.as_ref()).await }))
 				.await
 		}
 
@@ -2540,6 +2777,9 @@ mod tests {
 
 				return Ok(keys.iter().zip(shown).map(dirty).collect());
 			}
+			if self.ctx.is(Fault::ShortBatch) && keys.len() > 1 {
+				return Ok(shown.split_last().map(|(_, kept)| kept.to_vec()).unwrap_or_default());
+			}
 			if !self.ctx.is(Fault::SortsBatch) {
 				return Ok(shown);
 			}
@@ -2550,6 +2790,7 @@ mod tests {
 				.filter_map(|(key, stored)| Some((key, stored?)))
 				.collect();
 			present.sort_by(|left, right| left.0.cmp(&right.0));
+			
 			let absent = shown.iter().filter(|stored| stored.is_none()).count();
 			let sorted = present.into_iter().map(|(_, stored)| Some(stored));
 			Ok(sorted.chain(core::iter::repeat_n(None, absent)).collect())
@@ -2622,7 +2863,7 @@ mod tests {
 			Ok(entries.into_iter().map(shown).collect())
 		}
 
-		async fn check_now(&mut self, key: &Key, expected: Option<&Revision>) -> Result<ConfirmOutcome, DriverError> {
+		async fn confirm_now(&mut self, key: &Key, expected: Option<&Revision>) -> Result<ConfirmOutcome, DriverError> {
 			let key = self.ctx.key(key)?;
 			self.ctx.wait_on(|ctx| ctx.read_blocker(slice::from_ref(&key))).await?;
 			let early = self.ctx.is(Fault::EarlyStale) && self.ctx.written_by_other(&key).is_some();
@@ -2638,7 +2879,7 @@ mod tests {
 			Ok(checked)
 		}
 
-		/// The answer of a check of `key` under the fault.
+		/// The answer of a confirm of `key` under the fault.
 		async fn check_by_fault(
 			&mut self,
 			key: &Key,
@@ -2646,7 +2887,7 @@ mod tests {
 		) -> Result<ConfirmOutcome, DriverError> {
 			let key = key.clone();
 			match (self.ctx.fault, expected) {
-				(Some(Fault::ForgetsChecks), _) | (Some(Fault::ForgetsRevisionChecks), Some(_)) => {
+				(Some(Fault::ForgetsConfirms), _) | (Some(Fault::ForgetsRevisionConfirms), Some(_)) => {
 					let current = self.current(&key).await?;
 					let held = current.as_ref().map(Stored::revision) == expected;
 					Ok(if held {
@@ -2748,13 +2989,13 @@ mod tests {
 			})
 		}
 
-		fn check<'a>(
+		fn confirm<'a>(
 			mut self: Box<Self>,
 			key: &'a Key,
 			expected: Option<&'a Revision>,
 		) -> TxnFuture<'a, ConfirmOutcome> {
 			Box::pin(async move {
-				let checked = self.check_now(key, expected).await?;
+				let checked = self.confirm_now(key, expected).await?;
 				Ok((self as Box<dyn OrderedKvTxn>, checked))
 			})
 		}
@@ -2821,10 +3062,10 @@ mod tests {
 		an_ignored_revision_breaks_guards_revision, an_ignored_revision_with_latency_breaks_guards_revision
 			=> (IgnoresRevision, GuardsRevision),
 		blind_swaps_break_races_swap, blind_swaps_with_latency_break_races_swap => (BlindSwaps, RacesSwap),
-		forgotten_checks_break_checks_reads, forgotten_checks_with_latency_break_checks_reads
-			=> (ForgetsChecks, ChecksReads),
-		a_stale_beside_a_check_breaks_checks_reads, a_stale_beside_a_check_with_latency_breaks_checks_reads
-			=> (StaleBesideCheck, ChecksReads),
+		forgotten_confirms_break_confirms_reads, forgotten_confirms_with_latency_break_confirms_reads
+			=> (ForgetsConfirms, ConfirmsReads),
+		a_stale_beside_a_confirm_breaks_confirms_reads, a_stale_beside_a_confirm_with_latency_breaks_confirms_reads
+			=> (StaleBesideConfirm, ConfirmsReads),
 		a_stale_absent_remove_breaks_removes_absent, a_stale_absent_remove_with_latency_breaks_removes_absent
 			=> (StaleOnAbsent, RemovesAbsent),
 		revisions_by_length_break_revises, revisions_by_length_with_latency_break_revises => (RevisesByLength, Revises),
@@ -2834,11 +3075,314 @@ mod tests {
 		a_signed_order_breaks_scans_ordered, a_signed_order_with_latency_breaks_scans_ordered
 			=> (SignedOrder, ScansOrdered),
 		a_sorted_batch_breaks_gets_batch, a_sorted_batch_with_latency_breaks_gets_batch => (SortsBatch, GetsBatch),
+		a_short_batch_breaks_gets_batch, a_short_batch_with_latency_breaks_gets_batch => (ShortBatch, GetsBatch),
 		short_keys_break_accepts_keys, short_keys_with_latency_break_accepts_keys => (ShortKeys, AcceptsKeys),
+		text_keys_break_scans_ordered, text_keys_with_latency_break_scans_ordered => (TextKeys, ScansOrdered),
+		flipped_large_values_break_preserves, flipped_large_values_with_latency_break_preserves
+			=> (FlipsLarge, Preserves),
 		an_early_stale_breaks_conflicts_early, an_early_stale_with_latency_breaks_conflicts_early
 			=> (EarlyStale, ConflictsEarly),
 		a_conflict_as_failure_breaks_aborts_typed, a_conflict_as_failure_with_latency_breaks_aborts_typed
 			=> (ConflictAsFailed, AbortsTyped),
+	}
+
+	/// A scenario per fault that the native port shows: the check of
+	/// `Indexed` over a driver under the fault breaks the native clause that
+	/// runs the KV clause the fault breaks.
+	macro_rules! refused_through_indexed {
+		($($name:ident => ($fault:ident, $clause:ident)),+ $(,)?) => {
+			$(
+				tb_scenario! {
+					name: $name,
+					spec: FaultyDriverSpec,
+					environment Bare {
+						exec: |SetupEnv { trace, .. }| async move {
+							let fresh = || async { Ok(Indexed::from(Faulty::new(Some(Fault::$fault), NONE))) };
+							let checked = DriverConformance::new(fresh).check().await;
+							let breached = checked.as_ref().err().map(DriverBreach::clause);
+							trace.event_with(REFUSED, &[], breached == Some(DriverClause::$clause))?;
+							Ok(())
+						}
+					}
+				}
+			)+
+		};
+	}
+
+	refused_through_indexed! {
+		indexed_dirty_reads_break_isolates => (DirtyReads, Isolates),
+		indexed_ignored_removes_break_isolates => (IgnoresRemoves, Isolates),
+		indexed_hidden_own_writes_break_reads_own => (HidesOwn, ReadsOwn),
+		an_indexed_partial_commit_breaks_commits_atomic => (PartialCommit, CommitsAtomic),
+		an_indexed_kept_rollback_breaks_discards => (KeepsRolledBack, Discards),
+		an_indexed_overwrite_breaks_inserts_once => (Overwrites, InsertsOnce),
+		indexed_blind_inserts_break_races_insert => (BlindInserts, RacesInsert),
+		an_indexed_ignored_revision_breaks_guards_revision => (IgnoresRevision, GuardsRevision),
+		indexed_blind_swaps_break_races_swap => (BlindSwaps, RacesSwap),
+		indexed_forgotten_confirms_break_confirms_reads => (ForgetsConfirms, ConfirmsReads),
+		indexed_forgotten_revision_confirms_break_confirms_reads => (ForgetsRevisionConfirms, ConfirmsReads),
+		an_indexed_stale_beside_a_confirm_breaks_confirms_reads => (StaleBesideConfirm, ConfirmsReads),
+		an_indexed_stale_absent_remove_breaks_removes_absent => (StaleOnAbsent, RemovesAbsent),
+		indexed_revisions_by_length_break_revises => (RevisesByLength, Revises),
+		indexed_flipped_large_frames_break_preserves => (FlipsLarge, Preserves),
+		indexed_text_keys_break_accepts_keys => (TextKeys, AcceptsKeys),
+		indexed_flat_keys_break_separates_types => (FlatKeys, SeparatesTypes),
+		an_indexed_sorted_batch_breaks_gets_batch => (SortsBatch, GetsBatch),
+		an_indexed_early_stale_breaks_conflicts_early => (EarlyStale, ConflictsEarly),
+		an_indexed_conflict_as_failure_breaks_aborts_typed => (ConflictAsFailed, AbortsTyped),
+	}
+
+	/// How an [`Askew`] driver answers a prepare, whatever the schema.
+	#[derive(Clone, Copy, Debug)]
+	enum Skew {
+		/// `Ready`.
+		BlindPrepare,
+		/// `Foreign`.
+		ForeignPrepare,
+		/// `Ready` the first time, and `Foreign` after.
+		ForgetsRecord,
+	}
+
+	/// A memory driver whose prepare answers as its [`Skew`] says.
+	struct Askew {
+		skew: Skew,
+		inner: MemoryDriver,
+		/// Whether a prepare answered.
+		prepared: AtomicBool,
+	}
+
+	impl Askew {
+		/// A fresh memory driver with `skew`.
+		fn new(skew: Skew) -> Self {
+			Self { skew, inner: MemoryDriver::default(), prepared: AtomicBool::new(false) }
+		}
+	}
+
+	impl Driver for Askew {
+		fn prepare<'a>(&'a self, _schema: &'a Schema, _tables: &'a [FrameType]) -> DriverFuture<'a, Prepared> {
+			let again = self.prepared.swap(true, Ordering::SeqCst);
+			let skew = self.skew;
+			Box::pin(async move {
+				match (skew, again) {
+					(Skew::BlindPrepare, _) | (Skew::ForgetsRecord, false) => Ok(Prepared::Ready),
+					(Skew::ForeignPrepare, _) | (Skew::ForgetsRecord, true) => {
+						Ok(Prepared::foreign("a foreign backend"))
+					}
+				}
+			})
+		}
+
+		fn begin(&self) -> DriverFuture<'_, Box<dyn DriverTxn>> {
+			self.inner.begin()
+		}
+
+		fn scope(&self) -> Scope {
+			self.inner.scope()
+		}
+	}
+
+	/// The clause and the step of `breach`.
+	fn at<C: Copy>(breach: &Breach<C>) -> (C, &str) {
+		match breach {
+			Breach::Answered { clause, step, .. }
+			| Breach::Failed { clause, step, .. }
+			| Breach::Lapsed { clause, step, .. } => (*clause, step),
+		}
+	}
+
+	/// Whether the check of an [`Askew`] driver breaks `clause` at `step`.
+	async fn askew_breach(skew: Skew, clause: DriverClause, step: &str) -> bool {
+		let checked = DriverConformance::new(move || async move { Ok(Askew::new(skew)) })
+			.check()
+			.await;
+		checked.err().as_ref().map(at) == Some((clause, step))
+	}
+
+	/// A scenario per skew of the native port: the check breaks the clause
+	/// that the skew answers, at the step that reads it.
+	macro_rules! refused_askew {
+		($($name:ident => ($skew:ident, $clause:ident, $step:literal)),+ $(,)?) => {
+			$(
+				tb_scenario! {
+					name: $name,
+					spec: FaultyDriverSpec,
+					environment Bare {
+						exec: |SetupEnv { trace, .. }| async move {
+							let refused = askew_breach(Skew::$skew, DriverClause::$clause, $step).await;
+							trace.event_with(REFUSED, &[], refused)?;
+							Ok(())
+						}
+					}
+				}
+			)+
+		};
+	}
+
+	refused_askew! {
+		a_blind_prepare_breaks_prepares => (BlindPrepare, Prepares, "a prepare of a schema that no release holds"),
+		a_foreign_prepare_breaks_prepares => (ForeignPrepare, Prepares, "a prepare of the tables of the check"),
+		a_forgotten_record_breaks_prepares => (ForgetsRecord, Prepares, "a second prepare of the tables"),
+	}
+
+	// `Indexed` refuses a get of its backend that answers one value fewer
+	// than it took keys, before the native port answers.
+	tb_scenario! {
+		name: indexed_refuses_a_short_batch,
+		spec: FaultyDriverSpec,
+		environment Bare {
+			exec: |SetupEnv { trace, .. }| async move {
+				let fresh = || async { Ok(Indexed::from(Faulty::new(Some(Fault::ShortBatch), NONE))) };
+				let checked = DriverConformance::new(fresh).check().await;
+				let refused = matches!(
+					checked,
+					Err(Breach::Failed { clause: DriverClause::GetsBatch, error: DriverError::Failed(ref source), .. })
+						if matches!(source.downcast_ref(), Some(IndexedError::Batch { asked: 3, answered: 2 }))
+				);
+				trace.event_with(REFUSED, &[], refused)?;
+				Ok(())
+			}
+		}
+	}
+
+	// A driver whose revision is the length of its value gives two frames of
+	// one length one revision, so `revises` breaks at its frames of other
+	// metadata, which it checks first.
+	tb_scenario! {
+		name: revisions_by_length_break_revises_at_its_metadata_step,
+		spec: FaultyDriverSpec,
+		environment Bare {
+			exec: |SetupEnv { trace, .. }| async move {
+				let fresh = || async { Ok(Indexed::from(Faulty::new(Some(Fault::RevisesByLength), NONE))) };
+				let checked = DriverConformance::new(fresh).clause(DriverClause::Revises).await;
+				let refused = checked.err().as_ref().map(at) == Some((DriverClause::Revises, "the revision of a frame of other metadata"));
+				trace.event_with(REFUSED, &[], refused)?;
+				Ok(())
+			}
+		}
+	}
+
+	// A failure in a race of the native port names the native clause that
+	// raced, beside the clause it breaks.
+	tb_scenario! {
+		name: a_native_race_failure_names_the_native_clause,
+		spec: FaultyDriverSpec,
+		environment Bare {
+			exec: |SetupEnv { trace, .. }| async move {
+				let fresh = || async { Ok(Indexed::from(Faulty::new(Some(Fault::ConflictAsFailed), NONE))) };
+				let checked = DriverConformance::new(fresh).clause(DriverClause::CommitsAtomic).await;
+				let named = checked.err().as_ref().map(at) == Some((DriverClause::AbortsTyped, "the commit of a racer, in a race of commits_atomic"));
+				trace.event_with(REFUSED, &[], named)?;
+				Ok(())
+			}
+		}
+	}
+
+	/// Whether a prepare answered `Ready`.
+	fn is_ready(prepared: &Result<Prepared, DriverError>) -> bool {
+		matches!(prepared, Ok(Prepared::Ready))
+	}
+
+	/// Whether a prepare aborted over another prepare.
+	fn is_raced(prepared: &Result<Prepared, DriverError>) -> bool {
+		matches!(prepared, Err(DriverError::Aborted(source)) if matches!(source.downcast_ref(), Some(IndexedError::Raced)))
+	}
+
+	/// Whether one of two racing prepares answered `Ready`.
+	const ONE_READY: Urn<'static> = urn!("test", "event:store-conformance/one-ready");
+
+	/// Whether one of two racing prepares aborted over the other.
+	const ONE_RACED: Urn<'static> = urn!("test", "event:store-conformance/one-raced");
+
+	/// Whether a prepare after the race answered `Ready`.
+	const AFTER: Urn<'static> = urn!("test", "event:store-conformance/after-prepares");
+
+	tb_assert_spec! {
+		pub RacedPreparesSpec,
+		V(1,0,0): {
+			mode: Accept,
+			assertions: [
+				(ONE_READY, exactly!(1), equals!(true)),
+				(ONE_RACED, exactly!(1), equals!(true)),
+				(AFTER, exactly!(1), equals!(true))
+			]
+		}
+	}
+
+	// Two prepares that write the layout record of an empty backend in step
+	// commit one record: the second commit conflicts and aborts, so the first
+	// `begin` of its store runs again.
+	tb_scenario! {
+		name: racing_prepares_write_one_layout_record,
+		spec: RacedPreparesSpec,
+		environment Bare {
+			exec: |SetupEnv { trace, .. }| async move {
+				let driver = Indexed::from(Faulty::new(None, YIELDS));
+				let (first, second) = join!(driver.prepare(&Schema::CURRENT, &TABLES), driver.prepare(&Schema::CURRENT, &TABLES));
+				let raced = [first, second];
+				trace.event_with(ONE_READY, &[], raced.iter().filter(|prepared| is_ready(prepared)).count() == 1)?;
+				trace.event_with(ONE_RACED, &[], raced.iter().filter(|prepared| is_raced(prepared)).count() == 1)?;
+				trace.event_with(AFTER, &[], is_ready(&driver.prepare(&Schema::CURRENT, &TABLES).await))?;
+				Ok(())
+			}
+		}
+	}
+
+	// A prepare that reads no layout record, and then meets one that another
+	// prepare committed since, aborts at its insert. The clock is paused, so
+	// the sleeps take no wall time.
+	tb_scenario! {
+		name: a_prepare_that_meets_a_committed_record_aborts,
+		spec: RacedPreparesSpec,
+		environment Bare {
+			exec: |SetupEnv { trace, .. }| async move {
+				pause();
+				let driver = Indexed::from(Faulty::new(None, SLOW_CALL));
+				let late = async {
+					sleep(Duration::from_millis(200)).await;
+					driver.prepare(&Schema::CURRENT, &TABLES).await
+				};
+				let (first, second) = join!(driver.prepare(&Schema::CURRENT, &TABLES), late);
+				let raced = [first, second];
+				trace.event_with(ONE_READY, &[], raced.iter().filter(|prepared| is_ready(prepared)).count() == 1)?;
+				trace.event_with(ONE_RACED, &[], raced.iter().filter(|prepared| is_raced(prepared)).count() == 1)?;
+				trace.event_with(AFTER, &[], is_ready(&driver.prepare(&Schema::CURRENT, &TABLES).await))?;
+				Ok(())
+			}
+		}
+	}
+
+	/// Whether a probe of a clause on a backend that answers `Foreign` broke
+	/// that clause at its prepare.
+	const PREPARED: Urn<'static> = urn!("test", "event:store-conformance/prepared");
+
+	tb_assert_spec! {
+		pub PreparedSpec,
+		V(1,0,0): {
+			mode: Accept,
+			assertions: [
+				(PREPARED, exactly!(1), equals!(true))
+			]
+		}
+	}
+
+	// A clause on rows that runs alone on a backend whose prepare answers
+	// `Foreign` breaks that clause at the prepare of its tables.
+	tb_scenario! {
+		name: a_foreign_backend_breaks_a_clause_at_its_prepare,
+		spec: PreparedSpec,
+		environment Bare {
+			exec: |SetupEnv { trace, .. }| async move {
+				let fresh = || async { Ok(Askew::new(Skew::ForeignPrepare)) };
+				let checked = DriverConformance::new(fresh).clause(DriverClause::Discards).await;
+				let prepared = matches!(
+					checked,
+					Err(Breach::Answered { clause: DriverClause::Discards, ref step, .. })
+						if step == "the prepare of the tables of the check"
+				);
+				trace.event_with(PREPARED, &[], prepared)?;
+				Ok(())
+			}
+		}
 	}
 
 	/// Whether a driver with latency and no fault met the contract.
@@ -2863,6 +3407,21 @@ mod tests {
 			exec: |SetupEnv { trace, .. }| async move {
 				let checked = KvConformance::new(|| async { Ok(Faulty::new(None, YIELDS)) }).check().await;
 				checked.map_err(io::Error::other)?;
+				trace.event_with(CONFORMS, &[], true)?;
+				Ok(())
+			}
+		}
+	}
+
+	// `Indexed` over a driver that yields before each call meets the native
+	// contract.
+	tb_scenario! {
+		name: indexed_over_a_driver_with_latency_meets_the_native_contract,
+		spec: LaggedDriverSpec,
+		environment Bare {
+			exec: |SetupEnv { trace, .. }| async move {
+				let fresh = || async { Ok(Indexed::from(Faulty::new(None, YIELDS))) };
+				DriverConformance::new(fresh).check().await.map_err(io::Error::other)?;
 				trace.event_with(CONFORMS, &[], true)?;
 				Ok(())
 			}
@@ -2900,7 +3459,7 @@ mod tests {
 		}
 	}
 
-	/// Whether a check of a slow driver answered as the clauses place.
+	/// Whether a confirm of a slow driver answered as the clauses place.
 	const SLOW: Urn<'static> = urn!("test", "event:store-conformance/slow");
 
 	tb_assert_spec! {
@@ -2931,21 +3490,21 @@ mod tests {
 		}
 	}
 
-	// A slow driver that forgets a check of a revision at the commit breaks
+	// A slow driver that forgets a confirm of a revision at the commit breaks
 	// the clause of checks: the checker waits out its slow rival, so the
 	// competing commit lands first. The clock is paused, so the sleeps take no
 	// wall time.
 	tb_scenario! {
-		name: a_slow_driver_that_forgets_revision_checks_breaks_checks_reads,
+		name: a_slow_driver_that_forgets_revision_checks_breaks_confirms_reads,
 		spec: SlowDriverSpec,
 		environment Bare {
 			exec: |SetupEnv { trace, .. }| async move {
 				pause();
-				let fresh = || async { Ok(Faulty::new(Some(Fault::ForgetsRevisionChecks), SLOW_CALL)) };
+				let fresh = || async { Ok(Faulty::new(Some(Fault::ForgetsRevisionConfirms), SLOW_CALL)) };
 				let conformance = KvConformance::new(fresh).with_patience(SLOW_PATIENCE);
-				let checked = conformance.clause(KvClause::ChecksReads).await;
+				let checked = conformance.clause(KvClause::ConfirmsReads).await;
 				let breached = checked.as_ref().err().map(KvBreach::clause);
-				trace.event_with(SLOW, &[], breached == Some(KvClause::ChecksReads))?;
+				trace.event_with(SLOW, &[], breached == Some(KvClause::ConfirmsReads))?;
 				Ok(())
 			}
 		}
@@ -2971,6 +3530,24 @@ mod tests {
 		}
 	}
 
+	// `Indexed` over a slow driver, and over a driver of locks, meets the
+	// native contract. The clock is paused, so the sleeps take no wall time.
+	tb_scenario! {
+		name: indexed_over_slow_and_locking_drivers_meets_the_native_contract,
+		spec: SlowDriverSpec,
+		environment Bare {
+			exec: |SetupEnv { trace, .. }| async move {
+				pause();
+				let slow = || async { Ok(Indexed::from(Faulty::new(None, SLOW_CALL))) };
+				DriverConformance::new(slow).with_patience(SLOW_PATIENCE).check().await.map_err(io::Error::other)?;
+				let locking = || async { Ok(Indexed::from(Faulty::new(None, NONE).with_locks())) };
+				DriverConformance::new(locking).check().await.map_err(io::Error::other)?;
+				trace.event_with(SLOW, &[], true)?;
+				Ok(())
+			}
+		}
+	}
+
 	/// Whether a clause broke at the step that alone catches its fault.
 	const DECIDED: Urn<'static> = urn!("test", "event:store-conformance/decided");
 
@@ -2984,19 +3561,19 @@ mod tests {
 		}
 	}
 
-	// A driver that forgets checks lets two crossed checks of absence both
+	// A driver that forgets checks lets two crossed confirms of absence both
 	// commit, the write skew that the clause of checks refuses first.
 	tb_scenario! {
-		name: forgotten_checks_let_crossed_checks_commit_together,
+		name: forgotten_confirms_let_crossed_checks_commit_together,
 		spec: DecidingStepSpec,
 		environment Bare {
 			exec: |SetupEnv { trace, .. }| async move {
-				let fresh = || async { Ok(Faulty::new(Some(Fault::ForgetsChecks), NONE)) };
-				let checked = KvConformance::new(fresh).clause(KvClause::ChecksReads).await;
+				let fresh = || async { Ok(Faulty::new(Some(Fault::ForgetsConfirms), NONE)) };
+				let checked = KvConformance::new(fresh).clause(KvClause::ConfirmsReads).await;
 				let decided = matches!(
 					checked,
-					Err(KvBreach::Answered { clause: KvClause::ChecksReads, ref step, .. })
-						if step == "two crossed checks of absence"
+					Err(KvBreach::Answered { clause: KvClause::ConfirmsReads, ref step, .. })
+						if step == "two crossed confirms of absence"
 				);
 				trace.event_with(DECIDED, &[], decided)?;
 				Ok(())
@@ -3045,7 +3622,7 @@ mod tests {
 		spec: JudgeSpec,
 		environment Bare {
 			exec: |SetupEnv { trace, .. }| async move {
-				let probe = Probe { clause: KvClause::RacesSwap, patience: PATIENCE, kv: MemoryKv::default() };
+				let probe = Probe::new(KvClause::RacesSwap, PATIENCE, MemoryKv::default());
 				let key = Key::from_static(NORTH, b"judged");
 				probe.seed(&[(&key, b"seeded")]).await.map_err(io::Error::other)?;
 				let refused = Raced::Refused(String::from("a swap answered Stale"));
@@ -3075,7 +3652,7 @@ mod tests {
 			races_insert => (KvClause::RacesInsert, "races_insert"),
 			guards_revision => (KvClause::GuardsRevision, "guards_revision"),
 			races_swap => (KvClause::RacesSwap, "races_swap"),
-			checks_reads => (KvClause::ChecksReads, "checks_reads"),
+			confirms_reads => (KvClause::ConfirmsReads, "confirms_reads"),
 			removes_absent => (KvClause::RemovesAbsent, "removes_absent"),
 			revises => (KvClause::Revises, "revises"),
 			preserves => (KvClause::Preserves, "preserves"),
@@ -3100,7 +3677,7 @@ mod tests {
 			"races_insert",
 			"guards_revision",
 			"races_swap",
-			"checks_reads",
+			"confirms_reads",
 			"removes_absent",
 			"revises",
 			"preserves",
@@ -3112,6 +3689,33 @@ mod tests {
 			"aborts_typed",
 		];
 		assert_eq!(names, documented);
+	}
+
+	#[test]
+	fn every_native_clause_runs_in_the_documented_order_under_its_name() {
+		let names: Vec<String> = DriverClause::ALL.iter().map(ToString::to_string).collect();
+		let documented = [
+			"prepares",
+			"isolates",
+			"reads_own",
+			"commits_atomic",
+			"discards",
+			"inserts_once",
+			"races_insert",
+			"guards_revision",
+			"races_swap",
+			"confirms_reads",
+			"removes_absent",
+			"revises",
+			"preserves",
+			"separates_types",
+			"gets_batch",
+			"accepts_keys",
+			"conflicts_early",
+			"aborts_typed",
+		];
+		assert_eq!(names, documented);
+		assert!(DriverClause::ALL.iter().all(|clause| clause.name() == clause.to_string()));
 	}
 
 	tightbeam::tb_cases! {
@@ -3156,8 +3760,8 @@ mod tests {
 			swap => (Write::Swap(&JUDGED_KEY, &JUDGED_REVISION, KvValue::new(*b"b")), "a swap to \"b\" at conformance-north \"k\""),
 			guarded_remove => (Write::Remove(&JUDGED_KEY, Some(&JUDGED_REVISION)), "a guarded remove at conformance-north \"k\""),
 			unguarded_remove => (Write::Remove(&JUDGED_KEY, None), "an unguarded remove at conformance-north \"k\""),
-			check_of_a_revision => (Write::Check(&JUDGED_KEY, Some(&JUDGED_REVISION)), "a check of a revision at conformance-north \"k\""),
-			check_of_absence => (Write::Check(&JUDGED_KEY, None), "a check of absence at conformance-north \"k\""),
+			check_of_a_revision => (Write::Confirm(&JUDGED_KEY, Some(&JUDGED_REVISION)), "a confirm of a revision at conformance-north \"k\""),
+			check_of_absence => (Write::Confirm(&JUDGED_KEY, None), "a confirm of absence at conformance-north \"k\""),
 		}
 	}
 
@@ -3227,6 +3831,25 @@ mod tests {
 				let broke = matches!(
 					checked,
 					Err(KvBreach::Failed { clause: KvClause::Isolates, ref step, .. }) if step == "the build of a fresh backend"
+				);
+				trace.event_with(BROKE, &[], broke)?;
+				Ok(())
+			}
+		}
+	}
+
+	// A native backend that never begins a transaction breaks the first
+	// clause with the lapse of its prepare, within the patience of the check.
+	tb_scenario! {
+		name: a_native_backend_that_never_begins_breaks_the_check_with_a_lapse,
+		spec: HangingDriverSpec,
+		environment Bare {
+			exec: |SetupEnv { trace, .. }| async move {
+				let checked = DriverConformance::new(|| async { Ok(Indexed::from(Hanging)) }).with_patience(SHORT).check().await;
+				let broke = matches!(
+					checked,
+					Err(Breach::Lapsed { clause: DriverClause::Prepares, ref step, patience })
+						if step == "a prepare of the tables of the check" && patience == SHORT
 				);
 				trace.event_with(BROKE, &[], broke)?;
 				Ok(())

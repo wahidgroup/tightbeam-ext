@@ -9,6 +9,7 @@ use tightbeam::Errorizable;
 use crate::driver::{
 	CommitOutcome, ConfirmOutcome, DriverError, DriverFuture, InsertOutcome, RemoveOutcome, Revision, SwapOutcome,
 };
+use crate::indexed::Indexed;
 use crate::kv::{Entry, Key, KeyRange, KvValue, OrderedKv, OrderedKvTxn, Partition, Stored, TxnFuture};
 use crate::scope::Scope;
 use crate::selection::Direction;
@@ -52,6 +53,19 @@ impl OrderedKv for MemoryKv {
 		Scope::Process
 	}
 }
+
+/// The native port over a [`MemoryKv`]: the real backend of local work and
+/// of tests, process-local and not durable.
+///
+/// # Examples
+///
+/// ```
+/// use tightbeam_store::{Driver, MemoryDriver, Scope};
+///
+/// let driver = MemoryDriver::default();
+/// assert_eq!(driver.scope(), Scope::Process);
+/// ```
+pub type MemoryDriver = Indexed<MemoryKv>;
 
 /// The failures of a [`MemoryKv`], each the source of a [`DriverError::Failed`].
 #[derive(Debug, Errorizable)]
@@ -285,7 +299,7 @@ impl MemoryTxn {
 		Ok(entries)
 	}
 
-	fn check_now(&mut self, key: &Key, expected: Option<&Revision>) -> Result<ConfirmOutcome, DriverError> {
+	fn confirm_now(&mut self, key: &Key, expected: Option<&Revision>) -> Result<ConfirmOutcome, DriverError> {
 		let shared = Arc::clone(&self.committed);
 		let committed = Committed::lock(&shared)?;
 		let held = self.revision(&committed, key);
@@ -355,10 +369,10 @@ impl OrderedKvTxn for MemoryTxn {
 		})
 	}
 
-	fn check<'a>(mut self: Box<Self>, key: &'a Key, expected: Option<&'a Revision>) -> TxnFuture<'a, ConfirmOutcome> {
+	fn confirm<'a>(mut self: Box<Self>, key: &'a Key, expected: Option<&'a Revision>) -> TxnFuture<'a, ConfirmOutcome> {
 		Box::pin(async move {
-			let checked = self.check_now(key, expected)?;
-			Ok((self as Box<dyn OrderedKvTxn>, checked))
+			let confirmed = self.confirm_now(key, expected)?;
+			Ok((self as Box<dyn OrderedKvTxn>, confirmed))
 		})
 	}
 
@@ -433,11 +447,13 @@ mod tests {
 
 				let past = key(MAX_WRITES)?;
 				let refused = txn.insert(&past, &filler).await;
+
 				trace.event_with(PAST_THE_CAP, &[], matches!(refused, Err(DriverError::Failed(_))))?;
 
 				let first = key(0)?;
 				let reader = kv.begin().await.map_err(io::Error::other)?;
 				let (_, read) = reader.get(slice::from_ref(&first)).await.map_err(io::Error::other)?;
+
 				trace.event_with(NONE_COMMITTED, &[], read == [None])?;
 				Ok(())
 			}
@@ -476,6 +492,7 @@ mod tests {
 				let first = key(0)?;
 				let txn = kv.begin().await.map_err(io::Error::other)?;
 				let read = txn.get(slice::from_ref(&first)).await;
+
 				trace.event_with(POISONED, &[], panicked.is_err() && matches!(read, Err(DriverError::Failed(_))))?;
 				Ok(())
 			}

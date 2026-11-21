@@ -4,6 +4,10 @@ import:
   - ./ws/node_modules/@wahidgroup/lint-rules/cspell.base.json
 words:
   - tightbeam
+  - kekri
+  - ktri
+  - pwri
+  - kemct
   - alpn
   - bidi
   - svid

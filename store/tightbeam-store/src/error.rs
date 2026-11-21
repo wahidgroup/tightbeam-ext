@@ -1,9 +1,10 @@
 //! The errors of the store.
 
 use tightbeam::urn::UrnValidationError;
-use tightbeam::Errorizable;
+use tightbeam::{Errorizable, TightBeamError};
 
 use crate::frame_type::FrameType;
+use crate::schema::Field;
 
 /// A refusal or a failure of the store.
 #[derive(Debug, Errorizable)]
@@ -39,4 +40,25 @@ pub enum StoreError {
 		/// The table the URN names.
 		found: String,
 	},
+
+	/// A frame carries a value of more than 100 bytes in a field that holds at
+	/// most 100.
+	#[error("the frame carries a {field} value of {length} bytes, past 100")]
+	FieldLength {
+		/// The field of the value.
+		field: Field,
+		/// The length of the value, in bytes.
+		length: usize,
+	},
+
+	/// A frame carries more values in a field than it holds.
+	#[error("the frame carries more than 32 values of {field}")]
+	FieldCount {
+		/// The field of the values.
+		field: Field,
+	},
+
+	/// A frame does not encode, or its metadata does not project.
+	#[error("the frame does not project: {0}")]
+	Frame(TightBeamError),
 }
